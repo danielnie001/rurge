@@ -2,7 +2,7 @@
 
 需要真实网卡、真实的 Wi-Fi 与有线网络、真实的系统代理设置和真实的位置权限的项目。自动化测试只用回环地址，用文件后端（`RURGE_NETWORK_BACKEND`、`RURGE_SYSTEM_PROXY_BACKEND`）模拟网络和系统代理，覆盖不了这些：读网络的那几条命令与文件在 Linux 与 macOS 上只对着假的机器测过（`docs/superpowers/plans/2026-10-16-phase3-m1-network-subnet-plan.md` 末尾「延后事项」第 1、3 行），非英文系统上真实的 `netsh wlan show interfaces` 输出（开发机的系统语言是中文，量的时候 Wi-Fi 是断开的，输出里没有 `SSID` 与 `BSSID` 这两行，所以这两个键本身没有见过，见过的只是断开时就有的键）、含非 ASCII 字母的真实网络名、位置权限和 VPN 这些情形没有量过（解析器对着按公开格式写的文本夹具测过，其中有含非 ASCII 字母的名字）。由项目所有者在自己的机器上验收；每一项记下日期、系统版本与结果。**一项也没有做过。**
 
-清单随里程碑逐节增加：下面是 M1（网络环境与子网）与 M2（进程识别），M3 起各加一节。M1 的设计见 `docs/superpowers/specs/2026-10-16-phase3-m1-network-subnet-design.md`，M2 的设计见 `docs/superpowers/specs/2026-10-17-phase3-m2-process-design.md`；API 与日志行见 `docs/api/phase3.md`，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 2.3、3.1、3.4、3.5、5.1、5.2、9.4、10.4 节。
+清单随里程碑逐节增加：下面是 M1（网络环境与子网）、M2（进程识别）与 M3（内存设备上的 TUN 内核，M3a、M3b、M3c 合成一节），M4 起每个里程碑各加一节。M1 的设计见 `docs/superpowers/specs/2026-10-16-phase3-m1-network-subnet-design.md`，M2 的设计见 `docs/superpowers/specs/2026-10-17-phase3-m2-process-design.md`，M3 的设计见 `docs/superpowers/specs/2026-10-18-phase3-m3-tun-core-design.md`；API 与日志行见 `docs/api/phase3.md`，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 2.3、3.1、3.4、3.5、4.1、5.1、5.2、6.4、9.1、9.4、10.4 节。**M1 与 M2 的各节在今天的 `rurge run` 上就能做；M3 一节要等 M4 的虚拟网卡。**
 
 ## M1　网络环境与子网
 
@@ -203,3 +203,275 @@
 | P16 | **进程不进 INFO。** 缺省日志级别（`loglevel = notify`，INFO）下，用 W11 / M9 / L10 的办法产生几条被拒与放行的会话（含 `ads.test` 那种被拒的），然后在日志文件里搜进程的名字（`curl`）、路径里的目录名和 PID。再用 `--log-level debug` 做同样的搜索 | 缺省级别下**搜不到**查到的进程：被拒与失败的会话的 INFO 行带来源、目标、规则文字和策略；规则文字里的 `PROCESS-NAME,curl,…` 是使用者自己写的，不是查到的。`--log-level debug` 时进程的名字、路径与 PID 只出现在 `process lookup found the process` 那一行（和请求记录、API 里）。两句 WARN 不带会话、地址与进程 | 日志文件 | | | |
 | P17 | **`check` 与 `rule match`。** `<conf>` 里写 `PROCESS-NAME,curl,DIRECT`、`PROCESS-NAME,C:\Program Files\App\app.exe,DIRECT`、`PROCESS-NAME,/Applications/Foo.app/Contents/MacOS/*,DIRECT`、`DEVICE-NAME,Kids-iPad,DIRECT`，在三个平台上各跑 `rurge check -c <conf>`；再 `rurge rule match -c <conf> example.com --process curl` | 三个平台上输出一样：**没有** `PROCESS-NAME` 的 `W0013`，有 `` `DEVICE-NAME` rules never match `` 一条警告（`0 error(s), 1 warning(s)`）——以盘符开头的路径在 Linux 与 macOS 上同样读作路径，为 Windows 写的 Profile 能在别的系统上被检查。`rule match … --process curl` 命中第一条（`rule match` 不查真实的进程，进程是命令行给的） | 各命令的输出 | | | |
 | P18 | **日常使用一天。** `rurge run -c <conf> --system-proxy --log-file <日志路径>`（缺省日志级别），正常使用一天，含睡眠与唤醒、换网络 | 日志里没有 `process lookup took longer than 200 ms`（出现过的话把前后的情形、平台和机器写下来：谁慢了，是表大、进程多，还是机器刚睡醒），没有 `process lookup: the tcp table could not be read`；空闲时 CPU 接近 0（查找只随会话发生，空闲时不读表） | 日志；任务管理器 / `top` | | | |
+
+---
+
+## M3　内存设备上的 TUN 内核
+
+设计 `docs/superpowers/specs/2026-10-18-phase3-m3-tun-core-design.md`，计划 `docs/superpowers/plans/2026-10-18-phase3-m3a-tun-tcp-plan.md`、`docs/superpowers/plans/2026-10-22-phase3-m3b-udp-icmp-pool-engine-plan.md` 与 `docs/superpowers/plans/2026-10-23-phase3-m3c-dns-responder-prematch-plan.md`（M3a 延后第 2、11、13 行，M3b 延后第 6 行，M3c 延后第 5、12、14 行是这一节的来由），API 与日志行见 `docs/api/phase3.md` 的「M3b」与「M3c」两节，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 4.1、6.4、9.1 节。
+
+**这一节的每一项都要真实设备上的 TUN（P27 的监听器那一半除外）。**设备层、地址、路由与系统 DNS 是 M4 的内容：今天 `rurge run` 不起虚拟网卡，也没有命令行选项能起，M3 的内核只在内存里的设备上测过——"应用"是测试里的另一个 smoltcp 栈，上游是回环上的测试服务器，什么也没有改系统。所以**这一节要等 M4 之后才能做**，下面的"操作"按 M4 会有的样子写（M4 的开关与命令行定下来之后，照实改"开增强模式"那几处）。自动化覆盖不了的是：真实的应用（浏览器、`dig`、`nslookup`、带 0x20 的解析器）问应答器会怎样、真实设备上的数字（系统调用的开销不在内存基准里）、真实的发送方在长停顿里怎样探测零窗口、停止时最后一轮的复位会不会被设备丢掉。**一项也没有做过。**编号接着 M2 往下排（W16、M14、L15、P19），整份清单里的编号不重复。
+
+### 前置条件
+
+- M4 的构建：`cargo build --release`，用得到的二进制，以管理员（Windows）或 root（macOS、Linux）运行，开增强模式（M4 定下开关）。下文把虚拟网卡写作 `198.18.0.1`，应答器写作 `198.18.0.2`（`198.18.0.2` ～ `198.18.0.9` 与 `fd00:6152::2` 都是应答器的地址，只有 53 端口去应答器）；M4 的实际地址不同时照实改。
+- 一份测试用 Profile（下文的 `<conf>`）。每一项要加的规则与键写在对应的节里，改完重载（`curl -X POST -H "X-Key: testkey" http://127.0.0.1:6171/v1/profiles/reload`，Windows 用 `curl.exe`）或重启：
+
+  ```ini
+  [General]
+  http-listen = 127.0.0.1:6152
+  socks5-listen = 127.0.0.1:6153
+  http-api = testkey@127.0.0.1:6171
+
+  [Rule]
+  FINAL,DIRECT
+  ```
+
+- 看记录：`curl -s -H "X-Key: testkey" "http://127.0.0.1:6171/v1/requests/recent?limit=1000"`（M2 一节有 PowerShell 与 `jq` 的写法）；每条看 `listener`（虚拟网卡的会话是 `tun`）、`dst`、`rule`、`status`、`rejectKind`、`error`、`notes`、`pid`、`processPath`。
+- 看计数：`GET /v1/features/enhanced_mode`（M4 起）的 `dropped`（十个原因）与 `stackPanics`，形状见设计第 14 节。
+- 日志：`rurge run -c <conf> --log-level debug --log-file <日志路径>`；DEBUG 的 `tun: DNS query` 行说应答器对每个查询做了什么（`decision`），`docs/api/phase3.md` 的「M3c」一节有全部的行。
+- 内存设备上量过的数字（对照用；一台 Windows 11 x86-64 的开发机，release 构建，不是真实设备）：**B1**（单流吞吐，MTU 1500，`tx_max` 256 KiB，远端在内存里）中位数上行约 7.2、下行约 5.5 Gbit/s，门槛是每个方向不低于 0.7 Gbit/s；**B2**（一万条空闲连接加一百条活跃连接，缺省设置）门槛读数（扣掉测试一侧自己的内存）402.5 MB，对着 429,000,000 字节的线，保守读数 444.1 MB（超线）；**b3**（`Responder::answer` 加造应答包，不含设备、写任务与引擎的规则评估）中位数 0.9 微秒、p99 3.2 微秒、最大 5.8 毫秒，NFR-01 要小于 0.2 毫秒。
+- 一台局域网里的另一台机器（下文写作 `<服务器>`，下面几个脚本里的服务器在它上面跑，被测机器经 TUN 连它；规则 `FINAL,DIRECT`）。七个脚本（Python 3；Windows 上写 `python`）：
+  - `stall_server.py <端口> <秒数>`：接受一条连接，睡 `<秒数>` 秒不读，再读完并打印收到的字节数。零窗口探测用：
+
+    ```python
+    import socket, sys, time
+
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 9000
+    stall = int(sys.argv[2]) if len(sys.argv) > 2 else 300
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", port))
+    server.listen()
+    conn, peer = server.accept()
+    print("accepted", peer, "- not reading for", stall, "seconds", flush=True)
+    time.sleep(stall)
+    total = 0
+    while True:
+        data = conn.recv(1 << 16)
+        if not data:
+            break
+        total += len(data)
+    print("received", total, "bytes", flush=True)
+    ```
+
+  - `hold_server.py <端口>`：接受连接、一直拿着不读不写。停止与一万条连接用：
+
+    ```python
+    import socket, sys
+
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", int(sys.argv[1])))
+    server.listen(1024)
+    held = []
+    while True:
+        conn, _ = server.accept()
+        held.append(conn)
+    ```
+
+  - `many_connections.py <服务器> <端口> <条数> [hold]`：开 `<条数>` 条连接；有 `hold` 时拿着 15 分钟，否则等它们结束（你停掉 rurge），打印多少条在多久之内以复位或 EOF 结束（Windows 上 `select` 最多 512 条，条数多时用 `hold`）：
+
+    ```python
+    import select, socket, sys, time
+
+    host, port, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+    hold = len(sys.argv) > 4 and sys.argv[4] == "hold"
+    conns = [socket.create_connection((host, port)) for _ in range(count)]
+    print("opened", len(conns), "connections", flush=True)
+    if hold:
+        print("holding them for 15 minutes", flush=True)
+        time.sleep(900)
+        sys.exit(0)
+    print("stop rurge now", flush=True)
+    alive = set(conns)
+    ended = []
+    deadline = None
+    while alive and (deadline is None or time.time() < deadline):
+        readable, _, _ = select.select(list(alive), [], [], 1.0)
+        for conn in readable:
+            try:
+                how = "eof" if not conn.recv(4096) else None
+            except OSError as error:
+                how = type(error).__name__
+            if how:
+                ended.append((time.time(), how))
+                alive.discard(conn)
+                if deadline is None:
+                    deadline = time.time() + 30
+    if ended:
+        first = ended[0][0]
+        kinds = {}
+        for _, how in ended:
+            kinds[how] = kinds.get(how, 0) + 1
+        print("ended", len(ended), "of", count, "- the last", "%.2f" % (ended[-1][0] - first), "seconds after the first", kinds)
+    print("still open", len(alive))
+    ```
+
+  - `dns_latency.py <应答器>[:端口] <类型> <次数>`：向应答器发 `<次数>` 个查询、各等应答，打印往返的中位数、p99 与最大值；类型 1 是 A（每次一个不同的名字），16 是 TXT（`example.com`）：
+
+    ```python
+    import socket, struct, sys, time
+
+    server, qtype, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])  # qtype: 1 = A, 16 = TXT
+    host, _, port = server.partition(":")
+    address = (host, int(port or 53))
+
+
+    def query(ident, name):
+        labels = b"".join(bytes([len(part)]) + part.encode() for part in name.split("."))
+        return struct.pack(">HHHHHH", ident & 0xFFFF, 0x0100, 1, 0, 0, 0) + labels + b"\x00" + struct.pack(">HH", qtype, 1)
+
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2)
+    times = []
+    for i in range(count):
+        name = "n%d.test" % i if qtype == 1 else "example.com"
+        started = time.perf_counter()
+        sock.sendto(query(i, name), address)
+        sock.recvfrom(4096)
+        times.append((time.perf_counter() - started) * 1000)
+    times.sort()
+    print("median %.3f ms, p99 %.3f ms, max %.3f ms" % (times[len(times) // 2], times[int(len(times) * 0.99)], times[-1]))
+    ```
+
+  - `burst_queries.py <应答器>[:端口] <条数>`：一个 UDP 套接字不等应答、连发 `<条数>` 个不同 ID 与名字的 A 查询，再收 3 秒应答，打印收到几个；没收到的补问一遍再收 3 秒：
+
+    ```python
+    import socket, struct, sys, time
+
+    server, count = sys.argv[1], int(sys.argv[2])
+    host, _, port = server.partition(":")
+    address = (host, int(port or 53))
+
+
+    def query(ident, name):
+        labels = b"".join(bytes([len(part)]) + part.encode() for part in name.split("."))
+        return struct.pack(">HHHHHH", ident, 0x0100, 1, 0, 0, 0) + labels + b"\x00" + struct.pack(">HH", 1, 1)
+
+
+    def listen(sock, seconds):
+        seen = set()
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                data, _ = sock.recvfrom(4096)
+                seen.add(struct.unpack(">H", data[:2])[0])
+            except socket.timeout:
+                pass
+        return seen
+
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.2)
+    for i in range(count):
+        sock.sendto(query(i, "n%d.test" % i), address)
+    seen = listen(sock, 3)
+    print("answered at once:", len(seen), "of", count)
+    missing = [i for i in range(count) if i not in seen]
+    for i in missing:
+        sock.sendto(query(i, "n%d.test" % i), address)
+    seen |= listen(sock, 3)
+    print("answered after asking the rest again:", len(seen), "of", count)
+    ```
+
+  - `tcp_pipeline.py <应答器>[:端口] <条数>`：向应答器开一条 TCP 连接，一次写完 `<条数>` 个带两字节长度的 A 查询，再读应答，打印收到几个、ID 是不是按发的次序：
+
+    ```python
+    import socket, struct, sys
+
+    server, count = sys.argv[1], int(sys.argv[2])
+    host, _, port = server.partition(":")
+
+
+    def query(ident, name):
+        labels = b"".join(bytes([len(part)]) + part.encode() for part in name.split("."))
+        message = struct.pack(">HHHHHH", ident, 0x0100, 1, 0, 0, 0) + labels + b"\x00" + struct.pack(">HH", 1, 1)
+        return struct.pack(">H", len(message)) + message
+
+
+    def read_exactly(sock, n):
+        data = b""
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                raise SystemExit("the connection was closed after %d bytes" % len(data))
+            data += chunk
+        return data
+
+
+    sock = socket.create_connection((host, int(port or 53)), timeout=10)
+    sock.sendall(b"".join(query(i, "t%d.test" % i) for i in range(count)))
+    ids = []
+    for _ in range(count):
+        length = struct.unpack(">H", read_exactly(sock, 2))[0]
+        ids.append(struct.unpack(">H", read_exactly(sock, length)[:2])[0])
+    print("answers:", len(ids), "of", count, "- in order:", ids == list(range(count)))
+    ```
+
+  - `show_requests.py <端口>`：在 `<服务器>` 上收明文的 HTTP 请求，打印收到的头（看 `Host:`）并答 200：
+
+    ```python
+    import socket, sys
+
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", int(sys.argv[1])))
+    server.listen()
+    while True:
+        conn, peer = server.accept()
+        print("---", peer, flush=True)
+        print(conn.recv(4096).decode("latin-1"), flush=True)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        conn.close()
+    ```
+
+- 每一步执行后，在对应行填写「结果」（通过 / 不通过，附简要说明）、「日期」与「系统版本」三栏。
+
+---
+
+### Windows
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| W16 | **零窗口探测：Windows 作发送方。**（M3a 延后第 11 行）开增强模式。在 `<服务器>` 上 `python3 stall_server.py 9000 300`；在被测机器上 `python -c "import socket; s=socket.create_connection(('<服务器>',9000)); s.sendall(b'x'*(200<<20)); print('sent')"`，同时在虚拟网卡上抓包（Wireshark）。服务器睡着的 5 分钟里不要动，之后等服务器打印收到的字节数 | 上传在服务器睡着时停住（rurge 的接收缓冲满了，窗口为 0），**连接不被重置**：服务器醒来读完之后，上传继续并完成，服务器打印的字节数是 209,715,200，客户端打印 `sent`。记录里这条连接一直是 `active`。抓包里记下 Windows 发零窗口探测的间隔（重传计时器的指数退避）和 rurge 是不是每次都回了 ACK（smoltcp 对越过窗口边缘的段每个套接字每秒至多回一个 ACK）。`dropped` 里 `beyond_window` 很小，`rst_limited` 与 `stackPanics` 为 0。没有观察过：真实的 Windows 发送方会不会因为得不到足够的回答而重置连接——重置了就把间隔、持续多久与报错写下来 | `stall_server.py` 的输出；Wireshark；`/v1/requests/active`；计数 | | | |
+| W17 | **停止时最后一轮的复位与 `STOP_GRACE`。**（M3a 延后第 13 行）开增强模式。在 `<服务器>` 上 `python3 hold_server.py 7000`；在被测机器上 `python many_connections.py <服务器> 7000 500`，打印 `stop rurge now` 之后在另一个窗口 `rurge.exe stop -c <conf>`（或在 rurge 的窗口按 Ctrl-C），同时抓虚拟网卡 | 脚本打印 `ended 500 of 500`，最后一条在第一条之后约 1 秒之内（`STOP_GRACE` 是 1 秒），种类是 `ConnectionResetError`；**没有一条挂到应用自己的 TCP 超时才断**（`still open 0`）。少了几条、或最后一条晚了多久，写下来——最后一轮的复位在真实设备满了时会被丢，应用的 TCP 就要等自己的超时。抓包里看这些复位是不是都发出去了 | 脚本的输出；Wireshark | | | |
+| W18 | **Windows 的应用问应答器。**开增强模式，系统 DNS 指向应答器（M4）。(a) `nslookup example.com 198.18.0.2`、`nslookup -type=AAAA example.com 198.18.0.2`、`nslookup -type=TXT example.com 198.18.0.2`、`nslookup -type=HTTPS example.com 198.18.0.2`、`nslookup use-application-dns.net 198.18.0.2`；(b) `nslookup -vc example.com 198.18.0.2`（经 TCP）和 `Resolve-DnsName example.com -Server 198.18.0.2 -DnsOnly -TcpOnly`；(c) Edge、Chrome、Firefox 各打开 `http://example.com/`，读 `recent` | (a) A 得 `198.18.x.y`（TTL 30），AAAA 得 `fd00:6152::` 开头的地址，TXT 得真实的 TXT（转发），HTTPS 得 NOTIMP（`allow-dns-svcb` 缺省关着），canary 得 NXDOMAIN；(b) 经 TCP 的结果相同；(c) 页面能打开，`recent` 里 `dst` 是名字（`example.com:80`）、`listener` 是 `tun`、`pid` 是浏览器的进程。把每个浏览器的 DNS 请求是不是真的发给了应答器写下来（Chrome 的"安全 DNS"、Edge 的 DNS over HTTPS 会绕开它，应当在 DEBUG 日志里看不到它们的 `tun: DNS query`） | 命令的输出；`recent`；DEBUG 日志 | | | |
+
+---
+
+### macOS
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| M14 | **零窗口探测：macOS 作发送方。**（M3a 延后第 11 行）同 W16：在 `<服务器>` 上 `python3 stall_server.py 9000 300`；在被测机器上 `python3 -c "import socket; s=socket.create_connection(('<服务器>',9000)); s.sendall(b'x'*(200<<20)); print('sent')"`，同时在 utun 上抓包（`sudo tcpdump -i utunN -n`，`N` 看 M4 建的是哪一个） | 同 W16：上传停住、连接不被重置、服务器醒来之后收到 209,715,200 字节；记下 macOS 的探测间隔与 rurge 的 ACK；`dropped` 里 `beyond_window` 很小，`rst_limited` 与 `stackPanics` 为 0 | `stall_server.py` 的输出；`tcpdump`；计数 | | | |
+| M15 | **停止时最后一轮的复位与 `STOP_GRACE`。**（M3a 延后第 13 行）同 W17：`python3 hold_server.py 7000` 在 `<服务器>`，被测机器 `python3 many_connections.py <服务器> 7000 500`，打印 `stop rurge now` 之后 `./rurge stop -c <conf>` | 同 W17：500 条约 1 秒之内都以复位结束，没有挂到应用自己的 TCP 超时的；macOS 上 utun 收不下时最后一轮的复位会不会被丢（设计 4.1 节：内存设备会等，真实设备收不下就丢）——少了几条写下来 | 脚本的输出；`tcpdump` | | | |
+| M16 | **macOS 的应用问应答器。**开增强模式，系统 DNS 指向应答器（M4）。(a) `dig @198.18.0.2 example.com`、`dig @198.18.0.2 example.com AAAA`、`dig @198.18.0.2 example.com TXT`、`dig @198.18.0.2 example.com HTTPS`、`dig @198.18.0.2 use-application-dns.net`；(b) `dig +tcp @198.18.0.2 example.com`；(c) `dscacheutil -q host -a name example.com` 和 `ping -c 3 example.com`（系统解析库经 mDNSResponder 问应答器）；(d) Safari、Chrome、Firefox 各打开 `http://example.com/`，读 `recent`；`scutil --dns` 看系统的解析器 | (a) 同 W18(a)：A 得 `198.18.x.y`（TTL 30，`aa` 与 `ra` 置位），AAAA 得 `fd00:6152::` 开头的地址，TXT 得真实的 TXT，HTTPS 得 NOTIMP，canary 得 NXDOMAIN；(b) 经 TCP 的结果相同；(c) 解析出 fake 地址，`ping` 的回显发往名字背后的真实地址并拿到应答（`icmp-forwarding` 缺省开着；真实的 ICMP 套接字是 M4 的）；(d) 页面能打开，`recent` 里 `dst` 是名字、`listener` 是 `tun`。`.local` 名字（mDNS）的行为单独记下：A / AAAA 拿 fake 地址还是被系统直接用 mDNS 解析 | `dig` 的输出；`recent`；`scutil --dns` | | | |
+
+---
+
+### Linux
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| L15 | **零窗口探测：Linux 作发送方。**（M3a 延后第 11 行）同 W16：在 `<服务器>` 上 `python3 stall_server.py 9000 300`；在被测机器上 `python3 -c "import socket; s=socket.create_connection(('<服务器>',9000)); s.sendall(b'x'*(200<<20)); print('sent')"`，同时在 TUN 设备上抓包（`sudo tcpdump -i <设备名> -n`） | 同 W16：上传停住、连接不被重置、服务器醒来之后收到 209,715,200 字节；Linux 的持续计时器（persist timer）的探测间隔与 rurge 的 ACK 写下来；`dropped` 里 `beyond_window` 很小，`rst_limited` 与 `stackPanics` 为 0 | `stall_server.py` 的输出；`tcpdump`；计数 | | | |
+| L16 | **停止时最后一轮的复位与 `STOP_GRACE`。**（M3a 延后第 13 行）同 W17：`python3 hold_server.py 7000` 在 `<服务器>`，被测机器 `ulimit -n 4096; python3 many_connections.py <服务器> 7000 500`，打印 `stop rurge now` 之后 `./rurge stop -c <conf>` | 同 W17：500 条约 1 秒之内都以复位结束；少了几条、最后一条晚了多久写下来（TUN 设备的发送队列满时最后一轮的复位会不会被丢） | 脚本的输出；`tcpdump` | | | |
+| L17 | **Linux 的应用问应答器。**开增强模式，系统 DNS 指向应答器（M4）。(a) `dig @198.18.0.2 example.com`、`dig @198.18.0.2 example.com AAAA`、`dig @198.18.0.2 example.com TXT`、`dig @198.18.0.2 example.com HTTPS`、`dig @198.18.0.2 use-application-dns.net`；(b) `dig +tcp @198.18.0.2 example.com`；(c) `getent hosts example.com`、`resolvectl query example.com`（systemd-resolved 的服务器指向应答器时）和 `host -t TXT example.com 198.18.0.2`；(d) Firefox、Chromium 各打开 `http://example.com/`，读 `recent` | (a)(b) 同 M16；(c) 解析出 fake 地址；systemd-resolved 对 SVCB / HTTPS 的 NOTIMP 的反应（会不会因此降级到别的服务器）写下来；(d) 页面能打开，`recent` 里 `dst` 是名字、`listener` 是 `tun`、`pid` 是浏览器的进程（Snap 或 Flatpak 的见 M2 的 L14） | `dig` 的输出；`recent` | | | |
+
+---
+
+### 与平台无关
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| P19 | **B1：真实设备上的单流吞吐。**（M3a 延后第 2 行）开增强模式，MTU 取 M4 给的（M3 的缺省 1500）。在 `<服务器>` 上 `iperf3 -s`；在被测机器上 `iperf3 -c <服务器> -t 30`（上行）和 `iperf3 -c <服务器> -t 30 -R`（下行），三个平台各做一次；同时看 rurge 的 CPU（任务管理器 / `top`） | 记下每个平台每个方向的 Gbit/s、rurge 占几个核、`dropped` 里 `beyond_window`、`queue_full`、`rst_limited` 与 `stackPanics`（都应当是 0）。对照：内存设备上 B1 的中位数上行约 7.2、下行约 5.5 Gbit/s，门槛是每个方向不低于 0.7 Gbit/s（rurge 一侧单线程，M3-D9）。真实设备上低多少、是系统调用、转发循环的 8 KiB 缓冲还是别的拖的，写下来 | `iperf3` 的输出；任务管理器 / `top`；计数 | | | |
+| P20 | **B2：真实设备上的内存。**（M3a 延后第 2 行）开增强模式。在 `<服务器>` 上 `python3 hold_server.py 7000`；在被测机器上（Linux 与 macOS 先 `ulimit -n 20000`）`python3 many_connections.py <服务器> 7000 10000 hold`，再在 `<服务器>` 上 `iperf3 -s`、被测机器上 `iperf3 -c <服务器> -P 100 -t 60`（一百条在传的连接）；读 rurge 的峰值常驻内存（Windows：`(Get-Process rurge).PeakWorkingSet64`；Linux：`grep VmHWM /proc/<pid>/status`；macOS：`/usr/bin/time -l ./rurge …` 的 `maximum resident set size`，或活动监视器） | 峰值不超过 429,000,000 字节（NFR-01 的 300 MB 除以 0.7）。内存设备上缺省设置的门槛读数是 402.5 MB、保守读数 444.1 MB（超线）；真实设备上 rurge 一侧没有测试的东西，读到的峰值就是 rurge 自己的，记下它。再记下：预算（64 MiB）用完之后建的连接一辈子只有 4 KiB 的缓冲，这样的一条高吞吐连接多快（M3a 延后第 6 行：跑 `iperf3 -c <服务器> -t 30` 看，此时一万条已开着） | 内存读数；`iperf3` 的输出 | | | |
+| P21 | **fake 应答的延迟与转发的往返。**（M3c 延后第 5、12 行）开增强模式。在被测机器上 `python3 dns_latency.py 198.18.0.2 1 100000`（十万个不同的名字，A 查询，fake 应答）和 `python3 dns_latency.py 198.18.0.2 16 1000`（TXT，转发到上游），三个平台各做一次 | A 查询的往返：记下中位数、p99、最大。NFR-01 要小于 0.2 毫秒；内存里 `Responder::answer` 加造应答包是中位数 0.9 微秒、p99 3.2 微秒（不含设备、写任务与引擎的规则评估），真实设备上多出来的是设备的往返。最大值是不是落在第 57,345 个不同的名字附近（池的 `HashMap` 翻倍，内存里量到 5.8 毫秒，M3c 延后第 12 行）；TXT 的往返是上游的往返加一点 | 脚本的输出 | | | |
+| P22 | **一阵上千个查询。**（M3c 延后第 14 行）开增强模式。(a) `python3 burst_queries.py 198.18.0.2 1000`；(b) 同时开五个，各 `python3 burst_queries.py 198.18.0.2 2000`；(c) 一条 TCP 连接上流水线 200 个查询：`python3 tcp_pipeline.py 198.18.0.2 200` | (a)(b) 第一次收到几个、补问之后几个，`dropped.queue_full` 涨了多少：应答器的队列（1,024）与写任务的队列（缺省 256）放不下的应答被丢，应用约 1 秒后重问，所以补问之后应当全部收到；记下第一次丢了多少，丢得多就是真实设备比内存设备慢；(c) 脚本打印 `answers: 200 of 200 - in order: True`（应答器在本地按次序一个接一个答，不并发）；之后 rurge 的 CPU 回到接近 0，没有 WARN | 脚本的输出；计数；日志 | | | |
+| P23 | **带 0x20 的解析器与 canary。**开增强模式。(a) 把 Unbound 的上游指到应答器（`forward-zone: name: "." forward-addr: 198.18.0.2`，`use-caps-for-id: yes`），解析 `ExAmPle.test`、`example.com` 几次；(b) 缺省打开 DNS over HTTPS 的 Firefox，系统 DNS 指向应答器（M4），打开 `http://example.com/`，看 `about:networking#dns` 或 `about:config` 的 `network.trr.mode` | (a) Unbound 不报 0x20 失败，解析成功：应答的问题段逐字节回显它发的大小写；同一个名字不论大小写拿同一个 fake 地址。(b) 应答器对 `use-application-dns.net` 答 NXDOMAIN，Firefox 不用 DoH，它的 DNS 查询出现在 DEBUG 的 `tun: DNS query` 行里 | Unbound 的日志；DEBUG 日志；Firefox 的页面 | | | |
+| P24 | **`hijack-dns`。**开增强模式，`[General]` 里 `hijack-dns = 8.8.8.8:53, 1.1.1.1:53`（重载）。(a) `dig @8.8.8.8 example.com`；(b) `dig +tcp @1.1.1.1 example.com`；(c) 向 `8.8.8.8:53` 发一个不是 DNS 查询的 UDP 包（`printf 'garbage' \| nc -u -w1 8.8.8.8 53`）；(d) `dig @2001:4860:4860::8888 example.com`；(e) 把 `hijack-dns` 换成 `*:53` 再试 (a)，然后去掉这个键、重载，再试 (a) | (a) 得到 fake 地址，`dig` 不抱怨"reply from unexpected source"（应答的来源是 `8.8.8.8:53`）；(b) 经 TCP 的不被劫持：真的连 `1.1.1.1:53`（经规则与策略，`recent` 里 `dst` 是 `1.1.1.1:53`）；(c) 照常作 UDP 会话（`recent` 里有 `transport` 为 `udp` 的会话）；(d) IPv6 的从不劫持；(e) `*:53` 劫持任何 IPv4 的 DNS 查询；去掉之后，下一个包就不再被劫持（发往 `8.8.8.8` 的真的出去了） | `dig` 的输出；`recent` | | | |
+| P25 | **预匹配在真实应用上。**开增强模式，`[Rule]` 里加（写在 `FINAL,DIRECT` 之前）：`DOMAIN-SUFFIX,ads.test,REJECT,pre-matching`、`DOMAIN-SUFFIX,drop.test,REJECT-DROP,pre-matching`、`DOMAIN-SUFFIX,sink.test,REJECT-NO-DROP,pre-matching`、`AND,((DOMAIN-SUFFIX,port.test),(DEST-PORT,443)),REJECT,pre-matching`；重载。(a) 对 `x.ads.test`、`x.drop.test`、`x.sink.test`、`x.port.test` 各 `dig @198.18.0.2` 一次（A 与 AAAA 都问）；(b) 浏览器打开 `http://x.ads.test/`；(c) `curl http://198.18.0.244/`（`dig` 到的 `x.sink.test` 的地址）；(d) 对 `x.port.test` 的 fake 地址 `curl https://x.port.test/ -k` 和 `curl http://x.port.test:8080/`（`<服务器>` 上起一个 8080 的服务，规则让它走 DIRECT）；(e) 在 30 秒内对 `x.ads.test` 连问 60 次 | (a) `ads.test`：空应答（NOERROR、没有记录）；`drop.test`：没有应答（`dig` 超时重试）；`sink.test`：A 得 `198.18.0.244`，AAAA 得空应答；`port.test`：DNS 层不拒绝，得 fake 地址；(b) 浏览器得不到地址；(c) 连接被拒（RST）；(d) 443 的连接被 RST，8080 的连得上；(e) 第 50 次起不再有应答（自动升级，第 50 次本身就静默）。`recent` 里：每条规则 5 分钟只有一条记录，`notes` 含 `pre-matching at DNS` 或 `pre-matching at SYN`，DNS 层记录的 `dst` 是名字、没有 `:0`；INFO 日志里 `session rejected by REJECT` 一行带名字（设计要名字只在 DEBUG，这一处不照做，M3c 延后第 6 行） | `dig` 的输出；`recent`；日志 | | | |
+| P26 | **经监听器来的 fake 地址。**开增强模式，`http-listen = 127.0.0.1:6152`、`socks5-listen = 127.0.0.1:6153`，系统代理不指向 rurge；`<conf>` 的 `[Host]` 里加 `origin.test = <服务器的地址>`，`<服务器>` 上 `python3 show_requests.py 8080`。先拿一个 fake 地址：`A=$(dig +short @198.18.0.2 origin.test)`（PowerShell：`$A=(Resolve-DnsName origin.test -Server 198.18.0.2 -DnsOnly -Type A).IPAddress`），再：(a) `curl -p -x http://127.0.0.1:6152 http://$A:8080/ -I`（`-p`：用 CONNECT）；(b) `curl --socks5 127.0.0.1:6153 http://$A:8080/ -I`；(c) `curl -x http://127.0.0.1:6152 http://$A:8080/ -I`（明文，绝对形式）；(d) 对 `198.18.0.1`、`198.18.0.244` 和池不认识的 `198.19.200.1` 重复 (a)；(e) 不开增强模式（没有池）重复 (a) | (a)(b) 连得上，`show_requests.py` 收到请求，`recent` 里 `dst` 是名字（`origin.test:8080`），不是 fake 地址；(c) 连得上，但**已知的缺口**（阶段 4）：请求行与 `Host` 仍是 fake 地址，`show_requests.py` 打印的 `Host:` 是 `$A:8080`，把实际看到的写下来；(d) HTTP 答 502，SOCKS5 答 `0x05`（把 `-p -x` 换成 `--socks5` 试一遍），`recent` 里 `error` 是 `fake address not known`，没有拨号；(e) 照普通地址处理（连不上），没有这条错误 | `curl` 的输出；`show_requests.py` 的输出；`recent` | | | |
+| P27 | **`local` 与进程查找：监听器与虚拟网卡各一种。**（M3b 延后第 6 行）`[General]` 里 `http-listen = 0.0.0.0:6152`（同时 `[::]:6152`，在支持处），开增强模式，`--log-level debug`。(a) 本机的客户端经本机的局域网地址连：`curl -x http://<本机的局域网地址>:6152 http://example.com/ -I`；(b) 同一个 `curl` 不经代理端口、直接连：`curl http://example.com/ -I`（经虚拟网卡）；读 DEBUG 的 `process lookup found the process` 行 | (a) `remote` 是 `<本机的局域网地址>:6152`——被接受的那条连接自己的本地地址，不是绑定的 `0.0.0.0:6152`——，找得到进程，`pid` 是 `curl`；(b) `remote` 是应用连的端点（fake 地址与 80），找得到进程，`pid` 是 `curl`。这一项的监听器那一半不需要 TUN，可以在 M4 之前先做 | DEBUG 日志；`recent` | | | |
+| P28 | **计数与日志行。**（设计第 16 节）做完上面的项之后：(a) 读 `GET /v1/features/enhanced_mode`；(b) 缺省日志级别（INFO）下搜日志里的名字（`example.com`、`ads.test`）、上游的地址（`8.8.8.8`）和 fake 地址；(c) `--log-level debug` 看 `tun: DNS query` 行的 `decision` | (a) `dropped` 的十个原因里不为 0 的，各自能对上做过的事（`unknown_fake`：重启之后应用还在用的旧 fake 地址；`martian`：真实网卡上的组播与广播，从不写日志；`queue_full`：P22 里丢的应答；`rst_limited`：一阵被拒的 SYN）；`stackPanics` 是 0。(b) INFO 与 WARN 里除了被预匹配拒绝的会话的那一行 `session rejected by …`（带名字，P25）之外没有名字与地址；WARN 只有每种丢包原因第一次的一行（不带地址，`martian` 除外）、池耗尽、设备出错这几句。(c) `decision` 的取值见 `docs/api/phase3.md` 的「M3c」一节 | `/v1/features/enhanced_mode`；日志文件 | | | |

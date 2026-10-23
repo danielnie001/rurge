@@ -6,6 +6,8 @@
 
 阶段 3 / M3b（UDP、ICMP、fake-IP 池与引擎接入，设计 `docs/superpowers/specs/2026-10-18-phase3-m3-tun-core-design.md`，计划 `docs/superpowers/plans/2026-10-22-phase3-m3b-udp-icmp-pool-engine-plan.md`）**没有新增端点**：`GET /v1/traffic` 的 `listener` 多了一个键 `tun`，进程查找的 DEBUG 行的字段 `listen_port` 换成了 `remote`，数据目录里多了池的文件 `fake-ip.txt` 与它的三行日志。引擎一侧的 `Engine::start_tun` 只有测试调用，`rurge run` 要到 M4 才起虚拟网卡，所以前两处在今天的 `rurge run` 里是这样的：`tun` 恒为 0，查找行只有监听器的会话；池的文件与它的日志使用者要到 M4 才看得到。见最后一节「M3b　虚拟网卡的 UDP、ICMP 与引擎」。
 
+阶段 3 / M3c（DNS 应答器、预匹配与经监听器来的 fake 地址，设计 `docs/superpowers/specs/2026-10-18-phase3-m3-tun-core-design.md` 第 11 ～ 13 节，计划 `docs/superpowers/plans/2026-10-23-phase3-m3c-dns-responder-prematch-plan.md`）**没有新增端点**，也没有改任何响应的形状：经虚拟网卡来的会话在请求记录里多了预匹配的两种 `notes` 和没有端口的 `dst`，经监听器来的 fake 地址有了一条失败原因 `fake address not known`，应答器与预匹配有了几行日志，计数的 `queue_full` 多了几处来源。**`rurge run` 要到 M4 才起虚拟网卡，使用者今天看不到这些**（连经监听器来的那一半也要有 TUN 的池）；见最后一节「M3c　虚拟网卡的 DNS 应答器、预匹配与经监听器来的 fake 地址」。
+
 ## 端点
 
 | 方法 | 路径 | 阶段 3 / M1 的变化 |
@@ -313,4 +315,82 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 - 绑在 `0.0.0.0` / `[::]` 上的监听器的会话，`remote` 是被接受的那条连接的本地地址、不是绑定的地址：这只由读代码和回环上的用例保证（用例只绑回环，M3b 延后第 6 行），M4 的手工验收看。
 - 经虚拟网卡来的会话、池的文件与 `listener.tun` 只在一台 Windows 11 x86-64 的开发机上、内存设备里跑过，CI 没有跑过；真实的设备、真实的 `Pinger`（ICMP 套接字）、系统 DNS 与防环随 M4。池的文件在 Linux 与 macOS 上读写出错的情形只按两处假定写了用例，没有在那两个平台上跑过（M3b 延后第 27 行）。
 - 被拒与失败的会话，引擎的 INFO 行照旧带 `src` 与 `dst`（阶段 1 起的写法）；经虚拟网卡来的会话的 `dst` 是 fake 地址背后的名字。设计第 14 节要名字只出现在 DEBUG，这一处没有照做（M3b 延后第 1 行，留给项目所有者）。
-- 手工验收清单 `docs/acceptance/phase3-manual.md` 没有 M3b 的一节：M3b 加的行为在 M4 之前验不了。
+- 手工验收清单 `docs/acceptance/phase3-manual.md` 的 M3 一节（M3a、M3b、M3c 合在一起，M3c 收尾时加的）里有 M3b 的行为要在真实设备上看的几项：M3b 加的行为在 M4 之前验不了，那一节一项也没有做过。
+
+## M3c　虚拟网卡的 DNS 应答器、预匹配与经监听器来的 fake 地址
+
+阶段 3 / M3c 在虚拟网卡的内核（`crates/rurge-tun`）里做了 DNS 应答器（`Responder`）和预匹配在 DNS 与 SYN 两层的拒绝，在引擎里做了预匹配的钩子（`crates/rurge-engine/src/prematch.rs`）和经 HTTP / SOCKS5 监听器来的 fake 地址的换回（`crates/rurge-engine/src/fake_address.rs`）；M3（内存设备上的 TUN 内核）到此做完。**没有新增端点、诊断码、命令行选项或配置键**：`allow-dns-svcb`、`hijack-dns`、`always-real-ip` 自阶段 1 起被解析，到这一份才有读它们的人。
+
+**`rurge run` 要到 M4 才起虚拟网卡，所以使用者今天看不到这一节的任何东西。**经虚拟网卡来的会话、应答器的应答、预匹配的记录和下面的日志行，都只在 `Engine::start_tun` 起着 TUN 的时候才有，今天只有测试调用它；连"经监听器来的 fake 地址"那一半也一样——引擎的池（`Engine.fake_pool`）由 `start_tun` 放进去、TUN 结束时清掉，没有池时那样的地址照普通地址处理，`rurge run` 今天从不放。使用者今天看得到的只有一处文字：`rurge dns lookup --trace` 一类的输出里，应答码 FORMERR 与 NOTIMP 现在写它们的名字（原来写 `RCODE1`、`RCODE4`）。
+
+### 请求记录里的虚拟网卡会话
+
+`GET /v1/requests/recent` 与 `active` 的形状不变（`docs/api/phase1.md`、本页「M2」一节）。经虚拟网卡来的会话（M3b 起）在里面是这个样子：
+
+| 键 | 内容 |
+| --- | --- |
+| `listener` | `"tun"` |
+| `listenPort` | `null`：虚拟网卡没有监听端口（`in_port` 为 0） |
+| `transport` | `"tcp"` 或 `"udp"`；预匹配的 DNS 层记录是那条查询自己的传输 |
+| `src` | 应用的源端点（M4 起是虚拟网卡上的地址，如 `198.18.0.1:53000`） |
+| `pid`、`processPath` | 照 M2 与 M3b：TCP 按应用连的端点查，UDP 只按应用自己的端点查，查不到是 `null`（预匹配的记录该记时也查，DNS 层的按那条查询自己的传输） |
+| `dst` | fake 地址背后的**名字**（连接开着时它拿着地址的租约），或目的 IP，加 `:端口`；**端口为 0 时只写名字，不写 `:0`**——只有预匹配在 DNS 层的记录是这样，同一个写法也用在引擎的会话日志行里 |
+
+被预匹配拒绝的会话（DNS 层的一次查询、SYN 层的一个连接）进记录，是这样的一条（DNS 层，`DOMAIN-SUFFIX,ads.test,REJECT,pre-matching`）：
+
+```json
+{"id":31,"listener":"tun","transport":"udp","src":"198.18.0.1:53000","listenPort":null,"pid":null,"processPath":null,"dst":"x.ads.test","remoteAddr":null,"rule":"DOMAIN-SUFFIX,ads.test,REJECT,pre-matching","policy":["REJECT"],"sni":null,"protocol":null,"up":0,"down":0,"startedMs":1792800000000,"elapsedMs":0,"connectMs":null,"firstByteMs":null,"dnsMs":null,"status":"rejected","rejectKind":"REJECT","error":null,"notes":["pre-matching at DNS"]}
+```
+
+- `status` 是 `"rejected"`，`rejectKind` 是实际用的那一种：`REJECT`、`REJECT-TINYGIF`、`REJECT-NO-DROP`，或自动升级（见下）之后的 `REJECT-DROP`；`policy` 是规则点名的那一个内置策略（升级之后也是），`rule` 是规则的文字；`error` 是 `null`（`notes` 说明来由，不说明失败）。这样的会话当场结束，不会出现在 `active` 里。
+- `notes` 的第一句是 **`pre-matching at DNS`** 或 **`pre-matching at SYN`**；命中的是集合（`RULE-SET` 或 `DOMAIN-SET`）里的一行时，第二句是 ``Sub-rule matched: <那一行> (in <集合>)``（同一句也在 DEBUG 日志里，带会话号）。
+- **同一代里同一条规则 5 分钟内只记一次**（换代，即重载之后，从头记）。不该记的拒绝照样被拒、照样计入自动升级，只是不进记录，也不为它查进程。
+
+**自动升级**：`REJECT` 与 `REJECT-TINYGIF` 的拒绝记入引擎已有的计数（`REJECT-DROP` 本来就是丢弃，`REJECT-NO-DROP` 从不升级），同一个主机（DNS 层是名字，SYN 层是名字或地址的文字）30 秒内的第 50 次起按 `REJECT-DROP` 处理——第 50 次本身就是：DNS 层不答，SYN 层丢 SYN。计数与监听器的会话共用一份；计入的是每个被拒的 **A 或 AAAA 查询**，所以一次查找问 A 与 AAAA 的应用，比按会话数更早静默。
+
+**只在规则模式下**：钩子问当前的出站模式（取活的，不随代），不是规则模式就不看，也不看 `strict` 的暂停；出站模式是全局而全局策略不可用时，引擎在拨号处按规则走（含预匹配那一遍），这样的拒绝落在拨号，不在 DNS 或 SYN。
+
+### `fake address not known`
+
+有池时（TUN 起着），经 HTTP / SOCKS5 监听器来的、目的是 rurge 地址空间里的 IP 的会话，引擎在规则之前把它换回池里那个编号的名字：
+
+- 池里有：会话的 `dst` 是名字，规则与日志看到的是名字，地址的租约挂在会话上直到它结束（SOCKS5 的 UDP 流：到引擎回收这条流为止，空闲 60 秒，已有应答的 53 端口的流更早）。
+- 池里没有：会话失败，**`error` 是 `fake address not known`**，`status` 是 `"failed"`，`dst` 是客户端写的地址，什么也不拨。HTTP 监听器答 **502**（`show-error-page` 开着时是错误页，它缺省开着；关着时关连接），SOCKS5 答 **`0x05`**（连接被拒），SOCKS5 的 UDP 流照别的失败的流办（数据报丢弃，约 5 秒后再试）。
+- "rurge 地址空间"是整个 `198.18.0.0/15` 与 `fd00:6152::/64`：运行 TUN 时，经代理端口去 rurge 自己的地址（`198.18.0.1`、`.2`、`.244`……）或这个空间里池不认识的地址，也是 `fake address not known`；这个空间里真实的主机，经代理端口到不了。
+- 没有池（没有 TUN）时，这样的地址照普通地址处理，没有这条错误。
+- SOCKS5 的 UDP 流换回名字之后，回包的来源在引擎里换回客户端写的那个 fake 地址（客户端认得的是它）；两条流发往同一个目标（两个 fake 地址，或一个名字与它自己的真实地址，同 IP 同端口）时回包保留真实的来源，客户端对不上。
+- **明文 HTTP 请求**（`GET http://<fake 地址>/…`）换回名字之后，请求行、`Host` 与 `session.url` 仍是 fake 地址：经 `http` 策略（绝对形式）时上游代理被要求去连 fake 地址，直连时源站看到 `Host: <fake 地址>`，`URL-REGEX` 与扩展匹配看到的也是 fake 地址；`CONNECT` 与 SOCKS5 的目标里是名字，不受影响。不改，去向阶段 4（HTTP 引擎改写请求行与 `Host`）。
+
+### 计数
+
+`TunHandle::counters()` 给出一份快照：丢弃的包按原因各一个数，加 `stack_panics`。`GET /v1/features/enhanced_mode` 要到 M4 才生效，它的形状在设计第 14 节：`{"enabled": <bool>, "dropped": {"malformed": <n>, …}, "stackPanics": <n>}`。M3c 之后各原因里变了的：
+
+| 原因 | M3c 起还数 |
+| --- | --- |
+| `queue_full` | 应答器的队列（`dns_queue`，缺省 1,024）放不下的查询；写任务的队列放不下的本地应答（应答器的应答，和 M3b 起的 ICMP 消息、回显的本地应答：本地应答从不等空位）；TUN 里排队的 UDP 超过字节预算（`udp_bytes`，缺省 64 MiB，所有 UDP 会话共用）的数据报 |
+| `rst_limited` | 预匹配的 RST 也经"3 秒 100 个"的限频，超出的丢包计这里 |
+
+不计数的：预匹配丢掉的 SYN（只有一行 DEBUG），应答器正常答出去的查询。
+
+### 日志
+
+日志文本是英文；DEBUG 的行要 `--log-level debug`。**名字与上游的地址只出现在 DEBUG 的行与请求记录里**，下面表里的 INFO 行是例外。
+
+| 级别 | 文本 | 字段 | 什么时候 |
+| --- | --- | --- | --- |
+| DEBUG | `tun: DNS query` | `name`、`qtype`、`decision`、`fitted` | 应答器读成查询的每个消息一行。`decision` 是下面这些之一：`a class other than IN: NOTIMP`、`the canary: NXDOMAIN`、`SVCB or HTTPS while they are not allowed: NOTIMP`、`refused by a rule: an empty answer`、`refused by a rule: no answer`、`refused by a rule: an address of rurge's own`、`the family of the transport is the other: an empty answer`、`always-real-ip: the addresses [Host] maps`、`a fake address`、`every fake address is in use: SERVFAIL`、`too many queries are being forwarded: SERVFAIL`、`forwarded`、`the forward failed: SERVFAIL`。`fitted` 只在应答被改过时有：`truncated: over the UDP limit`（UDP 上超过限度，置 TC）或 `SERVFAIL: too long for TCP` |
+| DEBUG | `tun: a DNS message that is no query is not answered`；``tun: a DNS message of an opcode other than QUERY is answered NOTIMP``（字段 `opcode`）；`tun: a DNS message that does not read is answered FORMERR` | | 不是查询的消息（QR 置位、不足 12 字节）不答；opcode 不是 0；读不懂。不带名字 |
+| WARN | `tun: every fake address is in use; new names get SERVFAIL` | | 池里的编号全有租约、又来了新名字：这个 TUN 的一生里第一次一行，不带名字与地址 |
+| DEBUG | `tun: a SYN is dropped, as a pre-matching rule says` | `src`、`dst`、`name` | SYN 层被 `REJECT-DROP`（或升级之后）丢掉的 SYN；不回包、不计数；`name` 是 fake 地址背后的名字（有的话） |
+| INFO | `session rejected by <REJECT 的种类>` | `session`、`listener`、`src`、`dst`、`rule`、`policy`、`elapsed_ms`、`error` | 引擎已有的会话日志行，预匹配被拒的记录也经它：**DNS 层被拒的名字在 `dst` 里**，每条规则每代 5 分钟至多一行（设计要名字只在 DEBUG，这一处不照做，留给项目所有者，M3c 计划延后第 6 行） |
+| DEBUG | ``Sub-rule matched: <行> (in <集合>)`` | `session` | 命中的是集合里的一行；同文的一句也在 `notes` 里 |
+| DEBUG | `forwarded` / `forward failed`（目标 `rurge_dns::resolver`） | `name`、`qtype`、`rcode` 或 `error`、`elapsed_ms` | 应答器转发一个查询的结果，一次转发一行；读不了的查询只有 `error` |
+| DEBUG | `forward send`、`forward answer`、`forward failed`、`forward ignored a message that is no reply to the send`（目标 `rurge_dns::fanout`） | `upstream`、`round` 或 `rcode`、`error`、`elapsed_ms` | 转发扇出里每个上游的往返；这里有上游的名字 |
+| WARN | `tun: the system's random source failed; the identifications of the fragments the TUN writes begin at a fixed number` | `error` | 系统的随机源失败，分片的标识从一个固定的数起（M3b 的分片，M3c 加的这行）；不带地址 |
+
+### 没有覆盖的
+
+- 这一节说的一切只在一台 Windows 11 x86-64 的开发机上、内存设备里跑过，CI 没有跑过；真实的设备、地址、路由、系统 DNS 与防环随 M4。手工验收清单 `docs/acceptance/phase3-manual.md` 的 M3 一节（19 项）一项也没有做过。
+- 真实的应用（浏览器、`dig`、`nslookup`、带 0x20 大小写混排的解析器）经真实设备问应答器会怎样，没有观察过；用例里的"应用"是测试里的另一个 smoltcp 栈。真实设备上一阵来上千个查询时，写任务的队列放不下的应答被丢（应用约 1 秒后重问）。
+- 应答器的延迟（NFR-01：小于 0.2 毫秒）只量过内核本身——`Responder::answer` 加造应答包，不含设备、写任务和引擎的规则评估：中位数 0.9 微秒、p99 3.2 微秒，最大 5.8 毫秒；整条路在真实设备上的数字要在 M4 量。
+- 上游全挂时，被转发的查询要等约 5 秒才得到 SERVFAIL；系统的 DNS 服务器名单要排除应答器与虚拟网卡的地址，随 M4。

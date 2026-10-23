@@ -3,7 +3,7 @@
 | 项       | 内容 |
 | -------- | ---- |
 | 日期     | 2026-10-18 |
-| 状态     | 草案。已决事项 M3-D1 ～ D26 是在项目所有者"自己决定、继续做"的常设授权下定的（代项目所有者作的裁定），所有者可以改。M3a 已做完（2026-10-19，代码在 `crates/rurge-tun`；同一天做了整分支终审，结论是改了再合并：没有 Critical，两条 Important 在 M3a 里都够不到、是 M3b 与 M4 要靠的东西，已按第 18 节第 15 条和 M3a 计划延后事项第 8、12 行改了说明与去向，修正波只动文档、说明、注释和几处不改行为的守卫，留下的次要项各有去向，在 M3a 计划延后事项第 16、17 行）。M3b 的十个任务做完了（2026-10-23，计划 `docs/superpowers/plans/2026-10-22-phase3-m3b-udp-icmp-pool-engine-plan.md`，代码在 `crates/rurge-tun`、`crates/rurge-dns/src/fakeip` 与 `crates/rurge-engine/src/tun.rs`；整分支终审在同一天做了（只读代码与文档，什么也没运行），结论是改了再合并：没有 Critical，没有 Important；最终修正波改了它的五条次要项里的四条和各任务评审留下的小项里的十条，登记了一条（M3b 计划延后第 29 行：TUN 里排队的 UDP 没有字节上限），其余各有去向，在 M3b 计划记录第 20 行与延后第 10 ～ 14、26、28、29 行）。实施期与本文不一致处以第 18 节第 11 ～ 22 条为准（11 ～ 15 是 M3a 的，16 ～ 22 是 M3b 的），正文里被它们订正的地方各有一个指到那里的括号 |
+| 状态     | 草案。已决事项 M3-D1 ～ D26 是在项目所有者"自己决定、继续做"的常设授权下定的（代项目所有者作的裁定），所有者可以改。M3a 已做完（2026-10-19，代码在 `crates/rurge-tun`；同一天做了整分支终审，结论是改了再合并：没有 Critical，两条 Important 在 M3a 里都够不到、是 M3b 与 M4 要靠的东西，已按第 18 节第 15 条和 M3a 计划延后事项第 8、12 行改了说明与去向，修正波只动文档、说明、注释和几处不改行为的守卫，留下的次要项各有去向，在 M3a 计划延后事项第 16、17 行）。M3b 的十个任务做完了（2026-10-23，计划 `docs/superpowers/plans/2026-10-22-phase3-m3b-udp-icmp-pool-engine-plan.md`，代码在 `crates/rurge-tun`、`crates/rurge-dns/src/fakeip` 与 `crates/rurge-engine/src/tun.rs`；整分支终审在同一天做了（只读代码与文档，什么也没运行），结论是改了再合并：没有 Critical，没有 Important；最终修正波改了它的五条次要项里的四条和各任务评审留下的小项里的十条，登记了一条（M3b 计划延后第 29 行：TUN 里排队的 UDP 没有字节上限），其余各有去向，在 M3b 计划记录第 20 行与延后第 10 ～ 14、26、28、29 行）。M3c 的任务 0 ～ 6 做完了（2026-10-23，计划 `docs/superpowers/plans/2026-10-23-phase3-m3c-dns-responder-prematch-plan.md`，代码在 `crates/rurge-tun`、`crates/rurge-dns`、`crates/rurge-rules` 与 `crates/rurge-engine`）：至此 M3 整个做完——一块内存里的设备上的 TUN 内核，真实的设备、地址、路由、系统 DNS 与防环是 M4。实施期与本文不一致处以第 18 节第 11 ～ 33 条为准（11 ～ 15 是 M3a 的，16 ～ 22 是 M3b 的，23 ～ 33 是 M3c 的），正文里被它们订正的地方各有一个指到那里的括号 |
 | 上位设计 | [阶段 3 总设计](2026-10-16-phase3-enhanced-mode-design.md) 第 1.4、2.3、3.1、3.2、4、8、12、13 节；不一致处以本文为准，订正列在第 18 节 |
 | 需求     | FR-IN-06（协议栈部分：TCP / UDP 经用户态协议栈进入流水线）、FR-IN-08（UDP 会话）、FR-DNS-08（fake-IP 应答器）；FR-RULE-01 的 `pre-matching` 在 DNS 与 SYN 层的一半 |
 | 清单     | 3.2 节 `pre-matching`（L266）；4.1 节 REJECT 一族（L325、L333 ～ L336）；6.4 节应答器与 fake-IP（L543 ～ L551）；9.1 节 ICMP 与 fake 段（L709、L710）；`[General]` 的 `allow-dns-svcb`、`hijack-dns`、`always-real-ip`、`icmp-forwarding`（L149 ～ L159） |
@@ -79,7 +79,7 @@ pub trait Pinger: Send + Sync {
 }
 ```
 
-- `TunSettings`（每一代一份，由引擎在发布新一代时建好、`Hooks::settings` 交出）：这一代的解析器（`Arc<Resolver>`，转发、`[Host]` 的地址映射、ICMP 发往 fake 地址时的解析都经它）、`always-real-ip`、`allow-dns-svcb`、`hijack-dns`、`icmp-forwarding`、出站模式是不是规则模式（预匹配只在规则模式下做）。（M3b 里只有解析器与 `icmp-forwarding`，解析器是 `Arc<dyn Resolve>`，第 18 节第 16 条）
+- `TunSettings`（每一代一份，由引擎在发布新一代时建好、`Hooks::settings` 交出）：这一代的解析器（`Arc<Resolver>`，转发、`[Host]` 的地址映射、ICMP 发往 fake 地址时的解析都经它）、`always-real-ip`、`allow-dns-svcb`、`hijack-dns`、`icmp-forwarding`、出站模式是不是规则模式（预匹配只在规则模式下做）。（M3b 里只有解析器与 `icmp-forwarding`，解析器是 `Arc<dyn Resolve>`，第 18 节第 16 条；M3c 加的字段与 `Hooks::pre_match` 的实际签名，第 18 节第 32 条）
 - `TunOptions`（整个 TUN 一份）：是否收 IPv6（`ipv6`，M4 按 `ipv6-vif` 给出；为假时 IPv6 包丢弃并计数）、`drop_hold`（引擎的 `DROP_HOLD`，30 秒）、片数、缓冲与各种上限的常数（都有缺省值，测试可以调小）。
 - `TunHandle`：`stop()`（不再收新的连接与会话，已有的随之结束——总设计 Q-28；会话怎样随连接结束，第 18 节第 15 条）、`join()`、`counters()`（第 14 节）。
 - 引擎一侧：`Engine::start_tun(self: &Arc<Self>, device, pinger, options) -> TunHandle`：建池（数据目录里的文件，第 10.3 节）、实现 `Hooks`、把自己作为 `Dialer` 交出；引擎停下时停 TUN（取消它的会话，或限时地等 `join`，第 18 节第 15 条）并让池写最后一次（做到的是取消会话，拨号那一半留给 M4，第 18 节第 22 条）。M3 里只有测试调用它，M4 由可执行文件调用。
@@ -349,7 +349,7 @@ M2 延后第 18 行（Linux 上整张表一行也解析不出时报 `Layout` 加
 ### 11.1 哪些包交给它
 
 - 发往 `198.18.0.2` ～ `198.18.0.9` 或 `fd00:6152::2` 的 53 端口的 UDP 与 TCP（清单 L543）；
-- `hijack-dns` 的每一项（IPv4 地址或 `*`，可带端口，缺省 53）：只对 UDP、只对 IPv4，且只有解析得出合法 DNS 查询的包才算，别的照常作 UDP 会话；应答的来源是被劫持的那个服务器的地址与端口（清单 L547）。发往别的服务器 53 端口的 TCP 照常作 TCP 连接。
+- `hijack-dns` 的每一项（IPv4 地址或 `*`，可带端口，缺省 53）：只对 UDP、只对 IPv4，且只有解析得出合法 DNS 查询的包才算，别的照常作 UDP 会话；应答的来源是被劫持的那个服务器的地址与端口（清单 L547）。发往别的服务器 53 端口的 TCP 照常作 TCP 连接。（实施期：一个 UDP 包的去处次序、应答器的 53 端口的 TCP，第 18 节第 24 条。）
 
 ### 11.2 应答
 
@@ -366,15 +366,15 @@ M2 延后第 18 行（Linux 上整张表一行也解析不出时报 `Layout` 加
    5. fake 地址，TTL 30 秒；池耗尽时 SERVFAIL。
 5. 其余类型：经 `Resolver::forward` 原样转发，应答原样交回（ID 换回查询的）。
 
-查询带 OPT 的，应答带 OPT，UDP 负载大小 1232。UDP 上的应答大于客户端允许的大小（有 OPT 时取它的值与 1232 的较小者，没有时 512）时置 TC、去掉记录，客户端改用 TCP。同时在转发的查询至多 256 个，超出的回 SERVFAIL（M3-D19）。
+查询带 OPT 的，应答带 OPT，UDP 负载大小 1232。UDP 上的应答大于客户端允许的大小（有 OPT 时取它的值与 1232 的较小者，没有时 512）时置 TC、去掉记录，客户端改用 TCP。同时在转发的查询至多 256 个，超出的回 SERVFAIL（M3-D19）。（判定的细节与 UDP 的限度，第 18 节第 25 条。）
 
 ### 11.3 `Resolver::forward`
 
-`rurge-dns` 新加 `Resolver::forward(&self, query: &[u8]) -> io::Result<Vec<u8>>`（异步）：把查询报文发给这一代的主上游（与内部 DNS 客户端相同的服务器配置，`[SSID Setting]` 的覆盖随这一代的解析器自然生效），遵守 `[Host]` 的 `server:`（清单 L545），发出时换一个新的 ID、收到后换回；不进缓存。`server:syslib` 与 `server:force-syslib` 写明的名字：系统解析库只能问 A / AAAA，所以这样的名字的其余类型转发给系统当前的 DNS 服务器（登记；M4 起系统 DNS 指向应答器，那时系统的服务器列表要排除应答器与虚拟网卡的地址，总设计第 4 节已记）。
+`rurge-dns` 新加 `Resolver::forward(&self, query: &[u8]) -> io::Result<Vec<u8>>`（异步）：把查询报文发给这一代的主上游（与内部 DNS 客户端相同的服务器配置，`[SSID Setting]` 的覆盖随这一代的解析器自然生效），遵守 `[Host]` 的 `server:`（清单 L545），发出时换一个新的 ID、收到后换回；不进缓存。`server:syslib` 与 `server:force-syslib` 写明的名字：系统解析库只能问 A / AAAA，所以这样的名字的其余类型转发给系统当前的 DNS 服务器（登记；M4 起系统 DNS 指向应答器，那时系统的服务器列表要排除应答器与虚拟网卡的地址，总设计第 4 节已记）。（实施期：上游怎么选、怎么收，第 18 节第 27 条。）
 
 ### 11.4 DNS over TCP
 
-发往应答器 53 端口的 TCP 连接照常完成握手，之后不交给引擎，在本地按长度前缀读查询、逐个应答（同第 11.2 节），空闲 10 秒关掉。
+发往应答器 53 端口的 TCP 连接照常完成握手，之后不交给引擎，在本地按长度前缀读查询、逐个应答（同第 11.2 节），空闲 10 秒关掉。（实施期：关法与长度，第 18 节第 26 条。）
 
 ## 12. 预匹配在 DNS 与 SYN 层（M3c）
 
@@ -382,7 +382,7 @@ M2 延后第 18 行（Linux 上整张表一行也解析不出时报 `Layout` 加
 
 今天的 `pre_match_domain` / `pre_match_ip`（`crates/rurge-rules/src/engine.rs`）按 `SessionInfo::tcp(..)` 求值（来源 `127.0.0.1:0`、监听器 HTTP），必须带端口，而且没有调用者。换成一个入口：给出会话（`SessionInfo`：真实的来源、`ListenerKind::Tun`、目的是名字或 IP）和这一次是哪一层（DNS 或 SYN），照现有的预匹配那一遍（`positions()` 上逐条、`EvalCtx::with_network`、从不解析）求值，返回命中的规则与策略。
 
-**DNS 层没有端口**：编译规则时记下每条规则（连同逻辑规则的每层子规则）是否含 `DEST-PORT` 或 `SRC-PORT`；DNS 层跳过含它们的规则（不是当作"不命中"——`NOT,((DEST-PORT,443))` 当作不命中会让 `NOT` 成立而拒绝一切）；集合里逐条求值的行同样，含端口的行在 DNS 层不命中。`SRC-IP` 是查询的源地址（本机的应用共用虚拟网卡的地址），`SUBNET` 看当前网络；IP 类的规则在 DNS 层永不命中（只有名字、从不解析）；SYN 层的会话是这条连接（域名经 fake 地址反查，或目的 IP），端口齐全（M3-D20）。
+**DNS 层没有端口**：编译规则时记下每条规则（连同逻辑规则的每层子规则）是否含 `DEST-PORT` 或 `SRC-PORT`；DNS 层跳过含它们的规则（不是当作"不命中"——`NOT,((DEST-PORT,443))` 当作不命中会让 `NOT` 成立而拒绝一切）；集合里逐条求值的行同样，含端口的行在 DNS 层不命中。`SRC-IP` 是查询的源地址（本机的应用共用虚拟网卡的地址），`SUBNET` 看当前网络；IP 类的规则在 DNS 层永不命中（只有名字、从不解析）；SYN 层的会话是这条连接（域名经 fake 地址反查，或目的 IP），端口齐全（M3-D20）。（实施期订正：不是编译时记标记、跳过规则，而是三值的判定，第 18 节第 23 条。）
 
 ### 12.2 引擎的钩子
 
@@ -392,7 +392,7 @@ M2 延后第 18 行（Linux 上整张表一行也解析不出时报 `Layout` 加
 - 用这一代的规则引擎求值；
 - 命中 `REJECT` 或 `REJECT-TINYGIF` 的，记进 `Escalation`，过了同一主机 30 秒 50 次就改答 `REJECT-DROP`；
 - 记请求记录（第 12.4 节）；
-- 同步、不等任何东西（预匹配从不解析；`PROCESS-NAME` 不能带 `pre-matching`），在收包的任务或应答器的任务上直接调。
+- 同步、不等任何东西（预匹配从不解析；`PROCESS-NAME` 不能带 `pre-matching`），在收包的任务或应答器的任务上直接调。（实施期：钩子取活的出站模式，升级与记录的细节，第 18 节第 28 条。）
 
 ### 12.3 两层的行为
 
@@ -400,17 +400,17 @@ M2 延后第 18 行（Linux 上整张表一行也解析不出时报 `Layout` 加
 
 ### 12.4 请求记录
 
-被预匹配拒绝的会话进请求记录，`notes` 写 `pre-matching at DNS` 或 `pre-matching at SYN`；同一代里同一条规则 5 分钟内只记一次（清单 L336，它的阶段从 4 改为 3）；换代时从头记。DNS 层的记录是那个名字、没有端口；SYN 层的是那条连接。
+被预匹配拒绝的会话进请求记录，`notes` 写 `pre-matching at DNS` 或 `pre-matching at SYN`；同一代里同一条规则 5 分钟内只记一次（清单 L336，它的阶段从 4 改为 3）；换代时从头记。DNS 层的记录是那个名字、没有端口；SYN 层的是那条连接。（实施期：第 18 节第 28 条。）
 
 ## 13. 经监听器来的 fake 地址（M3c）
 
-有池时（TUN 起着），经 HTTP / SOCKS5 监听器来的、目的是 rurge 地址空间里的 IP 的会话，引擎在规则之前经池换回域名（同虚拟网卡的会话，拿租约到会话结束）；池里没有：会话失败，`error` 是 `fake address not known`，不拨。没有池时（不开增强模式）照普通地址处理（M4 定是否在不开增强模式时也载入池）（M3-D21）。
+有池时（TUN 起着），经 HTTP / SOCKS5 监听器来的、目的是 rurge 地址空间里的 IP 的会话，引擎在规则之前经池换回域名（同虚拟网卡的会话，拿租约到会话结束）；池里没有：会话失败，`error` 是 `fake address not known`，不拨。没有池时（不开增强模式）照普通地址处理（M4 定是否在不开增强模式时也载入池）（M3-D21）。（实施期：SOCKS5 的 UDP 流、整个地址空间、明文 HTTP 请求的缺口，第 18 节第 29 条。）
 
 ## 14. 日志、计数与个人信息
 
-- 计数（`TunHandle::counters()`，一份快照）：丢弃的包按原因——`malformed`、`fragment`、`martian`、`unsupported`、`queue_full`、`unknown_fake`、`busy`、`beyond_window`、`rst_limited`、`icmp_limited`——和 `stack_panics`。M4 起由 `GET /v1/features/enhanced_mode` 给出，形状 `{"enabled": <bool>, "dropped": {"malformed": <n>, …}, "stackPanics": <n>}`（M3-D22）。
+- 计数（`TunHandle::counters()`，一份快照）：丢弃的包按原因——`malformed`、`fragment`、`martian`、`unsupported`、`queue_full`、`unknown_fake`、`busy`、`beyond_window`、`rst_limited`、`icmp_limited`——和 `stack_panics`。M4 起由 `GET /v1/features/enhanced_mode` 给出，形状 `{"enabled": <bool>, "dropped": {"malformed": <n>, …}, "stackPanics": <n>}`（M3-D22）。（`queue_full` 的含义与 `TunOptions` 的新字段，第 18 节第 31 条。）
 - 每种原因第一次出现时一行 WARN（不带地址；`martian` 不报——真实网卡上的组播与广播很多），其余 DEBUG。
-- 名字（DNS 查询、fake 地址反查出的域名）与地址只在 DEBUG 的行与请求记录里；INFO 及以上的行里没有（同会话的日志行今天的做法，计划核对，第 17 节 V12）。
+- 名字（DNS 查询、fake 地址反查出的域名）与地址只在 DEBUG 的行与请求记录里；INFO 及以上的行里没有（同会话的日志行今天的做法，计划核对，第 17 节 V12）。（预匹配被拒的会话的 INFO 行是例外，第 18 节第 30 条。）
 - 凭据的规矩不变；虚拟网卡一侧不碰凭据。
 
 ## 15. 测试
@@ -435,7 +435,7 @@ M2 延后第 18 行（Linux 上整张表一行也解析不出时报 `Layout` 加
 
 ### 15.3 基准（忽略的用例）
 
-B1、B2（第 6 节）；fake 应答的延迟（M3c；NFR-01：小于 0.2 毫秒；在应答器的入口与写回之间量，不含设备）。都不作门禁，数字记进各计划的执行期修正记录。
+B1、B2（第 6 节）；fake 应答的延迟（M3c；NFR-01：小于 0.2 毫秒；在应答器的入口与写回之间量，不含设备）。都不作门禁，数字记进各计划的执行期修正记录。（b3 量什么、数字，第 18 节第 33 条。）
 
 ## 16. 文档
 
@@ -470,7 +470,7 @@ B1、B2（第 6 节）；fake 应答的延迟（M3c；NFR-01：小于 0.2 毫秒
 4. 第 8.2 节的 `SessionInfo` → 多一个 `local`（第 9.2 节）；"失败（拒绝或拨不通）回 RST" → `REJECT-DROP` 拿着连接 30 秒再 FIN（再读掉应用还在发的字节，第 18 节第 14 条），其余 RST（第 5.6 节）。
 5. 第 8.3 节"会话数的上限与引擎现有的 4096 个关联的关系在 M3 定" → 计入那 4096 个（第 7.1 节）；回包来源的做法见第 7.2 节。
 6. 第 8.5 节"`fd00:6152::/64` 里的 fake 地址（具体的一段在 M3 定）" → 低 32 位是同编号的 v4 地址（第 4.2 节）；"文件的格式、写的时机与大小上限在 M3 定" → 第 10.3 节；`REJECT-NO-DROP` 的 AAAA 答空（第 11.2 节）。
-7. 第 8.6 节"端口可以没有" → DNS 层跳过含端口条件的规则（第 12.1 节）。
+7. 第 8.6 节"端口可以没有" → DNS 层跳过含端口条件的规则（第 12.1 节）。（M3c 改成三值的判定，第 23 条。）
 8. 第 12 节"丢弃的包按原因计数……形状在 M3 定" → 第 14 节。
 9. 第 13 节"虚拟网卡同样有一个内存后端供起守护进程的用例用（M3 / M4）" → M4（M3 的用例都在引擎与 `rurge-tun` 这一层）。
 10. 第 2.3 节 Q-07"回 RST 并记一行日志" → 每次一行 DEBUG、第一次另有一行 WARN（第 10.4 节）。
@@ -489,7 +489,7 @@ B1、B2（第 6 节）；fake 应答的延迟（M3c；NFR-01：小于 0.2 毫秒
 
 下面七条订正的是本文自己的第 3、5、7、9、10 节，是 M3b 实施时读到、做到的（计划 `docs/superpowers/plans/2026-10-22-phase3-m3b-udp-icmp-pool-engine-plan.md`，下面写"M3b 记录第 N 行""M3b 延后第 N 行"指它末尾的「执行期修正记录」与「延后事项」两张表，写"P N"指它的「计划期决定」）；与第 1 ～ 15 条一样是代项目所有者作的裁定，所有者可以改，M3b 的代码以它们为准。
 
-16. 第 3.3 节 `TunSettings`：设计写这一代的解析器（`Arc<Resolver>`）、`always-real-ip`、`allow-dns-svcb`、`hijack-dns`、`icmp-forwarding`、出站模式是不是规则模式 → M3b 里 `TunSettings` 只有 `resolver: Arc<dyn Resolve>`（`rurge_net::connector::Resolve`，`rurge_dns::Resolver` 实现它，所以 `rurge-tun` 的用例用假解析器、不必建真的）与 `icmp_forwarding`（`crates/rurge-tun/src/hooks.rs`）；`always-real-ip`、`allow-dns-svcb`、`hijack-dns`、规则模式与 `Hooks::pre_match` 随 M3c（应答器与预匹配才用到，M3b 延后第 5 行）。`Tun::start` 的参数照第 3.3 节（`device`、`dialer`、`hooks`、`pinger`、`pool`、`options`）；引擎一侧的 `Hooks` 实现读 `Runtime.tun`，每一代的 `Runtime::build` 重建它，所以一次重载在 TUN 跑着的时候被它的下一次询问看到。（P2）
+16. 第 3.3 节 `TunSettings`：设计写这一代的解析器（`Arc<Resolver>`）、`always-real-ip`、`allow-dns-svcb`、`hijack-dns`、`icmp-forwarding`、出站模式是不是规则模式 → M3b 里 `TunSettings` 只有 `resolver: Arc<dyn Resolve>`（`rurge_net::connector::Resolve`，`rurge_dns::Resolver` 实现它，所以 `rurge-tun` 的用例用假解析器、不必建真的）与 `icmp_forwarding`（`crates/rurge-tun/src/hooks.rs`）；`always-real-ip`、`allow-dns-svcb`、`hijack-dns`、规则模式与 `Hooks::pre_match` 随 M3c（应答器与预匹配才用到，M3b 延后第 5 行）。`Tun::start` 的参数照第 3.3 节（`device`、`dialer`、`hooks`、`pinger`、`pool`、`options`）；引擎一侧的 `Hooks` 实现读 `Runtime.tun`，每一代的 `Runtime::build` 重建它，所以一次重载在 TUN 跑着的时候被它的下一次询问看到。（M3c 加了这些字段与钩子，第 32 条。）（P2）
 
 17. 第 10.3 节"读不了、读不懂……从空表开始，一次 WARN，文件留着不动，下一次写时覆盖"：一、打开时就写：`clean 1` 的文件载入后立刻改写成 `clean 0`，没有文件时立刻写一份空表的 `clean 0`——一次在第一次保存之前崩溃的运行，下次也认得出它是不干净的（M3b 计划的评审要点第 4 条）；读不了的文件仍留着不动，第一次保存时覆盖。二、读不了、读不懂的文件，从空表开始时同样隔离从 0 起的 2048 个编号 120 秒：那份文件里的映射可能还在应用手里（设计没有写这一处）。三、"接下来会交出的 2048 个"照分配的次序数：隔离期已过的编号（先进先出）→ 游标 → 最久没用到的（LRU），所以隔离不会漏掉下一次会交出的编号。`FakeIpPool::open` 返回 `Loaded`（`Missing`、`Clean`、`Unclean`、`NotRead(原因)`）而自己不写日志，日志由 `Engine::start_tun` 在调用它的线程上写：`NotRead` 一行 WARN（原因是池自己的固定文字加行号、或系统的错误文本，不引用文件的任何内容）、`Unclean` 一行 INFO，别的不说；一次保存失败的 WARN 由 `keep_saved` 写（不带名字）。读文件严格：第一行、第二行的三对、编号在范围内、名字不重复且是规范形式、行以 LF 结尾、末尾至多一个空行。（P4、P6、P24；M3b 记录第 4 行）
 
@@ -502,6 +502,30 @@ B1、B2（第 6 节）；fake 应答的延迟（M3c；NFR-01：小于 0.2 毫秒
 21. 第 5.5 节"拿掉套接字：smoltcp 报 CLOSED 或 TIME-WAIT 时"：套接字到 TIME-WAIT（rurge 先关了自己的一侧）或 `Closed` 时，流还在而 `recv_queue` 里有没读的字节，则片把它们拷进连接与流共用的记录（`ConnShared` 的 `Leftover`，`crates/rurge-tun/src/tcp/mod.rs`），接收缓冲的预算份额留到读完或流被丢掉再还，套接字、四元组的表项和 `max_sockets` 的计数立刻放掉；读先从记录里答，答完是结局。结局取 `recv_slice(&mut [])` 的回答：收到过 FIN 的是 `Closed`，读完字节之后是 `Ok(0)`；没有的是 `Reset`，读完字节之后仍是复位；拷的时候读失败或读到的比排队的少，结局也是 `Reset`（smoltcp 0.12 里走不到，有 `debug_assert_eq!` 守着；`856db45`）。所以在应用的 FIN 之前超时的连接照旧以复位结束，不会变成干净的 EOF；FIN 之后才超时的，读完字节是 `Ok(0)`。两种情形一并这样办：TIME-WAIT 过了宽限（不等 smoltcp 自己 10 秒之后的 `reset()` 清空缓冲）、`Closed` 而没有远端端点（应用先关、rurge 后关，或 smoltcp 自己的超时）。原因：应用的 TCP 看到这些字节都被确认了，被 `reset()` 清掉是它看不见的丢数据，转发循环看到的只是一个复位。**不只修结局**——只把结局改成 `Closed` 会把看得见的丢失变成悄悄的截断。代价：留着字节的连接占着至多 65,535 字节的预算份额，直到读完或流被丢掉。（P26；M3b 记录第 6、20 行）
 
 22. 第 3.3 节"引擎停下时停 TUN（取消它的会话，或限时地等 `join`）"与第 15 条的了结：做到了"取消它的会话"。`TunHandle::stop` 只发出停止、立刻返回，不等任何东西；每个会话的任务在拨通之后等着停止，一到就取消自己的会话令牌，再等它的转发结束，`join` 等所有的任务；停止与转发赛跑时停止居先（`session::serve`，`biased`）。每个转发中的会话等的是停止令牌的子令牌（`Life::session_stop`，各有自己的 `Notify`）：tokio 1.53.1 的 `Notified::poll` 在等待时每次轮询都拿一次 `Notify` 的等待者锁，都等同一个令牌的话，每个转发中的会话每次被唤醒都要拿同一把锁（M3b 延后第 26 行）。握手在停止之后才结束的会话不拨号（`established()` 之后先看停止；那条连接正被片的最后一轮复位）；`REJECT-DROP` 的拿着与连接的结束赛跑（`TunStream::closed`），读掉丢弃改用 512 字节的数组，不再用 `tokio::io::copy` 的 8 KiB 堆缓冲；`Engine::start_tun` 在引擎停止接受时 `stop()` 这个 TUN；第 15 条要的端到端用例是 `stopping_the_tun_ends_a_relay_stuck_on_its_upstream`（`crates/rurge-engine/tests/tun.rs`）。**没有做、也不会在 `rurge-tun` 里做的**：取消正在进行的拨号——拨号进行中会话的令牌还在引擎手里（`Engine::dial` 里才建 `SessionHandle`），TUN 够不到，丢掉拨号的 future 会留下开着的请求记录。改由引擎的拨号自己的时限界住：`Engine::dial` 每一条会等待的路都读过，没有一条没有时限（M3b 记录第 15 行），但其中一个由 Profile 定（`evaluate-before-use` 的等待，`test-timeout` 可以写任意多秒），所以停止之后 `join` 最长等多久不是一个常数；可执行文件停 TUN 时仍给等 `join` 的那一步一个自己的时限（M3b 延后第 8 行，M4）。（P29、P30）
+
+下面十一条订正的是本文自己的第 3、11 ～ 15 节与已决事项，是 M3c 实施时读到、做到的（计划 `docs/superpowers/plans/2026-10-23-phase3-m3c-dns-responder-prematch-plan.md`，下面写"M3c 记录第 N 行""M3c 延后第 N 行"指它末尾的「执行期修正记录」与「延后事项」两张表，写"P N"指它的「计划期决定」，写"R N"指执行期的裁定，见记录各行）；与第 1 ～ 22 条一样是代项目所有者作的裁定，所有者可以改，M3c 的代码以它们为准。
+
+23. 第 12.1 节与 M3-D20（第 7 条的再订正）："DNS 层没有端口"不是"编译时记下含端口的规则、DNS 层跳过它们"，而是**三值的判定**：匹配器多一个结论 `Verdict::NeedsConnection`（"要有连接才知道"），规则引擎的 DNS 层入口置位时，`DEST-PORT`、`SRC-PORT`、`IN-PORT`、`PROTOCOL`、`USER-AGENT`、`URL-REGEX` 和对名字的 IP 类规则（`IP-CIDR`、`IP-CIDR6`、`GEOIP`、`IP-ASN`，含 `UNKNOWN`；在 `no-resolve` 之前判）答它；`DOMAIN` 一族、`HOSTNAME-TYPE`、`SRC-IP`、`SUBNET` 照常判定，`PROCESS-NAME` 仍答 `NeedsProcess`。逻辑规则按"能定就定"组合：`AND` 有一个不成立就不成立，`OR` 有一个成立就成立，`NOT` 把成立与不成立互换、三种"还不知道"原样传出；集合里任何一处命中就命中，否则有一处答了 `NeedsConnection` 就是 `NeedsConnection`。原因：集合的内容运行中会换（`SetHandle::store`），编译时的标记要跟着每个集合的每一行走，三值在集合里自然成立；`NOT,((DEST-PORT,443))` 一类仍然不当作不命中，所以 `NOT` 不会把"不知道"翻成拒绝一切。与"跳过"相比**多出的命中**有两种，结论都与端口无关（SYN 层同一条规则对每个端口都命中，所以不是误拒）：`OR` 的另一支不靠连接就成立（`OR,((DOMAIN,a.test),(DEST-PORT,443))` 对 `a.test`），和 `NOT` 套在"名字使之不成立"的 `AND` 上（`NOT,((AND,((DOMAIN,a.test),(DEST-PORT,443))))` 对 `b.test`；计划期决定 P2 漏了第二种，M3c 记录第 9 行补上）。入口是 `RuleEngine::pre_match(session, layer)`（`PreMatchLayer { Dns, Syn }` 在 `rurge_config::session`，因为 `rurge-tun` 不直接依赖 `rurge-rules`），取代 `pre_match_domain` 与 `pre_match_ip`；SYN 层的会话是这条连接，`USER-AGENT` 与 `URL-REGEX` 在那里仍读成不命中，所以它们外面的 `NOT` 成立（今天的行为，M3c 延后第 1 行）。（P2、P3；M3c 记录第 8 ～ 10 行）
+
+24. 第 11.1、11.2 节与 M3-D8：**应答器是每个 TUN 一个**，UDP 与 TCP 共用它的 256 个转发许可，池耗尽的 WARN 也是每个 TUN 一次（`Tun::start` 在建片之前建 `Arc<Responder>`，放进 `Context`，同一个交给片，R3）。一个 UDP 包的去处在 `udp::destination` 一处按次序定：发往应答器地址的 53 端口 → 应答器；发往应答器地址的别的端口或 rurge 自己的别的地址 → ICMP"管理上禁止"（M3b，不变）；IPv4、不是 rurge 自己的地址、端口（与带地址的项的地址）合 `hijack-dns` 的某一项、负载 `read_request` 得 `Ok` → 应答器，应答的来源是被劫持的那个端点（`class` 不看：class 不对的照样由应答器答 NOTIMP，P12）；其余 → UDP 会话。所以 M3b 的"发往 `198.18.0.2` 的 UDP 回 ICMP"现在只对 53 以外的端口成立（R4）；TCP 同理：应答器的 53 端口的 SYN 建套接字，别的端口与 rurge 自己的别的地址照旧 RST（R5）；发往被劫持的服务器的 TCP 照常作 TCP 连接（第 11.1 节原文）。应答器的应答是本地应答：`try_send` 给写任务，满了丢、计 `queue_full`，**从不等空位**（R12；假应答不拿转发的许可，等空位的任务在卡住的设备后面会无界地堆），设备跟不上时应用重发查询。应答器自己的队列是 `dns_queue`（缺省 1,024，满了计 `queue_full`），每个查询一个任务、在 TUN 的任务集里、与停止赛跑（队列任务是 TUN 自己的任务，`session_tasks()` 减 `shards.len() + 3`，R10）。（P12、P13；M3c 记录第 11、15、16、18 行）
+
+25. 第 11.2 节：判定的细节（P7、P8）。opcode 先看（只看报文头），不是 QUERY 答 NOTIMP、只带报文头；解析不了或问题数不是 1 答 FORMERR；QR 置位的或不足 12 字节的不答；class 不是 IN 答 NOTIMP、带问题；canary 对任何类型 NXDOMAIN（名字不分大小写）；SVCB（64）与 HTTPS（65）都按 `allow-dns-svcb` 拒绝（手册写 "SVCB/HTTPS (type 65)"，没有把 64 单独讲，推断都拒绝），允许时照其余类型转发；本地造的应答置 AA 与 RA、照抄 RD、问题段逐字节回显（0x20 大小写混排的解析器拿回它自己的大小写，同一个名字不论大小写拿同一个 fake 地址）；`REJECT-NO-DROP` 的 A 记录 TTL 30；`always-real-ip` 按 `matches(&Domain(名字), 0)` 判，写了端口的条目在 DNS 层永不命中（查询没有端口）；系统 hosts 文件里的映射同 `[Host]` 的地址映射；名字不合池的样子（`NotAName`）照转发；池耗尽答 SERVFAIL。**UDP 的限度**：有 OPT 时是 min(max(它的值, 512), 1232)，没有时 512（第 11.2 节原写"取它的值与 1232 的较小者"，没有说小于 512 的值）；超出时置 TC、去掉记录、应答码照上游的；本地造的应答（最大的是 `always-real-ip` 的一串地址）同样受限度；应答带的 OPT 是 1232，只在查询带 OPT 时才有。TCP 从不按限度截断（但见下一条）。（M3c 记录第 4 行）
+
+26. 第 11.4 节与 M3-D8：**DNS over TCP**（P15、R19、R25）。连接照常完成握手，之后不交给引擎，在本地按长度前缀读查询、按次序一个接一个应答（流水线发来的查询照收、照次序答，不并发，M3c 延后第 7 行）；空闲 `dns_tcp_idle`（缺省 10 秒）关，空闲只算等下一个完整的查询（转发等应答的时间不算）；收到没有应答的消息（长度 0、不是查询的报文、被 `REJECT-DROP` 拒绝的查询）也关。**关法**：先 `shutdown`（FIN），再读掉丢弃应用还在发的字节直到应用的 FIN 或 `dns_tcp_idle`，然后才丢流——不是计划原写的"先 `shutdown` 再丢"（第 11.4 节只写了"空闲 10 秒关掉"）：被丢掉的流在 smoltcp 的 `may_recv()` 仍为真时（FIN-WAIT-1、FIN-WAIT-2）会被复位，FIN 与最后一个应答一起丢了（`REJECT-DROP` 的拿着本来就这样，第 14 条；两个调用者共用 `TunStream::close_and_wait_for_the_app`）；应答的写也以 `dns_tcp_idle` 为限，应用不读就复位。代价：应用不关自己那一半时，连接与它的任务多占至多 `dns_tcp_idle`。**长度**：TCP 的应答长过 65,535 字节（DoH 的服务端可以回任意大的正文）不能以两字节的长度分帧，答 SERVFAIL（R19）；读查询时缓冲随收到的字节增长，不按声称的长度预分配。（M3c 记录第 13、19、20 行）
+
+27. 第 11.3 节与 M3-D19：**`Resolver::forward` 的上游怎么选、怎么收**（P4 ～ P6、R20）。`[Host]` 的 `server:<地址或 URL>` → 那些服务器；`server:system`、`server:syslib`、`server:force-syslib` 三种写法同一件事（同阶段 1；`force-syslib` 的区分随 M4）→ 系统当前的 DNS 服务器；其余（地址映射、别名、没有命中）→ 主上游。**别名不跟随**（转发的是原来的问题，问主上游）；`proxy_hostnames` 的豁免与 `localhost` 的规则不适用（它们管的是 rurge 自己的查找）；`.local` 与单标签名字照主上游，不交系统解析库（解析库只答地址，不能原样转发）——所以第 11.3 节原写的"`server:syslib` 与 `server:force-syslib` 写明的名字的其余类型转发给系统当前的 DNS 服务器"只对那三种写法写明的名字成立，没写明的 `.local` 名字的其余类型问主上游（M3c 延后第 2 行）。同时问所选的每个上游，每 `resend` 对还没答的重发，至多 `attempts` 轮（缺省 1 秒 × 5），每次发出换新的随机 ID（UDP 上游自己给每个在途的查询一个不冲突的 ID，此前两个同 ID 的查询同时在途时第一个失败），只收 QR 置位、问题与查询相同（名字不分大小写）的应答，第一个 NOERROR 或 NXDOMAIN 胜出，其余的码留着、都答了或到截止时交回第一个；**出错的上游不算答过**，所以上游全挂时要等满约 5 秒才 SERVFAIL（M3c 延后第 10 行）；发出之前把查询的 OPT 降到 1232；不进缓存，不看也不计 AAAA 抑制。（M3c 记录第 4 ～ 7 行）
+
+28. 第 12.2、12.4 节与 M3-D23：**引擎的钩子与记录**（P16、P17、R8、R28）。钩子取**活的**出站模式（`Engine::mode()`，不随代），不是规则模式就不看；不看 `strict` 暂停（被暂停的会话被拒在拨号处）；模式是全局而全局策略不可用时引擎在拨号处按规则走，钩子不答，这样的拒绝落在拨号（M3c 延后第 17 行）。自动升级的键是 `dst_host` 的文字（同 `connect_session`），先 `record` 后 `should_drop`，所以第 50 次本身就静默；计入的是每个被拒的 A 或 AAAA 查询，一次查找问两种的应用比按会话数更早静默（延后第 18 行）。记录：同一代、同一条规则 5 分钟只记一次，限频表在 `Runtime` 里（换代即从头记），判断是带 `now` 的纯函数 `Recorded::due`；该记时才查进程、建 handle，不该记时什么也不建，自动升级照样计；记录的 `rule` 是规则的文字，策略链是那一个内置策略，`notes` 先写 `pre-matching at DNS` 或 `pre-matching at SYN`、有子规则时再写 `Sub-rule matched: … (in …)`；DNS 层的记录是那个名字、没有端口（端口为 0 时记录与会话日志的 `dst` 只写主机，P21），SYN 层的是那条连接。SYN 层的钩子在片的锁里、建套接字之前调用，同步、不碰 TUN；`Drop` 不回包、不计数、一行 DEBUG，其余经 RST 限频；被拒的 SYN 不留租约；应答器的 53 端口的 SYN 不问。（M3c 记录第 22、24、25 行）
+
+29. 第 13 节与 M3-D21：**经监听器来的 fake 地址**（P19、P20、R16、R27）。换回名字在 `Dialer::dial` 里、`look_up_owner` 之前，只对 HTTP 与 SOCKS5 的会话（SOCKS5 的 UDP 流在 `run_flow` 里同样换），租约挂在会话的结束钩子上（UDP 流的租约随流，到引擎回收它为止：空闲 60 秒，已有应答的 53 端口的流更早）；池里没有：`error` 是 `fake address not known`（HTTP 502，SOCKS5 `0x05`），不拨；没有池（没有 TUN）时照普通地址。"rurge 地址空间里的 IP"是整个 `198.18.0.0/15` 与 `fd00:6152::/64`（`rurge_dns::fakeip::in_space`），所以经代理端口去 rurge 自己的地址，或这个空间里池不认识的地址，也是 `fake address not known`（M3c 延后第 20 行）。**SOCKS5 的 UDP 回包的来源在引擎里换回 fake 地址**，不在 `rurge-inbound`（那要它依赖 `rurge-dns`）：`Flow` 记下客户端写的目标 `asked` 与有没有换过 `swapped`；回包应答恰好一条换过的流时，交给客户端的来源与 `answers` 都是 `asked`，不知道应答哪一条的保留真实的来源（两条流发往同一个目标时即如此，延后第 21 行）。**设计没有写的缺口**：明文 HTTP 请求（`GET http://<fake 地址>/…`）换回名字之后，请求行、`Host` 与 `session.url` 仍是 fake 地址，经 `http` 策略（绝对形式）时上游代理被要求去连 fake 地址，`URL-REGEX` 与扩展匹配看到的也是；`CONNECT` 与 SOCKS5 的目标里是名字，不受影响。不改，去向阶段 4（HTTP 引擎改写请求行与 `Host`）（R27，M3c 延后第 19 行）。（M3c 记录第 21、23 行）
+
+30. 第 14 节与 M3-D26："名字与地址只在 DEBUG"有一处不照做（P18）。被预匹配拒绝的会话进请求记录之后，经引擎已有的会话日志行写 INFO（`session rejected by REJECT`，带 `dst` 与 `src`），所以 DNS 层被拒的名字出现在 INFO 里——每条规则每代 5 分钟至多一行；与第 14 节不一致，照第 17 节 V12 以今天的会话日志为准（M3b 计划期决定 P13 与延后第 1 行同一件事，M3c 延后第 6 行，留给项目所有者）。应答器自己的行只在 DEBUG（`tun: DNS query`，字段 `name`、`qtype`、`decision` 与 `fitted`），WARN 不带名字与地址（池耗尽一行，每个 TUN 一次）；`rurge-dns` 的转发行（`forwarded`、`forward failed`）在 DEBUG，名字只在每次转发的那一行里，上游的名字在转发扇出的行里。
+
+31. 第 14 节的计数与 M3-D8 的上限（P13、P14、P27）。`queue_full` 现在还数：应答器的队列放不下的查询，写任务的队列放不下的应答（本地应答从不等空位，第 24 条），TUN 里排队的 UDP 超过字节预算的数据报（`udp_bytes`，缺省 64 MiB，所有 UDP 会话共用，每个数据报占它负载的字节，引擎取走或它被丢弃时还；第一个数据报放不下时不开会话；M3b 延后第 29 行的 TUN 一侧）。`TunOptions` 加了四个字段，都进 `TunOptions::check`：`dns_queue`（缺省 1,024）、`udp_dns_idle`（缺省 10 秒：会话发过包的目标全是 53 端口时的空闲，**不得大于 `udp_idle`**，所以把 `udp_idle` 调到 10 秒以下的调用者也要调它）、`udp_bytes`、`dns_tcp_idle`（缺省 10 秒）。`udp_dns_idle` 的标志是**粘住**的：会话发过任何不是 53 端口的目标，此后永远按 `udp_idle`，目标表的扫除也按 `udp_idle`、不按 `udp_dns_idle`。（M3c 记录第 15 ～ 17 行）
+
+32. 第 3.3 节 `Hooks` 与 `TunSettings`（接第 16 条）。`TunSettings` 现在是 `resolver`、`icmp_forwarding`、`dns: Arc<dyn TunDns>`（`mapped` 只认 `[Host]` 与系统 hosts 文件的地址映射，`forward` 是 `Resolver::forward`；`rurge_dns::Resolver` 实现它）、`always_real_ip`、`allow_dns_svcb`、`hijack_dns`；"出站模式是不是规则模式"不在里面，钩子自己读活的模式（第 28 条）。`Hooks::pre_match(layer, session) -> Option<RejectKind>` 没有缺省实现、同步、从不等待，取代设计写的 `pre_match(&PreMatchAt)`。（M3c 记录第 8、11、14 行）
+
+33. 第 15.3 节与 NFR-01：**b3 与 B2 在 M3c 之后的数字**（P22）。b3 量 `Responder::answer` 加造应答包，不含设备与写任务，钩子是什么也不记的空钩子，所以是整条路的下限，不含引擎的规则评估、进程查找和设备的系统调用；一台 Windows 11 x86-64 的开发机上 release 构建：中位数 0.9 微秒、p99 3.2 微秒，最大值 5.8 毫秒（落在池的 `HashMap` 翻倍处，第 57,345 个名字），NFR-01 的线是 0.2 毫秒；真实设备上的数字要在 M4 量。B2 在 M3c 的最后一个改代码的提交上缺省设置跑了三次：门槛读数 397.7 / 402.4 / 402.5 MB（余量 31.3 / 26.6 / 26.5 MB），保守读数超线 10.4 / 15.1 / 15.1 MB；第 11 条里"390.4 MB（余量 38.6 MB）""保守读数超线 3.1 MB"是 M3a 的数字，这里的以这一条为准，原因没有查（M3c 记录第 26 行，延后第 13 行）。
 
 ## 19. 已决事项
 
@@ -525,11 +549,11 @@ B1、B2（第 6 节）；fake 应答的延迟（M3c；NFR-01：小于 0.2 毫秒
 | M3-D16 | ICMP | 回显不经规则；rurge 自己的地址本地应答、fake 地址先解析再转发、其余经 `Pinger`；保留应用的标识与序号；`Pinger` 是 trait，真实的 ICMP 套接字在 M4 |
 | M3-D17 | fake 地址的编址 | v4 `198.18.1.1 + i`（130,814 个），v6 `fd00:6152::` 加同编号的 v4 地址；rurge 自己的地址 `198.18.0.0/24` 与 `fd00:6152::/120`；整个地址空间 `198.18.0.0/15` 与 `fd00:6152::/64` |
 | M3-D18 | 池 | 名字规范化、只收 `[a-z0-9_-]` 的标签与 253 字节以内；先游标后 LRU；租约挡住回收；耗尽时 SERVFAIL；TTL 30 秒；`fake-ip.txt` 文本、至多每 10 秒与停下时写、不 fsync、读不了从空表开始；上一次没有干净停下时隔离接下来的 2048 个编号 120 秒（打开时的写、读不了的文件与文件里没有名字的编号，第 18 节第 17、18 条） |
-| M3-D19 | 应答器 | 第 11.2 节的次序；OPT 1232；超出时置 TC；同时转发至多 256 个；`hijack-dns` 只对 UDP 与 IPv4、只认合法的查询、应答的来源是被劫持的服务器 |
-| M3-D20 | 预匹配的入口 | 一个入口给出会话与层；DNS 层跳过含 `DEST-PORT` / `SRC-PORT` 的规则、集合里含端口的行不命中；IP 类规则在 DNS 层不命中；从不解析 |
-| M3-D21 | 经监听器来的 fake 地址 | 有池时在规则之前换回名字（持租约），池里没有就失败、不拨；没有池时照普通地址 |
+| M3-D19 | 应答器 | 第 11.2 节的次序；OPT 1232；超出时置 TC；同时转发至多 256 个；`hijack-dns` 只对 UDP 与 IPv4、只认合法的查询、应答的来源是被劫持的服务器（实施期：第 18 节第 24 ～ 27 条） |
+| M3-D20 | 预匹配的入口 | 一个入口给出会话与层；DNS 层跳过含 `DEST-PORT` / `SRC-PORT` 的规则、集合里含端口的行不命中；IP 类规则在 DNS 层不命中；从不解析（M3c 实施时改成三值，不是跳过，第 18 节第 23 条） |
+| M3-D21 | 经监听器来的 fake 地址 | 有池时在规则之前换回名字（持租约），池里没有就失败、不拨；没有池时照普通地址（实施期：第 18 节第 29 条） |
 | M3-D22 | 计数与 API | 按原因的丢包计数与 `stack_panics`；M4 起在 `GET /v1/features/enhanced_mode` 里给出，形状见第 14 节 |
-| M3-D23 | 预匹配的钩子与记录 | 规则模式才看；`REJECT` 与 `REJECT-TINYGIF` 计入 `Escalation`；同一代里同一条规则 5 分钟只记一次，`notes` 写层；清单 L336 的阶段改为 3 |
+| M3-D23 | 预匹配的钩子与记录 | 规则模式才看；`REJECT` 与 `REJECT-TINYGIF` 计入 `Escalation`；同一代里同一条规则 5 分钟只记一次，`notes` 写层；清单 L336 的阶段改为 3（实施期：第 18 节第 28 条） |
 | M3-D24 | 拒绝在虚拟网卡上的样子 | 第 9.4 节的表；`198.18.0.244` 的 TCP 回 RST、UDP 回 ICMP（不限频） |
 | M3-D25 | 测试 | 应用端是另一个 smoltcp 栈；经虚拟网卡不以回环为目的：名字经 fake 地址钉到回环，真实 IP 用文档地址并有两道防线（要测的规则、`SRC-IP` 的 `REJECT`）；ICMP 用假 `Pinger`；M3 的用例不建网卡、不改系统 |
-| M3-D26 | 名字与地址的日志 | 名字与地址只在 DEBUG 与请求记录里；每种丢包原因第一次 WARN（`martian` 不报），其余 DEBUG |
+| M3-D26 | 名字与地址的日志 | 名字与地址只在 DEBUG 与请求记录里；每种丢包原因第一次 WARN（`martian` 不报），其余 DEBUG（预匹配被拒的会话的 INFO 行例外，第 18 节第 30 条） |
