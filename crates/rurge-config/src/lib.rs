@@ -55,7 +55,7 @@ pub use rule::{
     HostnameType, InternalSet, ParseCtx, Pattern, PolicyRef, PortExpr, ProcessPattern,
     ProtocolKind, ResourceRef, Rule, RuleKind, RuleParams, SubRule,
 };
-pub use session::{DeviceInfo, ListenerKind, ProcessInfo, SessionInfo, Transport};
+pub use session::{DeviceInfo, ListenerKind, PreMatchLayer, ProcessInfo, SessionInfo, Transport};
 pub use span::Span;
 pub use spec::{PolicySpec, ProtoSpec};
 pub use ssid_setting::{SsidSetting, TfoBehaviour};

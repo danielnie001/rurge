@@ -22,6 +22,14 @@ pub enum Transport {
     Udp,
 }
 
+/// Where a session is pre-matched: a DNS query for its name (no connection
+/// yet: no port, no address), or the first packet of a TCP connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreMatchLayer {
+    Dns,
+    Syn,
+}
+
 /// The process that opened a session: one the caller names (`rurge rule match
 /// --process`), or one the engine found when a rule asked for it.
 #[derive(Clone, Debug, PartialEq, Eq)]

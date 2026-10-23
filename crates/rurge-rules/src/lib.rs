@@ -17,4 +17,5 @@ pub use engine::{
 pub use geoip::{DbKind, GeoAnswer, GeoDb, GeoDbInfo};
 pub use geoip_update::{GeoUpdater, GeoUrls};
 pub use matcher::{GeoLookup, GeoResult};
+pub use pre_matching::PreMatch;
 pub use registry::{SetRegistry, SetStatus};

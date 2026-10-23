@@ -184,6 +184,13 @@ impl CompiledSet {
     /// The IPv4 address is asked first and the IPv6 one after it, so a name
     /// resolved to both, each inside a line, reports the IPv4 line whatever
     /// the prefix lengths.
+    ///
+    /// Before the connection exists (`EvalCtx::before_connection`) a line
+    /// that matches still matches: a name the set holds is a match. A name it
+    /// does not hold is `NoMatch` only if no line waits for the connection: an
+    /// IP or `IP-ASN` line has no address to look at, whether it says
+    /// `no-resolve` or not, and a line about ports, the transport or HTTP has
+    /// nothing to look at either. With one, the answer is `NeedsConnection`.
     pub fn eval(
         &self,
         s: &SessionInfo,
@@ -204,7 +211,7 @@ impl CompiledSet {
                 }
             }
         }
-        let (mut needs_process, mut needs_resolve) = (false, false);
+        let (mut needs_connection, mut needs_process, mut needs_resolve) = (false, false, false);
         for (i, rule) in &self.linear {
             match rule.matcher.eval(
                 s,
@@ -213,6 +220,7 @@ impl CompiledSet {
                 extended || rule.extended,
             ) {
                 Verdict::Match => return self.hit(*i),
+                Verdict::NeedsConnection => needs_connection = true,
                 Verdict::NeedsProcess => needs_process = true,
                 Verdict::NeedsResolve => needs_resolve = true,
                 Verdict::NoMatch => {}
@@ -227,6 +235,7 @@ impl CompiledSet {
                         return self.hit(i);
                     }
                 }
+                Err(Verdict::NeedsConnection) => needs_connection = true,
                 Err(Verdict::NeedsResolve) => needs_resolve = true,
                 Err(_) => {}
             }
@@ -239,13 +248,15 @@ impl CompiledSet {
                             return self.hit(i);
                         }
                     }
+                    Err(Verdict::NeedsConnection) => needs_connection = true,
                     Err(Verdict::NeedsResolve) => needs_resolve = true,
                     Err(_) => {}
                 }
             }
         }
         SetVerdict {
-            verdict: still_needs(needs_process, needs_resolve).unwrap_or(Verdict::NoMatch),
+            verdict: still_needs(needs_connection, needs_process, needs_resolve)
+                .unwrap_or(Verdict::NoMatch),
             entry: None,
         }
     }

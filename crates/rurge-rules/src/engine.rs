@@ -11,11 +11,10 @@ use crate::pre_matching::{PreMatch, PreMatchingSet};
 use crate::registry::SetRegistry;
 use rurge_config::policy::Builtin;
 use rurge_config::rule::{PolicyRef, RuleParams};
-use rurge_config::session::{ProcessInfo, SessionInfo};
-use rurge_config::{Config, HostName, NetworkCell, NetworkFacts, Span};
+use rurge_config::session::{PreMatchLayer, ProcessInfo, SessionInfo};
+use rurge_config::{Config, NetworkCell, NetworkFacts, Span};
 use rurge_net::BoxFuture;
 use std::fmt;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -209,6 +208,7 @@ fn verdict_name(v: Verdict) -> &'static str {
         Verdict::NoMatch => "no-match",
         Verdict::NeedsResolve => "needs-resolve",
         Verdict::NeedsProcess => "needs-process",
+        Verdict::NeedsConnection => "needs-connection",
     }
 }
 
@@ -397,6 +397,14 @@ impl RuleEngine {
                     }
                 }
             }
+            // only the pre-match of a DNS query is without a connection; a
+            // session decided here has one, and the verdict is a miss if it
+            // ever comes
+            debug_assert_ne!(
+                verdict,
+                Verdict::NeedsConnection,
+                "a rule waits for the connection of a session that has one"
+            );
             Self::collect_notes(rule, &mut ctx, &mut notes);
             if let Some(t) = trace.as_mut() {
                 t.push(TraceStep {
@@ -537,29 +545,26 @@ impl RuleEngine {
         }
     }
 
-    /// Pre-matching never resolves: every rule is evaluated as if it had `no-resolve`.
-    pub fn pre_match_domain(&self, host: &str, port: u16) -> Option<PreMatch> {
-        self.pre_match(SessionInfo::tcp(
-            HostName::Domain(host.trim_end_matches('.').to_ascii_lowercase()),
-            port,
-        ))
-    }
-
-    pub fn pre_match_ip(&self, ip: IpAddr, port: u16) -> Option<PreMatch> {
-        self.pre_match(SessionInfo::tcp(HostName::Ip(ip), port))
-    }
-
-    fn pre_match(&self, s: SessionInfo) -> Option<PreMatch> {
+    /// The first rule written with `pre-matching` that refuses `s` at `layer`,
+    /// without resolving anything and without waiting: at `Dns` a condition that
+    /// needs the connection (ports, addresses, transport, HTTP) is not known and
+    /// a rule that depends on one is not a hit; at `Syn` the session is the
+    /// connection. Counts the hit. Does not look at the outbound mode.
+    pub fn pre_match(&self, s: &SessionInfo, layer: PreMatchLayer) -> Option<PreMatch> {
         let facts = self.network.load();
         let mut ctx = EvalCtx::with_network(self.geo.as_ref(), &facts, self.wifi_always_match);
+        ctx.before_connection = layer == PreMatchLayer::Dns;
         for &pos in self.pre.positions() {
             let rule = &self.rules[pos];
-            let matched = Self::pre_matches(rule, &s, &mut ctx);
+            ctx.sub_hit = None;
+            let matched = Self::pre_matches(rule, s, &mut ctx);
             ctx.notes.clear();
             if matched {
+                rule.hits.fetch_add(1, Ordering::Relaxed);
                 return Some(PreMatch {
                     rule: rule.index,
                     policy: rule.policy.clone(),
+                    sub_rule: ctx.sub_hit.take(),
                 });
             }
         }
@@ -577,10 +582,13 @@ mod tests {
     use rurge_config::Reach;
     use rurge_config::config::{LoadOptions, from_text};
     use rurge_config::rule::{ParseCtx, ResourceRef};
-    use rurge_config::{NetKind, Primary, WifiLink};
+    use rurge_config::{HostName, NetKind, Primary, WifiLink};
     use std::collections::{HashMap, HashSet};
+    use std::net::IpAddr;
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
+
+    mod pre_match;
 
     fn load(text: &str) -> Config {
         let l = from_text(text, Path::new("t.conf"), &LoadOptions::for_tests());
@@ -703,6 +711,19 @@ DOMAIN,inline.example.com
 
     fn session(host: &str) -> SessionInfo {
         SessionInfo::tcp(HostName::parse(host), 443)
+    }
+
+    /// What the first packet of a connection to the name `host`, in its
+    /// lowercase form, pre-matches.
+    fn syn_to_domain(e: &RuleEngine, host: &str, port: u16) -> Option<PreMatch> {
+        let s = SessionInfo::tcp(HostName::Domain(host.into()), port);
+        e.pre_match(&s, PreMatchLayer::Syn)
+    }
+
+    /// The same for a connection to the address `ip`.
+    fn syn_to_ip(e: &RuleEngine, ip: &str, port: u16) -> Option<PreMatch> {
+        let s = SessionInfo::tcp(HostName::Ip(ip.parse().unwrap()), port);
+        e.pre_match(&s, PreMatchLayer::Syn)
     }
 
     fn named(p: &PolicyRef) -> String {
@@ -933,12 +954,10 @@ DOMAIN,before.example,REJECT,pre-matching\nFINAL,DIRECT\n\
 DOMAIN,between.example,REJECT,pre-matching\nFINAL,P\n\
 DOMAIN,after.example,REJECT,pre-matching\n",
         );
-        let m = e
-            .pre_match_domain("before.example", 443)
-            .expect("the rule before the first FINAL");
+        let m = syn_to_domain(&e, "before.example", 443).expect("the rule before the first FINAL");
         assert_eq!(m.rule, 0);
-        assert!(e.pre_match_domain("between.example", 443).is_none());
-        assert!(e.pre_match_domain("after.example", 443).is_none());
+        assert!(syn_to_domain(&e, "between.example", 443).is_none());
+        assert!(syn_to_domain(&e, "after.example", 443).is_none());
         let d = e
             .evaluate(&session("before.example"), OutboundMode::Rule, &Panicking)
             .await;
@@ -1066,18 +1085,14 @@ DOMAIN,local.example,P\nFINAL,P\n",
     fn pre_matching_extracts_reject_rules_and_never_resolves() {
         let e = engine(CONF);
         assert_eq!(e.pre_matching().len(), 2);
-        let m = e
-            .pre_match_domain("PRE.example.com.", 443)
-            .expect("domain pre-match");
+        let m = syn_to_domain(&e, "pre.example.com", 443).expect("domain pre-match");
         assert_eq!(m.rule, 4);
         assert_eq!(m.policy.name(), "REJECT");
-        let m = e
-            .pre_match_ip("192.168.1.1".parse().unwrap(), 80)
-            .expect("ip pre-match");
+        let m = syn_to_ip(&e, "192.168.1.1", 80).expect("ip pre-match");
         assert_eq!(m.rule, 5);
         assert_eq!(m.policy.name(), "REJECT-DROP");
-        assert!(e.pre_match_domain("other.com", 443).is_none());
-        assert!(e.pre_match_ip("10.0.0.1".parse().unwrap(), 80).is_none());
+        assert!(syn_to_domain(&e, "other.com", 443).is_none());
+        assert!(syn_to_ip(&e, "10.0.0.1", 80).is_none());
     }
 
     /// The allowing rule is written first; the flagged ones still go first.
@@ -1412,7 +1427,7 @@ SUBNET,TYPE:WIFI,A\nSUBNET,ROUTER:192.168.1.1,B\nSUBNET,SSID:Home,C\nFINAL,DIREC
 
     /// A rule flagged `pre-matching` is checked ahead of the written order,
     /// and it looks at the network too — in the evaluation of a session and in
-    /// the two entries that ask before a name is resolved.
+    /// the entry that asks before a name is resolved.
     #[tokio::test]
     async fn a_pre_matching_subnet_rule_sees_the_network() {
         let cell = Arc::new(NetworkCell::new(NetworkFacts::default()));
@@ -1429,26 +1444,22 @@ SUBNET,TYPE:WIFI,REJECT,pre-matching\nFINAL,DIRECT\n",
         };
         // off Wi-Fi the flagged rule misses and the written order is walked
         assert_eq!(ads().await, (Reason::Rule, Some(0), "P".to_string()));
-        assert_eq!(e.pre_match_domain("ads.example", 443), None);
-        assert_eq!(e.pre_match_ip("192.0.2.1".parse().unwrap(), 443), None);
+        assert_eq!(syn_to_domain(&e, "ads.example", 443), None);
+        assert_eq!(syn_to_ip(&e, "192.0.2.1", 443), None);
         // on Wi-Fi it decides first
         cell.store(at_home());
         assert_eq!(
             ads().await,
             (Reason::PreMatching, Some(1), "REJECT".to_string())
         );
-        let m = e
-            .pre_match_domain("ads.example", 443)
-            .expect("the pre-match sees the network");
+        let m = syn_to_domain(&e, "ads.example", 443).expect("the pre-match sees the network");
         assert_eq!((m.rule, m.policy.name()), (1, "REJECT".to_string()));
-        let m = e
-            .pre_match_ip("192.0.2.1".parse().unwrap(), 443)
-            .expect("the pre-match sees the network");
+        let m = syn_to_ip(&e, "192.0.2.1", 443).expect("the pre-match sees the network");
         assert_eq!(m.rule, 1);
         // and off it again
         cell.store(NetworkFacts::default());
         assert_eq!(ads().await, (Reason::Rule, Some(0), "P".to_string()));
-        assert_eq!(e.pre_match_domain("ads.example", 443), None);
+        assert_eq!(syn_to_domain(&e, "ads.example", 443), None);
     }
 
     /// Answers 192.0.2.1 and, on the way, the machine joins another network.
@@ -1949,9 +1960,9 @@ AND,((RULE-SET,Y),(OR,((DEST-PORT,1),(DEST-PORT,443)))),P\nFINAL,DIRECT\n\
     }
 
     /// A rule flagged `pre-matching` that takes its lines from a set with a
-    /// `PROCESS-NAME` line in it: the pre-pass and the two lookups before a
-    /// name is resolved do not ask for the process (they have none to give),
-    /// the rule misses there and is evaluated where it is written.
+    /// `PROCESS-NAME` line in it: the pre-pass and the lookup before a name
+    /// is resolved do not ask for the process (they have none to give), the
+    /// rule misses there and is evaluated where it is written.
     #[tokio::test]
     async fn pre_matching_does_not_ask_for_the_process() {
         let e = engine(
@@ -1959,8 +1970,8 @@ AND,((RULE-SET,Y),(OR,((DEST-PORT,1),(DEST-PORT,443)))),P\nFINAL,DIRECT\n\
 [Ruleset Marked]\nPROCESS-NAME,x\n",
         );
         assert_eq!(e.pre_matching().len(), 1);
-        assert!(e.pre_match_domain("example.com", 443).is_none());
-        assert!(e.pre_match_ip("192.0.2.1".parse().unwrap(), 443).is_none());
+        assert!(syn_to_domain(&e, "example.com", 443).is_none());
+        assert!(syn_to_ip(&e, "192.0.2.1", 443).is_none());
         let process = CountedProcess::is("x");
         let d = decide_with(&e, "example.com", &Panicking, &process).await;
         assert_eq!((d.reason, d.matched), (Reason::Rule, Some(0)));

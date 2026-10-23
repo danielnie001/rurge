@@ -23,6 +23,11 @@ pub enum Verdict {
     /// The rule cannot be decided before the process that opened the session
     /// is known.
     NeedsProcess,
+    /// The rule cannot be decided before the connection exists: it looks at
+    /// its ports, its addresses, its transport or the HTTP request in it.
+    /// Only a session that has no connection yet, a DNS query pre-matched,
+    /// is given this.
+    NeedsConnection,
 }
 
 impl From<bool> for Verdict {
@@ -94,6 +99,10 @@ pub struct EvalCtx<'a> {
     /// before each rule; the logical matchers see to it that a rule leaves
     /// only the hit of a set that is part of why it matched.
     pub sub_hit: Option<SubRuleHit>,
+    /// The session has no connection yet, as with a DNS query: nothing that
+    /// only the connection has is known (ports, addresses, transport, HTTP),
+    /// and a rule that looks at one answers `NeedsConnection`.
+    pub(crate) before_connection: bool,
     geo: &'a dyn GeoLookup,
     /// The network the machine is on, with `subnet-exp-wifi-always-match`
     /// (phase 3 M1 design 8). `None`: this evaluation was never told, and no
@@ -118,6 +127,7 @@ impl<'a> EvalCtx<'a> {
             process: ProcessState::NotAsked,
             notes: Vec::new(),
             sub_hit: None,
+            before_connection: false,
             geo,
             network: None,
             country_cache: None,
@@ -320,6 +330,9 @@ impl Matcher {
         no_resolve: bool,
         extended: bool,
     ) -> Verdict {
+        if ctx.before_connection && self.needs_the_connection() {
+            return Verdict::NeedsConnection;
+        }
         match self {
             Matcher::Domain(d) => domain_targets(s, extended).any(|h| h == d.as_str()).into(),
             Matcher::DomainSuffix(d) => domain_targets(s, extended).any(|h| is_suffix(h, d)).into(),
@@ -407,38 +420,48 @@ impl Matcher {
                 .is_some_and(|(facts, wifi_always_match)| expr.matches(facts, wifi_always_match))
                 .into(),
             Matcher::And(subs) => ctx.in_branches(|ctx| {
-                let (mut needs_process, mut needs_resolve) = (false, false);
+                let (mut needs_connection, mut needs_process, mut needs_resolve) =
+                    (false, false, false);
                 for sub in subs {
                     match sub.eval(s, ctx) {
                         Verdict::NoMatch => return Verdict::NoMatch,
+                        Verdict::NeedsConnection => needs_connection = true,
                         Verdict::NeedsProcess => needs_process = true,
                         Verdict::NeedsResolve => needs_resolve = true,
                         Verdict::Match => {}
                     }
                 }
-                still_needs(needs_process, needs_resolve).unwrap_or(Verdict::Match)
+                still_needs(needs_connection, needs_process, needs_resolve)
+                    .unwrap_or(Verdict::Match)
             }),
             Matcher::Or(subs) => ctx.in_branches(|ctx| {
-                let (mut needs_process, mut needs_resolve) = (false, false);
+                let (mut needs_connection, mut needs_process, mut needs_resolve) =
+                    (false, false, false);
                 for sub in subs {
                     match sub.eval(s, ctx) {
                         Verdict::Match => return Verdict::Match,
+                        Verdict::NeedsConnection => needs_connection = true,
                         Verdict::NeedsProcess => needs_process = true,
                         Verdict::NeedsResolve => needs_resolve = true,
                         Verdict::NoMatch => {}
                     }
                 }
-                still_needs(needs_process, needs_resolve).unwrap_or(Verdict::NoMatch)
+                still_needs(needs_connection, needs_process, needs_resolve)
+                    .unwrap_or(Verdict::NoMatch)
             }),
             Matcher::Not(sub) => {
                 // what matched inside a NOT is not what matched the rule
                 let found = ctx.sub_hit.take();
                 let verdict = sub.eval(s, ctx);
                 ctx.sub_hit = found;
+                // not knowing stays not knowing: a NOT never turns it into a
+                // match
                 match verdict {
                     Verdict::Match => Verdict::NoMatch,
                     Verdict::NoMatch => Verdict::Match,
-                    Verdict::NeedsResolve | Verdict::NeedsProcess => verdict,
+                    Verdict::NeedsConnection | Verdict::NeedsResolve | Verdict::NeedsProcess => {
+                        verdict
+                    }
                 }
             }
             Matcher::Set(set) => {
@@ -471,13 +494,31 @@ impl Matcher {
             Matcher::Final => Verdict::Match,
         }
     }
+
+    /// Whether the rule looks at something only the connection has, other than
+    /// an address: its ports, its transport, what the app says in it.
+    fn needs_the_connection(&self) -> bool {
+        matches!(
+            self,
+            Matcher::DestPort(_)
+                | Matcher::SrcPort(_)
+                | Matcher::InPort(_)
+                | Matcher::Protocol(_)
+                | Matcher::UserAgent(_)
+                | Matcher::UrlRegex(_)
+        )
+    }
 }
 
-/// What a rule that none of its parts decided still waits for: the process
-/// before the lookup, since the process is found on this machine at once and
-/// may make the lookup unnecessary. `None`: it waits for nothing.
-pub(crate) fn still_needs(process: bool, resolve: bool) -> Option<Verdict> {
-    if process {
+/// What a rule that none of its parts decided still waits for: the
+/// connection first, since until it exists neither of the others can be
+/// asked, then the process before the lookup, since the process is found on
+/// this machine at once and may make the lookup unnecessary. `None`: it waits
+/// for nothing.
+pub(crate) fn still_needs(connection: bool, process: bool, resolve: bool) -> Option<Verdict> {
+    if connection {
+        Some(Verdict::NeedsConnection)
+    } else if process {
         Some(Verdict::NeedsProcess)
     } else if resolve {
         Some(Verdict::NeedsResolve)
@@ -518,6 +559,11 @@ pub(crate) fn target_ip(
             Family::Any => true,
         };
         return if ok { Ok(ip) } else { Err(Verdict::NoMatch) };
+    }
+    // before the connection exists the address of a name is not known,
+    // whether or not the rule says it need not be looked up
+    if ctx.before_connection {
+        return Err(Verdict::NeedsConnection);
     }
     let Some(r) = &ctx.resolved else {
         return Err(if no_resolve {

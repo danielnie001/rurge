@@ -4,6 +4,7 @@
 //! supported rule type.
 
 use crate::engine::CompiledRule;
+use crate::matcher::SubRuleHit;
 use rurge_config::rule::PolicyRef;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11,6 +12,9 @@ pub struct PreMatch {
     /// Index into `Config.rules`.
     pub rule: usize,
     pub policy: PolicyRef,
+    /// The line of the set that made the rule match, when the rule refers to
+    /// one.
+    pub sub_rule: Option<SubRuleHit>,
 }
 
 pub struct PreMatchingSet {
