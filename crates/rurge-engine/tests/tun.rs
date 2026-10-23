@@ -1,4 +1,4 @@
-//! The engine behind a virtual adapter (phase 3 M3b design 9, 15.2):
+//! The engine behind a virtual adapter (phase 3 M3 design 9, 15.2):
 //! `Engine::start_tun` on one end of a memory device, an app's TCP/IP stack on
 //! the other, and between them the real rules, the real DIRECT, the pool of
 //! fake addresses and the request log.
@@ -649,7 +649,8 @@ async fn stopping_the_tun_ends_a_relay_stuck_on_its_upstream() {
 /// in the file, and the file says that the run ended cleanly once the TUN has.
 #[tokio::test]
 async fn the_pool_is_saved_in_the_data_directory() {
-    let rig = Rig::new(Profile::default()).await;
+    let rules = guarded("");
+    let rig = Rig::new(profile(&rules)).await;
     assert!(
         pool_file(rig.data_dir()).is_some(),
         "the pool's file is there from the start"
@@ -671,7 +672,11 @@ async fn the_pool_is_saved_in_the_data_directory() {
 /// left them, at the addresses it gave them.
 #[tokio::test]
 async fn the_engine_reopens_the_pool() {
-    let rig = Rig::new(Profile::default()).await;
+    // held across the awaits: what the engine logs for this test is logged on
+    // this thread
+    let log = LogCapture::start();
+    let rules = guarded("");
+    let rig = Rig::new(profile(&rules)).await;
     let (v4, v6) = rig.fakes("kept.test");
     rig.tun.stop();
     ends(&rig.tun).await;
@@ -690,13 +695,21 @@ async fn the_engine_reopens_the_pool() {
     assert_eq!(pool.address_of("kept.test", true), Some(v6));
     tun.stop();
     ends(&tun).await;
+    // The first engine found no file and the second a clean one, and the pool
+    // says nothing of either.
+    let lines = log.lines();
+    assert!(
+        lines.iter().all(|line| !line.contains("fake-ip:")),
+        "{lines:?}"
+    );
 }
 
 /// The engine that stops accepting stops the TUN, and the pool is saved as
 /// having ended cleanly.
 #[tokio::test]
 async fn stopping_the_engine_stops_the_tun() {
-    let rig = Rig::new(Profile::default()).await;
+    let rules = guarded("");
+    let rig = Rig::new(profile(&rules)).await;
     rig.fakes("saved.test");
     assert!(!ended_cleanly(rig.data_dir()));
     rig.h.engine.stop_accepting();
@@ -711,7 +724,8 @@ async fn an_unreadable_pool_file_is_left_and_warned_once() {
     // held across the awaits: what the engine logs for this test is logged on
     // this thread
     let log = LogCapture::start();
-    let h = harness(Profile::default()).await;
+    let rules = guarded("");
+    let h = harness(profile(&rules)).await;
     let secret = "nothing-of-the-file-is-to-be-logged.test";
     let content = format!("this is not a pool\n{secret}\n");
     let file = h.dir.path().join(FILE_NAME);
@@ -723,12 +737,13 @@ async fn an_unreadable_pool_file_is_left_and_warned_once() {
         .iter()
         .filter(|line| line.contains("fake-ip:"))
         .collect();
-    assert_eq!(told.len(), 1, "{lines:?}");
-    assert!(
-        told[0]
-            .starts_with("WARN fake-ip: the saved addresses could not be read; starting with none"),
-        "{}",
-        told[0]
+    // the line in full: the reason is the one the file's parser gives for a
+    // first line that is not the pool's, and it quotes nothing of the file
+    assert_eq!(
+        told,
+        [
+            "WARN fake-ip: the saved addresses could not be read; starting with none error=the first line is not `rurge-fake-ip 1`"
+        ]
     );
     assert!(lines.iter().all(|line| !line.contains(secret)), "{lines:?}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
@@ -739,7 +754,8 @@ async fn an_unreadable_pool_file_is_left_and_warned_once() {
 #[tokio::test]
 async fn a_pool_left_unclean_is_told_of_once() {
     let log = LogCapture::start();
-    let h = harness(Profile::default()).await;
+    let rules = guarded("");
+    let h = harness(profile(&rules)).await;
     std::fs::write(
         h.dir.path().join(FILE_NAME),
         "rurge-fake-ip 1\ncursor 1 wrapped 0 clean 0\n0 left-behind.test\n",

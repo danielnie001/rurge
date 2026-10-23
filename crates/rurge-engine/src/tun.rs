@@ -1,4 +1,4 @@
-//! The engine behind the virtual adapter (phase 3 M3b design 9): what the TUN
+//! The engine behind the virtual adapter (phase 3 M3 design 9): what the TUN
 //! asks of it as its `Hooks`, and `Engine::start_tun`, which starts a TUN on a
 //! device with the engine as its dialer, opens the pool of fake addresses in
 //! the data directory and keeps it saved.

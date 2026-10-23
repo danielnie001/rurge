@@ -42,7 +42,7 @@ pub struct Runtime {
     pub(crate) subscriptions: Subscriptions,
     /// The task watching `subscriptions`; it goes with the generation.
     pub(crate) watcher: OnceLock<AbortOnDropHandle<()>>,
-    /// What the virtual adapter asks of this generation (phase 3 M3b design
+    /// What the virtual adapter asks of this generation (phase 3 M3 design
     /// 9.1): handed out by `Hooks::settings` while the generation is in use.
     pub(crate) tun: Arc<TunSettings>,
     /// The DNS override of the network the machine was on when this
