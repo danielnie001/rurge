@@ -426,6 +426,10 @@ impl TunHandle {
     /// association to return, as the engine's does at once. The echo requests
     /// that wait for their replies end at once, wherever they are.
     ///
+    /// A session that finds the TUN stopped once its connection's handshake
+    /// is done does not dial at all: it drops its stream, which resets the
+    /// connection, as the shard's last turn does anyway.
+    ///
     /// A dial that is under way is not cancelled: it is the dialer's, which
     /// holds the session's handle, and a dial dropped half way would leave the
     /// session's record open. When it comes back the session is cancelled like

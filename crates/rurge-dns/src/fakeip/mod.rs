@@ -42,14 +42,19 @@ pub const FAKE_TTL: Duration = Duration::from_secs(30);
 /// file that could not be read, the next [`QUARANTINE_COUNT`] indices besides.
 pub const QUARANTINE: Duration = Duration::from_secs(120);
 /// How many indices an unclean stop, or a file that could not be read, holds
-/// back: the next ones the allocator would hand out. They are held back on top
-/// of the indices the file has no name for, not among them, so each open
-/// within [`QUARANTINE`] of an unclean one holds back this many more. Some 64
-/// crashes in a row (130,814 / 2,048) leave no fresh index to give for the
-/// first [`QUARANTINE`] of each run, until a run lives past it: `assign` then
-/// takes over the index of the name used longest ago, and answers `Exhausted`
-/// when no name is left to take over. No index is lost for good: all are free
-/// [`QUARANTINE`] after the last open.
+/// back: the next ones the allocator would hand out (once it has been through
+/// every index, those of the names used longest ago, and the names go). They
+/// are held back on top of the indices the file has no name for, not among
+/// them. An index held back has no name until it is given out, which waits for
+/// [`QUARANTINE`], and every open finds it nameless and holds it back again;
+/// so each unclean open before the last one's indices are given out holds back
+/// this many more. Some 64 crashes in a row (130,814 / 2,048) take the
+/// allocator through every index: from then on each open holds back every
+/// index without a name for the first [`QUARANTINE`], in which `assign` can
+/// only take over the index of the name used longest ago, and answers
+/// `Exhausted` when there is none, until runs past [`QUARANTINE`] have given
+/// those indices out. No index is lost for good: all are free [`QUARANTINE`]
+/// after the last open.
 pub const QUARANTINE_COUNT: u32 = 2_048;
 /// The name of the file in the data directory.
 pub const FILE_NAME: &str = "fake-ip.txt";
