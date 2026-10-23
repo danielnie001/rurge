@@ -36,10 +36,20 @@ use tokio::sync::Notify;
 pub const FAKE_COUNT: u32 = 130_814;
 /// The TTL of an answer that carries a fake address.
 pub const FAKE_TTL: Duration = Duration::from_secs(30);
-/// How long the indices held back after an unclean stop stay unused.
+/// How long what an open holds back stays unused, counted from that open: the
+/// indices the file has no name for (those below its cursor, and any once it
+/// has wrapped), whatever the last stop was; and after an unclean stop, or a
+/// file that could not be read, the next [`QUARANTINE_COUNT`] indices besides.
 pub const QUARANTINE: Duration = Duration::from_secs(120);
-/// How many indices an unclean stop holds back: the next ones the allocator
-/// would hand out, besides any the file has no name for.
+/// How many indices an unclean stop, or a file that could not be read, holds
+/// back: the next ones the allocator would hand out. They are held back on top
+/// of the indices the file has no name for, not among them, so each open
+/// within [`QUARANTINE`] of an unclean one holds back this many more. Some 64
+/// crashes in a row (130,814 / 2,048) leave no fresh index to give for the
+/// first [`QUARANTINE`] of each run, until a run lives past it: `assign` then
+/// takes over the index of the name used longest ago, and answers `Exhausted`
+/// when no name is left to take over. No index is lost for good: all are free
+/// [`QUARANTINE`] after the last open.
 pub const QUARANTINE_COUNT: u32 = 2_048;
 /// The name of the file in the data directory.
 pub const FILE_NAME: &str = "fake-ip.txt";
@@ -116,9 +126,11 @@ pub enum Loaded {
     /// the allocator would hand out are held back, besides the ones the file
     /// has no name for.
     Unclean,
-    /// The file could not be read or made no sense: an empty pool, with what
-    /// the file may have held held back. The reason quotes nothing of the
-    /// file.
+    /// The file could not be read or made no sense: an empty pool, and the
+    /// next [`QUARANTINE_COUNT`] indices are held back, as after an unclean
+    /// stop (what the file held may still be in applications' hands). The file
+    /// is left as it is until the first save replaces it. The reason quotes
+    /// nothing of the file.
     NotRead(String),
 }
 

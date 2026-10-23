@@ -181,12 +181,19 @@ impl MockDns {
                 // A prior reply to a peer that's already gone can surface as
                 // a receive error (e.g. WSAECONNRESET on Windows); that's
                 // noise, not the end of the transport, so log and keep
-                // serving. Cancellation happens from the outside via abort
-                // (see `Drop for MockDns`), never by returning here.
+                // serving, at once for that one. Any other error is followed
+                // by a pause of 10 ms: one that repeats (a socket out of
+                // resources, say) would otherwise spin a worker thread.
+                // Whether that is what hung a test binary once is not known.
+                // Cancellation happens from the outside via abort (see `Drop
+                // for MockDns`), never by returning here.
                 let (n, peer) = match udp_socket.recv_from(&mut buf).await {
                     Ok(x) => x,
                     Err(e) => {
                         tracing::debug!("mock dns udp recv error: {e}");
+                        if e.kind() != io::ErrorKind::ConnectionReset {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
                         continue;
                     }
                 };
@@ -207,6 +214,9 @@ impl MockDns {
                     Ok(x) => x,
                     Err(e) => {
                         tracing::debug!("mock dns tcp accept error: {e}");
+                        // an error that repeats would otherwise spin a worker
+                        // thread (see the receive loop above)
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                         continue;
                     }
                 };
