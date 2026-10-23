@@ -4,6 +4,7 @@
 //! the data directory and keeps it saved.
 
 use crate::engine::Engine;
+use arc_swap::ArcSwapOption;
 use rurge_config::{PreMatchLayer, SessionInfo};
 use rurge_dns::fakeip::{FILE_NAME, FakeIpPool, Loaded, QUARANTINE, QUARANTINE_COUNT};
 use rurge_inbound::Dialer;
@@ -16,6 +17,16 @@ use std::time::{Duration, Instant};
 /// How often the pool's file is written at most while mappings change.
 const POOL_SAVE_EVERY: Duration = Duration::from_secs(10);
 
+/// Takes `pool` out of `slot`, when it is the pool there: a TUN that was started
+/// after the one the pool belonged to has put its own there by now, and keeps
+/// it.
+fn let_go(slot: &ArcSwapOption<FakeIpPool>, pool: &Arc<FakeIpPool>) {
+    slot.rcu(|stored| match stored {
+        Some(stored) if Arc::ptr_eq(stored, pool) => None,
+        other => other.clone(),
+    });
+}
+
 impl Hooks for Engine {
     /// The settings of the generation in use now: a reload that comes while the
     /// TUN runs is seen by the next thing the TUN asks.
@@ -23,10 +34,9 @@ impl Hooks for Engine {
         self.runtime().tun.clone()
     }
 
-    /// Refuses nothing yet: the engine's pre-matching rules are not asked here
-    /// until phase 3 / M3c has wired them.
-    fn pre_match(&self, _layer: PreMatchLayer, _session: &SessionInfo) -> Option<RejectKind> {
-        None
+    /// The pre-matching rules of the generation in use (`pre_match_refusal`).
+    fn pre_match(&self, layer: PreMatchLayer, session: &SessionInfo) -> Option<RejectKind> {
+        self.pre_match_refusal(layer, session)
     }
 }
 
@@ -34,7 +44,8 @@ impl Engine {
     /// Opens the fake-address pool in the data directory (on a blocking thread),
     /// starts a TUN on `device` with this engine as its dialer and hooks, and keeps
     /// the pool saved until the TUN has ended. The TUN stops when the engine stops
-    /// accepting.
+    /// accepting. While it runs, the proxy listeners turn the fake addresses that
+    /// come in at them back into names with the pool.
     ///
     /// The pool's file is one pool's at a time: another TUN is started on this
     /// data directory only once the first has ended and its last save is written
@@ -44,8 +55,8 @@ impl Engine {
     ///
     /// As [`Tun::start`] does: for options that [`TunOptions::check`] refuses,
     /// and for a device whose MTU is below 1280. The pool's file has been opened
-    /// by then, and says that the run has not ended: whoever starts a TUN checks
-    /// the options first.
+    /// by then, and says that the run has not ended, and the engine holds the
+    /// pool for its listeners: whoever starts a TUN checks the options first.
     pub async fn start_tun(
         self: &Arc<Self>,
         device: Arc<dyn Device>,
@@ -75,14 +86,26 @@ impl Engine {
         }
         let dialer: Arc<dyn Dialer> = self.clone();
         let hooks: Arc<dyn Hooks> = self.clone();
+        // the proxy listeners turn the fake addresses that come in at them
+        // back into names with this pool, as long as the TUN runs
+        self.fake_pool.store(Some(pool.clone()));
         let tun = Tun::start(device, dialer, hooks, pinger, Some(pool.clone()), options);
         // The pool is written while its mappings change, and once more when the
-        // TUN has ended: the engine's tracker waits for that last save.
+        // TUN has ended: the engine's tracker waits for that last save. After
+        // it the engine has no pool of the TUN's, unless a TUN that started in
+        // the meantime has put its own there.
         let ended = tun.clone();
-        self.tracker()
-            .spawn(pool.keep_saved(path, POOL_SAVE_EVERY, async move {
+        let engine = Arc::downgrade(self);
+        let kept = pool.clone();
+        self.tracker().spawn(async move {
+            pool.keep_saved(path, POOL_SAVE_EVERY, async move {
                 let _ = ended.join().await;
-            }));
+            })
+            .await;
+            if let Some(engine) = engine.upgrade() {
+                let_go(&engine.fake_pool, &kept);
+            }
+        });
         // The TUN stops with the engine's accepting, as the listeners do; and
         // this task ends with the TUN when that comes first.
         let stopped = self.accepting_token();
@@ -94,5 +117,30 @@ impl Engine {
             }
         });
         tun
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pool is let go by the end of its own TUN only: a TUN that has been
+    /// started since keeps its pool, and an empty place stays empty.
+    #[test]
+    fn a_pool_is_let_go_by_its_own_end_only() {
+        let (first, second) = (Arc::new(FakeIpPool::new()), Arc::new(FakeIpPool::new()));
+        let slot = ArcSwapOption::empty();
+        slot.store(Some(first.clone()));
+        slot.store(Some(second.clone()));
+        let_go(&slot, &first);
+        let kept = slot.load_full();
+        assert!(
+            kept.is_some_and(|pool| Arc::ptr_eq(&pool, &second)),
+            "the pool of the TUN that started later stays"
+        );
+        let_go(&slot, &second);
+        assert!(slot.load_full().is_none());
+        let_go(&slot, &first);
+        assert!(slot.load_full().is_none());
     }
 }

@@ -1,6 +1,7 @@
 //! One immutable config generation (M3 design §7.1).
 
 use crate::outbounds::EngineFactory;
+use crate::prematch::Recorded;
 use crate::shared::EngineShared;
 use crate::stack::{DnsOverride, Stack, StackOptions, build_stack};
 use crate::subscriptions::Subscriptions;
@@ -45,6 +46,10 @@ pub struct Runtime {
     /// What the virtual adapter asks of this generation (phase 3 M3 design
     /// 9.1): handed out by `Hooks::settings` while the generation is in use.
     pub(crate) tun: Arc<TunSettings>,
+    /// When each rule of this generation last had a pre-matching refusal put
+    /// in the request log (phase 3 M3 design 12.4): a generation records them
+    /// anew.
+    pub(crate) pre_matched: Recorded,
     /// The DNS override of the network the machine was on when this
     /// generation was built; the resolver was made with it.
     dns_override: DnsOverride,
@@ -149,6 +154,7 @@ impl Runtime {
             subscriptions,
             watcher: OnceLock::new(),
             tun,
+            pre_matched: Recorded::default(),
             dns_override,
         })
     }

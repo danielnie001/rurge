@@ -90,6 +90,18 @@ pub fn index_of(ip: IpAddr) -> Option<u32> {
         .filter(|&index| index < FAKE_COUNT)
 }
 
+/// Whether `ip` is in rurge's space, `198.18.0.0/15` and `fd00:6152::/64`:
+/// the fake addresses and the addresses of rurge's own, the adapter's, the
+/// stack's and the responder's among them. An IPv4-mapped IPv6 address is the
+/// IPv4 address it maps, unlike for [`index_of`], which takes the two forms of
+/// an index only.
+pub fn in_space(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => matches!(v4.octets(), [198, 18 | 19, _, _]),
+        IpAddr::V6(v6) => matches!(v6.segments(), [0xfd00, 0x6152, 0, 0, ..]),
+    }
+}
+
 /// A name as the pool knows it: one trailing dot off, ASCII lower case, and
 /// then non-empty labels of `a`-`z`, `0`-`9`, `-` and `_` only, at most 253
 /// bytes in all. Anything else is not a name the pool gives an address.
@@ -731,6 +743,59 @@ mod tests {
         assert_eq!(QUARANTINE, Duration::from_secs(120));
         assert_eq!(QUARANTINE_COUNT, 2_048);
         assert_eq!(FILE_NAME, "fake-ip.txt");
+    }
+
+    /// Rurge's space is `198.18.0.0/15` and `fd00:6152::/64`, whole: the fake
+    /// addresses and the addresses of rurge's own (the adapter's, the stack's,
+    /// the responder's) are in it, the edges of both prefixes included and the
+    /// addresses next to them left out. An IPv4-mapped IPv6 address is the
+    /// IPv4 address it maps, unlike for `index_of`, which takes the two forms
+    /// of an index only.
+    #[test]
+    fn in_space_is_rurges_space() {
+        for ours in [
+            "198.18.0.0",
+            "198.18.0.1",
+            "198.18.0.244",
+            "198.18.1.1",
+            "198.19.0.0",
+            "198.19.255.254",
+            "198.19.255.255",
+            "fd00:6152::",
+            "fd00:6152::1",
+            "fd00:6152::fd",
+            "fd00:6152::c612:101",
+            "fd00:6152:0:0:ffff:ffff:ffff:ffff",
+            // the IPv4 address that is mapped
+            "::ffff:198.18.0.0",
+            "::ffff:198.18.1.1",
+            "::ffff:198.19.255.255",
+        ] {
+            let ip: IpAddr = ours.parse().unwrap();
+            assert!(in_space(ip), "{ours}");
+        }
+        for not_ours in [
+            "198.17.255.255",
+            "198.20.0.0",
+            "10.0.0.1",
+            "192.0.2.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "fd00:6151:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fd00:6152:0:1::",
+            "fd00:6153::",
+            "fd01:6152::",
+            "fc00:6152::",
+            "2001:db8::1",
+            "::1",
+            "::",
+            "::ffff:198.17.255.255",
+            "::ffff:198.20.0.0",
+            "::ffff:8.8.8.8",
+        ] {
+            let ip: IpAddr = not_ours.parse().unwrap();
+            assert!(!in_space(ip), "{not_ours}");
+        }
     }
 
     #[test]

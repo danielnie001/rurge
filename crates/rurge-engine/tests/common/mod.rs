@@ -6,6 +6,7 @@
 #![allow(dead_code, unused_imports)]
 
 mod log_capture;
+pub mod tun;
 mod world;
 
 pub use log_capture::LogCapture;

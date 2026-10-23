@@ -3,12 +3,13 @@
 
 use crate::auto::{EVALUATION_FAILED, resolve_ready};
 use crate::control::Mode;
+use crate::fake_address::Turned;
 use crate::observe::{RequestLog, TrafficStats};
 use crate::owner::{LOOKUPS, NOT_IN_TIME, SLOW, SlotProcess, query_for};
 use crate::runtime::Runtime;
 use crate::shared::EngineShared;
 use crate::state::StateStore;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use rurge_config::Builtin;
 use rurge_config::HostName;
 use rurge_config::NetworkFacts;
@@ -16,6 +17,7 @@ use rurge_config::general::{General, UdpFallback};
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_config::spec::{PolicySpec, ProtoSpec};
+use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::{
     DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, ProcessSlot,
     Running, SessionHandle, SessionOutcome, Socks5Listener, UdpAdmission, UdpClient,
@@ -26,6 +28,7 @@ use rurge_net::packet_datagram::packet_datagram;
 use rurge_policy::auto::SelectCtx;
 use rurge_policy::{Note, PolicyRegistry, Resolution, TerminalKind};
 use rurge_proto::{OutboundError, OutboundRef, UdpSupport};
+use rurge_rules::matcher::SubRuleHit;
 use rurge_rules::{OutboundMode, Outcome};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -59,6 +62,9 @@ pub const REBIND_WAIT: Duration = Duration::from_secs(2);
 /// What a session says when it is refused because the managed profile
 /// requires an update (`Engine::suspend`).
 pub const REFUSED_STRICT: &str = "refused: the managed profile requires an update (strict)";
+/// What a session says when it is refused because it was sent to an address
+/// of rurge's space that no name stands behind (`Engine::turn_back`).
+pub const FAKE_ADDRESS_NOT_KNOWN: &str = "fake address not known";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListenerSpec {
@@ -75,7 +81,8 @@ struct Observe {
 }
 
 /// Per-destination sliding-window counter for REJECT auto-escalation (§7.4).
-struct Escalation {
+/// A pre-matching refusal counts in it as well (`Engine::pre_match_refusal`).
+pub(crate) struct Escalation {
     hosts: std::sync::Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
@@ -91,7 +98,7 @@ impl Escalation {
     /// is not remembered (and so never escalates) rather than growing the
     /// table — a reject flood to fresh hosts must not cost unbounded memory
     /// nor an O(n) sweep per reject under this lock.
-    fn record(&self, host: &str, now: Instant) {
+    pub(crate) fn record(&self, host: &str, now: Instant) {
         let mut map = self.hosts.lock().expect("escalation");
         if let Some(times) = map.get_mut(host) {
             times.push_back(now);
@@ -111,7 +118,7 @@ impl Escalation {
     }
 
     /// Whether `host` has reached the threshold within the window.
-    fn should_drop(&self, host: &str, now: Instant) -> bool {
+    pub(crate) fn should_drop(&self, host: &str, now: Instant) -> bool {
         let mut map = self.hosts.lock().expect("escalation");
         match map.get_mut(host) {
             Some(times) => {
@@ -148,7 +155,7 @@ pub struct Engine {
     /// shutdown can wait for them to drain.
     tracker: TaskTracker,
     observe: Arc<Observe>,
-    escalation: Escalation,
+    pub(crate) escalation: Escalation,
     /// Runtime outbound mode and global policy (M4 design §4.1). Seeded from
     /// the first `Runtime`, changed by the API / CLI, never touched by reload.
     mode: ArcSwap<Mode>,
@@ -159,6 +166,11 @@ pub struct Engine {
     suspended: ArcSwap<Option<String>>,
     /// "proxy mode but no usable global policy" is warned once per change.
     global_warned: AtomicBool,
+    /// The pool of fake addresses of the TUN that runs, if one does (phase 3
+    /// M3 design 13): the proxy listeners turn the fake addresses that come in
+    /// at them back into names with it (`turn_back`). Set by `start_tun` and
+    /// cleared when the TUN has ended and its pool is saved.
+    pub(crate) fake_pool: ArcSwapOption<FakeIpPool>,
     state: OnceLock<Arc<StateStore>>,
     shared: EngineShared,
     /// Held while a registry or a whole generation is published, and while
@@ -211,6 +223,7 @@ impl Engine {
             global_policy: ArcSwap::from_pointee(global),
             suspended: ArcSwap::from_pointee(None),
             global_warned: AtomicBool::new(false),
+            fake_pool: ArcSwapOption::empty(),
             state: OnceLock::new(),
             shared,
             generation: std::sync::Mutex::new(()),
@@ -778,9 +791,7 @@ impl Engine {
             }
         }
         if let Some(hit) = &decision.sub_rule {
-            let note = format!("Sub-rule matched: {} (in {})", hit.entry, hit.set);
-            tracing::debug!(session = handle.id(), "{note}");
-            handle.add_note(note);
+            note_sub_rule(handle, hit);
         }
         match decision.outcome {
             Outcome::Policy(p) => Chosen::Policy(p),
@@ -792,6 +803,14 @@ impl Engine {
 pub(crate) enum Chosen {
     Policy(PolicyRef),
     DnsFailed,
+}
+
+/// Says which line of a set made the rule match: in the session's notes, and
+/// in a line at DEBUG.
+pub(crate) fn note_sub_rule(handle: &SessionHandle, hit: &SubRuleHit) {
+    let note = format!("Sub-rule matched: {} (in {})", hit.entry, hit.set);
+    tracing::debug!(session = handle.id(), "{note}");
+    handle.add_note(note);
 }
 
 /// `true` for the built-in policies and every policy / group of `registry` —
@@ -1240,7 +1259,7 @@ impl Engine {
 fn log_session(h: &SessionHandle, outcome: &SessionOutcome) {
     let s = h.session();
     let (up, down) = h.bytes();
-    let dst = format!("{}:{}", s.dst_host, s.dst_port);
+    let dst = crate::observe::destination(&s.dst_host, s.dst_port);
     let rule = h.rule().unwrap_or_default();
     let policy = h.policy_chain().join(" > ");
     let elapsed_ms = h.elapsed().as_millis() as u64;
@@ -1317,7 +1336,7 @@ fn reject(handle: Arc<SessionHandle>, kind: rurge_proto::RejectKind) -> Result<D
 /// Looks up the raw text of the rule at `index` (M2a `CompiledRule.index` is
 /// the rule's position in `Config.rules`, and `RuleEngine::rules()` returns
 /// them in that ascending order), so a binary search finds it.
-fn rule_raw(rules: &rurge_rules::RuleEngine, index: usize) -> Option<String> {
+pub(crate) fn rule_raw(rules: &rurge_rules::RuleEngine, index: usize) -> Option<String> {
     let all = rules.rules();
     all.binary_search_by_key(&index, |r| r.index)
         .ok()
@@ -1520,13 +1539,22 @@ impl Engine {
 }
 
 impl Dialer for Engine {
-    fn dial<'a>(&'a self, session: SessionInfo) -> BoxFuture<'a, Result<Dialed, DialError>> {
+    fn dial<'a>(&'a self, mut session: SessionInfo) -> BoxFuture<'a, Result<Dialed, DialError>> {
         Box::pin(async move {
             // loaded once, together: the name is picked, approved and
             // resolved against the same generation
             let (rt, registry) = self.snapshot();
+            // a fake address that came in at a proxy port is the name behind
+            // it before anything else sees the session (phase 3 M3 design 13)
+            let turned = self.turn_back(&mut session);
             let process = self.look_up_owner(&session);
             let handle = self.new_handle_with(session, process);
+            match turned {
+                Turned::Unchanged => {}
+                // the address stays the name's as long as the session lasts
+                Turned::Name(lease) => handle.on_finish(move |_, _| drop(lease)),
+                Turned::Unknown => return fail(handle, FailKind::Other, FAKE_ADDRESS_NOT_KNOWN),
+            }
             let trail = handle.trail().clone();
             trail
                 .follow(self.connect_session(rt, registry, handle))

@@ -2,6 +2,7 @@
 //! finished requests plus an index of the in-flight ones) and traffic stats.
 //! The M4 API reads these; nothing here reaches outside the process.
 
+use rurge_config::HostName;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, Transport};
 use rurge_inbound::{ProcessSlot, SessionHandle, SessionOutcome};
@@ -69,6 +70,17 @@ pub struct RequestRecord {
     pub notes: Vec<String>,
 }
 
+/// The destination of a session as the request record and the session log
+/// write it: `host:port`, or the host alone for a session that has no port, as
+/// a DNS query has none (port 0).
+pub(crate) fn destination(host: &HostName, port: u16) -> String {
+    if port == 0 {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -99,7 +111,7 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         src: s.src,
         listen_port: s.in_port,
         process: h.process().clone(),
-        dst: format!("{}:{}", s.dst_host, s.dst_port),
+        dst: destination(&s.dst_host, s.dst_port),
         remote_addr: match s.transport {
             Transport::Tcp => h.trail().peer(),
             Transport::Udp => None,
@@ -446,6 +458,40 @@ mod tests {
         let recent = log.recent(1);
         assert_eq!(recent[0].notes, ["first", "second"]);
         assert_eq!(recent[0].error, None);
+    }
+
+    /// A destination is the host and the port; one without a port, which a DNS
+    /// query is, is the host alone. An IPv6 host is written as it is everywhere
+    /// else, without brackets, and port 0 of it is no port either.
+    #[test]
+    fn a_destination_without_a_port_is_the_host_alone() {
+        let host = |text: &str| HostName::parse(text);
+        assert_eq!(destination(&host("a.test"), 443), "a.test:443");
+        assert_eq!(destination(&host("a.test"), 1), "a.test:1");
+        assert_eq!(destination(&host("a.test"), 65535), "a.test:65535");
+        assert_eq!(destination(&host("192.0.2.7"), 80), "192.0.2.7:80");
+        assert_eq!(destination(&host("2001:db8::1"), 80), "2001:db8::1:80");
+        assert_eq!(destination(&host("x.ads.test"), 0), "x.ads.test");
+        assert_eq!(destination(&host("192.0.2.7"), 0), "192.0.2.7");
+        assert_eq!(destination(&host("2001:db8::1"), 0), "2001:db8::1");
+    }
+
+    /// The record of a session has its destination as `destination` writes it:
+    /// a session that has no port has none in its record.
+    #[test]
+    fn a_record_writes_its_destination_by_destination() {
+        let log = RequestLog::new(2);
+        let t = TrafficStats::new();
+        let mut s = SessionInfo::udp(HostName::parse("x.ads.test"), 0);
+        s.listener = ListenerKind::Tun;
+        let a = SessionHandle::new(1, s);
+        a.finish(SessionOutcome::Completed);
+        log.record_finished(&a, &SessionOutcome::Completed, &t);
+        assert_eq!(log.recent(1)[0].dst, "x.ads.test");
+        let b = handle(2, "a.test");
+        b.finish(SessionOutcome::Completed);
+        log.record_finished(&b, &SessionOutcome::Completed, &t);
+        assert_eq!(log.recent(1)[0].dst, "a.test:443");
     }
 
     /// A record says when its session began, in milliseconds since the Unix

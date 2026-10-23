@@ -4,7 +4,8 @@
 //! every datagram it receives, whoever sent it (full cone, M5-D2).
 
 use crate::auto::{EVALUATION_FAILED, resolve_ready};
-use crate::engine::{CONNECT_TIMEOUT, Chosen, Engine, REFUSED_STRICT};
+use crate::engine::{CONNECT_TIMEOUT, Chosen, Engine, FAKE_ADDRESS_NOT_KNOWN, REFUSED_STRICT};
+use crate::fake_address::Turned;
 use rurge_config::HostName;
 use rurge_config::general::{BlockQuicGlobal, UdpFallback};
 use rurge_config::policy::Builtin;
@@ -95,16 +96,30 @@ struct Times {
 struct Flow {
     handle: Arc<SessionHandle>,
     port: u16,
+    /// The target the client wrote for the flow, as it wrote it: the client
+    /// knows the flow, and what comes back for it, by this. It is the
+    /// session's destination, unless the client wrote a fake address and the
+    /// flow goes to the name behind it (`swapped`).
+    asked: Target,
+    /// The client wrote a fake address (`asked`), and the flow goes to the name
+    /// behind it. What the name's address sends back is not from an address the
+    /// client has heard of: it is shown as from `asked`.
+    swapped: bool,
     times: Mutex<Times>,
     /// Woken by an answer, which may bring the deadline forward.
     wake: tokio::sync::Notify,
 }
 
 impl Flow {
+    /// A flow that goes where the client wrote: to the session's destination.
     fn new(handle: Arc<SessionHandle>, port: u16) -> Flow {
+        let session = handle.session();
+        let asked = Target::new(session.dst_host.clone(), session.dst_port);
         Flow {
             handle,
             port,
+            asked,
+            swapped: false,
             times: Mutex::new(Times {
                 last: now(),
                 answered: None,
@@ -224,19 +239,32 @@ async fn receive(
         // the client may be told which flow this answers, by the target it
         // wrote for it, when there is one it is known to be
         let mut answers = None;
+        // where the client is told the datagram is from, when that is not the
+        // address it came from
+        let mut shown = None;
         if let Some((flow, answered)) = routes.flow_for(&from) {
             flow.handle.add_down(n as u64);
             flow.handle.mark_first_byte();
             flow.answered();
             if answered {
-                let session = flow.handle.session();
-                answers = Some(Target::new(session.dst_host.clone(), session.dst_port));
+                answers = Some(flow.asked.clone());
+                // A flow that goes to the name behind a fake address sends
+                // from the name's address, which the client knows nothing of
+                // (SOCKS5 clients take the reply's source for the flow's
+                // target). The routes key a flow by the target it sends to,
+                // the name, so that the reply finds its flow; only what the
+                // client is told is the fake address it wrote. A datagram that
+                // answers no one flow keeps the address it came from.
+                if flow.swapped {
+                    shown = Some(flow.asked.clone());
+                }
             }
         }
         // one datagram the client cannot take (too long once the SOCKS5
         // header is on, a full buffer) is lost alone: anyone may send to
         // the carrier, and the association lives by its control connection
-        if let Err(e) = client.send(&buf[..n], &from, answers.as_ref()).await {
+        let source = shown.as_ref().unwrap_or(&from);
+        if let Err(e) = client.send(&buf[..n], source, answers.as_ref()).await {
             tracing::debug!(error = %e, "udp: a datagram for the client is dropped");
         }
     }
@@ -445,6 +473,11 @@ async fn run_flow(
     let mut session = association.template.clone();
     session.dst_host = to.host.clone();
     session.dst_port = to.port;
+    // A fake address the client wrote is the name behind it (phase 3 M3 design
+    // 13): the rules see the name, and the flow goes to it. `to` stays what the
+    // client wrote, which is how it knows the flow and how the flow is kept.
+    let turned = engine.turn_back(&mut session);
+    let sends_to = Target::new(session.dst_host.clone(), session.dst_port);
     // the rules see what the first datagram is (`PROTOCOL,QUIC`)
     session.protocol = Some(
         if to.port == 443 && crate::sniff::is_quic_initial(&first.datagram) {
@@ -454,11 +487,24 @@ async fn run_flow(
         },
     );
     let handle = engine.new_handle_with(session, association.process.clone());
+    let unknown = match turned {
+        Turned::Unchanged => false,
+        // the address stays the name's as long as the flow lasts
+        Turned::Name(lease) => {
+            handle.on_finish(move |_, _| drop(lease));
+            false
+        }
+        Turned::Unknown => true,
+    };
     let trail = handle.trail().clone();
-    let opened = tokio::select! {
-        _ = association.ended.cancelled() => Err(SessionOutcome::Completed),
-        _ = handle.token().cancelled() => Err(SessionOutcome::Completed),
-        opened = trail.follow(open(&engine, &association, &handle, &to)) => opened,
+    let opened = if unknown {
+        Err(failed(&handle, FAKE_ADDRESS_NOT_KNOWN))
+    } else {
+        tokio::select! {
+            _ = association.ended.cancelled() => Err(SessionOutcome::Completed),
+            _ = handle.token().cancelled() => Err(SessionOutcome::Completed),
+            opened = trail.follow(open(&engine, &association, &handle, &sends_to, &to)) => opened,
+        }
     };
     match opened {
         Ok((flow, carrier, send_to)) => {
@@ -506,12 +552,15 @@ pub(crate) fn failed(handle: &SessionHandle, message: impl Into<String>) -> Sess
     SessionOutcome::Failed(message)
 }
 
-/// Rules → policy → the outbound's carrier (M5 design 5.2).
+/// Rules → policy → the outbound's carrier (M5 design 5.2). `to` is where the
+/// flow goes; `asked`, what the client wrote for it, is the same unless it was
+/// a fake address and `to` is the name behind it.
 async fn open(
     engine: &Engine,
     association: &Association,
     handle: &Arc<SessionHandle>,
     to: &Target,
+    asked: &Target,
 ) -> Result<(Arc<Flow>, Arc<Carrier>, Target), SessionOutcome> {
     // Refused before anything is asked of the rules, a name lookup or a `smart`
     // group, and as a failure, not a rejection: a failed flow is tried again
@@ -620,7 +669,12 @@ async fn open(
             silence_tells(&send_to),
         );
     }
-    let flow = Arc::new(Flow::new(handle.clone(), to.port));
+    let mut flow = Flow::new(handle.clone(), to.port);
+    if asked != to {
+        flow.asked = asked.clone();
+        flow.swapped = true;
+    }
+    let flow = Arc::new(flow);
     carrier.routes.add(send_to.clone(), &flow);
     Ok((flow, carrier, send_to))
 }
