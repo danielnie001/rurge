@@ -574,9 +574,16 @@ async fn a_dial_under_way_is_not_cancelled_by_the_stop() {
     gated.open.send_replace(true);
     let ending = in_five_seconds("the TUN to end", tun.join()).await;
     assert_eq!(ending, Ending::Stopped);
+    // The stop comes first: the session's token is cancelled by it, and the
+    // relay ends as cancelled, not as a copy that met the reset of its
+    // connection. The token that the session waits on is made after the stop
+    // here, and is cancelled already.
     let ends = fake.relay_ends();
-    assert_eq!(ends.len(), 1, "the relay ran and ended: {ends:?}");
-    assert!(ends[0].is_err(), "ended by the stop, not cleanly: {ends:?}");
+    assert_eq!(
+        ends,
+        [Err("cancelled".to_string())],
+        "the relay ran once and the stop cancelled it"
+    );
     let error = in_five_seconds("the reset", tcp.read(&mut [0; 1]))
         .await
         .expect_err("the stop reset the connection");

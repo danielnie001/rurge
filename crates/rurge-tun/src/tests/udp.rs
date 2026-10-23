@@ -649,14 +649,16 @@ async fn a_session_ends_after_the_idle_time() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_with_traffic_stays() {
     let mut lab = lab(TunOptions {
-        udp_idle: Duration::from_millis(300),
+        udp_idle: Duration::from_secs(1),
         ..TunOptions::default()
     });
     let (app, dst) = (addr(APP4), addr(FAR4));
     let from = target_of(dst);
     lab.send(app, dst, b"subscribe");
     lab.associations_open(1).await;
-    for push in 0..10 {
+    // 25 pushes at the pace of 100 ms last 2.5 s, two and a half times the idle
+    // time: the pushes alone, and nothing else, keep the session that long
+    for push in 0..25 {
         // the pace of the server, shorter than the idle time
         tokio::time::sleep(Duration::from_millis(100)).await;
         lab.dialer()
@@ -681,13 +683,14 @@ async fn a_session_with_traffic_stays() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_third_party_push_keeps_the_session_too() {
     let mut lab = lab(TunOptions {
-        udp_idle: Duration::from_millis(300),
+        udp_idle: Duration::from_secs(1),
         ..TunOptions::default()
     });
     let (app, dst) = (addr(APP4), addr(FAR4));
     lab.send(app, dst, b"hello");
     lab.associations_open(1).await;
-    for push in 0..8 {
+    // 25 pushes 100 ms apart last 2.5 s, two and a half times the idle time
+    for push in 0..25 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         lab.dialer()
             .send_to_app(app, target("192.0.2.99", 3478), None, b"push".to_vec())
@@ -714,7 +717,7 @@ async fn a_target_that_only_the_server_talks_to_keeps_its_lease() {
     let pool = Arc::new(FakeIpPool::with_count(1));
     let mut lab = lab_with(
         TunOptions {
-            udp_idle: Duration::from_millis(300),
+            udp_idle: Duration::from_secs(1),
             ..TunOptions::default()
         },
         Extras {
@@ -728,7 +731,8 @@ async fn a_target_that_only_the_server_talks_to_keeps_its_lease() {
     let (app, fake, name) = (addr(APP4), sock(v4_of(index), 53), named("a.test", 53));
     lab.send(app, fake, b"subscribe");
     lab.associations_open(1).await;
-    for push in 0..8 {
+    // 25 pushes 100 ms apart last 2.5 s, two and a half times the idle time
+    for push in 0..25 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         lab.dialer()
             .send_to_app(app, name.clone(), Some(name.clone()), b"push".to_vec())

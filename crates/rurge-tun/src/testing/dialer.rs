@@ -252,7 +252,8 @@ impl FakeDialer {
         self.book().dialed.clone()
     }
 
-    /// How each relay ended, in order: `Ok(())` or the error's text.
+    /// How each relay ended, in order: `Ok(())` or the error's text. A relay
+    /// that its session's token ended is recorded as `Err("cancelled")`.
     pub fn relay_ends(&self) -> Vec<Result<(), String>> {
         self.book().relay_ends.clone()
     }
