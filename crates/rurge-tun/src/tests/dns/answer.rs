@@ -7,22 +7,19 @@
 use super::{
     A, AAAA, HTTPS, Lab, SVCB, TXT, assert_empty, authoritative, counts, echoed, id_of,
     is_response, lab, lab_with, parsed, query, query_opt, question_of, rcode_of,
-    recursion_available, tcp4, tcp6, truncated, udp4, udp6,
+    recursion_available, tcp4, tcp6, udp4, udp6,
 };
-use crate::dns::{Ask, MAX_FORWARDS, Responder};
+use crate::dns::Ask;
 use crate::space::REFUSED_V4;
-use crate::stats::Stats;
-use crate::testing::{FakeHooks, ForwardScript};
+use crate::testing::ForwardScript;
 use crate::tests::log_capture::LogCapture;
-use crate::tests::support::{Extras, WITHIN, eventually, within};
-use crate::{Hooks, TunSettings};
+use crate::tests::support::Extras;
 use rurge_config::{HostName, ListenerKind, PreMatchLayer, SessionInfo};
 use rurge_dns::fakeip::{FakeIpPool, index_of, v4_of, v6_of};
-use rurge_dns::message::{Rcode, opt_size};
+use rurge_dns::message::Rcode;
 use rurge_proto::RejectKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ---- a message that is no query to answer
@@ -125,6 +122,19 @@ async fn another_class_gets_notimp_with_the_question() {
     lab.assert_untouched();
 }
 
+/// The class is looked at before the name: the canary asked in a class other
+/// than IN is NOTIMP, as any name is.
+#[tokio::test]
+async fn the_class_comes_before_the_canary() {
+    let lab = lab();
+    let mut q = query(12, "use-application-dns.net", A);
+    let end = q.len();
+    // CH
+    q[end - 2..].copy_from_slice(&3u16.to_be_bytes());
+    assert_empty(&lab.reply(&q, &udp4()).await, &q, Rcode::NotImp);
+    lab.assert_untouched();
+}
+
 // ---- the names and types that are answered before anything else
 
 #[tokio::test]
@@ -162,6 +172,18 @@ async fn svcb_and_https_are_notimp_unless_allowed() {
         &queries[0],
         Rcode::NotImp,
     );
+}
+
+/// The canary is looked at before the type: asked as SVCB or HTTPS while those
+/// are not allowed it is NXDOMAIN, not NOTIMP.
+#[tokio::test]
+async fn the_canary_comes_before_svcb_and_https() {
+    let lab = lab();
+    for (id, qtype) in [SVCB, HTTPS].into_iter().enumerate() {
+        let q = query(id as u16, "use-application-dns.net", qtype);
+        assert_empty(&lab.reply(&q, &udp4()).await, &q, Rcode::NxDomain);
+    }
+    lab.assert_untouched();
 }
 
 // ---- A and AAAA
@@ -439,6 +461,32 @@ async fn always_real_ip_answers_from_the_host_section_or_forwards() {
     assert_eq!(lab.extras.dns.forwarded().len(), 1);
 }
 
+/// The family of the transport is looked at before `always-real-ip`: a name on
+/// the list that `[Host]` maps to addresses of both families, asked with the
+/// family the transport does not fit, gets the empty answer of the family check,
+/// not the addresses, and nothing is forwarded.
+#[tokio::test]
+async fn the_family_check_comes_before_always_real_ip() {
+    let lab = lab();
+    lab.configure("real.test", false);
+    lab.extras.dns.map(
+        "real.test",
+        &[
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7)),
+        ],
+    );
+    let a_over_v6 = query(1, "real.test", A);
+    let reply = lab.reply(&a_over_v6, &udp6()).await;
+    assert!(authoritative(&reply));
+    assert_empty(&reply, &a_over_v6, Rcode::NoError);
+    let aaaa_over_v4 = query(2, "real.test", AAAA);
+    let reply = lab.reply(&aaaa_over_v4, &udp4()).await;
+    assert!(authoritative(&reply));
+    assert_empty(&reply, &aaaa_over_v4, Rcode::NoError);
+    assert!(lab.extras.dns.forwarded().is_empty());
+}
+
 /// A name the pool does not take (a label with a character other than a letter,
 /// a digit, `-` and `_`, the root) is a question for the upstreams.
 #[tokio::test]
@@ -463,6 +511,20 @@ async fn without_a_pool_a_and_aaaa_are_forwarded() {
     assert_eq!(lab.reply(&a, &udp4()).await, echoed(&a, 0));
     assert_eq!(lab.reply(&aaaa, &udp6()).await, echoed(&aaaa, 0));
     assert_eq!(lab.extras.dns.forwarded(), [a, aaaa]);
+}
+
+/// `always-real-ip` is looked at before the lack of a pool: with no pool a name
+/// on the list that `[Host]` maps still gets its addresses, and is not forwarded.
+#[tokio::test]
+async fn always_real_ip_comes_before_the_lack_of_a_pool() {
+    let lab = Lab::without_a_pool();
+    lab.configure("real.test", false);
+    let real = Ipv4Addr::new(192, 0, 2, 7);
+    lab.extras.dns.map("real.test", &[IpAddr::V4(real)]);
+    let reply = lab.reply(&query(1, "real.test", A), &udp4()).await;
+    assert!(authoritative(&reply));
+    assert_eq!(parsed(&reply).v4, [(real, 30)]);
+    assert!(lab.extras.dns.forwarded().is_empty());
 }
 
 /// With every address leased a new name gets SERVFAIL, and the first time the
@@ -564,370 +626,4 @@ async fn a_failed_forward_is_servfail() {
     lab.configure("down.test", false);
     let a = query(2, "down.test", A);
     assert_empty(&lab.reply(&a, &tcp4()).await, &a, Rcode::ServFail);
-}
-
-/// A reply longer than the datagram the client can take is TC without its
-/// records, with the response code the upstream gave, and the client takes the
-/// whole of it over TCP.
-#[tokio::test]
-async fn a_large_udp_answer_is_truncated() {
-    let lab = lab();
-    lab.extras
-        .dns
-        .script("big.test", ForwardScript::Echo { pad: 2000 });
-    // the size the query announces: none (a limit of 512), 4096 (1232), 300 (512)
-    for size in [None, Some(4096), Some(300)] {
-        let q = match size {
-            Some(size) => query_opt(5, "big.test", TXT, size),
-            None => query(5, "big.test", TXT),
-        };
-        let reply = lab.reply(&q, &udp4()).await;
-        assert!(truncated(&reply), "{size:?}");
-        assert!(!authoritative(&reply), "{size:?}");
-        assert_empty(&reply, &q, Rcode::NoError);
-        // the header, the question and the OPT the query had
-        assert_eq!(reply.len(), q.len(), "{size:?}");
-        // the same over TCP, whole
-        assert_eq!(lab.reply(&q, &tcp4()).await, echoed(&q, 2000), "{size:?}");
-    }
-    // the response code is the upstream's
-    let mut nx = query(6, "big.test", TXT);
-    nx[3] |= 3;
-    let reply = lab.reply(&nx, &udp4()).await;
-    assert!(truncated(&reply));
-    assert_empty(&reply, &nx, Rcode::NxDomain);
-}
-
-/// The limit of a datagram is the size the query announces, no less than 512
-/// and no more than 1232: a reply as long as the limit is whole, one byte more
-/// is TC.
-#[tokio::test]
-async fn the_udp_limit_is_the_announced_size_between_512_and_1232() {
-    let lab = lab();
-    let cases = [
-        (None, 512),
-        (Some(0), 512),
-        (Some(300), 512),
-        (Some(512), 512),
-        (Some(900), 900),
-        (Some(1232), 1232),
-        (Some(4096), 1232),
-        (Some(u16::MAX), 1232),
-    ];
-    for (size, limit) in cases {
-        let q = match size {
-            Some(size) => query_opt(5, "edge.test", TXT, size),
-            None => query(5, "edge.test", TXT),
-        };
-        let pad = limit - q.len();
-        lab.extras
-            .dns
-            .script("edge.test", ForwardScript::Echo { pad });
-        let reply = lab.reply(&q, &udp4()).await;
-        assert!(!truncated(&reply), "{size:?}: {limit} bytes are whole");
-        assert_eq!(reply.len(), limit, "{size:?}");
-        lab.extras
-            .dns
-            .script("edge.test", ForwardScript::Echo { pad: pad + 1 });
-        let reply = lab.reply(&q, &udp4()).await;
-        assert!(truncated(&reply), "{size:?}: {} bytes are not", limit + 1);
-    }
-}
-
-/// A two-byte length frames a message over TCP: a reply of more than 65,535
-/// bytes cannot be sent there and is SERVFAIL; over UDP the limit truncates it
-/// as it does any other.
-#[tokio::test]
-async fn a_reply_too_long_for_tcp_gets_servfail() {
-    let lab = lab();
-    let q = query(3, "huge.test", TXT);
-    let pad_to = |len: usize| ForwardScript::Echo { pad: len - q.len() };
-    lab.extras.dns.script("huge.test", pad_to(65_535));
-    assert_eq!(lab.reply(&q, &tcp4()).await.len(), 65_535);
-    lab.extras.dns.script("huge.test", pad_to(65_536));
-    assert_empty(&lab.reply(&q, &tcp4()).await, &q, Rcode::ServFail);
-    lab.extras
-        .dns
-        .script("huge.test", ForwardScript::Echo { pad: 70_000 });
-    assert_empty(&lab.reply(&q, &tcp4()).await, &q, Rcode::ServFail);
-    lab.extras
-        .dns
-        .script("huge.test", ForwardScript::Echo { pad: 2_000 });
-    assert_eq!(lab.reply(&q, &tcp4()).await, echoed(&q, 2_000));
-    // over UDP it is TC, not SERVFAIL
-    lab.extras
-        .dns
-        .script("huge.test", ForwardScript::Echo { pad: 70_000 });
-    let reply = lab.reply(&q, &udp4()).await;
-    assert!(truncated(&reply));
-    assert_empty(&reply, &q, Rcode::NoError);
-}
-
-/// What the responder makes itself is bound by the limit as well: forty
-/// addresses of `always-real-ip` do not fit 512 bytes, so over UDP they are TC
-/// and without records, and over TCP, or to a client that announces more, they
-/// are all there.
-#[tokio::test]
-async fn a_large_always_real_ip_answer_is_truncated_over_udp() {
-    let lab = lab();
-    lab.configure("many.test", false);
-    let addrs: Vec<IpAddr> = (1..=40)
-        .map(|n| IpAddr::V4(Ipv4Addr::new(192, 0, 2, n)))
-        .collect();
-    lab.extras.dns.map("many.test", &addrs);
-    let a = query(1, "many.test", A);
-    let reply = lab.reply(&a, &udp4()).await;
-    assert!(truncated(&reply));
-    assert_empty(&reply, &a, Rcode::NoError);
-    // 4096 announced: the limit is 1232, and they fit
-    let big = query_opt(2, "many.test", A, 4096);
-    let reply = lab.reply(&big, &udp4()).await;
-    assert!(!truncated(&reply));
-    assert_eq!(parsed(&reply).v4.len(), 40);
-    // over TCP there is no limit but the frame
-    let reply = lab.reply(&a, &tcp4()).await;
-    assert!(!truncated(&reply));
-    let answer = parsed(&reply);
-    assert_eq!(answer.rcode, Rcode::NoError);
-    assert_eq!(answer.v4.len(), 40);
-    assert!(answer.v4.iter().all(|&(_, ttl)| ttl == 30));
-    assert!(lab.extras.dns.forwarded().is_empty());
-}
-
-// ---- the limit on what is forwarded
-
-/// Starts `count` queries for `name` of type TXT, each in a task of its own,
-/// over UDP; the tasks give the reply they got.
-fn start_forwards(
-    lab: &Lab,
-    name: &str,
-    count: usize,
-) -> Vec<tokio::task::JoinHandle<Option<Vec<u8>>>> {
-    (0..count)
-        .map(|n| {
-            let responder = lab.responder.clone();
-            let q = query(n as u16, name, TXT);
-            tokio::spawn(async move { responder.answer(&q, &udp4()).await })
-        })
-        .collect()
-}
-
-/// At most 256 queries are forwarded at once; the next gets SERVFAIL at once
-/// and the resolver is not asked, and once the held ones are answered the
-/// places are free again.
-#[tokio::test]
-async fn forwards_in_flight_are_capped_at_256() {
-    let lab = lab();
-    lab.extras.dns.script("held.test", ForwardScript::Hold);
-    let held = start_forwards(&lab, "held.test", MAX_FORWARDS);
-    eventually("256 queries to reach the resolver", WITHIN, || {
-        lab.extras.dns.forwarded().len() == MAX_FORWARDS
-    })
-    .await;
-    let late = query(999, "held.test", TXT);
-    assert_empty(&lab.reply(&late, &udp4()).await, &late, Rcode::ServFail);
-    assert_eq!(
-        lab.extras.dns.forwarded().len(),
-        MAX_FORWARDS,
-        "the resolver was not asked"
-    );
-    assert!(held.iter().all(|task| !task.is_finished()), "all are held");
-    lab.extras.dns.release();
-    for (n, task) in held.into_iter().enumerate() {
-        let reply = within("a held query to be answered", task)
-            .await
-            .expect("the task ends")
-            .expect("an answer");
-        assert_eq!(reply, echoed(&query(n as u16, "held.test", TXT), 0));
-    }
-    // the places are back
-    let after = query(1000, "held.test", TXT);
-    assert_eq!(lab.reply(&after, &udp4()).await, echoed(&after, 0));
-}
-
-/// An answer that needs no resolver does not wait for one: with 256 queries
-/// held a name still gets its fake address at once.
-#[tokio::test]
-async fn a_fake_answer_does_not_wait_for_forwards() {
-    let lab = lab();
-    lab.extras.dns.script("held.test", ForwardScript::Hold);
-    let held = start_forwards(&lab, "held.test", MAX_FORWARDS);
-    eventually("256 queries to reach the resolver", WITHIN, || {
-        lab.extras.dns.forwarded().len() == MAX_FORWARDS
-    })
-    .await;
-    let answer = parsed(&lab.reply(&query(1, "fast.test", A), &udp4()).await);
-    assert_eq!(answer.v4.len(), 1);
-    lab.extras.dns.release();
-    for task in held {
-        within("a held query to be answered", task)
-            .await
-            .expect("the task ends");
-    }
-}
-
-// ---- the answers made here
-
-/// Every kind of answer the responder makes itself has an OPT record that
-/// announces 1232 when the query had one, and has none when it had not.
-#[tokio::test]
-async fn an_answer_to_a_query_with_an_opt_has_one_of_1232() {
-    let lab = lab();
-    lab.configure("mapped.test", false);
-    lab.extras
-        .dns
-        .map("mapped.test", &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))]);
-    for (name, kind) in [
-        ("rejected.test", RejectKind::Reject),
-        ("refused.test", RejectKind::NoDrop),
-    ] {
-        lab.extras.hooks.script_pre_match(
-            PreMatchLayer::Dns,
-            HostName::Domain(name.to_owned()),
-            kind,
-        );
-    }
-    // a fake address, the canary, NOTIMP for SVCB, a real address, both refusals
-    // and the empty answer of a family that does not fit
-    let cases = [
-        ("fake.test", A, udp4()),
-        ("use-application-dns.net", A, udp4()),
-        ("svc.test", SVCB, udp4()),
-        ("mapped.test", A, udp4()),
-        ("rejected.test", A, udp4()),
-        ("refused.test", A, udp4()),
-        ("fake.test", AAAA, udp4()),
-    ];
-    for (name, qtype, ask) in cases {
-        let with = lab.reply(&query_opt(1, name, qtype, 4096), &ask).await;
-        assert_eq!(opt_size(&with), Some(1232), "{name} type {qtype}");
-        let without = lab.reply(&query(1, name, qtype), &ask).await;
-        assert_eq!(opt_size(&without), None, "{name} type {qtype}");
-    }
-    // an answer that is no records at all: NOTIMP for a class other than IN
-    let mut chaos = query_opt(2, "fake.test", A, 4096);
-    let end = chaos.len() - 11;
-    chaos[end - 2..end].copy_from_slice(&3u16.to_be_bytes());
-    assert_eq!(opt_size(&lab.reply(&chaos, &udp4()).await), Some(1232));
-}
-
-// ---- once per query
-
-/// Hooks that count how often the settings are asked for.
-struct Counting {
-    inner: Arc<FakeHooks>,
-    settings_asked: AtomicUsize,
-}
-
-impl Hooks for Counting {
-    fn settings(&self) -> Arc<TunSettings> {
-        self.settings_asked.fetch_add(1, Ordering::SeqCst);
-        self.inner.settings()
-    }
-
-    fn pre_match(&self, layer: PreMatchLayer, session: &SessionInfo) -> Option<RejectKind> {
-        self.inner.pre_match(layer, session)
-    }
-}
-
-/// The settings are taken once for a query, however many of them the answer
-/// looks at: a reload cannot change them in the middle of one.
-#[tokio::test]
-async fn the_settings_are_taken_once_for_a_query() {
-    let extras = Extras::default();
-    extras.hooks.script_pre_match(
-        PreMatchLayer::Dns,
-        HostName::Domain("rejected.test".to_owned()),
-        RejectKind::Reject,
-    );
-    let counting = Arc::new(Counting {
-        inner: extras.hooks.clone(),
-        settings_asked: AtomicUsize::new(0),
-    });
-    let responder = Responder::new(
-        counting.clone(),
-        extras.pool.clone(),
-        Arc::new(Stats::default()),
-    );
-    let mut chaos = query(9, "fake.test", A);
-    let end = chaos.len();
-    chaos[end - 2..].copy_from_slice(&3u16.to_be_bytes());
-    let queries = [
-        query(1, "fake.test", A),
-        query(2, "fake.test", AAAA),
-        query(3, "rejected.test", A),
-        query(4, "txt.test", TXT),
-        query(5, "svc.test", SVCB),
-        query(6, "use-application-dns.net", A),
-        chaos,
-    ];
-    for q in &queries {
-        let before = counting.settings_asked.load(Ordering::SeqCst);
-        for ask in [udp4(), udp6()] {
-            let _ = within("an answer", responder.answer(q, &ask)).await;
-        }
-        let asked = counting.settings_asked.load(Ordering::SeqCst) - before;
-        assert_eq!(asked, 2, "once for each of the two queries: {q:?}");
-    }
-}
-
-// ---- what is said
-
-/// A query is said in one line at debug level, with its name, its type and
-/// what became of it, whether it was answered or not; nothing above debug level
-/// says a name.
-#[tokio::test]
-async fn every_query_is_said_in_one_debug_line_and_no_name_above_debug() {
-    let log = LogCapture::start();
-    let lab = lab();
-    lab.extras.hooks.script_pre_match(
-        PreMatchLayer::Dns,
-        HostName::Domain("dropped.test".to_owned()),
-        RejectKind::Drop,
-    );
-    lab.extras.dns.script("fail.test", ForwardScript::Fail);
-    // (the name, the type as the line writes it, the query)
-    let queries = [
-        ("fake.test", "A", query(1, "fake.test", A)),
-        ("forward.test", "TYPE16", query(2, "forward.test", TXT)),
-        ("dropped.test", "A", query(3, "dropped.test", A)),
-        ("fail.test", "TYPE16", query(4, "fail.test", TXT)),
-        (
-            "use-application-dns.net",
-            "AAAA",
-            query(5, "use-application-dns.net", AAAA),
-        ),
-    ];
-    for (_, _, q) in &queries {
-        let _ = lab.ask(q, &udp4()).await;
-    }
-    // and one that is no query, which has no name to say
-    let mut reply = query(6, "reply.test", A);
-    reply[2] |= 0x80;
-    assert_eq!(lab.ask(&reply, &udp4()).await, None);
-    let lines = log.lines();
-    assert!(
-        lines.iter().all(|line| line.starts_with("DEBUG")),
-        "nothing above debug level: {lines:?}"
-    );
-    assert_eq!(
-        lines.len(),
-        queries.len() + 1,
-        "one line for each: {lines:?}"
-    );
-    let mut decisions = Vec::new();
-    for (name, qtype, _) in &queries {
-        let said: Vec<&String> = lines.iter().filter(|line| line.contains(name)).collect();
-        assert_eq!(said.len(), 1, "{name}: {lines:?}");
-        assert!(said[0].contains(&format!("qtype={qtype} ")), "{}", said[0]);
-        let decision = said[0]
-            .split("decision=")
-            .nth(1)
-            .unwrap_or_else(|| panic!("what was decided: {}", said[0]));
-        decisions.push(decision.to_owned());
-    }
-    // five different things became of them
-    decisions.sort();
-    decisions.dedup();
-    assert_eq!(decisions.len(), queries.len(), "{decisions:?}");
 }

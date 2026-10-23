@@ -4,12 +4,17 @@
 //! of fake addresses). The query is made with `query_wire`; a reply is read
 //! byte by byte where its bytes are the point and with `parse_response` where
 //! its records are.
+//!
+//! `answer` follows the order the responder decides in, step by step; `forward`
+//! is about the forwards in flight, what becomes of a reply on its way out (the
+//! size of a datagram and of a frame, the OPT record), how often the settings
+//! are taken, and what is said.
 
 mod answer;
+mod forward;
 
 use crate::TunSettings;
 use crate::dns::{Ask, DNS_PORT, Responder};
-use crate::stats::Stats;
 use crate::testing::FakeResolve;
 use crate::tests::support::{Extras, addr, settings, sock, within};
 use rurge_config::{HostList, Transport};
@@ -152,11 +157,7 @@ fn lab() -> Lab {
 }
 
 fn lab_with(extras: Extras) -> Lab {
-    let responder = Arc::new(Responder::new(
-        extras.hooks.clone(),
-        extras.pool.clone(),
-        Arc::new(Stats::default()),
-    ));
+    let responder = Arc::new(Responder::new(extras.hooks.clone(), extras.pool.clone()));
     Lab { responder, extras }
 }
 

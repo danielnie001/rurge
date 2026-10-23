@@ -11,7 +11,6 @@
 
 use crate::hooks::{Hooks, TunSettings};
 use crate::space::REFUSED_V4;
-use crate::stats::Stats;
 use rurge_config::{HostName, ListenerKind, PreMatchLayer, SessionInfo, Transport};
 use rurge_dns::fakeip::{AssignError, FAKE_TTL, FakeIpPool, v4_of, v6_of};
 use rurge_dns::message::{self, ANSWER_UDP_SIZE, Rcode, Request, RequestError};
@@ -69,10 +68,6 @@ pub(crate) struct Ask {
 pub(crate) struct Responder {
     hooks: Arc<dyn Hooks>,
     pool: Option<Arc<FakeIpPool>>,
-    /// Not used yet: nothing the responder decides is counted, as a query it
-    /// cannot take is answered and not dropped.
-    #[allow(dead_code)]
-    stats: Arc<Stats>,
     /// The places among the `MAX_FORWARDS` queries that can be forwarded at
     /// once. A query that finds none is answered SERVFAIL, not made to wait.
     forwards: Semaphore,
@@ -81,15 +76,10 @@ pub(crate) struct Responder {
 }
 
 impl Responder {
-    pub(crate) fn new(
-        hooks: Arc<dyn Hooks>,
-        pool: Option<Arc<FakeIpPool>>,
-        stats: Arc<Stats>,
-    ) -> Responder {
+    pub(crate) fn new(hooks: Arc<dyn Hooks>, pool: Option<Arc<FakeIpPool>>) -> Responder {
         Responder {
             hooks,
             pool,
-            stats,
             forwards: Semaphore::new(MAX_FORWARDS),
             exhaustion_said: AtomicBool::new(false),
         }
@@ -97,8 +87,9 @@ impl Responder {
 
     /// The reply to `query`, or `None` when nothing is to be sent back. The
     /// settings are those of the generation in use when the query is read, the
-    /// same for all of the answer. What is decided is said in one line at
-    /// debug level, and nowhere else: the name is not said above it.
+    /// same for all of the answer. What is decided, and what became of the
+    /// reply on its way out (see `fit`), is said in one line at debug level,
+    /// and nowhere else: the name is not said above it.
     pub(crate) async fn answer(&self, query: &[u8], ask: &Ask) -> Option<Vec<u8>> {
         let req = match message::read_request(query) {
             Ok(req) => req,
@@ -120,13 +111,18 @@ impl Responder {
         };
         let settings = self.hooks.settings();
         let (reply, decision) = self.decide(&settings, &req, query, ask).await;
+        let (reply, fitted) = match reply.map(|reply| fit(&req, ask.transport, reply)) {
+            Some((reply, fitted)) => (Some(reply), fitted),
+            None => (None, None),
+        };
         tracing::debug!(
             name = %req.name,
             qtype = %TypeName(req.qtype),
             decision,
+            fitted,
             "tun: DNS query"
         );
-        reply.map(|reply| fit(&req, ask.transport, reply))
+        reply
     }
 
     /// The reply to `req`, read from `query`, and what became of it, in the
@@ -287,19 +283,26 @@ fn dns_session(req: &Request, ask: &Ask) -> SessionInfo {
     }
 }
 
-/// `reply` as the transport it goes back on can carry it. Over UDP a reply of
-/// more than the client takes (`udp_limit`) is replaced by one that says so: TC,
-/// without records, with the response code it had. Over TCP a reply that a
-/// two-byte length cannot frame (an upstream over HTTPS can send one) is
-/// replaced by SERVFAIL.
-fn fit(req: &Request, transport: Transport, reply: Vec<u8>) -> Vec<u8> {
+/// `reply` as the transport it goes back on can carry it, and what was done to
+/// it, for the debug line, if anything was. Over UDP a reply of more than the
+/// client takes (`udp_limit`) is replaced by one that says so: TC, without
+/// records, with the response code it had. Over TCP a reply that a two-byte
+/// length cannot frame (an upstream over HTTPS can send one) is replaced by
+/// SERVFAIL.
+fn fit(req: &Request, transport: Transport, reply: Vec<u8>) -> (Vec<u8>, Option<&'static str>) {
     match transport {
         Transport::Udp if reply.len() > udp_limit(req) => {
             let rcode = message::wire_rcode(&reply).unwrap_or(Rcode::ServFail);
-            message::answer_truncated(req, rcode)
+            (
+                message::answer_truncated(req, rcode),
+                Some("truncated: over the UDP limit"),
+            )
         }
-        Transport::Tcp if reply.len() > TCP_MAX => empty(req, Rcode::ServFail),
-        _ => reply,
+        Transport::Tcp if reply.len() > TCP_MAX => (
+            empty(req, Rcode::ServFail),
+            Some("SERVFAIL: too long for TCP"),
+        ),
+        _ => (reply, None),
     }
 }
 
