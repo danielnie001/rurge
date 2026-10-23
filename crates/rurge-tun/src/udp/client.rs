@@ -3,11 +3,11 @@
 //! get back goes into the app's stack through `send`, with the source the app
 //! will recognize. A flow the engine refused is told to the app by `refused`.
 
-use super::{Queued, Session, datagram};
-use crate::dispatch::Context;
+use super::{Queued, Session};
+use crate::context::Context;
 use crate::fragment::ip_packets;
 use crate::icmp;
-use crate::packet::Reason;
+use crate::packet::{Reason, udp_datagram};
 use crate::stats::Stats;
 use rurge_config::HostName;
 use rurge_inbound::UdpClient;
@@ -111,7 +111,7 @@ impl UdpClient for TunUdpClient {
                 return Ok(());
             };
             let app = self.session.app;
-            let datagram = datagram(source, app, payload).ok_or_else(|| {
+            let datagram = udp_datagram(source, app, payload).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "the reply is too long to be a datagram",

@@ -3,14 +3,16 @@
 //! before any stack sees it, in the order of the design's table. smoltcp 0.12
 //! panics on or misreads several things a packet can hold (design 5.3), so
 //! nothing it would take reaches it without going through here first. And
-//! one packet the TUN makes itself: [`rst_for`], the reset it answers a SYN
-//! with when it turns the SYN away.
+//! two packets the TUN makes itself: [`rst_for`], the reset it answers a SYN
+//! with when it turns the SYN away, and [`udp_datagram`], the UDP datagram of a
+//! reply to an app.
 
 use crate::tcp::Tuple;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     IPV4_HEADER_LEN, Icmpv4Packet, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr,
-    Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket,
+    Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UDP_HEADER_LEN, UdpPacket,
+    UdpRepr,
 };
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -276,6 +278,31 @@ pub(crate) fn rst_for(syn: &[u8]) -> Vec<u8> {
         }
         _ => unreachable!("the two addresses of a packet are of one family"),
     }
+}
+
+/// The UDP datagram from `src` to `dst` that carries `payload`, its checksum
+/// worked out. `None` if it is longer than a packet of the family can carry:
+/// IPv4's packet is at most 65535 bytes, with a header of 20, and IPv6's
+/// payload is at most 65535, with the UDP header in it.
+pub(crate) fn udp_datagram(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
+    let longest = if src.is_ipv4() { 65535 - 20 } else { 65535 };
+    if UDP_HEADER_LEN + payload.len() > longest {
+        return None;
+    }
+    let repr = UdpRepr {
+        src_port: src.port(),
+        dst_port: dst.port(),
+    };
+    let mut bytes = vec![0; UDP_HEADER_LEN + payload.len()];
+    repr.emit(
+        &mut UdpPacket::new_unchecked(&mut bytes[..]),
+        &src.ip().into(),
+        &dst.ip().into(),
+        payload.len(),
+        |buffer| buffer.copy_from_slice(payload),
+        &ChecksumCapabilities::default(),
+    );
+    Some(bytes)
 }
 
 /// Takes the SACK-permitted options out of `packet`, a whole IP packet, if it

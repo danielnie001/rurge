@@ -11,6 +11,7 @@
 //! that goes out (`icmp`), and one writes to the device what all of them send
 //! (`writer`).
 
+mod context;
 pub mod device;
 mod dispatch;
 mod fragment;
@@ -151,7 +152,7 @@ impl Tun {
                 "tun: the system's random source failed; the TUN's initial sequence numbers are predictable"
             );
         }
-        let ctx = Arc::new(dispatch::Context {
+        let ctx = Arc::new(context::Context {
             dialer,
             pool: pool.clone(),
             hooks,
@@ -464,9 +465,14 @@ impl TunHandle {
     /// The sessions that are running: the TUN's tasks but the ones it starts
     /// itself, a shard's each, the writer and the device's reader. It is right
     /// only while those run, until a stop or a failing device ends them; after
-    /// that it means nothing, and it may panic.
+    /// that it means nothing, and a debug assertion makes it panic. Read
+    /// `live_tasks` after a stop.
     #[cfg(test)]
     pub(crate) fn session_tasks(&self) -> usize {
+        debug_assert!(
+            !self.inner.life.is_stopped(),
+            "session_tasks is asked of a TUN that has stopped; after a stop ask live_tasks"
+        );
         self.inner
             .tasks
             .len()

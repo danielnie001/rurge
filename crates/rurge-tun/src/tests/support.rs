@@ -65,23 +65,26 @@ pub(crate) fn rig(options: TunOptions) -> Rig {
 /// The same with `extras` in place of the default ones, which are given back
 /// for the test to reach what the TUN was started with.
 pub(crate) fn rig_extras(options: TunOptions, extras: Extras) -> (Rig, Extras) {
-    let (device, end) = MemoryDevice::pair(1500, 4096);
-    let dialer = FakeDialer::new();
-    let tun = tun_dialing(Arc::new(device), dialer.clone(), &extras, options);
-    let rig = Rig {
-        tun,
-        app: AppStack::start(end),
-        dialer,
-    };
+    let rig = rig_on_extras(MemoryDevice::pair(1500, 4096), options, &extras);
     (rig, extras)
 }
 
 /// A rig on a memory device, whose app end is `end`. The TUN is started by
-/// `tun_on`, and so in the end by `tun_dialing`, the one place that calls
-/// `Tun::start`: a change of what `Tun::start` takes is a change of that
-/// function only.
-pub(crate) fn rig_on((device, end): (MemoryDevice, AppEnd), options: TunOptions) -> Rig {
-    let (tun, dialer) = tun_on(device, options);
+/// `tun_dialing`, the one place that calls `Tun::start`: a change of what
+/// `Tun::start` takes is a change of that function only.
+pub(crate) fn rig_on(pair: (MemoryDevice, AppEnd), options: TunOptions) -> Rig {
+    rig_on_extras(pair, options, &Extras::default())
+}
+
+/// `rig_on` with `extras` in place of the default ones: the wiring of
+/// `rig_on` and of `rig_extras`.
+fn rig_on_extras(
+    (device, end): (MemoryDevice, AppEnd),
+    options: TunOptions,
+    extras: &Extras,
+) -> Rig {
+    let dialer = FakeDialer::new();
+    let tun = tun_dialing(Arc::new(device), dialer.clone(), extras, options);
     Rig {
         tun,
         app: AppStack::start(end),

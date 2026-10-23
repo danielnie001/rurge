@@ -8,7 +8,7 @@
 //! that no flow goes to.
 
 use crate::TunSettings;
-use crate::dispatch::Context;
+use crate::context::Context;
 use crate::fragment::{Ids, ip_packet, ip_packets};
 use crate::limit::Limiter;
 use crate::packet::{Parsed, Reason};

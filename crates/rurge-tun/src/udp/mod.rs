@@ -9,7 +9,7 @@
 mod client;
 mod targets;
 
-use crate::dispatch::Context;
+use crate::context::Context;
 use crate::icmp;
 use crate::packet::{Parsed, Reason, Transport};
 use crate::space::{self, Place, STACK_V4, STACK_V6};
@@ -19,8 +19,7 @@ use rurge_config::{HostName, ListenerKind, SessionInfo};
 use rurge_dns::fakeip::Lease;
 use rurge_inbound::UdpAdmission;
 use rurge_net::connector::Target;
-use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::wire::{Ipv4Packet, Ipv6Packet, UDP_HEADER_LEN, UdpPacket, UdpRepr};
+use smoltcp::wire::{Ipv4Packet, Ipv6Packet, UDP_HEADER_LEN, UdpPacket};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -98,8 +97,10 @@ impl Session {
     }
 
     /// The session ends: no datagram is queued for it from now on, and a datagram
-    /// of the app begins another.
-    fn ending(&self) {
+    /// of the app begins another. This only marks the session as ending; it
+    /// does not clear the destinations (`end` does that, and lets the leases on
+    /// the fake addresses go).
+    fn mark_ending(&self) {
         self.state().ending = true;
     }
 
@@ -370,34 +371,9 @@ async fn serve(ctx: Arc<Context>, session: Arc<Session>, client: Arc<TunUdpClien
             swept = now;
         }
     }
-    session.ending();
+    session.mark_ending();
     closed.cancel();
     if !returned {
         association.await;
     }
-}
-
-/// The UDP datagram from `src` to `dst` that carries `payload`, its checksum
-/// worked out. `None` if it is longer than a packet of the family can carry:
-/// IPv4's packet is at most 65535 bytes, with a header of 20, and IPv6's
-/// payload is at most 65535, with the UDP header in it.
-fn datagram(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
-    let longest = if src.is_ipv4() { 65535 - 20 } else { 65535 };
-    if UDP_HEADER_LEN + payload.len() > longest {
-        return None;
-    }
-    let repr = UdpRepr {
-        src_port: src.port(),
-        dst_port: dst.port(),
-    };
-    let mut bytes = vec![0; UDP_HEADER_LEN + payload.len()];
-    repr.emit(
-        &mut UdpPacket::new_unchecked(&mut bytes[..]),
-        &src.ip().into(),
-        &dst.ip().into(),
-        payload.len(),
-        |buffer| buffer.copy_from_slice(payload),
-        &ChecksumCapabilities::default(),
-    );
-    Some(bytes)
 }
