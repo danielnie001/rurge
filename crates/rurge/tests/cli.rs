@@ -2895,13 +2895,19 @@ mod run {
             "REJECT closes the connection: {rejected}"
         );
         assert_eq!(target.requests().len(), 1);
-        let summary = daemon.lines.try_iter().find(|l| l.contains("running:"));
-        assert!(
-            summary
-                .as_deref()
-                .is_some_and(|l| l.contains("outbound mode rule")),
-            "{summary:?}"
-        );
+        // The daemon prints this line after it has written `state.json`, which
+        // is after the listeners answer: it may still be on its way here.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut read = Vec::new();
+        let summary = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match daemon.lines.recv_timeout(remaining) {
+                Ok(line) if line.contains("running:") => break line,
+                Ok(line) => read.push(line),
+                Err(e) => panic!("no `running:` line within 10 s ({e:?}); read: {read:?}"),
+            }
+        };
+        assert!(summary.contains("outbound mode rule"), "{summary:?}");
     }
 
     /// A group without members goes DIRECT, as in Surge; the switch, and its
@@ -2987,7 +2993,8 @@ mod run {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
                 if let Ok(Some(status)) = daemon.child.try_wait() {
-                    let lines: Vec<String> = daemon.lines.try_iter().collect();
+                    // the lines that were still on their way when it exited too
+                    let lines = printed_to_the_end(&daemon);
                     return Some((status, lines));
                 }
                 if std::time::Instant::now() > deadline {
@@ -3765,7 +3772,8 @@ loglevel = notify",
         // once, so a `stop` that fell back on the shutdown grace period would
         // take much longer — and would print the line asserted against below.
         assert_eq!(wait_for_exit(&mut daemon, 3), Some(0), "stop exits 0");
-        let lines: Vec<String> = daemon.lines.try_iter().collect();
+        // all of it, so that the absence below is of every line it printed
+        let lines = printed_to_the_end(&daemon);
         assert!(
             !lines.iter().any(|l| l.contains("grace period elapsed")),
             "stop must not wait out the grace period: {lines:?}"

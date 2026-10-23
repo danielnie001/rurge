@@ -77,17 +77,7 @@ impl Engine {
         };
         let kind = RejectKind::from_builtin(builtin)?;
         let now = Instant::now();
-        let refusal = if kind.escalates() {
-            let host = session.dst_host.to_string();
-            self.escalation.record(&host, now);
-            if self.escalation.should_drop(&host, now) {
-                RejectKind::Drop
-            } else {
-                kind
-            }
-        } else {
-            kind
-        };
+        let refusal = self.escalation.refusal(session, kind, now);
         if rt.pre_matched.due(rule, now) {
             let process = self.look_up_owner(session);
             let handle = self.new_handle_with(session.clone(), process);
@@ -114,6 +104,14 @@ mod tests {
     use super::*;
 
     const SECOND: Duration = Duration::from_secs(1);
+
+    /// The five minutes are five minutes: the tests below take the interval from
+    /// the constant, so this is where the number itself is held to what the
+    /// documents say of it.
+    #[test]
+    fn the_interval_is_five_minutes() {
+        assert_eq!(RECORD_EVERY, Duration::from_secs(300));
+    }
 
     /// The first refusal by a rule is recorded and then none for five minutes,
     /// the minutes counted from the refusal that was recorded; at five minutes

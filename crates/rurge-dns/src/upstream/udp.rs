@@ -69,10 +69,15 @@ impl Socket {
 struct Pending(Mutex<HashMap<u16, Option<oneshot::Sender<Vec<u8>>>>>);
 
 impl Pending {
-    /// An ID for a query that came with `wanted`: that one when no query in
-    /// flight has it, else the first that none has, counting up from a random
-    /// one. All 65,536 taken: an error.
-    fn claim(&self, wanted: u16, waiter: oneshot::Sender<Vec<u8>>) -> Result<u16, UpstreamError> {
+    /// The claim on an ID for a query that came with `wanted`: that one when no
+    /// query in flight has it, else the first that none has, counting up from a
+    /// random one. The ID is given back when the claim is dropped. All 65,536
+    /// taken: an error.
+    fn claim(
+        &self,
+        wanted: u16,
+        waiter: oneshot::Sender<Vec<u8>>,
+    ) -> Result<Claim<'_>, UpstreamError> {
         let mut taken = self.0.lock().expect("udp pending lock");
         let id = if taken.contains_key(&wanted) {
             let start = random_id();
@@ -84,7 +89,7 @@ impl Pending {
             wanted
         };
         taken.insert(id, Some(waiter));
-        Ok(id)
+        Ok(Claim { pending: self, id })
     }
 
     /// Hands `answer` to the query that waits under `id`: the first answer
@@ -256,11 +261,8 @@ impl Upstream for UdpUpstream {
             })?;
             let shared = self.shared().await?;
             let (tx, rx) = oneshot::channel();
-            let id = shared.pending.claim(asked_id, tx)?;
-            let claim = Claim {
-                pending: &shared.pending,
-                id,
-            };
+            let claim = shared.pending.claim(asked_id, tx)?;
+            let id = claim.id;
             // under the ID that was claimed, which is the one it came with
             // unless another query in flight has it
             let sent = if id == asked_id {
@@ -611,13 +613,14 @@ mod tests {
     #[test]
     fn a_query_keeps_its_id_unless_one_in_flight_has_it() {
         let pending = Pending::default();
-        assert_eq!(pending.claim(7, waiter()), Ok(7));
+        let first = pending.claim(7, waiter()).unwrap();
+        assert_eq!(first.id, 7);
         let other = pending.claim(7, waiter()).unwrap();
-        assert_ne!(other, 7);
+        assert_ne!(other.id, 7);
         let third = pending.claim(7, waiter()).unwrap();
-        assert!(third != 7 && third != other);
-        pending.release(7);
-        assert_eq!(pending.claim(7, waiter()), Ok(7));
+        assert!(third.id != 7 && third.id != other.id);
+        drop(first);
+        assert_eq!(pending.claim(7, waiter()).unwrap().id, 7);
     }
 
     /// With every one of the 65,536 IDs taken there is none to give; with one
@@ -625,15 +628,22 @@ mod tests {
     #[test]
     fn with_every_id_taken_there_is_none_to_give() {
         let pending = Pending::default();
-        for id in 0..=u16::MAX {
-            assert_eq!(pending.claim(id, waiter()), Ok(id));
-        }
-        let none = Err(UpstreamError::Io("too many queries in flight".to_string()));
-        assert_eq!(pending.claim(5, waiter()), none);
+        let mut held: Vec<Option<Claim<'_>>> = (0..=u16::MAX)
+            .map(|id| {
+                let claim = pending.claim(id, waiter()).unwrap();
+                assert_eq!(claim.id, id);
+                Some(claim)
+            })
+            .collect();
+        let none = Some(UpstreamError::Io("too many queries in flight".to_string()));
+        assert_eq!(pending.claim(5, waiter()).err(), none);
+        let mut found = Vec::new();
         for free in [0, 1, 40_000, u16::MAX] {
-            pending.release(free);
-            assert_eq!(pending.claim(5, waiter()), Ok(free));
-            assert_eq!(pending.claim(5, waiter()), none);
+            drop(held[usize::from(free)].take());
+            let claim = pending.claim(5, waiter()).unwrap();
+            assert_eq!(claim.id, free);
+            found.push(claim);
+            assert_eq!(pending.claim(5, waiter()).err(), none);
         }
     }
 
@@ -643,14 +653,15 @@ mod tests {
     fn an_answer_goes_to_the_query_that_holds_its_id_once() {
         let pending = Pending::default();
         let (tx, mut rx) = oneshot::channel();
-        let id = pending.claim(9, tx).unwrap();
+        let claim = pending.claim(9, tx).unwrap();
+        let id = claim.id;
         // an answer for an ID nobody holds goes nowhere
         pending.deliver(id.wrapping_add(1), b"stray".to_vec());
         pending.deliver(id, b"first".to_vec());
         pending.deliver(id, b"again".to_vec());
         assert_eq!(rx.try_recv().unwrap(), b"first");
-        assert_ne!(pending.claim(id, waiter()).unwrap(), id, "still taken");
-        pending.release(id);
-        assert_eq!(pending.claim(id, waiter()), Ok(id));
+        assert_ne!(pending.claim(id, waiter()).unwrap().id, id, "still taken");
+        drop(claim);
+        assert_eq!(pending.claim(id, waiter()).unwrap().id, id);
     }
 }

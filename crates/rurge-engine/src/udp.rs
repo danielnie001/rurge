@@ -111,15 +111,18 @@ struct Flow {
 }
 
 impl Flow {
-    /// A flow that goes where the client wrote: to the session's destination.
-    fn new(handle: Arc<SessionHandle>, port: u16) -> Flow {
+    /// A flow of `handle`, a session to `port`. `asked` is the target the
+    /// client wrote for it: the session's destination, unless the client wrote
+    /// a fake address and the session's destination is the name behind it
+    /// (the flow is then `swapped`).
+    fn new(handle: Arc<SessionHandle>, port: u16, asked: Target) -> Flow {
         let session = handle.session();
-        let asked = Target::new(session.dst_host.clone(), session.dst_port);
+        let swapped = asked != Target::new(session.dst_host.clone(), session.dst_port);
         Flow {
             handle,
             port,
             asked,
-            swapped: false,
+            swapped,
             times: Mutex::new(Times {
                 last: now(),
                 answered: None,
@@ -462,25 +465,28 @@ pub(crate) async fn serve(
     }
 }
 
+/// The flow of one target of the client's: `asked` is the target the client
+/// wrote, which is how it knows the flow and how the flow is kept; `destination`
+/// (below) is where the flow goes, which is another target when `asked` is a
+/// fake address.
 async fn run_flow(
     engine: Arc<Engine>,
     association: Arc<Association>,
-    to: Target,
+    asked: Target,
     first: Queued,
     mut waiting: mpsc::Receiver<Queued>,
     id: u64,
 ) {
     let mut session = association.template.clone();
-    session.dst_host = to.host.clone();
-    session.dst_port = to.port;
+    session.dst_host = asked.host.clone();
+    session.dst_port = asked.port;
     // A fake address the client wrote is the name behind it (phase 3 M3 design
-    // 13): the rules see the name, and the flow goes to it. `to` stays what the
-    // client wrote, which is how it knows the flow and how the flow is kept.
+    // 13): the rules see the name, and the flow goes to it.
     let turned = engine.turn_back(&mut session);
-    let sends_to = Target::new(session.dst_host.clone(), session.dst_port);
+    let destination = Target::new(session.dst_host.clone(), session.dst_port);
     // the rules see what the first datagram is (`PROTOCOL,QUIC`)
     session.protocol = Some(
-        if to.port == 443 && crate::sniff::is_quic_initial(&first.datagram) {
+        if asked.port == 443 && crate::sniff::is_quic_initial(&first.datagram) {
             ProtocolKind::Quic
         } else {
             ProtocolKind::Udp
@@ -503,7 +509,7 @@ async fn run_flow(
         tokio::select! {
             _ = association.ended.cancelled() => Err(SessionOutcome::Completed),
             _ = handle.token().cancelled() => Err(SessionOutcome::Completed),
-            opened = trail.follow(open(&engine, &association, &handle, &sends_to, &to)) => opened,
+            opened = trail.follow(open(&engine, &association, &handle, &destination, &asked)) => opened,
         }
     };
     match opened {
@@ -529,18 +535,18 @@ async fn run_flow(
             // would give up on a destination that may be reachable by then
             let retry = matches!(outcome, SessionOutcome::Failed(_)).then(|| now() + RETRY_AFTER);
             let refused = match &outcome {
-                SessionOutcome::Rejected(kind) => Some((&to, *kind)),
+                SessionOutcome::Rejected(kind) => Some((&asked, *kind)),
                 _ => None,
             };
-            if let Some((to, kind)) = refused {
-                association.client.refused(to, kind);
+            if let Some((target, kind)) = refused {
+                association.client.refused(target, kind);
             }
             handle.finish(outcome);
             drain(&association, &handle, &mut waiting, retry, refused).await;
             waiting.close();
         }
     }
-    let _ = association.done.send((to, id));
+    let _ = association.done.send((asked, id));
 }
 
 /// A failure, with whatever note is already on the record in front of it.
@@ -552,14 +558,14 @@ pub(crate) fn failed(handle: &SessionHandle, message: impl Into<String>) -> Sess
     SessionOutcome::Failed(message)
 }
 
-/// Rules → policy → the outbound's carrier (M5 design 5.2). `to` is where the
-/// flow goes; `asked`, what the client wrote for it, is the same unless it was
-/// a fake address and `to` is the name behind it.
+/// Rules → policy → the outbound's carrier (M5 design 5.2). `destination` is
+/// where the flow goes; `asked`, what the client wrote for it, is the same
+/// unless it was a fake address and `destination` is the name behind it.
 async fn open(
     engine: &Engine,
     association: &Association,
     handle: &Arc<SessionHandle>,
-    to: &Target,
+    destination: &Target,
     asked: &Target,
 ) -> Result<(Arc<Flow>, Arc<Carrier>, Target), SessionOutcome> {
     // Refused before anything is asked of the rules, a name lookup or a `smart`
@@ -578,7 +584,7 @@ async fn open(
         Chosen::DnsFailed => return Err(failed(handle, "dns lookup failed")),
     };
     let ctx = SelectCtx {
-        host: Some(to.host.to_string()),
+        host: Some(destination.host.to_string()),
     };
     let resolution = match resolve_ready(&registry, &policy, &ctx).await {
         Ok(resolution) => resolution,
@@ -615,7 +621,7 @@ async fn open(
     let mut smart = resolution
         .smart
         .clone()
-        .filter(|_| !crate::smart::unsendable(to));
+        .filter(|_| !crate::smart::unsendable(destination));
     if outbound.udp() == UdpSupport::Unsupported {
         match rt.config.general.udp_policy_not_supported_behaviour {
             UdpFallback::Reject => {
@@ -631,7 +637,7 @@ async fn open(
             }
         }
     }
-    let host = to.host.to_string();
+    let host = destination.host.to_string();
     let book = &registry.auto().smart;
     let carrier = match association
         .carriers
@@ -648,12 +654,12 @@ async fn open(
     };
     // within the dial's time, as a TCP session's: a tunnel's DNS waits for
     // the tunnel to come up first
-    let send_to = tokio::time::timeout(CONNECT_TIMEOUT, carrier.socket.resolve(to))
+    let send_to = tokio::time::timeout(CONNECT_TIMEOUT, carrier.socket.resolve(destination))
         .await
         .unwrap_or_else(|_| {
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("looking up {} timed out", to.host),
+                format!("looking up {} timed out", destination.host),
             ))
         })
         .map_err(|e| failed(handle, e.to_string()))?;
@@ -669,12 +675,7 @@ async fn open(
             silence_tells(&send_to),
         );
     }
-    let mut flow = Flow::new(handle.clone(), to.port);
-    if asked != to {
-        flow.asked = asked.clone();
-        flow.swapped = true;
-    }
-    let flow = Arc::new(flow);
+    let flow = Arc::new(Flow::new(handle.clone(), destination.port, asked.clone()));
     carrier.routes.add(send_to.clone(), &flow);
     Ok((flow, carrier, send_to))
 }
@@ -799,6 +800,14 @@ mod tests {
     use rurge_net::BoxFuture;
     use rurge_proto::OutboundError;
 
+    /// A flow of `handle` to `port` that goes where the client wrote: the
+    /// session's destination.
+    fn written_to_the_destination(handle: Arc<SessionHandle>, port: u16) -> Flow {
+        let session = handle.session();
+        let asked = Target::new(session.dst_host.clone(), session.dst_port);
+        Flow::new(handle, port, asked)
+    }
+
     #[test]
     fn which_quic_flows_are_blocked() {
         use BlockQuicGlobal::*;
@@ -843,7 +852,7 @@ mod tests {
     /// `DNS_LINGER` later, though it was already waiting for `FLOW_IDLE`.
     #[tokio::test(start_paused = true)]
     async fn a_dns_flow_ends_soon_after_its_answer() {
-        let flow = Arc::new(Flow::new(
+        let flow = Arc::new(written_to_the_destination(
             SessionHandle::new(
                 1,
                 SessionInfo::udp(rurge_config::HostName::parse("10.0.0.1"), 53),
@@ -875,8 +884,8 @@ mod tests {
             )
         };
         let target = |port| Target::new(rurge_config::HostName::parse("10.0.0.1"), port);
-        let a = Arc::new(Flow::new(handle(1), 1));
-        let b = Arc::new(Flow::new(handle(2), 2));
+        let a = Arc::new(written_to_the_destination(handle(1), 1));
+        let b = Arc::new(written_to_the_destination(handle(2), 2));
         routes.add(target(1), &a);
         routes.add(target(2), &b);
         assert!(Arc::ptr_eq(&routes.flow_for(&target(2)).unwrap().0, &b));
@@ -894,7 +903,7 @@ mod tests {
     fn answers_for_a_name_find_a_flow_on_their_port() {
         let routes = Routes::default();
         let flow = |port| {
-            Arc::new(Flow::new(
+            Arc::new(written_to_the_destination(
                 SessionHandle::new(
                     u64::from(port),
                     SessionInfo::udp(HostName::parse("10.0.0.1"), port),
@@ -922,7 +931,7 @@ mod tests {
     #[test]
     fn which_flow_a_reply_answers() {
         let flow = |id: u16| {
-            Arc::new(Flow::new(
+            Arc::new(written_to_the_destination(
                 SessionHandle::new(
                     u64::from(id),
                     SessionInfo::udp(HostName::parse("10.0.0.1"), 53),
@@ -1075,7 +1084,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_from_a_source_in_ipv6_form_finds_its_flow() {
         let flow = |port: u16| {
-            Arc::new(Flow::new(
+            Arc::new(written_to_the_destination(
                 SessionHandle::new(
                     u64::from(port),
                     SessionInfo::udp(HostName::parse("10.0.0.1"), port),
@@ -1113,7 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn the_client_is_told_what_the_flow_was_written_to() {
         let flow = |name: &str| {
-            Arc::new(Flow::new(
+            Arc::new(written_to_the_destination(
                 SessionHandle::new(1, SessionInfo::udp(HostName::parse(name), 53)),
                 53,
             ))
@@ -1194,7 +1203,10 @@ mod tests {
             ended: CancellationToken::new(),
             done: mpsc::unbounded_channel().0,
         };
-        let flow = Arc::new(Flow::new(SessionHandle::new(1, session), to.port));
+        let flow = Arc::new(written_to_the_destination(
+            SessionHandle::new(1, session),
+            to.port,
+        ));
         let carrier = Carrier {
             outbound: Arc::new(rurge_proto::Reject::new(RejectKind::Reject)),
             socket: Arc::new(Stuck),

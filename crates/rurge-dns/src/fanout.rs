@@ -2,7 +2,10 @@
 //! selected upstream is asked at once, the query is re-sent every `resend`
 //! until `attempts` rounds went out, the first valid answer wins, and "empty"
 //! is reported only when every upstream said so (or some said so and the
-//! rest never answered).
+//! rest never answered). `resolve_name` asks for the address records of a
+//! name and reads them out of the answers. `forward_raw` takes a query of any
+//! type as it came and gives back the reply as it came, for
+//! `Resolver::forward`, which the TUN's DNS responder asks.
 
 use crate::message::{
     Answer, Qtype, Question, Rcode, build_query, parse_response, random_id, set_wire_id, wire_id,

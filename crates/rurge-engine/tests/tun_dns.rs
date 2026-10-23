@@ -156,16 +156,10 @@ async fn socks5_connect(proxy: SocketAddr, to: Ipv4Addr, port: u16) -> (TcpStrea
     (s, reply[1])
 }
 
-/// How many leases the pool holds on its addresses, from the one count that its
-/// `Debug` gives.
+/// How many addresses of the pool hold a lease (`FakeIpPool::leased`): each
+/// session that connected to a fake address holds one until it ends.
 fn leased(rig: &Rig) -> usize {
-    let pool = format!("{:?}", rig.tun.pool().expect("a pool"));
-    let (_, after) = pool.split_once("leased: ").expect("a count of leases");
-    after
-        .split(|c: char| !c.is_ascii_digit())
-        .next()
-        .and_then(|digits| digits.parse().ok())
-        .expect("a number")
+    rig.tun.pool().expect("a pool").leased()
 }
 
 /// Above 65535, so that no port number a log line carries can contain it.
@@ -419,7 +413,9 @@ async fn pre_matching_with_reject_tinygif_escalates_to_silence() {
 #[tokio::test]
 async fn pre_matching_with_reject_no_drop_is_never_upgraded() {
     let (_, answers) = asked_over_and_over("REJECT-NO-DROP").await;
-    let ids: Vec<u16> = answers.iter().map(|answer| answer.id).collect();
+    // every query is answered; the order they come in is no business of this
+    let mut ids: Vec<u16> = answers.iter().map(|answer| answer.id).collect();
+    ids.sort_unstable();
     assert_eq!(ids, (1..=ASKED).collect::<Vec<_>>());
     for answer in &answers {
         assert_eq!(answer.v4, [(Ipv4Addr::new(198, 18, 0, 244), 30)]);

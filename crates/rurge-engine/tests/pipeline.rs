@@ -1175,6 +1175,48 @@ async fn repeated_rejects_escalate_to_drop() {
     }
 }
 
+/// A name refused before there is a connection (a DNS query the virtual adapter
+/// asks the pre-matching rules about) and a session refused after its rule
+/// matched (what a listener hands to `dial`) are counted together towards the
+/// upgrade, by the name: forty-nine queries and then one session are the
+/// fiftieth refusal of the name, whichever way each came, and from there on a
+/// refusal is a drop at either place.
+#[tokio::test]
+async fn refusals_at_the_dns_layer_and_of_sessions_count_together() {
+    use rurge_config::PreMatchLayer;
+    use rurge_proto::RejectKind;
+    use rurge_tun::Hooks;
+    let h = harness(
+        "",
+        "DOMAIN-SUFFIX,ads.test,REJECT,pre-matching",
+        OutboundMode::Rule,
+    )
+    .await;
+    // a query as the DNS layer makes it a session: the name and no port
+    let query = SessionInfo::tcp(HostName::parse("x.ads.test"), 0);
+    let session = || SessionInfo::tcp(HostName::parse("x.ads.test"), 80);
+    let dial = || async {
+        match h.engine.dial(session()).await {
+            Err(DialError::Reject { kind, .. }) => kind,
+            _ => panic!("the session was not refused"),
+        }
+    };
+    for i in 1..rurge_engine::engine::ESCALATE_COUNT {
+        assert_eq!(
+            h.engine.pre_match(PreMatchLayer::Dns, &query),
+            Some(RejectKind::Reject),
+            "query {i}"
+        );
+    }
+    assert_eq!(dial().await, RejectKind::Drop, "the fiftieth refusal");
+    assert_eq!(
+        h.engine.pre_match(PreMatchLayer::Dns, &query),
+        Some(RejectKind::Drop),
+        "the next, at the DNS layer"
+    );
+    assert_eq!(dial().await, RejectKind::Drop, "the next, of a session");
+}
+
 /// Only `REJECT` and `REJECT-TINYGIF` are upgraded to `REJECT-DROP` once a host
 /// has been rejected fifty times: `REJECT-DROP` stays what it is, and
 /// `REJECT-NO-DROP` is never upgraded however often it rejects.

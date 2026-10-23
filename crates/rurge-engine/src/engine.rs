@@ -117,6 +117,32 @@ impl Escalation {
         map.insert(host.to_string(), VecDeque::from([now]));
     }
 
+    /// What a refusal of `session` of `kind` comes to. `REJECT` and
+    /// `REJECT-TINYGIF` count towards the upgrade, by the name or address of the
+    /// destination, and become `REJECT-DROP` once the destination has reached
+    /// the threshold; any other kind stays what it is and counts for nothing.
+    /// A session refused after its rule matched (`connect_session`) and a DNS
+    /// query or a connection refused by pre-matching
+    /// (`Engine::pre_match_refusal`) come this way both, so that they are
+    /// counted together, under one key.
+    pub(crate) fn refusal(
+        &self,
+        session: &SessionInfo,
+        kind: rurge_proto::RejectKind,
+        now: Instant,
+    ) -> rurge_proto::RejectKind {
+        if !kind.escalates() {
+            return kind;
+        }
+        let host = session.dst_host.to_string();
+        self.record(&host, now);
+        if self.should_drop(&host, now) {
+            rurge_proto::RejectKind::Drop
+        } else {
+            kind
+        }
+    }
+
     /// Whether `host` has reached the threshold within the window.
     pub(crate) fn should_drop(&self, host: &str, now: Instant) -> bool {
         let mut map = self.hosts.lock().expect("escalation");
@@ -1509,18 +1535,9 @@ impl Engine {
         }
         match failure.expect("a dial was tried") {
             OutboundError::Reject(kind) => {
-                let effective = if kind.escalates() {
-                    let host = handle.session().dst_host.to_string();
-                    let now = Instant::now();
-                    self.escalation.record(&host, now);
-                    if self.escalation.should_drop(&host, now) {
-                        rurge_proto::RejectKind::Drop
-                    } else {
-                        kind
-                    }
-                } else {
-                    kind
-                };
+                let effective = self
+                    .escalation
+                    .refusal(handle.session(), kind, Instant::now());
                 reject(handle, effective)
             }
             OutboundError::Unsupported(what) => {
@@ -1762,6 +1779,47 @@ mod tests {
         assert!(esc.should_drop("ads.test", t0 + Duration::from_secs(1)));
         assert!(esc.should_drop("ads.test", t0 + Duration::from_millis(29_999)));
         assert!(!esc.should_drop("ads.test", t0 + Duration::from_secs(30)));
+    }
+
+    /// `refusal` counts the kinds that escalate by the destination of the
+    /// session, upgrades the fiftieth within the window, and leaves the other
+    /// kinds as they are without counting them.
+    #[test]
+    fn a_refusal_is_counted_by_the_destination_of_its_session() {
+        use rurge_proto::RejectKind;
+        let esc = Escalation::new();
+        let t0 = std::time::Instant::now();
+        let ads = SessionInfo::tcp(HostName::parse("ads.test"), 80);
+        let other = SessionInfo::tcp(HostName::parse("other.test"), 80);
+        for kind in [RejectKind::Drop, RejectKind::NoDrop] {
+            for _ in 0..(ESCALATE_COUNT + 1) {
+                assert_eq!(esc.refusal(&ads, kind, t0), kind);
+            }
+        }
+        assert_eq!(esc.len(), 0, "a kind that does not escalate is not counted");
+        for i in 0..(ESCALATE_COUNT - 1) {
+            let kind = if i % 2 == 0 {
+                RejectKind::Reject
+            } else {
+                RejectKind::TinyGif
+            };
+            assert_eq!(esc.refusal(&ads, kind, t0), kind, "refusal {i}");
+        }
+        assert_eq!(
+            esc.refusal(&other, RejectKind::Reject, t0),
+            RejectKind::Reject,
+            "another destination has its own count"
+        );
+        assert_eq!(
+            esc.refusal(&ads, RejectKind::TinyGif, t0),
+            RejectKind::Drop,
+            "the fiftieth, of the two kinds together"
+        );
+        assert_eq!(
+            esc.refusal(&ads, RejectKind::Reject, t0 + ESCALATE_WINDOW),
+            RejectKind::Reject,
+            "past the window the count has fallen"
+        );
     }
 
     /// A reject flood to distinct hosts (a retry storm against random

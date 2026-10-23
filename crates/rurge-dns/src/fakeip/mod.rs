@@ -475,6 +475,19 @@ impl FakeIpPool {
         })
     }
 
+    /// How many addresses hold a lease: the indices that have at least one,
+    /// however many leases each has. These are the addresses that are not
+    /// recycled now. Counts only; no name is shown.
+    pub fn leased(&self) -> usize {
+        self.lock().leases.len()
+    }
+
+    /// How many names hold an address, leased or not. Counts only; no name is
+    /// shown.
+    pub fn named(&self) -> usize {
+        self.lock().indices.len()
+    }
+
     /// Keeps the file up to date until `done` completes: when a mapping or
     /// the cursor has changed, the table is written, and then not again for
     /// `every`; changes made meanwhile are written together once it is over.
@@ -916,6 +929,52 @@ mod tests {
         assert_eq!(pool.assign("y1.test", now), Ok(1));
         assert_eq!(pool.address_of("a.test", false), Some(ip4(0)));
         assert_eq!(pool.assign("y2.test", now), Ok(0));
+        assert_eq!(pool.address_of("a.test", false), None);
+    }
+
+    /// `leased` counts the addresses that hold a lease, not the leases: two on
+    /// one address are one. An address is counted from its first lease to its
+    /// last, and a name that has an address without a lease is not counted.
+    #[test]
+    fn leased_counts_the_addresses_that_hold_a_lease() {
+        let pool = Arc::new(FakeIpPool::with_count(3));
+        let now = Instant::now();
+        for name in ["a.test", "b.test", "c.test"] {
+            pool.assign(name, now).unwrap();
+        }
+        assert_eq!(pool.leased(), 0, "an address a name has is not leased");
+        let (_, first) = pool.lease(ip4(0)).unwrap();
+        let (_, second) = pool.lease(ip6(0)).unwrap();
+        assert_eq!(pool.leased(), 1, "two leases on one address");
+        let (_, other) = pool.lease(ip4(2)).unwrap();
+        assert_eq!(pool.leased(), 2);
+        drop(first);
+        assert_eq!(pool.leased(), 2, "the other lease still holds the address");
+        drop(second);
+        assert_eq!(pool.leased(), 1);
+        drop(other);
+        assert_eq!(pool.leased(), 0);
+    }
+
+    /// `named` counts the names that hold an address: one name asked for in
+    /// several spellings is one, a lookup names nothing, and an address that is
+    /// recycled has its new name and no longer its old.
+    #[test]
+    fn named_counts_the_names_that_hold_an_address() {
+        let pool = FakeIpPool::with_count(2);
+        let now = Instant::now();
+        assert_eq!(pool.named(), 0);
+        pool.assign("a.test", now).unwrap();
+        pool.assign("A.TEST.", now).unwrap();
+        assert_eq!(pool.named(), 1);
+        assert_eq!(pool.address_of("nobody.test", false), None);
+        assert_eq!(pool.assign("a..b", now), Err(AssignError::NotAName));
+        assert_eq!(pool.named(), 1, "neither a lookup nor a bad name names");
+        pool.assign("b.test", now).unwrap();
+        assert_eq!(pool.named(), 2);
+        // the pool is full: c takes the address a had
+        pool.assign("c.test", now).unwrap();
+        assert_eq!(pool.named(), 2);
         assert_eq!(pool.address_of("a.test", false), None);
     }
 
