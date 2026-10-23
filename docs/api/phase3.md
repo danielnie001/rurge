@@ -4,7 +4,7 @@
 
 阶段 3 / M2（进程识别，设计 `docs/superpowers/specs/2026-10-17-phase3-m2-process-design.md`，计划 `docs/superpowers/plans/2026-10-17-phase3-m2-process-plan.md`）**没有新增端点**，两个已有端点 `GET /v1/requests/recent` 与 `GET /v1/requests/active` 的每条记录多了两个键 `pid` 与 `processPath`；规则等不到进程时，会话的 `notes` 里多一句说明。下面到「没有覆盖的」为止说的是 M1，M2 在「M2　进程识别」一节。
 
-阶段 3 / M3b（UDP、ICMP、fake-IP 池与引擎接入，计划 `docs/superpowers/plans/2026-10-22-phase3-m3b-udp-icmp-pool-engine-plan.md`）**没有新增端点**：`GET /v1/traffic` 的 `listener` 多了一个键 `tun`，进程查找的 DEBUG 行的字段 `listen_port` 换成了 `remote`，数据目录里多了池的文件 `fake-ip.txt` 与它的三行日志。引擎一侧的 `Engine::start_tun` 只有测试调用，`rurge run` 要到 M4 才起虚拟网卡，所以前两处在今天的 `rurge run` 里是这样的：`tun` 恒为 0，查找行只有监听器的会话；池的文件与它的日志使用者要到 M4 才看得到。见最后一节「M3b　虚拟网卡的 UDP、ICMP 与引擎」。
+阶段 3 / M3b（UDP、ICMP、fake-IP 池与引擎接入，设计 `docs/superpowers/specs/2026-10-18-phase3-m3-tun-core-design.md`，计划 `docs/superpowers/plans/2026-10-22-phase3-m3b-udp-icmp-pool-engine-plan.md`）**没有新增端点**：`GET /v1/traffic` 的 `listener` 多了一个键 `tun`，进程查找的 DEBUG 行的字段 `listen_port` 换成了 `remote`，数据目录里多了池的文件 `fake-ip.txt` 与它的三行日志。引擎一侧的 `Engine::start_tun` 只有测试调用，`rurge run` 要到 M4 才起虚拟网卡，所以前两处在今天的 `rurge run` 里是这样的：`tun` 恒为 0，查找行只有监听器的会话；池的文件与它的日志使用者要到 M4 才看得到。见最后一节「M3b　虚拟网卡的 UDP、ICMP 与引擎」。
 
 ## 端点
 
@@ -269,7 +269,7 @@ SSID、BSSID 与网关从不出现在 INFO 及以上的行里；上表（网络�
 
 ## M3b　虚拟网卡的 UDP、ICMP 与引擎
 
-阶段 3 / M3b 把虚拟网卡的内核（`crates/rurge-tun`）接进引擎（`Engine::start_tun`，`crates/rurge-engine/src/tun.rs`）：经虚拟网卡来的 TCP 连接、UDP 数据报与回显请求照规则与策略走，发往 fake 地址的照它背后的名字走，被拒的 UDP 流以 ICMP"管理上禁止"回答应用。**`Engine::start_tun` 只有测试调用，`rurge run` 要到 M4 才起虚拟网卡**：经虚拟网卡来的会话和下面的池的文件与它的日志，使用者要到 M4 才看得到；前两小节说的两处今天的 `rurge run` 里就有，只是 `tun` 恒为 0、查找行只有监听器的会话。没有新增端点、诊断码或命令行选项，配置格式不变。
+阶段 3 / M3b 把虚拟网卡的内核（`crates/rurge-tun`）接进引擎（`Engine::start_tun`，`crates/rurge-engine/src/tun.rs`）：经虚拟网卡来的 TCP 连接与 UDP 数据报照规则与策略走，发往 fake 地址的照它背后的名字走，被拒的 UDP 流以 ICMP"管理上禁止"回答应用；回显请求不经规则与策略：rurge 自己的地址本地应答，fake 地址先解析它背后的名字、向解析出的地址经 `Pinger` 发出，其余的照原地址经 `Pinger` 发出，`icmp-forwarding = false` 时一律丢弃。**`Engine::start_tun` 只有测试调用，`rurge run` 要到 M4 才起虚拟网卡**：经虚拟网卡来的会话和下面的池的文件与它的日志，使用者要到 M4 才看得到；前两小节说的两处今天的 `rurge run` 里就有，只是 `tun` 恒为 0、查找行只有监听器的会话。没有新增端点、诊断码或命令行选项，配置格式不变。
 
 ### `GET /v1/traffic` 的 `listener.tun`
 
