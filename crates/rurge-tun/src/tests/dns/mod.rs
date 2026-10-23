@@ -25,7 +25,6 @@ use crate::dns::{Ask, DNS_PORT, Responder};
 use crate::testing::FakeResolve;
 use crate::tests::support::{Extras, addr, settings, sock, within};
 use rurge_config::{HostList, Transport};
-use rurge_dns::fakeip::v4_of;
 use rurge_dns::message::{Answer, Rcode, parse_response, wire_rcode, wire_truncated};
 use rurge_dns::testing::query_wire;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -154,24 +153,24 @@ fn assert_empty(reply: &[u8], query: &[u8], rcode: Rcode) {
 }
 
 /// A responder on the fake hooks of `Extras`, with the doubles behind it.
-struct Lab {
+struct ResponderRig {
     responder: Arc<Responder>,
     extras: Extras,
 }
 
-fn lab() -> Lab {
-    lab_with(Extras::default())
+fn responder_rig() -> ResponderRig {
+    responder_rig_with(Extras::default())
 }
 
-fn lab_with(extras: Extras) -> Lab {
+fn responder_rig_with(extras: Extras) -> ResponderRig {
     let responder = Arc::new(Responder::new(extras.hooks.clone(), extras.pool.clone()));
-    Lab { responder, extras }
+    ResponderRig { responder, extras }
 }
 
-impl Lab {
+impl ResponderRig {
     /// A lab whose responder has no pool of fake addresses.
-    fn without_a_pool() -> Lab {
-        lab_with(Extras {
+    fn without_a_pool() -> ResponderRig {
+        responder_rig_with(Extras {
             pool: None,
             ..Extras::default()
         })
@@ -207,14 +206,12 @@ impl Lab {
         self.extras.pool.as_ref()?.address_of(name, v6)
     }
 
-    /// No name has an address: the first address of the pool names nothing.
+    /// No name has an address: the pool, which the lab started with none, names
+    /// nothing. Every test that asks this starts its lab afresh and gives no
+    /// address itself first.
     fn assert_no_address_given(&self) {
         if let Some(pool) = &self.extras.pool {
-            assert_eq!(
-                pool.name_of(IpAddr::V4(v4_of(0))),
-                None,
-                "the responder gave an address"
-            );
+            assert_eq!(pool.named(), 0, "the responder gave an address");
         }
     }
 

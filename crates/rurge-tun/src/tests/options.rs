@@ -15,6 +15,7 @@ const UDP_IDLE: &str = "udp_idle must be at least 1 ms and at most 24 hours";
 const UDP_DNS_IDLE: &str =
     "udp_dns_idle must be at least 1 ms, at most 24 hours and at most udp_idle";
 const DNS_TCP_IDLE: &str = "dns_tcp_idle must be at least 1 ms and at most 24 hours";
+const DNS_TCP_MAX: &str = "dns_tcp_max must be more than zero";
 const ECHO_TIMEOUT: &str = "echo_timeout must be at least 1 ms and at most 24 hours";
 
 /// `options` are refused with `text`, the first that cannot be, and no other.
@@ -27,7 +28,7 @@ fn the_defaults_pass_the_check() {
     assert_eq!(TunOptions::default().check(), Ok(()));
 }
 
-/// Each of the sixteen texts, with what is just past the edge of each range. The
+/// Each of the seventeen texts, with what is just past the edge of each range. The
 /// timers are the stack's to add to its clock: `keep_alive` is at least a
 /// millisecond and `timeout` is more than it, and neither is more than a day,
 /// which is far below where the stack's sums overflow; `udp_idle`,
@@ -162,6 +163,13 @@ fn options_out_of_range_are_refused() {
             DNS_TCP_IDLE,
         );
     }
+    refused(
+        TunOptions {
+            dns_tcp_max: 0,
+            ..TunOptions::default()
+        },
+        DNS_TCP_MAX,
+    );
     for echo_timeout in [Duration::ZERO, MS - Duration::from_micros(1), DAY + MS] {
         refused(
             TunOptions {
@@ -227,6 +235,7 @@ fn the_first_option_out_of_range_is_the_one_reported() {
             max_udp_targets: 0,
             dns_queue: 0,
             dns_tcp_idle: Duration::ZERO,
+            dns_tcp_max: 0,
             echo_timeout: Duration::ZERO,
             max_echoes: 0,
             ..TunOptions::default()
@@ -241,6 +250,7 @@ fn the_first_option_out_of_range_is_the_one_reported() {
             max_udp_targets: 0,
             dns_queue: 0,
             dns_tcp_idle: Duration::ZERO,
+            dns_tcp_max: 0,
             echo_timeout: Duration::ZERO,
             max_echoes: 0,
             ..TunOptions::default()
@@ -254,6 +264,7 @@ fn the_first_option_out_of_range_is_the_one_reported() {
             max_udp_targets: 0,
             dns_queue: 0,
             dns_tcp_idle: Duration::ZERO,
+            dns_tcp_max: 0,
             echo_timeout: Duration::ZERO,
             max_echoes: 0,
             ..TunOptions::default()
@@ -266,6 +277,7 @@ fn the_first_option_out_of_range_is_the_one_reported() {
             max_udp_targets: 0,
             dns_queue: 0,
             dns_tcp_idle: Duration::ZERO,
+            dns_tcp_max: 0,
             echo_timeout: Duration::ZERO,
             max_echoes: 0,
             ..TunOptions::default()
@@ -277,6 +289,7 @@ fn the_first_option_out_of_range_is_the_one_reported() {
             max_udp_targets: 0,
             dns_queue: 0,
             dns_tcp_idle: Duration::ZERO,
+            dns_tcp_max: 0,
             echo_timeout: Duration::ZERO,
             max_echoes: 0,
             ..TunOptions::default()
@@ -287,6 +300,7 @@ fn the_first_option_out_of_range_is_the_one_reported() {
         TunOptions {
             dns_queue: 0,
             dns_tcp_idle: Duration::ZERO,
+            dns_tcp_max: 0,
             echo_timeout: Duration::ZERO,
             max_echoes: 0,
             ..TunOptions::default()
@@ -296,11 +310,21 @@ fn the_first_option_out_of_range_is_the_one_reported() {
     refused(
         TunOptions {
             dns_tcp_idle: Duration::ZERO,
+            dns_tcp_max: 0,
             echo_timeout: Duration::ZERO,
             max_echoes: 0,
             ..TunOptions::default()
         },
         DNS_TCP_IDLE,
+    );
+    refused(
+        TunOptions {
+            dns_tcp_max: 0,
+            echo_timeout: Duration::ZERO,
+            max_echoes: 0,
+            ..TunOptions::default()
+        },
+        DNS_TCP_MAX,
     );
     refused(
         TunOptions {
@@ -341,6 +365,7 @@ fn the_edges_of_the_ranges_pass() {
             udp_bytes: 1,
             max_udp_targets: 1,
             dns_queue: 1,
+            dns_tcp_max: 1,
             max_echoes: 1,
             ..TunOptions::default()
         };

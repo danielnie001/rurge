@@ -8,7 +8,7 @@
 
 use crate::dns::tcp::serve_dns;
 use crate::dns::{Ask, Responder};
-use crate::tcp::{TunStream, Tuple};
+use crate::tcp::{DnsPlace, TunStream, Tuple};
 use crate::{Life, TunOptions};
 use rurge_config::{HostName, ListenerKind, SessionInfo, Transport};
 use rurge_dns::fakeip::Lease;
@@ -69,8 +69,10 @@ impl Serving {
 /// What a connection that was let in is for.
 pub(crate) enum Purpose {
     /// DNS over TCP: the connection is to port 53 of the responder, which
-    /// answers the queries on it itself.
-    Dns,
+    /// answers the queries on it itself. The connection's place among the
+    /// `dns_tcp_max` the TUN serves at once goes with it, and is given back
+    /// when the session ends, or at once if no connection comes of the SYN.
+    Dns(DnsPlace),
     /// A session of the engine's, dialed where the app connected to. The name
     /// is the one behind the address the app connected to, with the lease on
     /// that address, if the address is a fake one: the session is for the name
@@ -122,7 +124,8 @@ pub(crate) async fn serve(
     }
     match purpose {
         // Boxed: its future would make every session's larger, by some 660 bytes (debug build).
-        Purpose::Dns => Box::pin(answer_dns(stream, &serving, tuple, &life)).await,
+        // The place is held to the end of the arm, which is the end of the serving.
+        Purpose::Dns(_place) => Box::pin(answer_dns(stream, &serving, tuple, &life)).await,
         Purpose::Session(name) => dial_and_relay(stream, &serving, tuple, name, &life).await,
     }
 }

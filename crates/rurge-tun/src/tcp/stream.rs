@@ -79,13 +79,14 @@ impl TunStream {
     /// Ends the connection by closing it, gently: the write side is shut down
     /// (a FIN, behind what was written), and what the app still sends is read
     /// and thrown away until the app closes its side too, the connection
-    /// fails, or `limit` has passed. The stream is let go after that, not right
-    /// after the `shutdown`: the drop of a stream resets a connection whose app
-    /// has not closed its side yet (`ShardState::stream_dropped`), and the
-    /// reset takes with it what is still to be sent, the end of the data and the
-    /// FIN. Let go after the app's FIN the connection ends well, and lingers
-    /// until the app has acknowledged ours; let go after `limit` with the app
-    /// still not closed, it is reset.
+    /// fails, or `limit` has passed. This does not let the stream go: the caller
+    /// does, by dropping it once this has returned, and not right after the
+    /// `shutdown`. The drop of a stream resets a connection whose app has not
+    /// closed its side yet (`ShardState::stream_dropped`), and the reset takes
+    /// with it what is still to be sent, the end of the data and the FIN. Let
+    /// go after the app's FIN the connection ends well, and lingers until the
+    /// app has acknowledged ours; let go after `limit` with the app still not
+    /// closed, it is reset.
     pub(crate) async fn close_and_wait_for_the_app(&mut self, limit: Duration) {
         if self.shutdown().await.is_err() {
             return;

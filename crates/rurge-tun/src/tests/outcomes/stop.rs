@@ -73,8 +73,9 @@ async fn stop_resets_every_open_connection() {
 /// has stopped those end, one after the other, and what is left counts nothing:
 /// a test that wants the tasks after a stop reads `live_tasks`. Asking for the
 /// count after a stop is a mistake in the test, and `session_tasks` says so in
-/// a debug build. This asks at once, on a runtime of one thread, where no task
-/// has ended yet and the subtraction still works: only the assertion can fail it.
+/// a debug build. This asks straight after the stop, on a runtime of one
+/// thread, where no task has run yet and so none has ended: the subtraction
+/// would still work, and only the assertion can make the call panic.
 #[cfg(debug_assertions)]
 #[tokio::test]
 #[should_panic(expected = "session_tasks is asked of a TUN that has stopped")]

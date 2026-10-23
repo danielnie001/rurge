@@ -5,17 +5,19 @@
 //! the order they came, with nothing cut short as it is over UDP. It closes the
 //! connection when the app does, when no query has come for `dns_tcp_idle` (the
 //! wait for an answer being forwarded is no part of that), and at a message that
-//! gets no answer at all. The app is the stack of `AppStack`, which reads and
-//! writes the connection; the doubles behind the responder are those of the
-//! other tests here. A connection to a server `hijack-dns` names is an ordinary
-//! one, dialed by the fake dialer.
+//! gets no answer at all. It serves `dns_tcp_max` connections at once: a SYN
+//! over that is reset and counted busy. The app is the stack of `AppStack`,
+//! which reads and writes the connection; the doubles behind the responder are
+//! those of the other tests here. A connection to a server `hijack-dns` names is
+//! an ordinary one, dialed by the fake dialer.
 
 use super::udp::extras_hijacking;
 use super::{A, AAAA, TXT, counts, echoed, id_of, parsed, query, rcode_of, truncated};
+use crate::space::ADAPTER_V4;
 use crate::testing::{AppTcp, ForwardScript, Script, Upstream};
 use crate::tests::log_capture::LogCapture;
 use crate::tests::support::{
-    Extras, WITHIN, addr, eventually, hello, in_five_seconds, sock, within,
+    Extras, WITHIN, addr, eventually, hello, in_five_seconds, is_syn, sock, syn_v4, within,
 };
 use crate::tests::udp::{APP4, Lab, lab_and_extras};
 use crate::{Counters, Ending, TunOptions};
@@ -84,7 +86,8 @@ fn assert_fake_reply(reply: &[u8], id: u16, wanted: IpAddr) {
 }
 
 /// The connection has ended and the TUN let go of it: the app closed its side
-/// too (it is shut down here), no socket is left and no task of a session.
+/// too (it is shut down here), no socket is left and no task of a session, and
+/// the connection's place among `dns_tcp_max` is given back.
 async fn assert_let_go(lab: &Lab, tcp: &mut AppTcp) {
     tcp.shutdown().await.expect("shutdown");
     eventually("the TUN to let the connection go", WITHIN, || {
@@ -94,6 +97,7 @@ async fn assert_let_go(lab: &Lab, tcp: &mut AppTcp) {
     assert_eq!(lab.rig.tun.sockets_counted(), 0);
     assert_eq!(lab.rig.tun.half_open(), 0);
     assert_eq!(lab.rig.tun.budget_in_use(), 0);
+    assert_eq!(lab.rig.tun.dns_connections(), 0, "the place is given back");
 }
 
 /// Two queries in one write on one connection are answered in the order they
@@ -444,6 +448,154 @@ async fn an_app_that_never_closes_is_let_go_after_the_idle_time() {
     assert_eq!(lab.rig.tun.budget_in_use(), 0);
 }
 
+/// The answer is not lost to the close. The app sends a query and a length of
+/// 0, which gets no answer and has the TUN close the connection as soon as it
+/// has written the answer to the query, and then reads nothing for a while. The
+/// TUN's FIN comes behind the answer, and the TUN waits for the app to close its
+/// own side (up to `dns_tcp_idle`) before it lets the stream go: a stream that
+/// is dropped while the app has not closed its side resets the connection
+/// (`ShardState::stream_dropped`), and an app that finds its connection reset
+/// reads nothing of what it took in. So the app finds the answer when it reads,
+/// then the end of the stream, not a reset; this is also what shows that the TUN
+/// waits at all, where `an_app_that_never_closes_is_let_go_after_the_idle_time`
+/// shows that it does not wait for ever.
+///
+/// The one fixed wait of this test is for what must not have happened by the
+/// time the app reads: the reset that a TUN which lets the stream go at once
+/// would send. It crosses the writer and the app's stack in well under a
+/// millisecond, as the other fixed waits here say of their packets; 200 ms is a
+/// margin of some hundred times. A TUN that resets is seen to, not raced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_read_late_is_not_lost_to_the_close() {
+    let (lab, _) = lab_and_extras(TunOptions::default(), Extras::default());
+    let mut tcp = connect(&lab, RESPONDER4).await;
+    let mut bytes = framed(&query(1, "a.test", A));
+    bytes.extend_from_slice(&[0, 0]);
+    tcp.write_all(&bytes).await.expect("write");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let reply = next_message(&mut tcp).await;
+    assert_fake_reply(&reply, 1, lab.fake("a.test", false));
+    assert_closed(&mut tcp).await;
+    assert_let_go(&lab, &mut tcp).await;
+}
+
+/// The TUN serves `dns_tcp_max` connections to the responder at once and no
+/// more. The app has two, with nothing sent on either: a third SYN is answered
+/// with a reset, counted busy, and takes no socket. When the app closes one of
+/// the two the TUN ends the serving of it and the place is free: a new
+/// connection gets through, and a query on it is answered, as one on the
+/// connection that stayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connections_to_the_responder_are_limited() {
+    let (lab, _) = lab_and_extras(
+        TunOptions {
+            dns_tcp_max: 2,
+            ..TunOptions::default()
+        },
+        Extras::default(),
+    );
+    let mut first = connect(&lab, RESPONDER4).await;
+    let mut second = connect(&lab, RESPONDER4).await;
+    let error = within(
+        "the third connection to be refused",
+        lab.rig.app.connect(addr(RESPONDER4)),
+    )
+    .await
+    .expect_err("the third SYN is answered with a reset");
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    assert_eq!(
+        lab.rig.tun.counters(),
+        Counters {
+            busy: 1,
+            ..Counters::default()
+        }
+    );
+    assert_eq!(lab.rig.tun.dns_connections(), 2);
+    assert_eq!(lab.rig.tun.sockets_in_use(), 2, "the third took no socket");
+    assert_eq!(lab.rig.tun.sockets_counted(), 2);
+    assert_eq!(lab.rig.tun.half_open(), 0);
+    // the app closes one of them: the serving of it ends, and its place is free
+    first.shutdown().await.expect("shutdown");
+    eventually("the place to be free", WITHIN, || {
+        lab.rig.tun.dns_connections() == 1
+    })
+    .await;
+    let mut third = connect(&lab, RESPONDER4).await;
+    third
+        .write_all(&framed(&query(1, "a.test", A)))
+        .await
+        .expect("write");
+    assert_fake_reply(
+        &next_message(&mut third).await,
+        1,
+        lab.fake("a.test", false),
+    );
+    // the connection that stayed is served as before
+    second
+        .write_all(&framed(&query(2, "b.test", A)))
+        .await
+        .expect("write");
+    assert_fake_reply(
+        &next_message(&mut second).await,
+        2,
+        lab.fake("b.test", false),
+    );
+    assert_eq!(lab.rig.tun.dns_connections(), 2);
+    assert_eq!(
+        lab.rig.tun.counters().busy,
+        1,
+        "no other SYN was turned away"
+    );
+}
+
+/// A connection takes its place with its SYN, not with its handshake: a SYN
+/// the app never completes holds the one place there is until the stack gives
+/// the half-open connection up (`half_open_timeout`), and then the place is
+/// free. Until then a connection is refused; after it the next gets through
+/// and is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_that_never_completes_gives_its_place_back() {
+    let (lab, _) = lab_and_extras(
+        TunOptions {
+            dns_tcp_max: 1,
+            half_open_timeout: Duration::from_millis(300),
+            ..TunOptions::default()
+        },
+        Extras::default(),
+    );
+    // the app's stack is not given the SYN-ACK, and the handshake stays open
+    let port = 40000;
+    let mut taken = lab.rig.app.divert(port..=port);
+    lab.rig
+        .app
+        .inject(syn_v4(sock(ADAPTER_V4, port), addr(RESPONDER4)));
+    let syn_ack = within("the SYN-ACK", taken.recv())
+        .await
+        .expect("the app's stack goes on handing packets over");
+    assert!(is_syn(&syn_ack), "a SYN-ACK");
+    assert_eq!(lab.rig.tun.dns_connections(), 1);
+    assert_eq!(lab.rig.tun.half_open(), 1);
+    let error = within(
+        "the connection to be refused",
+        lab.rig.app.connect(addr(RESPONDER4)),
+    )
+    .await
+    .expect_err("the one place is the half-open connection's");
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    assert_eq!(lab.rig.tun.counters().busy, 1);
+    // 300 ms after its SYN the TUN gives the connection up
+    eventually("the place to be given back", WITHIN, || {
+        lab.rig.tun.dns_connections() == 0
+    })
+    .await;
+    assert_eq!(lab.rig.tun.half_open(), 0);
+    let mut tcp = connect(&lab, RESPONDER4).await;
+    tcp.write_all(&framed(&query(1, "a.test", A)))
+        .await
+        .expect("write");
+    assert_fake_reply(&next_message(&mut tcp).await, 1, lab.fake("a.test", false));
+}
+
 /// Only port 53 of the responder's addresses has a connection of its own: any
 /// other port is refused, as any other address of rurge's is, and nothing is
 /// asked of the rules or counted.
@@ -554,7 +706,13 @@ async fn a_dns_connection_held_by_the_upstream_ends_at_the_stop() {
     })
     .await;
     assert_eq!(lab.rig.tun.session_tasks(), 1, "the task of the connection");
+    assert_eq!(lab.rig.tun.dns_connections(), 1);
     lab.rig.tun.stop();
     let ending = in_five_seconds("the TUN to end", lab.rig.tun.join()).await;
     assert_eq!(ending, Ending::Stopped);
+    assert_eq!(
+        lab.rig.tun.dns_connections(),
+        0,
+        "the place is given back at the stop"
+    );
 }

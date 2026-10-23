@@ -4,8 +4,8 @@
 //! often the settings are taken, and what is said of a query in the log.
 
 use super::{
-    A, AAAA, Lab, SVCB, TXT, assert_empty, authoritative, echoed, lab, parsed, query, query_opt,
-    tcp4, truncated, udp4, udp6,
+    A, AAAA, ResponderRig, SVCB, TXT, assert_empty, authoritative, echoed, parsed, query,
+    query_opt, responder_rig, tcp4, truncated, udp4, udp6,
 };
 use crate::dns::{MAX_FORWARDS, Responder};
 use crate::testing::{FakeHooks, ForwardScript};
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// whole of it over TCP.
 #[tokio::test]
 async fn a_large_udp_answer_is_truncated() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.extras
         .dns
         .script("big.test", ForwardScript::Echo { pad: 2000 });
@@ -58,7 +58,7 @@ async fn a_large_udp_answer_is_truncated() {
 /// is TC.
 #[tokio::test]
 async fn the_udp_limit_is_the_announced_size_between_512_and_1232() {
-    let lab = lab();
+    let lab = responder_rig();
     let cases = [
         (None, 512),
         (Some(0), 512),
@@ -94,7 +94,7 @@ async fn the_udp_limit_is_the_announced_size_between_512_and_1232() {
 /// as it does any other.
 #[tokio::test]
 async fn a_reply_too_long_for_tcp_gets_servfail() {
-    let lab = lab();
+    let lab = responder_rig();
     let q = query(3, "huge.test", TXT);
     let pad_to = |len: usize| ForwardScript::Echo { pad: len - q.len() };
     lab.extras.dns.script("huge.test", pad_to(65_535));
@@ -124,7 +124,7 @@ async fn a_reply_too_long_for_tcp_gets_servfail() {
 /// are all there.
 #[tokio::test]
 async fn a_large_always_real_ip_answer_is_truncated_over_udp() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.configure("many.test", false);
     let addrs: Vec<IpAddr> = (1..=40)
         .map(|n| IpAddr::V4(Ipv4Addr::new(192, 0, 2, n)))
@@ -154,7 +154,7 @@ async fn a_large_always_real_ip_answer_is_truncated_over_udp() {
 /// Starts `count` queries for `name` of type TXT, each in a task of its own,
 /// over UDP; the tasks give the reply they got.
 fn start_forwards(
-    lab: &Lab,
+    lab: &ResponderRig,
     name: &str,
     count: usize,
 ) -> Vec<tokio::task::JoinHandle<Option<Vec<u8>>>> {
@@ -172,7 +172,7 @@ fn start_forwards(
 /// places are free again.
 #[tokio::test]
 async fn forwards_in_flight_are_capped_at_256() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.extras.dns.script("held.test", ForwardScript::Hold);
     let held = start_forwards(&lab, "held.test", MAX_FORWARDS);
     eventually("256 queries to reach the resolver", WITHIN, || {
@@ -204,7 +204,7 @@ async fn forwards_in_flight_are_capped_at_256() {
 /// held a name still gets its fake address at once.
 #[tokio::test]
 async fn a_fake_answer_does_not_wait_for_forwards() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.extras.dns.script("held.test", ForwardScript::Hold);
     let held = start_forwards(&lab, "held.test", MAX_FORWARDS);
     eventually("256 queries to reach the resolver", WITHIN, || {
@@ -226,7 +226,7 @@ async fn a_fake_answer_does_not_wait_for_forwards() {
 /// forwarded again and not answered SERVFAIL.
 #[tokio::test]
 async fn a_forward_dropped_midway_gives_its_place_back() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.extras.dns.script("held.test", ForwardScript::Hold);
     lab.extras
         .dns
@@ -260,7 +260,7 @@ async fn a_forward_dropped_midway_gives_its_place_back() {
 /// announces 1232 when the query had one, and has none when it had not.
 #[tokio::test]
 async fn an_answer_to_a_query_with_an_opt_has_one_of_1232() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.configure("mapped.test", false);
     lab.extras
         .dns
@@ -364,7 +364,7 @@ async fn the_settings_are_taken_once_for_a_query() {
 #[tokio::test]
 async fn every_query_is_said_in_one_debug_line_and_no_name_above_debug() {
     let log = LogCapture::start();
-    let lab = lab();
+    let lab = responder_rig();
     lab.extras.hooks.script_pre_match(
         PreMatchLayer::Dns,
         HostName::Domain("dropped.test".to_owned()),

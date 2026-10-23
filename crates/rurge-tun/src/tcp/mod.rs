@@ -16,7 +16,7 @@ pub(crate) mod rebuild;
 pub(crate) mod shard;
 pub(crate) mod stream;
 
-pub(crate) use admission::Admission;
+pub(crate) use admission::{Admission, DnsPlace};
 pub(crate) use budget::Budget;
 pub(crate) use shard::Shard;
 pub(crate) use stream::TunStream;

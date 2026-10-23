@@ -64,7 +64,8 @@ pub(crate) enum Reason {
     /// address.
     UnknownFake,
     /// A packet turned away because of a limit: of sockets and half-open
-    /// connections for a SYN, of associations and of destinations for a UDP
+    /// connections for a SYN, and of connections to the responder's port 53
+    /// for a SYN to it, of associations and of destinations for a UDP
     /// datagram, of echo requests in flight for an echo request.
     Busy,
     /// A segment with data past the window the TUN last told of, dropped
@@ -286,7 +287,7 @@ pub(crate) fn rst_for(syn: &[u8]) -> Vec<u8> {
 /// worked out. `None` if it is longer than a packet of the family can carry:
 /// IPv4's packet is at most 65535 bytes, with a header of 20, and IPv6's
 /// payload is at most 65535, with the UDP header in it.
-pub(crate) fn udp_datagram(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
+fn udp_datagram(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
     let longest = if src.is_ipv4() { 65535 - 20 } else { 65535 };
     if UDP_HEADER_LEN + payload.len() > longest {
         return None;

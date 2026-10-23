@@ -95,9 +95,9 @@ pub(crate) fn rig_extras(options: TunOptions, extras: Extras) -> (Rig, Extras) {
     (rig, extras)
 }
 
-/// A rig on a memory device, whose app end is `end`. The TUN is started by
-/// `tun_dialing`, the one place that calls `Tun::start`: a change of what
-/// `Tun::start` takes is a change of that function only.
+/// A rig on `pair`, a memory device and the app's end of it. The TUN is
+/// started by `tun_dialing`, the one place that calls `Tun::start`: a change of
+/// what `Tun::start` takes is a change of that function only.
 pub(crate) fn rig_on(pair: (MemoryDevice, AppEnd), options: TunOptions) -> Rig {
     rig_on_extras(pair, options, &Extras::default())
 }
@@ -129,8 +129,9 @@ pub(crate) fn rig_with(device: Arc<dyn Device>, end: AppEnd, options: TunOptions
     }
 }
 
-/// The TUN half of `rig_on`, on the current runtime: for a test that runs
-/// the app's stack on another one.
+/// A TUN on `device` with the default `Extras`, started on the current
+/// runtime, and the dialer it was started with: no app stack comes with it, for
+/// a test that runs the app's stack on another runtime.
 pub(crate) fn tun_on(device: MemoryDevice, options: TunOptions) -> (TunHandle, Arc<FakeDialer>) {
     tun_with(Arc::new(device), options)
 }

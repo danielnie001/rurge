@@ -258,6 +258,8 @@ pub struct TunOptions {
     pub dns_queue: usize,
     /// How long a TCP connection to the responder's port 53 can go without a query from its app before the TUN closes it (a FIN), and then the longest the TUN waits for the app to close its side too, reading and throwing away what it sends; past that the connection is reset. It is also the longest an answer can wait to be written because the app does not read it; past that the connection is reset. The wait for an answer that is being forwarded is no part of it. The default is that of `udp_dns_idle`. At least 1 ms and at most 24 hours.
     pub dns_tcp_idle: Duration,
+    /// The most TCP connections to the responder's port 53 at once, in the whole TUN, counted from the SYN a shard takes to the end of the connection's serving. A SYN over that is answered with a reset (the limit on resets applies, as it does to the other SYNs turned away) and counted (`busy`). A connection holds at most one query, one answer and the copy of the answer with its length in front, each of up to 64 KiB, so the default bounds what they hold at about 24 MiB. The default is that of a local stub resolver (systemd-resolved takes at most 128 incoming TCP streams). More than zero.
+    pub dns_tcp_max: usize,
     /// How long an echo request waits for its reply before it is given up, counted from when its task begins: resolving the name of a fake address is part of the wait. At least 1 ms and at most 24 hours.
     pub echo_timeout: Duration,
     /// The most echo requests waiting for a reply at once, in the whole TUN. One more is dropped and counted (`busy`). More than zero.
@@ -288,6 +290,7 @@ impl Default for TunOptions {
             max_udp_targets: 1_024,
             dns_queue: 1_024,
             dns_tcp_idle: Duration::from_secs(10),
+            dns_tcp_max: 128,
             echo_timeout: Duration::from_secs(5),
             max_echoes: 1_024,
         }
@@ -356,6 +359,9 @@ impl TunOptions {
         }
         if self.dns_tcp_idle < Duration::from_millis(1) || self.dns_tcp_idle > Self::LONGEST {
             return Err("dns_tcp_idle must be at least 1 ms and at most 24 hours".into());
+        }
+        if self.dns_tcp_max == 0 {
+            return Err("dns_tcp_max must be more than zero".into());
         }
         if self.echo_timeout < Duration::from_millis(1) || self.echo_timeout > Self::LONGEST {
             return Err("echo_timeout must be at least 1 ms and at most 24 hours".into());
@@ -574,6 +580,13 @@ impl TunHandle {
         self.inner.admission.half_open()
     }
 
+    /// The connections to the responder's port 53 the TUN counts against
+    /// `dns_tcp_max`: from the SYN a shard took to the end of the serving.
+    #[cfg(test)]
+    pub(crate) fn dns_connections(&self) -> usize {
+        self.inner.admission.dns_tcp()
+    }
+
     /// What the shards keep of their connections besides the sockets, added
     /// up: every count is 0 once no connection is left behind.
     #[cfg(test)]
@@ -625,7 +638,7 @@ pub struct Counters {
     pub queue_full: u64,
     /// SYNs, UDP datagrams and echo requests to an address of rurge's own space that names nothing; replies from a name that has no address.
     pub unknown_fake: u64,
-    /// SYNs turned away because of the limits on sockets and on half-open connections; UDP datagrams turned away because the dialer had no association to give, or because the session already had its most destinations; echo requests beyond `max_echoes`.
+    /// SYNs turned away because of the limits on sockets and on half-open connections, and SYNs to the responder's port 53 beyond `dns_tcp_max`; UDP datagrams turned away because the dialer had no association to give, or because the session already had its most destinations; echo requests beyond `max_echoes`.
     pub busy: u64,
     /// Segments with data past the window the TUN last told of, dropped because the receive buffer had room.
     pub beyond_window: u64,

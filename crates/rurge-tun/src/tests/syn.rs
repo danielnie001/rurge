@@ -296,6 +296,54 @@ fn claims_at_once_keep_to_the_caps() {
     }
 }
 
+/// The same for the places among the connections to the responder: shards
+/// that claim at once are given as many as `dns_tcp_max` allows, and a place
+/// that is dropped is given back to the count.
+#[test]
+fn claims_of_dns_places_at_once_keep_to_the_cap() {
+    const ROUNDS: usize = 100;
+    const THREADS: usize = 16;
+    for round in 0..ROUNDS {
+        let options = TunOptions {
+            dns_tcp_max: 5,
+            ..TunOptions::default()
+        };
+        let admission = Arc::new(Admission::new(
+            Arc::new(Life::default()),
+            Arc::new(Stats::default()),
+            &options,
+        ));
+        let ready = AtomicUsize::new(0);
+        let go = AtomicBool::new(false);
+        let places: Vec<_> = std::thread::scope(|scope| {
+            let claimers: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        ready.fetch_add(1, Ordering::AcqRel);
+                        while !go.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        admission.claim_dns_tcp()
+                    })
+                })
+                .collect();
+            while ready.load(Ordering::Acquire) < THREADS {
+                std::thread::yield_now();
+            }
+            go.store(true, Ordering::Release);
+            claimers
+                .into_iter()
+                .filter_map(|claimer| claimer.join().expect("a claimer"))
+                .collect()
+        });
+        assert_eq!(places.len(), 5, "round {round}: the claims that succeeded");
+        assert_eq!(admission.dns_tcp(), 5, "round {round}: the places counted");
+        drop(places);
+        assert_eq!(admission.dns_tcp(), 0, "round {round}: all given back");
+        assert!(admission.claim_dns_tcp().is_some(), "round {round}");
+    }
+}
+
 // ---- one shard, its turns taken by hand
 
 const DST: &str = "192.0.2.1:80";
@@ -501,6 +549,140 @@ fn a_syn_smoltcp_does_not_take_leaves_nothing() {
     assert_eq!(lone.admission.sockets(), 0);
     assert_eq!(lone.admission.half_open(), 0);
     assert_eq!(lone.stats.counters(), Counters::default());
+}
+
+/// The connections to the responder's port 53 have a cap of their own,
+/// `dns_tcp_max`, met after the caps on sockets and half-open connections: a
+/// SYN over it is answered with a reset, counted as busy, and gives back the
+/// places it claimed in those caps. A place held by a connection comes back
+/// when the session of the connection lets it go (here, when the `Opened` that
+/// holds it is dropped), and the next SYN takes it.
+#[test]
+fn a_syn_to_the_responder_over_dns_tcp_max_is_reset_and_holds_nothing() {
+    let epoch = Instant::now();
+    let options = TunOptions {
+        dns_tcp_max: 2,
+        ..TunOptions::default()
+    };
+    let lone = lone_shard(&options, epoch);
+    let responder = addr("198.18.0.2:53");
+    let mut first = lone.shard.state().turn(
+        epoch,
+        &mut vec![
+            syn_v4(app4(40000), responder),
+            syn_v4(app4(40001), responder),
+        ],
+    );
+    assert_eq!(first.opened.len(), 2);
+    assert_eq!(lone.admission.dns_tcp(), 2);
+    // the third: a reset, one busy, and nothing is held for it
+    let app = app4(40002);
+    let turn = lone
+        .shard
+        .state()
+        .turn(epoch, &mut vec![syn_v4(app, responder)]);
+    assert!(turn.opened.is_empty());
+    assert_eq!(turn.out.len(), 1);
+    assert_reset(&turn.out[0], responder, app);
+    assert_eq!(
+        lone.stats.counters(),
+        Counters {
+            busy: 1,
+            ..Counters::default()
+        }
+    );
+    assert_eq!(lone.admission.dns_tcp(), 2);
+    assert_eq!(lone.admission.sockets(), 2, "no socket for the third");
+    assert_eq!(lone.admission.half_open(), 2, "no half-open place either");
+    assert_eq!(lone.shard.state().socket_count(), 2);
+    // a place that is given back is the next SYN's
+    drop(first.opened.pop());
+    assert_eq!(lone.admission.dns_tcp(), 1);
+    let app = app4(40003);
+    let turn = lone
+        .shard
+        .state()
+        .turn(epoch, &mut vec![syn_v4(app, responder)]);
+    assert_eq!(turn.opened.len(), 1);
+    assert_eq!(lone.admission.dns_tcp(), 2);
+    assert_eq!(lone.stats.counters().busy, 1);
+}
+
+/// The cap is on the connections to port 53 of the responder, and on those
+/// alone: a connection to another port of it is turned away as it always was,
+/// and holds no place; one to port 53 of an address that is not rurge's is no
+/// DNS connection (`hijack-dns` is for UDP) and takes none, however many of
+/// the others there are.
+#[test]
+fn only_connections_to_the_responders_port_53_take_a_dns_place() {
+    let epoch = Instant::now();
+    let options = TunOptions {
+        dns_tcp_max: 1,
+        ..TunOptions::default()
+    };
+    let lone = lone_shard(&options, epoch);
+    let (responder, other_port, far) = (
+        addr("198.18.0.2:53"),
+        addr("198.18.0.2:54"),
+        addr("192.0.2.53:53"),
+    );
+    let mut syns = vec![
+        syn_v4(app4(40000), other_port),
+        syn_v4(app4(40001), far),
+        syn_v4(app4(40002), far),
+    ];
+    let turn = lone.shard.state().turn(epoch, &mut syns);
+    assert_eq!(turn.opened.len(), 2, "the two to the far address");
+    assert_eq!(lone.admission.dns_tcp(), 0);
+    // and with the one place taken, those still go through
+    let dns = lone
+        .shard
+        .state()
+        .turn(epoch, &mut vec![syn_v4(app4(40003), responder)]);
+    assert_eq!(dns.opened.len(), 1);
+    assert_eq!(lone.admission.dns_tcp(), 1);
+    let more = lone.shard.state().turn(
+        epoch,
+        &mut vec![syn_v4(app4(40004), far), syn_v4(app4(40005), other_port)],
+    );
+    assert_eq!(more.opened.len(), 1, "the far address is still let in");
+    assert_eq!(lone.admission.dns_tcp(), 1);
+}
+
+/// A SYN to the responder that smoltcp does not take (an MSS of 0) makes no
+/// connection, and the place it claimed in the cap on the responder's
+/// connections goes back with the rest: the one place there is can still be
+/// had.
+#[test]
+fn a_syn_to_the_responder_smoltcp_does_not_take_gives_its_place_back() {
+    let epoch = Instant::now();
+    let options = TunOptions {
+        dns_tcp_max: 1,
+        ..TunOptions::default()
+    };
+    let lone = lone_shard(&options, epoch);
+    let (app, responder) = (app4(40000), addr("198.18.0.2:53"));
+    let repr = TcpRepr {
+        control: TcpControl::Syn,
+        seq_number: TcpSeqNumber(1),
+        max_seg_size: Some(0),
+        ..tcp_repr(app, responder, &[])
+    };
+    let turn = lone
+        .shard
+        .state()
+        .turn(epoch, &mut vec![tcp_packet(app, responder, &repr)]);
+    assert!(turn.opened.is_empty());
+    assert_eq!(lone.admission.dns_tcp(), 0);
+    assert_eq!(lone.admission.sockets(), 0);
+    assert_eq!(lone.admission.half_open(), 0);
+    assert_eq!(lone.stats.counters(), Counters::default());
+    let turn = lone
+        .shard
+        .state()
+        .turn(epoch, &mut vec![syn_v4(app4(40001), responder)]);
+    assert_eq!(turn.opened.len(), 1, "the place was given back");
+    assert_eq!(lone.admission.dns_tcp(), 1);
 }
 
 /// Eight SYNs to one endpoint in one batch: each is a connection of its own,

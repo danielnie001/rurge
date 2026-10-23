@@ -535,9 +535,11 @@ impl ShardState {
     /// for a name the pool does not have (or the TUN has no pool). In each
     /// case the SYN is turned away with a reset. The responder's port 53 is
     /// where the connection is the responder's (`Purpose::Dns`), and no rule is
-    /// asked about it. Any other SYN has the name behind its address, if it is
-    /// one that stands for a name, with a lease on the address; then the
-    /// pre-matching rules are asked about the connection it would make
+    /// asked about it; it has a place among the `dns_tcp_max` connections the
+    /// TUN serves at once, or the SYN is turned away as busy, with what it took
+    /// in the caps given back. Any other SYN has the name behind its address,
+    /// if it is one that stands for a name, with a lease on the address; then
+    /// the pre-matching rules are asked about the connection it would make
     /// (`refused_by_rules`); and if none refuses it, it is the first of a
     /// connection (`open`), which keeps the lease until its session ends
     /// (design 10.2).
@@ -567,7 +569,13 @@ impl ShardState {
             // the responder's port 53 is a place for a connection of its own,
             // answered by the responder, whatever the rules say of the address
             Place::Responder if dst.port() == DNS_PORT => {
-                return self.open(packet, segment, now, at, opened, Purpose::Dns);
+                // it has a cap of its own: what its connections hold is not in
+                // the budget of the sockets' buffers
+                let Some(place) = self.admission.claim_dns_tcp() else {
+                    self.release_held();
+                    return self.turn_away(&packet, &segment, now, Some(Reason::Busy));
+                };
+                return self.open(packet, segment, now, at, opened, Purpose::Dns(place));
             }
             // every other port of it is not, and no more is the rest of
             // rurge's own

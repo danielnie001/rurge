@@ -5,9 +5,9 @@
 //! to the resolver.
 
 use super::{
-    A, AAAA, HTTPS, Lab, SVCB, TXT, assert_empty, authoritative, counts, echoed, id_of,
-    is_response, lab, lab_with, parsed, query, query_opt, question_of, rcode_of,
-    recursion_available, tcp4, tcp6, udp4, udp6,
+    A, AAAA, HTTPS, ResponderRig, SVCB, TXT, assert_empty, authoritative, counts, echoed, id_of,
+    is_response, parsed, query, query_opt, question_of, rcode_of, recursion_available,
+    responder_rig, responder_rig_with, tcp4, tcp6, udp4, udp6,
 };
 use crate::dns::Ask;
 use crate::space::REFUSED_V4;
@@ -27,7 +27,7 @@ use std::time::Instant;
 /// A reply is not answered, and neither is anything shorter than a header.
 #[tokio::test]
 async fn a_reply_or_a_runt_gets_no_answer() {
-    let lab = lab();
+    let lab = responder_rig();
     let q = query(1, "a.test", A);
     let mut reply = q.clone();
     reply[2] |= 0x80;
@@ -42,7 +42,7 @@ async fn a_reply_or_a_runt_gets_no_answer() {
 /// nothing else, with the ID and RD it came with.
 #[tokio::test]
 async fn a_message_that_does_not_parse_gets_formerr() {
-    let lab = lab();
+    let lab = responder_rig();
     let formerr = |reply: &[u8], id: u16| {
         assert_eq!(reply.len(), 12, "the header only: {reply:?}");
         assert_eq!(id_of(reply), id);
@@ -74,7 +74,7 @@ async fn a_message_that_does_not_parse_gets_formerr() {
 
 #[tokio::test]
 async fn two_questions_get_formerr() {
-    let lab = lab();
+    let lab = responder_rig();
     let mut two = query(9, "a.test", A);
     two[4..6].copy_from_slice(&2u16.to_be_bytes());
     two.extend_from_slice(&query(0, "b.test", A)[12..]);
@@ -89,7 +89,7 @@ async fn two_questions_get_formerr() {
 /// header only, with the opcode the query had.
 #[tokio::test]
 async fn another_opcode_gets_notimp() {
-    let lab = lab();
+    let lab = responder_rig();
     // IQUERY, STATUS, NOTIFY, UPDATE
     for opcode in [1u8, 2, 4, 5] {
         let mut q = query(u16::from(opcode), "a.test", A);
@@ -112,7 +112,7 @@ async fn another_opcode_gets_notimp() {
 /// A class other than IN is NOTIMP, and the answer has the question.
 #[tokio::test]
 async fn another_class_gets_notimp_with_the_question() {
-    let lab = lab();
+    let lab = responder_rig();
     let mut q = query(11, "Class.test", A);
     let end = q.len();
     // CH
@@ -126,7 +126,7 @@ async fn another_class_gets_notimp_with_the_question() {
 /// than IN is NOTIMP, as any name is.
 #[tokio::test]
 async fn the_class_comes_before_the_canary() {
-    let lab = lab();
+    let lab = responder_rig();
     let mut q = query(12, "use-application-dns.net", A);
     let end = q.len();
     // CH
@@ -139,7 +139,7 @@ async fn the_class_comes_before_the_canary() {
 
 #[tokio::test]
 async fn the_canary_is_nxdomain_for_every_type() {
-    let lab = lab();
+    let lab = responder_rig();
     for (id, qtype) in [A, AAAA, TXT].into_iter().enumerate() {
         for ask in [udp4(), tcp6()] {
             let q = query(id as u16, "USE-Application-DNS.net", qtype);
@@ -153,7 +153,7 @@ async fn the_canary_is_nxdomain_for_every_type() {
 /// they came when it is on; the setting is the one in use when the query comes.
 #[tokio::test]
 async fn svcb_and_https_are_notimp_unless_allowed() {
-    let lab = lab();
+    let lab = responder_rig();
     let queries = [query(1, "svc.test", SVCB), query(2, "svc.test", HTTPS)];
     for q in &queries {
         assert_empty(&lab.reply(q, &udp4()).await, q, Rcode::NotImp);
@@ -178,7 +178,7 @@ async fn svcb_and_https_are_notimp_unless_allowed() {
 /// are not allowed it is NXDOMAIN, not NOTIMP.
 #[tokio::test]
 async fn the_canary_comes_before_svcb_and_https() {
-    let lab = lab();
+    let lab = responder_rig();
     for (id, qtype) in [SVCB, HTTPS].into_iter().enumerate() {
         let q = query(id as u16, "use-application-dns.net", qtype);
         assert_empty(&lab.reply(&q, &udp4()).await, &q, Rcode::NxDomain);
@@ -193,7 +193,7 @@ async fn the_canary_comes_before_svcb_and_https() {
 /// and asking again gets the same.
 #[tokio::test]
 async fn a_and_aaaa_get_fake_addresses() {
-    let lab = lab();
+    let lab = responder_rig();
     let a = query(1, "a.test", A);
     let reply = lab.reply(&a, &udp4()).await;
     assert!(is_response(&reply) && authoritative(&reply) && recursion_available(&reply));
@@ -236,7 +236,7 @@ async fn a_and_aaaa_get_fake_addresses() {
 /// it is written in.
 #[tokio::test]
 async fn a_mixed_case_query_gets_its_own_case_back() {
-    let lab = lab();
+    let lab = responder_rig();
     let mixed = query(21, "ExAmPle.TEST", A);
     let plain = query(22, "example.test", A);
     let from_mixed = lab.reply(&mixed, &udp4()).await;
@@ -260,7 +260,7 @@ async fn a_mixed_case_query_gets_its_own_case_back() {
 /// an empty answer, and the pool gives the name nothing.
 #[tokio::test]
 async fn the_family_must_match_the_transport() {
-    let lab = lab();
+    let lab = responder_rig();
     for ask in [udp6(), tcp6()] {
         let a = query(1, "fam.test", A);
         assert_empty(&lab.reply(&a, &ask).await, &a, Rcode::NoError);
@@ -301,7 +301,7 @@ fn dns_session(ask: &Ask, name: &str) -> SessionInfo {
 /// the rule is asked about is the one the query makes.
 #[tokio::test]
 async fn pre_matching_answers_by_kind() {
-    let lab = lab();
+    let lab = responder_rig();
     let blocked = HostName::Domain("blocked.test".to_owned());
     let mut expected = Vec::new();
     for kind in [
@@ -357,7 +357,7 @@ async fn pre_matching_answers_by_kind() {
 /// refuse is not refused for a type it is not asked about.
 #[tokio::test]
 async fn pre_matching_is_asked_only_for_a_and_aaaa() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.configure("", true);
     for name in ["t.test", "use-application-dns.net"] {
         lab.extras.hooks.script_pre_match(
@@ -392,7 +392,7 @@ async fn pre_matching_is_asked_only_for_a_and_aaaa() {
 /// refusal that says nothing is not turned into an empty answer.
 #[tokio::test]
 async fn a_refusal_comes_before_the_family_check() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.extras.hooks.script_pre_match(
         PreMatchLayer::Dns,
         HostName::Domain("x.test".to_owned()),
@@ -411,7 +411,7 @@ async fn a_refusal_comes_before_the_family_check() {
 /// whatever `[Host]` says of it.
 #[tokio::test]
 async fn always_real_ip_answers_from_the_host_section_or_forwards() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.configure(
         "mapped.test, unmapped.test, v6only.test, port.test:443",
         false,
@@ -467,7 +467,7 @@ async fn always_real_ip_answers_from_the_host_section_or_forwards() {
 /// not the addresses, and nothing is forwarded.
 #[tokio::test]
 async fn the_family_check_comes_before_always_real_ip() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.configure("real.test", false);
     lab.extras.dns.map(
         "real.test",
@@ -491,7 +491,7 @@ async fn the_family_check_comes_before_always_real_ip() {
 /// a digit, `-` and `_`, the root) is a question for the upstreams.
 #[tokio::test]
 async fn a_name_the_pool_does_not_take_is_forwarded() {
-    let lab = lab();
+    let lab = responder_rig();
     for (id, name) in ["*.wild.test", "with space.test", "."]
         .into_iter()
         .enumerate()
@@ -505,7 +505,7 @@ async fn a_name_the_pool_does_not_take_is_forwarded() {
 
 #[tokio::test]
 async fn without_a_pool_a_and_aaaa_are_forwarded() {
-    let lab = Lab::without_a_pool();
+    let lab = ResponderRig::without_a_pool();
     let a = query(1, "a.test", A);
     let aaaa = query(2, "a.test", AAAA);
     assert_eq!(lab.reply(&a, &udp4()).await, echoed(&a, 0));
@@ -517,7 +517,7 @@ async fn without_a_pool_a_and_aaaa_are_forwarded() {
 /// on the list that `[Host]` maps still gets its addresses, and is not forwarded.
 #[tokio::test]
 async fn always_real_ip_comes_before_the_lack_of_a_pool() {
-    let lab = Lab::without_a_pool();
+    let lab = ResponderRig::without_a_pool();
     lab.configure("real.test", false);
     let real = Ipv4Addr::new(192, 0, 2, 7);
     lab.extras.dns.map("real.test", &[IpAddr::V4(real)]);
@@ -534,7 +534,7 @@ async fn always_real_ip_comes_before_the_lack_of_a_pool() {
 async fn an_exhausted_pool_gets_servfail_and_one_warn() {
     let log = LogCapture::start();
     let pool = Arc::new(FakeIpPool::with_count(2));
-    let lab = lab_with(Extras {
+    let lab = responder_rig_with(Extras {
         pool: Some(pool.clone()),
         ..Extras::default()
     });
@@ -597,7 +597,7 @@ async fn an_exhausted_pool_gets_servfail_and_one_warn() {
 /// resolver as it came, and what the resolver answers is handed back as it is.
 #[tokio::test]
 async fn other_types_are_forwarded_and_handed_back_as_they_are() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.extras
         .dns
         .script("txt.test", ForwardScript::Echo { pad: 37 });
@@ -618,7 +618,7 @@ async fn other_types_are_forwarded_and_handed_back_as_they_are() {
 
 #[tokio::test]
 async fn a_failed_forward_is_servfail() {
-    let lab = lab();
+    let lab = responder_rig();
     lab.extras.dns.script("down.test", ForwardScript::Fail);
     let txt = query(1, "down.test", TXT);
     assert_empty(&lab.reply(&txt, &udp4()).await, &txt, Rcode::ServFail);

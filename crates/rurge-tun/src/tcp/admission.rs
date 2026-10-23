@@ -1,8 +1,9 @@
 //! What lets a new SYN in (phase 3 M3 design 5.2, 5.4): whether the TUN is
-//! stopping, how many TCP sockets and half-open connections it may have, and
-//! how many resets of its own it may send. All of it is the TUN's, not a
-//! shard's: every shard holds the same `Admission`, so the caps and the limit
-//! hold however the connections fall among the shards.
+//! stopping, how many TCP sockets and half-open connections it may have, how
+//! many connections to the responder's port 53 it serves at once, and how many
+//! resets of its own it may send. All of it is the TUN's, not a shard's: every
+//! shard holds the same `Admission`, so the caps and the limit hold however the
+//! connections fall among the shards.
 
 use crate::limit::Limiter;
 use crate::packet::Reason;
@@ -24,12 +25,29 @@ pub(crate) struct Admission {
     resets: Mutex<Limiter>,
     max_sockets: usize,
     max_half_open: usize,
+    max_dns_tcp: usize,
     /// The TCP sockets of every shard, and among them the connections whose
     /// handshake is not over. A shard raises both when a SYN gets a socket
     /// and lowers them as the connection goes (the half-open one sooner, once
     /// the handshake is over).
     sockets: AtomicUsize,
     half_open: AtomicUsize,
+    /// The connections to the responder's port 53 that hold a [`DnsPlace`].
+    dns_tcp: AtomicUsize,
+}
+
+/// A place among the TCP connections to the responder's port 53 that the TUN
+/// serves at once (`dns_tcp_max`). A shard claims it for a SYN it takes, the
+/// connection's session holds it for as long as it serves the connection, and
+/// it is given back when this is dropped, however the session ends: a
+/// handshake that never completes, the stop, the end of the queries on the
+/// connection. It is claimed without waiting, under the shard's lock.
+pub(crate) struct DnsPlace(Arc<Admission>);
+
+impl Drop for DnsPlace {
+    fn drop(&mut self) {
+        self.0.dns_tcp.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Admission {
@@ -40,8 +58,10 @@ impl Admission {
             resets: Mutex::new(Limiter::new(RESETS, RESETS_WINDOW)),
             max_sockets: options.max_sockets,
             max_half_open: options.max_half_open,
+            max_dns_tcp: options.dns_tcp_max,
             sockets: AtomicUsize::new(0),
             half_open: AtomicUsize::new(0),
+            dns_tcp: AtomicUsize::new(0),
         }
     }
 
@@ -67,6 +87,16 @@ impl Admission {
             return false;
         }
         true
+    }
+
+    /// A place for one more connection to the responder's port 53, in one
+    /// atomic step that tests the cap, or none when `dns_tcp_max` are served
+    /// already. It is claimed after the places `claim` gives, which the shard
+    /// gives back if this answers none.
+    pub(crate) fn claim_dns_tcp(self: &Arc<Self>) -> Option<DnsPlace> {
+        raise(&self.dns_tcp, self.max_dns_tcp)
+            .ok()
+            .map(|_| DnsPlace(self.clone()))
     }
 
     /// The places claimed, given back: no connection came of the SYN.
@@ -132,6 +162,11 @@ impl Admission {
     #[cfg(test)]
     pub(crate) fn half_open(&self) -> usize {
         self.half_open.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dns_tcp(&self) -> usize {
+        self.dns_tcp.load(Ordering::Relaxed)
     }
 }
 
