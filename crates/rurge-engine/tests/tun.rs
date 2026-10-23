@@ -21,9 +21,11 @@
 
 mod common;
 use common::*;
-use rurge_config::HostName;
 use rurge_config::session::{ProcessInfo, SessionInfo, Transport};
+use rurge_config::{HijackTarget, HostName};
 use rurge_dns::fakeip::FILE_NAME;
+use rurge_dns::message::parse_response;
+use rurge_dns::testing::query_wire;
 use rurge_engine::{OwnerLookup, OwnerQuery, RequestRecord};
 use rurge_inbound::{Dialer, UdpClient};
 use rurge_net::BoxFuture;
@@ -33,7 +35,7 @@ use rurge_proto::testing::{echo_server, udp_echo_server};
 use rurge_tun::device::MemoryDevice;
 use rurge_tun::testing::packets::{self, IcmpSeen, UdpSeen};
 use rurge_tun::testing::{AppStack, AppTcp, FakePinger, PingScript};
-use rurge_tun::{Ending, TunHandle, TunOptions};
+use rurge_tun::{Ending, Hooks, TunHandle, TunOptions};
 use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
@@ -883,4 +885,66 @@ async fn an_association_returns_when_closed_and_lets_go_of_its_client() {
         Arc::strong_count(&client) == 1
     })
     .await;
+}
+
+/// The settings the TUN asks the engine for carry what the DNS responder needs
+/// of the generation in use: the profile's `always-real-ip`, `allow-dns-svcb`
+/// and `hijack-dns`, the names `[Host]` maps to addresses, and the upstreams of
+/// the generation's resolver for what is forwarded.
+#[tokio::test]
+async fn the_tuns_settings_carry_the_dns_settings_of_the_profile() {
+    let h = harness(Profile {
+        general: "allow-dns-svcb = true\nhijack-dns = 192.0.2.53:5353, *\nalways-real-ip = real.test, *.cdn.test",
+        hosts: "mapped.test = 192.0.2.7\nalias.test = target.test",
+        ..Profile::default()
+    })
+    .await;
+    let settings = h.engine.settings();
+    assert!(settings.allow_dns_svcb);
+    assert_eq!(
+        settings.hijack_dns,
+        [
+            HijackTarget {
+                addr: Some("192.0.2.53".parse().unwrap()),
+                port: 5353
+            },
+            HijackTarget {
+                addr: None,
+                port: 53
+            }
+        ]
+    );
+    let always_real = |name: &str| {
+        settings
+            .always_real_ip
+            .matches(&HostName::Domain(name.to_owned()), 0)
+    };
+    assert_eq!(always_real("real.test"), Some(true));
+    assert_eq!(always_real("a.cdn.test"), Some(true));
+    assert_eq!(always_real("other.test"), None);
+    // an address `[Host]` maps; neither an alias nor a name it has no line for
+    assert_eq!(
+        settings.dns.mapped("mapped.test"),
+        Some(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))])
+    );
+    assert_eq!(settings.dns.mapped("alias.test"), None);
+    assert_eq!(settings.dns.mapped("target.test"), None);
+    // what is forwarded goes to the upstream of the generation (the harness's
+    // DNS, which knows `target.test`), and comes back with the query's ID
+    let query = query_wire(0x4242, "target.test", 1, None);
+    let reply = tokio::time::timeout(WITHIN, settings.dns.forward(&query))
+        .await
+        .expect("the upstream answers")
+        .expect("a reply");
+    assert_eq!(reply[..2], [0x42, 0x42]);
+    assert_eq!(
+        parse_response(&reply).expect("a reply that reads").v4,
+        [(Ipv4Addr::LOCALHOST, 60)]
+    );
+    // a profile that says nothing of it has the defaults
+    let plain = harness(Profile::default()).await;
+    let settings = plain.engine.settings();
+    assert!(!settings.allow_dns_svcb);
+    assert!(settings.hijack_dns.is_empty());
+    assert!(settings.always_real_ip.is_empty());
 }

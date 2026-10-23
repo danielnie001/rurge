@@ -5,11 +5,15 @@
 use crate::device::{AppEnd, Device, MemoryDevice};
 use crate::stats::Stats;
 use crate::tcp::{Admission, Budget, Shard};
-use crate::testing::{AppStack, AppTcp, FakeDialer, FakeHooks, FakePinger, FakeResolve, pattern};
+use crate::testing::{
+    AppStack, AppTcp, FakeDialer, FakeDns, FakeHooks, FakePinger, FakeResolve, pattern,
+};
 use crate::{Life, Tun, TunHandle, TunOptions, TunSettings};
+use rurge_config::HostList;
 use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
 use rurge_net::BoxFuture;
+use rurge_net::connector::Resolve;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, TcpControl, TcpPacket, TcpRepr,
@@ -38,21 +42,43 @@ pub(crate) struct Extras {
     pub(crate) hooks: Arc<FakeHooks>,
     pub(crate) pinger: Arc<FakePinger>,
     pub(crate) pool: Option<Arc<FakeIpPool>>,
+    /// The `FakeDns` the settings in `hooks` started with, for a test to teach
+    /// names and script replies. Settings a test sets later carry the DNS it
+    /// gives them.
+    pub(crate) dns: Arc<FakeDns>,
 }
 
 impl Default for Extras {
     /// Settings with a resolver that knows no name and `icmp-forwarding` on, a
-    /// pinger that has been scripted nothing (every echo request fails), and a
-    /// pool with no name in it.
+    /// `FakeDns` that maps no name and forwards everything as it came, no
+    /// `always-real-ip`, `allow-dns-svcb` off and no `hijack-dns`; a pinger
+    /// that has been scripted nothing (every echo request fails), and a pool
+    /// with no name in it.
     fn default() -> Extras {
+        let dns = FakeDns::new();
         Extras {
             hooks: FakeHooks::new(TunSettings {
-                resolver: FakeResolve::new(),
-                icmp_forwarding: true,
+                dns: dns.clone(),
+                ..settings(FakeResolve::new(), true)
             }),
             pinger: FakePinger::new(),
             pool: Some(Arc::new(FakeIpPool::new())),
+            dns,
         }
+    }
+}
+
+/// Settings with this `resolver` and `icmp-forwarding`, and the DNS settings
+/// of `Extras::default()` (a `FakeDns` of their own): for a test that is about
+/// the echo requests and writes nothing else of the settings.
+pub(crate) fn settings(resolver: Arc<dyn Resolve>, icmp_forwarding: bool) -> TunSettings {
+    TunSettings {
+        resolver,
+        icmp_forwarding,
+        dns: FakeDns::new(),
+        always_real_ip: HostList::empty(),
+        allow_dns_svcb: false,
+        hijack_dns: Vec::new(),
     }
 }
 

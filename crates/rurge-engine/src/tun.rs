@@ -4,8 +4,10 @@
 //! the data directory and keeps it saved.
 
 use crate::engine::Engine;
+use rurge_config::{PreMatchLayer, SessionInfo};
 use rurge_dns::fakeip::{FILE_NAME, FakeIpPool, Loaded, QUARANTINE, QUARANTINE_COUNT};
 use rurge_inbound::Dialer;
+use rurge_proto::RejectKind;
 use rurge_tun::device::Device;
 use rurge_tun::{Hooks, Pinger, Tun, TunHandle, TunOptions, TunSettings};
 use std::sync::Arc;
@@ -19,6 +21,12 @@ impl Hooks for Engine {
     /// TUN runs is seen by the next thing the TUN asks.
     fn settings(&self) -> Arc<TunSettings> {
         self.runtime().tun.clone()
+    }
+
+    /// Refuses nothing yet: the engine's pre-matching rules are not asked here
+    /// until phase 3 / M3c has wired them.
+    fn pre_match(&self, _layer: PreMatchLayer, _session: &SessionInfo) -> Option<RejectKind> {
+        None
     }
 }
 

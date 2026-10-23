@@ -4,23 +4,35 @@
 //! nowhere).
 
 use crate::{Hooks, Pinger, TunSettings};
+use rurge_config::{HostName, PreMatchLayer, SessionInfo};
 use rurge_net::BoxFuture;
 use rurge_net::connector::Resolve;
+use rurge_proto::RejectKind;
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// `Hooks` whose settings the test sets, as the engine sets them with each
-/// generation it publishes.
+/// generation it publishes, and whose pre-matching rules the test scripts.
 pub struct FakeHooks {
     settings: Mutex<Arc<TunSettings>>,
+    pre_match: Mutex<PreMatches>,
+}
+
+#[derive(Default)]
+struct PreMatches {
+    /// The kind each destination at each layer is refused with.
+    scripts: Vec<(PreMatchLayer, HostName, RejectKind)>,
+    /// Every session `pre_match` was asked about, in order, scripted or not.
+    asked: Vec<(PreMatchLayer, SessionInfo)>,
 }
 
 impl FakeHooks {
     pub fn new(settings: TunSettings) -> Arc<FakeHooks> {
         Arc::new(FakeHooks {
             settings: Mutex::new(Arc::new(settings)),
+            pre_match: Mutex::default(),
         })
     }
 
@@ -28,6 +40,25 @@ impl FakeHooks {
     /// gets them.
     pub fn set(&self, settings: TunSettings) {
         *self.settings.lock().expect("the fake hooks' settings") = Arc::new(settings);
+    }
+
+    fn pre_matches(&self) -> MutexGuard<'_, PreMatches> {
+        self.pre_match.lock().expect("the fake hooks' pre-matching")
+    }
+
+    /// A session at `layer` whose destination is `dst` is refused with `kind`
+    /// from now on; what an earlier call gave the same layer and destination is
+    /// replaced. A session that nothing was scripted for is not refused.
+    pub fn script_pre_match(&self, layer: PreMatchLayer, dst: HostName, kind: RejectKind) {
+        let mut book = self.pre_matches();
+        book.scripts.retain(|(l, d, _)| !(*l == layer && *d == dst));
+        book.scripts.push((layer, dst, kind));
+    }
+
+    /// Every session `pre_match` was asked about, with the layer, in order:
+    /// whatever it answered.
+    pub fn pre_matches_asked(&self) -> Vec<(PreMatchLayer, SessionInfo)> {
+        self.pre_matches().asked.clone()
     }
 }
 
@@ -37,6 +68,15 @@ impl Hooks for FakeHooks {
             .lock()
             .expect("the fake hooks' settings")
             .clone()
+    }
+
+    fn pre_match(&self, layer: PreMatchLayer, session: &SessionInfo) -> Option<RejectKind> {
+        let mut book = self.pre_matches();
+        book.asked.push((layer, session.clone()));
+        book.scripts
+            .iter()
+            .find(|(l, d, _)| *l == layer && *d == session.dst_host)
+            .map(|(_, _, kind)| *kind)
     }
 }
 

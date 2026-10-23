@@ -1,8 +1,8 @@
 //! The fake `Hooks`, the fake resolver and the fake pinger.
 
 use crate::testing::{FakeHooks, FakePinger, FakeResolve, PingScript};
-use crate::tests::support::within;
-use crate::{Hooks, Pinger, TunSettings};
+use crate::tests::support::{settings, within};
+use crate::{Hooks, Pinger};
 use rurge_net::connector::Resolve;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -13,16 +13,10 @@ use tokio::time::timeout;
 /// what it was.
 #[test]
 fn fake_hooks_give_the_settings_that_were_set_last() {
-    let hooks = FakeHooks::new(TunSettings {
-        resolver: FakeResolve::new(),
-        icmp_forwarding: true,
-    });
+    let hooks = FakeHooks::new(settings(FakeResolve::new(), true));
     let before = hooks.settings();
     assert!(before.icmp_forwarding);
-    hooks.set(TunSettings {
-        resolver: FakeResolve::new(),
-        icmp_forwarding: false,
-    });
+    hooks.set(settings(FakeResolve::new(), false));
     assert!(!hooks.settings().icmp_forwarding);
     assert!(before.icmp_forwarding, "the settings handed out before");
 }

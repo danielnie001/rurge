@@ -20,6 +20,11 @@ pub(crate) const ADAPTER_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x6152, 0, 0, 0, 0
 pub(crate) const STACK_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 253);
 pub(crate) const STACK_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x6152, 0, 0, 0, 0, 0, 0xfd);
 
+/// The address `REJECT-NO-DROP` answers an A query with at the DNS layer: one of
+/// rurge's own (`Place::Own`), where a connection is reset and a datagram is
+/// refused.
+pub(crate) const REFUSED_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 244);
+
 /// What the destination of a packet is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Place {

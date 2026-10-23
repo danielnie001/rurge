@@ -2,6 +2,7 @@
 
 mod bench;
 mod budget;
+mod dns;
 mod fake;
 mod filter;
 mod fixture;

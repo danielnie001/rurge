@@ -14,7 +14,7 @@ use super::support::{
 };
 use crate::limit::Limiter;
 use crate::packet::{Reason, rst_for, segment};
-use crate::space::{ADAPTER_V4, ADAPTER_V6, Place, STACK_V4, STACK_V6, place};
+use crate::space::{ADAPTER_V4, ADAPTER_V6, Place, REFUSED_V4, STACK_V4, STACK_V6, place};
 use crate::stats::Stats;
 use crate::tcp::{Admission, Outcome, Tuple};
 use crate::testing::{Direction, Script, Upstream};
@@ -85,6 +85,7 @@ fn places_are_told_by_address() {
     for own in [
         ADAPTER_V4.into(),
         STACK_V4.into(),
+        REFUSED_V4.into(),
         ADAPTER_V6.into(),
         STACK_V6.into(),
     ] {

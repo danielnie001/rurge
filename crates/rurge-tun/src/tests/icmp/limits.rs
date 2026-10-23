@@ -3,8 +3,8 @@
 
 use super::{APP4, APP6, FAR4, FAR6, echoed, ip, lab};
 use crate::testing::PingScript;
-use crate::tests::support::{WITHIN, eventually, in_five_seconds};
-use crate::{Counters, Ending, TunOptions, TunSettings};
+use crate::tests::support::{WITHIN, eventually, in_five_seconds, settings};
+use crate::{Counters, Ending, TunOptions};
 use rurge_dns::fakeip::v4_of;
 use rurge_net::BoxFuture;
 use rurge_net::connector::Resolve;
@@ -59,10 +59,7 @@ async fn the_timeout_counts_the_resolving_too() {
         echo_timeout: Duration::from_millis(300),
         ..TunOptions::default()
     });
-    lab.extras.hooks.set(TunSettings {
-        resolver: Arc::new(Slow),
-        icmp_forwarding: true,
-    });
+    lab.extras.hooks.set(settings(Arc::new(Slow), true));
     lab.extras.pinger.script(FAR4, PingScript::Echo);
     let slow = lab.assign("slow.test");
     lab.ping(APP4, IpAddr::V4(v4_of(slow)), 1, 1, b"anyone?");

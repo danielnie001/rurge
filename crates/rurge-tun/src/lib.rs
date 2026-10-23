@@ -14,6 +14,10 @@
 mod context;
 pub mod device;
 mod dispatch;
+// Nothing builds the responder yet: the UDP and the TCP side of the TUN will
+// (phase 3 / M3c), and until they do it is dead code outside of its tests.
+#[cfg_attr(not(test), allow(dead_code))]
+mod dns;
 mod fragment;
 mod hooks;
 mod icmp;
@@ -28,7 +32,7 @@ pub mod testing;
 mod udp;
 mod writer;
 
-pub use hooks::{Hooks, Pinger, TunSettings};
+pub use hooks::{Hooks, Pinger, TunDns, TunSettings};
 
 use device::Device;
 use rurge_dns::fakeip::FakeIpPool;

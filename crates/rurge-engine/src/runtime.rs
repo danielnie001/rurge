@@ -72,10 +72,17 @@ impl Runtime {
         };
         let mut stack = build_stack(&config, &opts.stack).await?;
         // the adapter's echo requests to a fake address look the name up with
-        // this generation's resolver, and are forwarded as its profile says
+        // this generation's resolver, and are forwarded as its profile says;
+        // its DNS responder asks the same resolver for the names `[Host]`
+        // maps and for the queries it forwards, and answers as the profile
+        // says of `always-real-ip`, `allow-dns-svcb` and `hijack-dns`
         let tun = Arc::new(TunSettings {
             resolver: stack.resolver.clone(),
             icmp_forwarding: config.general.icmp_forwarding,
+            dns: stack.resolver.clone(),
+            always_real_ip: config.general.always_real_ip.clone(),
+            allow_dns_svcb: config.general.allow_dns_svcb,
+            hijack_dns: config.general.hijack_dns.clone(),
         });
         // the engine's cell, not one of this generation's: the network is
         // the machine's, and outlives the profile it is read against

@@ -13,8 +13,8 @@ mod writer_queue;
 use crate::device::{AppEnd, Device, MemoryDevice};
 use crate::testing::packets::{self, IcmpSeen};
 use crate::testing::{AppStack, FakeDialer, FakeResolve};
-use crate::tests::support::{Extras, Rig, WITHIN, eventually, tun_dialing, within};
-use crate::{Counters, TunOptions, TunSettings};
+use crate::tests::support::{Extras, Rig, WITHIN, eventually, settings, tun_dialing, within};
+use crate::{Counters, TunOptions};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,10 +74,7 @@ fn lab_with(options: TunOptions, extras: Extras) -> Lab {
 /// A lab on a device of the test's own, with the app's stack on `end`.
 fn lab_on(device: Arc<dyn Device>, end: AppEnd, options: TunOptions, extras: Extras) -> Lab {
     let resolver = FakeResolve::new();
-    extras.hooks.set(TunSettings {
-        resolver: resolver.clone(),
-        icmp_forwarding: true,
-    });
+    extras.hooks.set(settings(resolver.clone(), true));
     let dialer = FakeDialer::new();
     let tun = tun_dialing(device, dialer.clone(), &extras, options);
     let app = AppStack::start(end);
@@ -113,10 +110,7 @@ impl Lab {
     /// From now on the settings of the generation in use have `icmp-forwarding`
     /// as `on` says.
     fn forwarding(&self, on: bool) {
-        self.extras.hooks.set(TunSettings {
-            resolver: self.resolver.clone(),
-            icmp_forwarding: on,
-        });
+        self.extras.hooks.set(settings(self.resolver.clone(), on));
     }
 
     /// The app sends an echo request.
