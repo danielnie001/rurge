@@ -358,6 +358,18 @@ impl Life {
         self.stop.cancelled()
     }
 
+    /// A token of one relaying session that is cancelled when the TUN stops,
+    /// to wait on in place of [`Life::stopped`]. tokio 1.53.1's `Notified::poll`
+    /// takes the waiter lock of its `Notify` every time it is polled while it
+    /// waits, so every relaying session that waited on the one stop token would
+    /// take one lock, the same for all of them, on every wake-up. A child has a
+    /// `Notify` of its own. `end` cancels the children with the stop token
+    /// before it returns (tokio-util 0.7.19, `tree_node::cancel`), and a child
+    /// made once the TUN has stopped is cancelled already (`child_node`).
+    pub(crate) fn session_stop(&self) -> CancellationToken {
+        self.stop.child_token()
+    }
+
     pub(crate) fn is_stopped(&self) -> bool {
         self.stop.is_cancelled()
     }

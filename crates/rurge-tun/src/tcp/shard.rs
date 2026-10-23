@@ -955,18 +955,35 @@ fn ends_at(now: Instant, after: Duration) -> Instant {
 /// stream is dropped (the connection no longer has it, so `remove` gives back
 /// the send buffer's). Answers how the connection ended, as the socket does
 /// once nothing is left in it: `Closed` if the app's FIN came, `Reset` if not,
-/// so that a socket closed by its own timeout is no clean end of the stream.
-/// The bytes are copied before anything else changes, for the stack is called
-/// here and may panic, and a rebuild finds the connection with all it held.
+/// so that a socket closed by its own timeout before the app's FIN is no clean
+/// end of the stream. It is `Reset` too, whatever the socket says, if the read
+/// failed or took fewer bytes than were queued: a clean end after bytes cut off
+/// without a word would be a truncation the app cannot see (M3b P26), and what
+/// was taken is kept all the same, for it is the app's, in order. The bytes are
+/// copied before anything else changes, for the stack is called here and may
+/// panic, and a rebuild finds the connection with all it held.
 fn keep_unread(socket: &mut tcp::Socket, conn: &mut Conn, budget: &Arc<Budget>) -> Outcome {
-    let mut bytes = vec![0; socket.recv_queue()];
-    // while the receive buffer is not empty smoltcp lets it be read in any
-    // state, so nothing is refused here
-    let taken = socket.recv_slice(&mut bytes).unwrap_or(0);
+    let queued = socket.recv_queue();
+    let mut bytes = vec![0; queued];
+    let read = socket.recv_slice(&mut bytes);
+    // While the receive buffer is not empty smoltcp 0.12 lets it be read in any
+    // state (`may_recv`), so the read takes all of it. A later smoltcp that
+    // does not is what this catches, in a build that checks; the outcome below
+    // is the same in any build.
+    debug_assert_eq!(
+        read,
+        Ok(queued),
+        "the read of a receive buffer that is not empty took less than was queued"
+    );
+    let taken = read.unwrap_or(0);
     bytes.truncate(taken);
-    let outcome = match socket.recv_slice(&mut []) {
-        Err(tcp::RecvError::Finished) => Outcome::Closed,
-        _ => Outcome::Reset,
+    let outcome = if taken < queued {
+        Outcome::Reset
+    } else {
+        match socket.recv_slice(&mut []) {
+            Err(tcp::RecvError::Finished) => Outcome::Closed,
+            _ => Outcome::Reset,
+        }
     };
     if !bytes.is_empty() {
         let share = Sizes {

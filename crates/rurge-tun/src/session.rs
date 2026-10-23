@@ -50,6 +50,14 @@ pub(crate) async fn serve(
     if stream.established().await.is_err() {
         return;
     }
+    // A connection whose handshake ended after the stop signal, before the
+    // shard's last turn, is being reset by that turn. Dialing it would start a
+    // session that the stop cannot cancel (the dial is not raced with the stop,
+    // below) and leave `join` waiting for the dial. Dropping the stream resets
+    // the connection, which is being reset anyway.
+    if life.is_stopped() {
+        return;
+    }
     let (dst_host, _lease) = match name {
         Some((name, lease)) => (HostName::Domain(name), Some(lease)),
         None => (HostName::Ip(tuple.dst.ip()), None),
@@ -74,10 +82,15 @@ pub(crate) async fn serve(
             // cancels the session as well, which a relay ends for whatever it
             // waits on. The relay is then waited for to its end, not dropped:
             // it is what finishes the session's handle, and a handle left
-            // unfinished leaves the session's record open.
+            // unfinished leaves the session's record open. The wait for the
+            // stop is on a token of this session's own, a child of the stop
+            // token (`Life::session_stop`), not on the stop token itself: that
+            // one is polled at every wake-up of every relaying session, under
+            // a lock that all of them share.
+            let stop = life.session_stop();
             let stopped = tokio::select! {
                 biased;
-                _ = life.stopped() => true,
+                _ = stop.cancelled() => true,
                 _ = &mut relay => false,
             };
             if stopped {

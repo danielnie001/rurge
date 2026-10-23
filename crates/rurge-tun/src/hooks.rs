@@ -20,7 +20,11 @@ pub trait Hooks: Send + Sync {
 pub struct TunSettings {
     /// Resolves a fake address's name for an echo request.
     pub resolver: Arc<dyn Resolve>,
-    /// `icmp-forwarding`: echo requests to addresses other than rurge's own are forwarded.
+    /// `icmp-forwarding`, asked for each echo request. When true, an echo
+    /// request to an address of rurge's own is answered by the TUN and any
+    /// other is forwarded through the [`Pinger`] (one to a fake address, to the
+    /// address of its name). When false, every echo request is dropped and
+    /// counted `unsupported`, those to rurge's own addresses too.
     pub icmp_forwarding: bool,
 }
 
