@@ -1,6 +1,7 @@
 //! In-process mock DNS servers for tests: one UDP socket and one TCP (or
-//! TLS) listener on the same port, with per-name answers and programmable
-//! misbehaviour (delay, drops, truncation, error codes) — and DNS over QUIC
+//! TLS) listener on the same port, with per-name answers (addresses, a TXT
+//! record, an error code) for a question of any type and programmable
+//! misbehaviour (delay, drops, truncation) — and DNS over QUIC
 //! and over HTTP/3 servers that answer from such a table (`quic`), and an
 //! upstream that asks one in memory (`MockDns::upstream`).
 
@@ -11,8 +12,11 @@ pub use quic::{
     RecordedStop,
 };
 
-use crate::message::{Qtype, Question, Rcode, build_response, parse_query};
+use crate::message::{Qtype, Question, Rcode};
 use crate::upstream::{Upstream, UpstreamError, UpstreamRef};
+use hickory_proto::op::{Message, MessageType, OpCode};
+use hickory_proto::rr::rdata::{A, AAAA, TXT};
+use hickory_proto::rr::{RData, Record};
 use rurge_net::BoxFuture;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -39,12 +43,15 @@ enum Behaviour {
 #[derive(Default)]
 struct State {
     names: HashMap<String, Behaviour>,
+    /// The text of the TXT record of a name; a name that has one is known.
+    txt: HashMap<String, String>,
     delay: Duration,
     drop_all: bool,
     drop_first: usize,
     drop_qtype: HashSet<Qtype>,
     truncate_udp: bool,
     queries: Vec<(Question, String)>,
+    wires: Vec<Vec<u8>>,
 }
 
 pub struct MockDns {
@@ -68,12 +75,102 @@ fn norm(name: &str) -> String {
     name.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Decide the reply for one query: `None` = drop.
+/// The TXT answers of `reply`, each as the text of its character-strings
+/// joined: what a test asks of the reply to a TXT question.
+#[cfg(test)]
+pub(crate) fn txt_answers(reply: &[u8]) -> Vec<String> {
+    let message = Message::from_vec(reply).expect("a reply that reads");
+    message
+        .answers
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::TXT(txt) => Some(
+                txt.txt_data
+                    .iter()
+                    .map(|part| String::from_utf8_lossy(part).into_owned())
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A standard query (RD set) with `id`, for `name` — in the case it is
+/// written, with or without the trailing dot — of the type `qtype` and the
+/// class IN; with an OPT record that announces `udp_size` when that is given.
+pub fn query_wire(id: u16, name: &str, qtype: u16, udp_size: Option<u16>) -> Vec<u8> {
+    let mut wire = id.to_be_bytes().to_vec();
+    // RD
+    wire.extend_from_slice(&[0x01, 0x00]);
+    // QDCOUNT is 1, ANCOUNT and NSCOUNT 0, ARCOUNT 1 for the OPT record
+    wire.extend_from_slice(&1u16.to_be_bytes());
+    wire.extend_from_slice(&[0; 4]);
+    wire.extend_from_slice(&u16::from(udp_size.is_some()).to_be_bytes());
+    for label in name
+        .trim_end_matches('.')
+        .split('.')
+        .filter(|l| !l.is_empty())
+    {
+        wire.push(u8::try_from(label.len()).expect("a label of at most 63 bytes"));
+        wire.extend_from_slice(label.as_bytes());
+    }
+    wire.push(0);
+    wire.extend_from_slice(&qtype.to_be_bytes());
+    wire.extend_from_slice(&1u16.to_be_bytes());
+    if let Some(size) = udp_size {
+        // the root name, OPT, the size where the class goes, no flags, no data
+        wire.extend_from_slice(&[0, 0, 41]);
+        wire.extend_from_slice(&size.to_be_bytes());
+        wire.extend_from_slice(&[0; 6]);
+    }
+    wire
+}
+
+/// The TTL of a TXT record.
+const TXT_TTL: u32 = 60;
+
+/// The address `ip` as the record of its own family.
+fn address(ip: IpAddr) -> RData {
+    match ip {
+        IpAddr::V4(a) => RData::A(A(a)),
+        IpAddr::V6(a) => RData::AAAA(AAAA(a)),
+    }
+}
+
+/// `text` as a TXT record, in character-strings of at most 255 bytes.
+fn txt_record(text: &str) -> RData {
+    let strings: Vec<&[u8]> = if text.is_empty() {
+        vec![&[]]
+    } else {
+        text.as_bytes().chunks(255).collect()
+    };
+    RData::TXT(TXT::from_bytes(strings))
+}
+
+/// Decide the reply for one query, of whatever type: `None` = drop. Every
+/// message is kept, those that are no query too; of the questions, those of
+/// type A and AAAA are counted. The reply echoes the question as it was
+/// asked.
 fn respond(state: &Arc<Mutex<State>>, wire: &[u8], transport: &str) -> Option<(Duration, Vec<u8>)> {
-    let (id, q) = parse_query(wire).ok()?;
     let mut st = state.lock().expect("mock state");
-    st.queries.push((q.clone(), transport.to_string()));
-    if st.drop_all || st.drop_qtype.contains(&q.qtype) {
+    st.wires.push(wire.to_vec());
+    let message = Message::from_vec(wire).ok()?;
+    let query = message.queries.first()?.clone();
+    let qtype = u16::from(query.query_type);
+    let name = norm(&query.name.to_ascii());
+    let counted = match qtype {
+        1 => Some(Qtype::A),
+        28 => Some(Qtype::Aaaa),
+        _ => None,
+    };
+    if let Some(qtype) = counted {
+        let question = Question {
+            name: name.clone(),
+            qtype,
+        };
+        st.queries.push((question, transport.to_string()));
+    }
+    if st.drop_all || counted.is_some_and(|qtype| st.drop_qtype.contains(&qtype)) {
         return None;
     }
     if st.drop_first > 0 {
@@ -81,22 +178,44 @@ fn respond(state: &Arc<Mutex<State>>, wire: &[u8], transport: &str) -> Option<(D
         return None;
     }
     let truncate = st.truncate_udp && transport == "udp";
-    let (rcode, records): (Rcode, Vec<(IpAddr, u32)>) = match st.names.get(&q.name) {
-        Some(Behaviour::Records { v4, v6, ttl }) => {
-            let list = match q.qtype {
-                Qtype::A => v4,
-                Qtype::Aaaa => v6,
-            };
-            (Rcode::NoError, list.iter().map(|ip| (*ip, *ttl)).collect())
-        }
-        Some(Behaviour::Empty) => (Rcode::NoError, Vec::new()),
+    let behaviour = st.names.get(&name);
+    let text = st.txt.get(&name);
+    let (rcode, records): (Rcode, Vec<(RData, u32)>) = match behaviour {
         Some(Behaviour::Rcode(rc)) => (*rc, Vec::new()),
-        None => (Rcode::NxDomain, Vec::new()),
+        None if text.is_none() => (Rcode::NxDomain, Vec::new()),
+        _ => {
+            let records = match (qtype, behaviour) {
+                (1, Some(Behaviour::Records { v4, ttl, .. })) => {
+                    v4.iter().map(|ip| (address(*ip), *ttl)).collect()
+                }
+                (28, Some(Behaviour::Records { v6, ttl, .. })) => {
+                    v6.iter().map(|ip| (address(*ip), *ttl)).collect()
+                }
+                (16, _) => text
+                    .map(|text| vec![(txt_record(text), TXT_TTL)])
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            (Rcode::NoError, records)
+        }
     };
     let delay = st.delay;
     drop(st);
-    let bytes = build_response(id, &q, rcode, &records, truncate).ok()?;
-    Some((delay, bytes))
+    let mut reply = Message::new(message.id, MessageType::Response, OpCode::Query);
+    reply.metadata.recursion_desired = true;
+    reply.metadata.recursion_available = true;
+    reply.metadata.response_code = rcode.to_hickory();
+    reply.metadata.truncation = truncate;
+    let owner = query.name.clone();
+    reply.add_query(query);
+    if !truncate {
+        for (data, ttl) in records {
+            reply
+                .answers
+                .push(Record::from_rdata(owner.clone(), ttl, data));
+        }
+    }
+    Some((delay, reply.to_vec().ok()?))
 }
 
 /// What `MockDns::start` panics with when no try found a port: the last error
@@ -292,6 +411,17 @@ impl MockDns {
             .insert(norm(name), Behaviour::Rcode(rcode));
     }
 
+    /// The TXT record `text` for `name` (the one answer to a TXT question; a
+    /// name that has only this is known, and its address questions are
+    /// answered with no records).
+    pub fn set_txt(&self, name: &str, text: &str) {
+        self.state
+            .lock()
+            .expect("mock state")
+            .txt
+            .insert(norm(name), text.to_string());
+    }
+
     pub fn set_delay(&self, delay: Duration) {
         self.state.lock().expect("mock state").delay = delay;
     }
@@ -319,6 +449,12 @@ impl MockDns {
 
     pub fn queries(&self) -> Vec<(Question, String)> {
         self.state.lock().expect("mock state").queries.clone()
+    }
+
+    /// Every message the mock received, whatever it was, by whichever path
+    /// it came: over UDP, over TCP or in memory.
+    pub fn wires(&self) -> Vec<Vec<u8>> {
+        self.state.lock().expect("mock state").wires.clone()
     }
 
     pub fn query_count(&self, name: &str, qtype: Qtype) -> usize {
@@ -411,7 +547,7 @@ fn tls_acceptor() -> TlsAcceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{build_query, parse_response};
+    use crate::message::{build_query, parse_response, wire_id, wire_question, wire_rcode};
     use tokio::net::TcpStream;
 
     fn q(name: &str, qtype: Qtype) -> Question {
@@ -517,6 +653,101 @@ mod tests {
         assert_eq!(m.query_count("a.test", Qtype::Aaaa), 1);
         assert_eq!(m.queries().len(), 3);
         assert_eq!(m.queries()[1].1, "tcp");
+    }
+
+    /// The mock answers a question of any type: the addresses it was given
+    /// for A and AAAA, the TXT record it was given for TXT, no records for
+    /// another type of a name it knows, NXDOMAIN for a name it does not, and
+    /// the code it was told to give for every type; the question comes back
+    /// as it was asked. Every message it gets is kept, whichever way it came
+    /// in, and the questions it counts are still those of A and AAAA.
+    #[tokio::test]
+    async fn mock_dns_answers_other_types() {
+        const TXT: u16 = 16;
+        const MX: u16 = 15;
+        let m = MockDns::spawn().await;
+        m.set("known.test", &["10.0.0.1"], &[], 42);
+        m.set_txt("known.test", "hello");
+        m.set("addresses-only.test", &["10.0.0.2"], &[], 42);
+        m.set_txt("text-only.test", "just text");
+        m.set_txt("long.test", &"x".repeat(600));
+        m.set_rcode("broken.test", Rcode::ServFail);
+        m.set_txt("broken.test", "unheard");
+        let ask = |name: &str, qtype: u16| {
+            let wire = query_wire(9, name, qtype, None);
+            let m = &m;
+            async move { udp_ask(m.addr(), &wire).await.expect("a reply") }
+        };
+
+        let reply = ask("known.test", TXT).await;
+        assert_eq!(wire_rcode(&reply), Some(Rcode::NoError));
+        assert_eq!(wire_id(&reply), Some(9));
+        assert_eq!(txt_answers(&reply), ["hello"]);
+        let reply = ask("known.test", MX).await;
+        assert_eq!(wire_rcode(&reply), Some(Rcode::NoError));
+        assert!(txt_answers(&reply).is_empty() && parse_response(&reply).unwrap().v4.is_empty());
+        let a = parse_response(&ask("known.test", 1).await).unwrap();
+        assert_eq!(a.v4, vec![("10.0.0.1".parse().unwrap(), 42)]);
+        // a name known by its addresses has no text, one known by its text no address
+        let reply = ask("addresses-only.test", TXT).await;
+        assert_eq!(wire_rcode(&reply), Some(Rcode::NoError));
+        assert!(txt_answers(&reply).is_empty());
+        let reply = ask("text-only.test", 1).await;
+        assert_eq!(wire_rcode(&reply), Some(Rcode::NoError));
+        assert!(parse_response(&reply).unwrap().v4.is_empty());
+        assert_eq!(
+            txt_answers(&ask("text-only.test", TXT).await),
+            ["just text"]
+        );
+        // text longer than a character-string holds comes back whole
+        assert_eq!(txt_answers(&ask("long.test", TXT).await), ["x".repeat(600)]);
+        // a name it does not know, of any type
+        for qtype in [1, TXT, MX] {
+            let reply = ask("unknown.test", qtype).await;
+            assert_eq!(wire_rcode(&reply), Some(Rcode::NxDomain), "type {qtype}");
+            assert!(txt_answers(&reply).is_empty());
+        }
+        // a code that was set is the code of every type
+        for qtype in [1, 28, TXT, MX] {
+            let reply = ask("broken.test", qtype).await;
+            assert_eq!(wire_rcode(&reply), Some(Rcode::ServFail), "type {qtype}");
+            assert!(txt_answers(&reply).is_empty());
+        }
+
+        // the question comes back as it was asked, the case of the name too
+        let wire = query_wire(10, "KnOwN.TeSt", TXT, None);
+        let reply = udp_ask(m.addr(), &wire).await.unwrap();
+        assert_eq!(reply[12..wire.len()], wire[12..]);
+        assert_eq!(
+            wire_question(&reply),
+            Some(("known.test".to_string(), TXT, 1))
+        );
+        assert_eq!(txt_answers(&reply), ["hello"]);
+
+        // every message is kept, over TCP and in memory too, in the order it came
+        let before = m.wires().len();
+        let over_tcp = query_wire(11, "known.test", TXT, None);
+        let mut tcp = TcpStream::connect(m.addr()).await.unwrap();
+        assert_eq!(txt_answers(&tcp_ask(&mut tcp, &over_tcp).await), ["hello"]);
+        let in_memory = query_wire(12, "known.test", TXT, None);
+        let reply = m
+            .upstream()
+            .query(&in_memory, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(txt_answers(&reply), ["hello"]);
+        let wires = m.wires();
+        assert_eq!(wires.len(), before + 2);
+        assert_eq!(wires[before..], [over_tcp, in_memory]);
+        assert_eq!(wires[0], query_wire(9, "known.test", TXT, None));
+        // of the questions, the A and AAAA ones were counted, and no others:
+        // the five that asked for an address
+        assert_eq!(m.queries().len(), 5);
+        assert_eq!(m.query_count("known.test", Qtype::A), 1);
+        assert_eq!(m.query_count("text-only.test", Qtype::A), 1);
+        assert_eq!(m.query_count("unknown.test", Qtype::A), 1);
+        assert_eq!(m.query_count("broken.test", Qtype::A), 1);
+        assert_eq!(m.query_count("broken.test", Qtype::Aaaa), 1);
     }
 
     #[tokio::test]

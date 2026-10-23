@@ -1,15 +1,18 @@
 //! DNS over UDP (design §7.2): one connected socket per upstream, a receive
 //! loop that routes answers to waiters by message ID (so several queries can
-//! be in flight at once), and one retry over TCP when the answer is truncated.
-//! An upstream `via` a connector sends its questions, and the retry, through
-//! it (`dns-follow-interface`, phase 2 M5 design 8.5).
+//! be in flight at once, each under an ID of its own: a query that comes with
+//! an ID another one in flight has is sent under another), and one retry over
+//! TCP when the answer is truncated. An upstream `via` a connector sends its
+//! questions, and the retry, through it (`dns-follow-interface`, phase 2 M5
+//! design 8.5).
 
 use super::tcp::exchange_framed;
 use super::{Upstream, UpstreamError};
-use crate::message::{wire_id, wire_truncated};
+use crate::message::{random_id, set_wire_id, wire_id, wire_truncated};
 use rurge_config::HostName;
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedDatagram, BoxedStream, ConnectOpts, Connector, Target};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::net::SocketAddr;
@@ -58,9 +61,68 @@ impl Socket {
     }
 }
 
+/// The queries in flight, by the ID they were sent under. An ID is taken from
+/// before the question is sent until its query is over, whichever way it ends
+/// (`Claim`); the sender is gone from its slot once the answer was handed
+/// over, and the slot stays taken.
+#[derive(Default)]
+struct Pending(Mutex<HashMap<u16, Option<oneshot::Sender<Vec<u8>>>>>);
+
+impl Pending {
+    /// An ID for a query that came with `wanted`: that one when no query in
+    /// flight has it, else the first that none has, counting up from a random
+    /// one. All 65,536 taken: an error.
+    fn claim(&self, wanted: u16, waiter: oneshot::Sender<Vec<u8>>) -> Result<u16, UpstreamError> {
+        let mut taken = self.0.lock().expect("udp pending lock");
+        let id = if taken.contains_key(&wanted) {
+            let start = random_id();
+            (0..=u16::MAX)
+                .map(|step| start.wrapping_add(step))
+                .find(|id| !taken.contains_key(id))
+                .ok_or_else(|| UpstreamError::Io("too many queries in flight".to_string()))?
+        } else {
+            wanted
+        };
+        taken.insert(id, Some(waiter));
+        Ok(id)
+    }
+
+    /// Hands `answer` to the query that waits under `id`: the first answer
+    /// only, and none when no query does.
+    fn deliver(&self, id: u16, answer: Vec<u8>) {
+        let waiter = self
+            .0
+            .lock()
+            .expect("udp pending lock")
+            .get_mut(&id)
+            .and_then(Option::take);
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(answer);
+        }
+    }
+
+    fn release(&self, id: u16) {
+        self.0.lock().expect("udp pending lock").remove(&id);
+    }
+}
+
+/// An ID claimed, given back when this is dropped: when the query is over,
+/// however it ends — and when its future is dropped, as a fanout does to the
+/// queries still waiting when it has an answer, though no answer ever comes.
+struct Claim<'a> {
+    pending: &'a Pending,
+    id: u16,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.pending.release(self.id);
+    }
+}
+
 struct Shared {
     socket: Socket,
-    pending: Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>,
+    pending: Pending,
 }
 
 pub struct UdpUpstream {
@@ -125,7 +187,7 @@ impl UdpUpstream {
                 };
                 let shared = Arc::new(Shared {
                     socket,
-                    pending: Mutex::new(HashMap::new()),
+                    pending: Pending::default(),
                 });
                 let receiver = Arc::clone(&shared);
                 let upstream = self.name.clone();
@@ -150,14 +212,7 @@ impl UdpUpstream {
                         let Some(id) = wire_id(&buf[..n]) else {
                             continue;
                         };
-                        let waiter = receiver
-                            .pending
-                            .lock()
-                            .expect("udp pending lock")
-                            .remove(&id);
-                        if let Some(tx) = waiter {
-                            let _ = tx.send(buf[..n].to_vec());
-                        }
+                        receiver.pending.deliver(id, buf[..n].to_vec());
                     }
                 });
                 Ok::<(Arc<Shared>, JoinHandle<()>), UpstreamError>((shared, task))
@@ -175,6 +230,16 @@ impl Drop for UdpUpstream {
     }
 }
 
+#[cfg(test)]
+impl UdpUpstream {
+    /// How many IDs are taken by queries in flight.
+    fn in_flight(&self) -> usize {
+        self.state.get().map_or(0, |(shared, _)| {
+            shared.pending.0.lock().expect("udp pending lock").len()
+        })
+    }
+}
+
 impl Upstream for UdpUpstream {
     fn name(&self) -> &str {
         &self.name
@@ -186,30 +251,38 @@ impl Upstream for UdpUpstream {
         deadline: Instant,
     ) -> BoxFuture<'a, Result<Vec<u8>, UpstreamError>> {
         Box::pin(async move {
-            let id = wire_id(wire).ok_or_else(|| {
+            let asked_id = wire_id(wire).ok_or_else(|| {
                 UpstreamError::BadResponse("query shorter than a DNS header".to_string())
             })?;
             let shared = self.shared().await?;
             let (tx, rx) = oneshot::channel();
-            shared
-                .pending
-                .lock()
-                .expect("udp pending lock")
-                .insert(id, tx);
-            if let Err(e) = shared.socket.send(wire).await {
-                shared.pending.lock().expect("udp pending lock").remove(&id);
-                return Err(io_err(e));
-            }
-            let resp = match tokio::time::timeout_at(deadline, rx).await {
+            let id = shared.pending.claim(asked_id, tx)?;
+            let claim = Claim {
+                pending: &shared.pending,
+                id,
+            };
+            // under the ID that was claimed, which is the one it came with
+            // unless another query in flight has it
+            let sent = if id == asked_id {
+                Cow::Borrowed(wire)
+            } else {
+                let mut copy = wire.to_vec();
+                set_wire_id(&mut copy, id);
+                Cow::Owned(copy)
+            };
+            shared.socket.send(&sent).await.map_err(io_err)?;
+            let mut resp = match tokio::time::timeout_at(deadline, rx).await {
                 Ok(Ok(bytes)) => bytes,
                 Ok(Err(_)) => {
-                    return Err(UpstreamError::Io("waiter replaced or dropped".to_string()));
+                    return Err(UpstreamError::Io(
+                        "waiter dropped without an answer".to_string(),
+                    ));
                 }
-                Err(_) => {
-                    shared.pending.lock().expect("udp pending lock").remove(&id);
-                    return Err(UpstreamError::Timeout);
-                }
+                Err(_) => return Err(UpstreamError::Timeout),
             };
+            drop(claim);
+            // under the ID it came with again
+            set_wire_id(&mut resp, asked_id);
             if !wire_truncated(&resp) {
                 return Ok(resp);
             }
@@ -232,6 +305,7 @@ impl Upstream for UdpUpstream {
                 Ok(Err(e)) => return Err(io_err(e)),
                 Err(_) => return Err(UpstreamError::Timeout),
             };
+            // asked as it came, under the ID it came with
             exchange_framed(&mut tcp, wire, deadline).await
         })
     }
@@ -240,6 +314,8 @@ impl Upstream for UdpUpstream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::parse_response;
+    use crate::testing::{MockDns, query_wire};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -381,5 +457,200 @@ mod tests {
             up.query(b"short", deadline(100)).await,
             Err(UpstreamError::BadResponse(_))
         ));
+    }
+
+    /// How long a test waits for something that is to happen: it ends when
+    /// that has, and this is only the bound.
+    const BOUND: Duration = Duration::from_secs(10);
+
+    async fn until(done: impl Fn() -> bool) {
+        tokio::time::timeout(BOUND, async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("it happens within the bound");
+    }
+
+    /// Two queries that come with the same ID, in flight at once: each is
+    /// sent with an ID of its own, and each gets its own answer, under the ID
+    /// it came with. The second is sent when the mock has the first and is
+    /// to answer it a good while later.
+    #[tokio::test]
+    async fn udp_upstream_gives_each_query_its_own_id() {
+        let mock = MockDns::spawn().await;
+        mock.set("a.test", &["10.0.0.1"], &[], 60);
+        mock.set("b.test", &["10.0.0.2"], &[], 60);
+        mock.set_delay(Duration::from_millis(400));
+        let up = Arc::new(UdpUpstream::new(mock.addr()));
+        let ask = |name: &'static str| {
+            let up = Arc::clone(&up);
+            tokio::spawn(async move {
+                up.query(&query_wire(0x4242, name, 1, None), deadline(10_000))
+                    .await
+            })
+        };
+        let first = ask("a.test");
+        until(|| mock.wires().len() == 1).await;
+        let second = ask("b.test");
+        let first = parse_response(&first.await.unwrap().unwrap()).unwrap();
+        let second = parse_response(&second.await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            (first.id, first.v4),
+            (0x4242, vec![("10.0.0.1".parse().unwrap(), 60)])
+        );
+        assert_eq!(
+            (second.id, second.v4),
+            (0x4242, vec![("10.0.0.2".parse().unwrap(), 60)])
+        );
+        // the mock was asked under two IDs, the first query's own among them
+        let ids: Vec<u16> = mock.wires().iter().map(|w| wire_id(w).unwrap()).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids[0], 0x4242);
+        // and neither is left in flight
+        assert_eq!(up.in_flight(), 0);
+    }
+
+    /// A query that is given up on while it waits — its future dropped, as a
+    /// fanout does to those still waiting when it has an answer — gives its
+    /// ID back, though no answer ever comes for it.
+    #[tokio::test]
+    async fn a_query_that_is_dropped_gives_its_id_back() {
+        let mock = MockDns::spawn().await;
+        mock.set_drop_all(true);
+        let up = Arc::new(UdpUpstream::new(mock.addr()));
+        let waiting = {
+            let up = Arc::clone(&up);
+            tokio::spawn(async move {
+                up.query(&query_wire(0x4242, "a.test", 1, None), deadline(60_000))
+                    .await
+            })
+        };
+        until(|| mock.wires().len() == 1).await;
+        assert_eq!(up.in_flight(), 1);
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert_eq!(up.in_flight(), 0);
+    }
+
+    /// A query that was sent under another ID than it came with, because a
+    /// query in flight had the one it came with, is asked again over TCP as it
+    /// came: under its own ID, and the answer is handed back under it.
+    #[tokio::test]
+    async fn a_truncated_answer_to_a_query_sent_under_another_id_is_retried_as_it_came() {
+        // TCP echo bound first so the UDP server can share the port number.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked_over_tcp = Arc::new(Mutex::new(Vec::new()));
+        let asked = Arc::clone(&asked_over_tcp);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let asked = Arc::clone(&asked);
+                tokio::spawn(async move {
+                    let mut len = [0u8; 2];
+                    s.read_exact(&mut len).await.unwrap();
+                    let mut m = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                    s.read_exact(&mut m).await.unwrap();
+                    asked.lock().unwrap().push(m.clone());
+                    let mut full = m;
+                    full.extend_from_slice(b"-full");
+                    let mut out = (full.len() as u16).to_be_bytes().to_vec();
+                    out.extend_from_slice(&full);
+                    s.write_all(&out).await.unwrap();
+                });
+            }
+        });
+        // every question is answered, a while after, with the TC bit: the
+        // second is asked while the first is in flight
+        let socket = Arc::new(UdpSocket::bind(("127.0.0.1", port)).await.unwrap());
+        let asked_over_udp = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked_over_udp);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                seen.lock().unwrap().push(wire_id(&buf[..n]).unwrap());
+                let mut reply = buf[..n].to_vec();
+                reply[2] |= 0x02; // TC
+                let socket = Arc::clone(&socket);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = socket.send_to(&reply, peer).await;
+                });
+            }
+        });
+        let up = Arc::new(UdpUpstream::new(SocketAddr::from(([127, 0, 0, 1], port))));
+        let ask = |payload: &'static [u8]| {
+            let up = Arc::clone(&up);
+            tokio::spawn(async move { up.query(&msg(9, 0, payload), deadline(10_000)).await })
+        };
+        let (one, two) = (ask(b"one"), ask(b"two"));
+        let full = |payload: &[u8]| [msg(9, 0, payload), b"-full".to_vec()].concat();
+        assert_eq!(one.await.unwrap().unwrap(), full(b"one"));
+        assert_eq!(two.await.unwrap().unwrap(), full(b"two"));
+        let ids = asked_over_udp.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "the second went out under another ID");
+        let mut retried = asked_over_tcp.lock().unwrap().clone();
+        retried.sort();
+        assert_eq!(retried, [msg(9, 0, b"one"), msg(9, 0, b"two")]);
+    }
+
+    fn waiter() -> oneshot::Sender<Vec<u8>> {
+        oneshot::channel().0
+    }
+
+    /// A query keeps the ID it came with unless a query in flight has it;
+    /// then it gets another, which none has; and a query that is over gives
+    /// its ID back.
+    #[test]
+    fn a_query_keeps_its_id_unless_one_in_flight_has_it() {
+        let pending = Pending::default();
+        assert_eq!(pending.claim(7, waiter()), Ok(7));
+        let other = pending.claim(7, waiter()).unwrap();
+        assert_ne!(other, 7);
+        let third = pending.claim(7, waiter()).unwrap();
+        assert!(third != 7 && third != other);
+        pending.release(7);
+        assert_eq!(pending.claim(7, waiter()), Ok(7));
+    }
+
+    /// With every one of the 65,536 IDs taken there is none to give; with one
+    /// free, wherever the search starts, that one is found.
+    #[test]
+    fn with_every_id_taken_there_is_none_to_give() {
+        let pending = Pending::default();
+        for id in 0..=u16::MAX {
+            assert_eq!(pending.claim(id, waiter()), Ok(id));
+        }
+        let none = Err(UpstreamError::Io("too many queries in flight".to_string()));
+        assert_eq!(pending.claim(5, waiter()), none);
+        for free in [0, 1, 40_000, u16::MAX] {
+            pending.release(free);
+            assert_eq!(pending.claim(5, waiter()), Ok(free));
+            assert_eq!(pending.claim(5, waiter()), none);
+        }
+    }
+
+    /// An answer goes to the query that holds its ID, the first answer
+    /// only; the ID stays taken until the query gives it back.
+    #[test]
+    fn an_answer_goes_to_the_query_that_holds_its_id_once() {
+        let pending = Pending::default();
+        let (tx, mut rx) = oneshot::channel();
+        let id = pending.claim(9, tx).unwrap();
+        // an answer for an ID nobody holds goes nowhere
+        pending.deliver(id.wrapping_add(1), b"stray".to_vec());
+        pending.deliver(id, b"first".to_vec());
+        pending.deliver(id, b"again".to_vec());
+        assert_eq!(rx.try_recv().unwrap(), b"first");
+        assert_ne!(pending.claim(id, waiter()).unwrap(), id, "still taken");
+        pending.release(id);
+        assert_eq!(pending.claim(id, waiter()), Ok(id));
     }
 }

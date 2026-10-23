@@ -5,8 +5,9 @@
 
 use crate::bootstrap::{Bootstrap, BootstrapConnector};
 use crate::cache::{CacheEntry, CacheHit, CachedAddrs, DEFAULT_CAPACITY, DnsCache};
-use crate::fanout::{Answers, FanoutError, FanoutOpts, resolve_name};
+use crate::fanout::{Answers, FanoutError, FanoutOpts, forward_raw, resolve_name};
 use crate::hosts::{HostAction, HostMap, parse_hosts_file};
+use crate::message::{ANSWER_UDP_SIZE, cap_udp_size, wire_question, wire_rcode};
 use crate::system::SystemDns;
 use crate::upstream::doh::DohUpstream;
 use crate::upstream::doh3::Doh3Upstream;
@@ -15,6 +16,7 @@ use crate::upstream::tcp::TcpUpstream;
 use crate::upstream::udp::UdpUpstream;
 use crate::upstream::{UpstreamRef, UpstreamSpec};
 use arc_swap::ArcSwap;
+use hickory_proto::rr::RecordType;
 use rurge_config::general::{DnsServer, EncryptedDns};
 use rurge_config::host::HostEntry;
 use rurge_config::{Config, Diagnostic, Diagnostics, codes};
@@ -872,6 +874,59 @@ impl Resolver {
         self.hosts.lookup(name)
     }
 
+    /// Forwards a client's query, as it is, to the upstreams this resolver would
+    /// ask for its name and hands back the reply with the query's ID. Not cached;
+    /// AAAA suppression is neither consulted nor counted.
+    ///
+    /// The upstreams are those of the name as `[Host]` has it: the servers a
+    /// `server:` value names, the system's current servers for `server:system`
+    /// (and `syslib`, `force-syslib`: one thing here), the primary servers for
+    /// any other name, whether `[Host]` maps it to addresses or to another
+    /// name or does not know it. An alias is not followed: the question is
+    /// forwarded as asked. What is a lookup's own business — the proxies'
+    /// names, `localhost`, `.local`, a single label with its search domain —
+    /// is not applied; the system resolver library, which gives addresses and
+    /// nothing else, is not asked.
+    pub async fn forward(&self, query: &[u8]) -> io::Result<Vec<u8>> {
+        let started = Instant::now();
+        let Some((name, qtype, _)) = wire_question(query) else {
+            let unreadable = io::Error::new(io::ErrorKind::InvalidInput, "not a DNS query");
+            tracing::debug!(target: "rurge_dns::resolver", error = %unreadable, "forward failed");
+            return Err(unreadable);
+        };
+        let upstreams = match self.hosts.lookup(&name).map(|hit| hit.action) {
+            Some(HostAction::Servers(specs)) => self.host_upstreams_for(&specs),
+            Some(HostAction::System(_)) => self.system_upstreams.load_full(),
+            _ => self.primary.load_full(),
+        };
+        let result = if upstreams.is_empty() {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no DNS server to forward to",
+            ))
+        } else {
+            // The reply is to fit the datagram the virtual interface's own
+            // answers have, whatever size the client announced: an upstream
+            // that is told of a larger one may send more than fits.
+            let mut query = query.to_vec();
+            cap_udp_size(&mut query, ANSWER_UDP_SIZE);
+            forward_raw(&upstreams, &query, &self.cfg.fanout).await
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let qtype = RecordType::from(qtype);
+        match &result {
+            Ok(reply) => {
+                let rcode =
+                    wire_rcode(reply).map_or_else(|| "unknown".to_string(), |rc| rc.to_string());
+                tracing::debug!(target: "rurge_dns::resolver", name = %name, qtype = %qtype, rcode = %rcode, elapsed_ms, "forwarded");
+            }
+            Err(e) => {
+                tracing::debug!(target: "rurge_dns::resolver", name = %name, qtype = %qtype, error = %e, elapsed_ms, "forward failed");
+            }
+        }
+        result
+    }
+
     /// Stores the outcome in the cache and feeds AAAA suppression.
     fn record(
         &self,
@@ -1288,9 +1343,9 @@ impl Resolve for Resolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Qtype;
+    use crate::message::{Qtype, Rcode, opt_size, parse_response, wire_id, wire_rcode};
     use crate::system::StaticSystemDns;
-    use crate::testing::MockDns;
+    use crate::testing::{MockDns, query_wire, txt_answers};
     use rurge_config::HostName;
     use rurge_config::config::{LoadOptions, from_text};
     use rurge_net::connector::{
@@ -3541,5 +3596,300 @@ https://dns.example/dns-query"
                 "{server}"
             );
         }
+    }
+
+    const TXT: u16 = 16;
+
+    /// A query is forwarded as it is — a question of a type the resolver
+    /// does not look up itself, with the OPT record it came with — to the
+    /// upstreams and the reply handed back under the ID the client gave it,
+    /// though the upstream was asked under an ID of its own.
+    #[tokio::test(start_paused = true)]
+    async fn forward_hands_back_the_reply_with_the_clients_id() {
+        let mock = MockDns::spawn().await;
+        mock.set_txt("t.test", "hello");
+        let e = env(&profile("", ""));
+        let r = resolver_in_memory(&e, &mock, StaticSystemDns::default());
+        let query = query_wire(0x1234, "T.Test", TXT, Some(1232));
+        // a future the virtual interface can spawn
+        let forwarding: BoxFuture<'_, io::Result<Vec<u8>>> = Box::pin(r.forward(&query));
+        let reply = forwarding.await.unwrap();
+        assert_eq!(wire_id(&reply), Some(0x1234));
+        assert_eq!(wire_rcode(&reply), Some(Rcode::NoError));
+        assert_eq!(txt_answers(&reply), ["hello"]);
+        let wires = mock.wires();
+        assert_eq!(wires.len(), 1);
+        assert_ne!(wire_id(&wires[0]), Some(0x1234));
+        assert_eq!(wires[0][2..], query[2..], "nothing but the ID is another");
+    }
+
+    /// The upstreams of a name are those `[Host]` gives it: `server:` its
+    /// own servers, and only those.
+    #[tokio::test]
+    async fn forward_asks_the_servers_the_host_section_names() {
+        let primary = MockDns::spawn().await;
+        let corp = MockDns::spawn().await;
+        primary.set_txt("a.corp.test", "primary");
+        primary.set_txt("b.test", "primary");
+        corp.set_txt("a.corp.test", "corp");
+        let e = env(&profile(
+            &format!("dns-server = {}", primary.addr()),
+            &format!("*.corp.test = server:{}\n", corp.addr()),
+        ));
+        let (r, _) = resolver_once(&e, StaticSystemDns::default());
+        let reply = r
+            .forward(&query_wire(5, "a.corp.test", TXT, None))
+            .await
+            .unwrap();
+        assert_eq!(txt_answers(&reply), ["corp"]);
+        assert_eq!((corp.wires().len(), primary.wires().len()), (1, 0));
+        // a name the section does not name goes to the primary servers
+        let reply = r
+            .forward(&query_wire(6, "b.test", TXT, None))
+            .await
+            .unwrap();
+        assert_eq!(txt_answers(&reply), ["primary"]);
+        assert_eq!((corp.wires().len(), primary.wires().len()), (1, 1));
+    }
+
+    /// `server:system` (and `syslib`, and `force-syslib`, which are one thing
+    /// here) is the servers the system has, not the library: the query is
+    /// forwarded, and a library gives addresses only.
+    #[tokio::test]
+    async fn forward_sends_system_names_to_the_system_servers() {
+        let primary = MockDns::spawn().await;
+        let system = MockDns::spawn().await;
+        let names = ["sys.test", "syslib.test", "force.test"];
+        for name in names {
+            primary.set_txt(name, "primary");
+            system.set_txt(name, name);
+        }
+        let e = env(&profile(
+            &format!("dns-server = {}", primary.addr()),
+            "sys.test = server:system\nsyslib.test = server:syslib\nforce.test = server:force-syslib\n",
+        ));
+        let sys = StaticSystemDns {
+            servers: vec![system.addr()],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        for name in names {
+            let reply = r.forward(&query_wire(1, name, TXT, None)).await.unwrap();
+            assert_eq!(txt_answers(&reply), [name]);
+        }
+        assert_eq!((system.wires().len(), primary.wires().len()), (3, 0));
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "the library was not asked"
+        );
+    }
+
+    /// Nothing to send a system name to: it fails as not found, and is not
+    /// sent to the primary servers instead.
+    #[tokio::test]
+    async fn forward_without_system_servers_fails_for_system_names() {
+        let primary = MockDns::spawn().await;
+        primary.set_txt("sys.test", "primary");
+        let e = env(&profile(
+            &format!("dns-server = {}", primary.addr()),
+            "sys.test = server:system\n",
+        ));
+        let (r, _) = resolver_once(&e, StaticSystemDns::default());
+        let err = r
+            .forward(&query_wire(1, "sys.test", TXT, None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(primary.wires().is_empty());
+        // and with no primary server either, nothing is anywhere to forward
+        // to: the same
+        let e = env(&profile("", ""));
+        let (r, _) = resolver_once(&e, StaticSystemDns::default());
+        let err = r
+            .forward(&query_wire(1, "b.test", TXT, None))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// Whatever it is asked it asks again: no answer is kept, and a
+    /// forwarded question is not counted for the suppression of AAAA nor
+    /// stopped by it.
+    #[tokio::test(start_paused = true)]
+    async fn forward_does_not_cache() {
+        let mock = MockDns::spawn().await;
+        mock.set_txt("t.test", "hello");
+        let e = env(&profile("", ""));
+        let r = resolver_in_memory(&e, &mock, StaticSystemDns::default());
+        let query = query_wire(1, "t.test", TXT, None);
+        r.forward(&query).await.unwrap();
+        r.forward(&query).await.unwrap();
+        assert_eq!(mock.wires().len(), 2, "asked twice");
+        assert!(r.cache_snapshot().is_empty());
+    }
+
+    /// AAAA questions forwarded that nobody answers are no lookups whose
+    /// AAAA timed out: there can be any number of them and AAAA stays on for
+    /// the lookups; and a resolver that has turned AAAA off for its lookups
+    /// still forwards the AAAA question of a client.
+    #[tokio::test(start_paused = true)]
+    async fn forward_neither_consults_nor_counts_aaaa_suppression() {
+        let mock = MockDns::spawn().await;
+        for i in 0..5 {
+            mock.set(&format!("h{i}.test"), &["10.0.0.1"], &["fd00::1"], 60);
+        }
+        mock.set("v6.test", &["10.0.0.9"], &["fd00::9"], 60);
+        let e = env(&profile(
+            &format!("dns-server = {}\nipv6 = true", mock.addr()),
+            "",
+        ));
+        let r = resolver_asking_aaaa(&e, &mock);
+        mock.set_drop_qtype(Qtype::Aaaa, true);
+        for i in 0..6 {
+            let silence = r.forward(&query_wire(i, "x.test", 28, None)).await;
+            assert_eq!(silence.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        }
+        assert!(!r.aaaa_suppressed(), "forwarded questions are not counted");
+
+        // five lookups turn AAAA off for lookups
+        for i in 0..5 {
+            lookup_and_complete(&r, &format!("h{i}.test")).await;
+        }
+        assert!(r.aaaa_suppressed());
+        mock.set_drop_qtype(Qtype::Aaaa, false);
+        let reply = r
+            .forward(&query_wire(9, "v6.test", 28, None))
+            .await
+            .unwrap();
+        assert_eq!(parse_response(&reply).unwrap().v6.len(), 1);
+        assert!(r.aaaa_suppressed(), "and it is not undone either");
+    }
+
+    /// A client that says it takes a datagram of 4096 bytes is forwarded as
+    /// one that takes 1232: an upstream answers into what a TUN can send on,
+    /// and the query's size is lowered only. What has none, or less, is
+    /// forwarded as it is.
+    #[tokio::test(start_paused = true)]
+    async fn forward_caps_the_opt_at_1232() {
+        let mock = MockDns::spawn().await;
+        mock.set_txt("t.test", "hello");
+        let e = env(&profile("", ""));
+        let r = resolver_in_memory(&e, &mock, StaticSystemDns::default());
+        for (asked, forwarded) in [
+            (Some(4096), Some(1232)),
+            (Some(512), Some(512)),
+            (None, None),
+        ] {
+            r.forward(&query_wire(1, "t.test", TXT, asked))
+                .await
+                .unwrap();
+            let sent = mock.wires().pop().unwrap();
+            assert_eq!(opt_size(&sent), forwarded, "asked {asked:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forward_rejects_a_query_it_cannot_read() {
+        let mock = MockDns::spawn().await;
+        mock.set_txt("t.test", "hello");
+        let e = env(&profile("", ""));
+        let r = resolver_in_memory(&e, &mock, StaticSystemDns::default());
+        let good = query_wire(1, "t.test", TXT, None);
+        // nothing, no header, a question cut short, a header without one
+        let unreadable: [&[u8]; 4] = [&[], b"short", &good[..14], &[0u8; 12]];
+        for unreadable in unreadable {
+            let err = r.forward(unreadable).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{unreadable:?}");
+        }
+        assert!(mock.wires().is_empty(), "nothing was sent");
+    }
+
+    /// The events of `forward`, those that tell what it did: its own, of the
+    /// resolver's target.
+    fn forward_events(events: &Events) -> Vec<BTreeMap<String, String>> {
+        events
+            .of("rurge_dns::resolver")
+            .into_iter()
+            .filter(|fields| fields["message"].starts_with("forward"))
+            .collect()
+    }
+
+    /// A forward leaves one DEBUG event, with the name, the type, the code of
+    /// the reply and how long it took — or, failed, the error. The name is
+    /// in no other event of the lookup machinery.
+    #[tokio::test(start_paused = true)]
+    async fn forward_says_what_it_did_in_one_debug_event() {
+        let events = Events::default();
+        let _logging = events.capture();
+        let mock = MockDns::spawn().await;
+        mock.set_txt("t.test", "hello");
+        let e = env(&profile("", ""));
+        let r = resolver_in_memory(&e, &mock, StaticSystemDns::default());
+        let fields = |event: &BTreeMap<String, String>| {
+            event
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        r.forward(&query_wire(1, "T.test", TXT, None))
+            .await
+            .unwrap();
+        let said = forward_events(&events);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(fields(&said[0]), "elapsed_ms,message,name,qtype,rcode");
+        assert_eq!(
+            (said[0]["name"].as_str(), said[0]["qtype"].as_str()),
+            ("t.test", "TXT")
+        );
+        assert_eq!(
+            (said[0]["rcode"].as_str(), said[0]["elapsed_ms"].as_str()),
+            ("NOERROR", "0")
+        );
+
+        mock.set_drop_all(true);
+        r.forward(&query_wire(2, "t.test", TXT, None))
+            .await
+            .unwrap_err();
+        let said = forward_events(&events);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert_eq!(fields(&said[1]), "elapsed_ms,error,message,name,qtype");
+        assert_eq!(said[1]["elapsed_ms"], "300");
+
+        r.forward(b"short").await.unwrap_err();
+        let said = forward_events(&events);
+        assert_eq!(said.len(), 3, "{said:?}");
+        assert_eq!(fields(&said[2]), "error,message");
+
+        // the name is in those events alone
+        let forwards = forward_events(&events);
+        for target in ["rurge_dns::fanout", "rurge_dns::resolver"] {
+            for event in events.of(target) {
+                if event.values().any(|text| text.contains("t.test")) {
+                    assert!(forwards.contains(&event), "{target}: {event:?}");
+                }
+            }
+        }
+    }
+
+    /// Above DEBUG a forward says nothing of what it was asked.
+    #[tokio::test(start_paused = true)]
+    async fn forward_names_nothing_at_info_or_above() {
+        let lines = Lines::default();
+        let _logging = lines.capture();
+        let mock = MockDns::spawn().await;
+        mock.set_txt("t.test", "hello");
+        let e = env(&profile("", ""));
+        let r = resolver_in_memory(&e, &mock, StaticSystemDns::default());
+        r.forward(&query_wire(1, "t.test", TXT, None))
+            .await
+            .unwrap();
+        mock.set_drop_all(true);
+        r.forward(&query_wire(2, "t.test", TXT, None))
+            .await
+            .unwrap_err();
+        assert!(lines.said("t.test").is_empty(), "{:?}", lines.said(""));
     }
 }
