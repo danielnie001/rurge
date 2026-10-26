@@ -170,12 +170,16 @@ struct On {
     adjust: bool,
 }
 
-/// What a close met: the first error, and the undo actions that did not go
-/// back (they stay in `state.json` for the next start).
+/// What a close met: the first error, and where in `state.json`'s backup the
+/// undo actions that did go back are. What did not go back stays for the next
+/// start — the ones that failed, and the ones the close never reached (a close
+/// also undoes a failed open, and an open that failed early never got to the
+/// stages that undo them).
 #[derive(Default)]
 struct Closing {
     first: Option<String>,
-    failed: Vec<Undo>,
+    /// The positions, in the backup the close read, of what went back.
+    undone: Vec<usize>,
 }
 
 impl Closing {
@@ -188,6 +192,17 @@ impl Closing {
         if self.first.is_none() {
             self.first = Some(error);
         }
+    }
+
+    /// What is left of `saved`, in its order: everything no close of this one
+    /// undid.
+    fn remaining(&self, saved: &[Undo]) -> Vec<Undo> {
+        saved
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.undone.contains(index))
+            .map(|(_, undo)| undo.clone())
+            .collect()
     }
 }
 
@@ -240,22 +255,14 @@ impl EnhancedMode {
             }
         };
         let mut closing = Closing::default();
-        for undo in backup.undo.iter().rev() {
+        for (index, undo) in backup.undo.iter().enumerate().rev() {
             let (backend, one) = (backend.clone(), undo.clone());
             match call(move || backend.undo(&one)).await {
-                Ok(()) => {}
-                Err(e) => {
-                    closing.keep(&undo.label(), e);
-                    closing.failed.push(undo.clone());
-                }
+                Ok(()) => closing.undone.push(index),
+                Err(e) => closing.keep(&undo.label(), e),
             }
         }
-        let remaining: Vec<Undo> = backup
-            .undo
-            .iter()
-            .filter(|undo| closing.failed.contains(undo))
-            .cloned()
-            .collect();
+        let remaining = closing.remaining(&backup.undo);
         let left = backup_value(&remaining);
         let all_back = remaining.is_empty();
         store
@@ -391,11 +398,14 @@ impl EnhancedMode {
         let dev = call(move || backend.open()).await?;
         on.dev = Some(dev.clone());
 
-        // 2. the adapter, with its IPv6 half when it is wanted
+        // 2. the adapter, with its IPv6 half when it is wanted. It is always
+        // asked: its address, MTU and link are wanted whether or not IPv6 is,
+        // and the answer is only about the IPv6 half.
         let backend = self.backend.clone();
         let asked = wanted.ipv6;
         let with = dev.clone();
-        let ipv6 = asked && call(move || backend.configure(&with, asked)).await?;
+        let configured = call(move || backend.configure(&with, asked)).await?;
+        let ipv6 = asked && configured;
 
         // 3. the TUN, so that packets are taken before traffic comes to it
         let tun = self.starter.start(dev.device.clone()).await?;
@@ -482,8 +492,10 @@ impl EnhancedMode {
             if let Err(e) = call(move || backend.give_dns_back(&with)).await {
                 closing.keep("give_dns_back", e);
             }
-            for undo in saved.iter().filter(|undo| undo.stage() == Stage::Dns) {
-                self.undo(undo, &mut closing).await;
+            for (index, undo) in saved.iter().enumerate() {
+                if undo.stage() == Stage::Dns {
+                    self.undo(index, undo, &mut closing).await;
+                }
             }
         }
         // the routes: the traffic goes back to the physical adapter first
@@ -516,18 +528,19 @@ impl EnhancedMode {
         }
         // the system's own adjustments go back after the device is gone
         if on.adjust {
-            for undo in saved.iter().filter(|undo| undo.stage() == Stage::Adjust) {
-                self.undo(undo, &mut closing).await;
+            for (index, undo) in saved.iter().enumerate() {
+                if undo.stage() == Stage::Adjust {
+                    self.undo(index, undo, &mut closing).await;
+                }
             }
         }
-        // the backup is what did not go back (P11: a write that fails only
-        // reaches the log; the next start undoes the same ones again)
+        // the backup is what did not go back: the ones that failed and the ones
+        // this close never reached. A close also undoes a failed open, and an
+        // open that failed early never got to the stages that undo them (P11: a
+        // write that fails only reaches the log; the next start undoes the same
+        // ones again)
         if rewrite {
-            let remaining: Vec<Undo> = saved
-                .iter()
-                .filter(|undo| closing.failed.contains(undo))
-                .cloned()
-                .collect();
+            let remaining = closing.remaining(saved);
             let all_back = remaining.is_empty();
             let left = backup_value(&remaining);
             self.store
@@ -546,13 +559,15 @@ impl EnhancedMode {
         }
     }
 
-    /// One saved change put back; a failure keeps it in the backup.
-    async fn undo(&self, undo: &Undo, closing: &mut Closing) {
+    /// One saved change put back; one that goes back is noted, and one that
+    /// fails keeps its place in the backup.
+    async fn undo(&self, index: usize, undo: &Undo, closing: &mut Closing) {
         let backend = self.backend.clone();
         let one = undo.clone();
         if let Err(e) = call(move || backend.undo(&one)).await {
             closing.keep(&undo.label(), e);
-            closing.failed.push(undo.clone());
+        } else {
+            closing.undone.push(index);
         }
     }
 }
@@ -670,7 +685,11 @@ mod tests {
         }
 
         fn configure_ipv6(&self, _dev: &Opened) -> Result<bool, String> {
-            self.step("configure_ipv6")?;
+            // as the file backend: no IPv6 to be had is no failure of the step
+            if self.fails("configure_ipv6") {
+                return Ok(false);
+            }
+            self.calls.push("configure_ipv6");
             Ok(true)
         }
 
@@ -899,6 +918,21 @@ mod tests {
                 explicit_space: false,
             }),
             ipv6: true,
+            primary: Some("eth0".to_string()),
+        }
+    }
+
+    /// The same for a profile that does not want IPv6.
+    fn without_ipv6() -> Wanted {
+        Wanted {
+            routes: RouteSet::compute(&RouteInputs {
+                ipv6: false,
+                excluded: &[],
+                included: &[],
+                external: &[],
+                explicit_space: false,
+            }),
+            ipv6: false,
             primary: Some("eth0".to_string()),
         }
     }
@@ -1197,6 +1231,102 @@ mod tests {
         assert!(!add.v4.is_empty());
         assert!(!f.backend.dns.lock().unwrap()[0], "nor does the DNS");
         assert!(f.mode.enabled());
+    }
+
+    /// IPv6 off (`ipv6-vif = disabled`, say): the adapter is configured all the
+    /// same — its address, MTU and link are nobody's IPv6 — and nothing of
+    /// this open is IPv6's.
+    #[tokio::test]
+    async fn an_open_without_ipv6_still_configures_the_adapter() {
+        let mut f = fixture(true).await;
+        f.mode.enable(without_ipv6()).await.unwrap();
+        assert_eq!(
+            f.backend.calls.list(),
+            lines(&[
+                "open",
+                "configure",
+                "start",
+                "egress",
+                "routes",
+                "dns_undo",
+                "take_dns",
+                "adjust_undo",
+                "adjust",
+            ]),
+            "the adapter is configured whether or not IPv6 is"
+        );
+        assert_eq!(*f.backend.configured.lock().unwrap(), [false]);
+        let (add, remove) = f.backend.routes.lock().unwrap()[0].clone();
+        assert!(add.v6.is_empty(), "the routes have no IPv6 half");
+        assert!(!add.v4.is_empty());
+        assert!(remove.is_empty());
+        assert_eq!(*f.backend.dns.lock().unwrap(), [false]);
+        assert!(f.mode.enabled());
+    }
+
+    /// An open that fails must leave the undo actions it never reached: those a
+    /// close of an earlier run could not undo are the machine's own settings,
+    /// and only `state.json` remembers them.
+    #[tokio::test]
+    async fn an_open_that_fails_leaves_the_undo_actions_it_never_reached() {
+        let rp_filter = json!({"undo": [{"kind": "rp_filter", "value": 1}]});
+        let mac_dns = json!({"undo": [{"kind": "mac_dns", "service": "Wi-Fi", "servers": []}]});
+        for left in [rp_filter, mac_dns] {
+            let mut f = fixture(true).await;
+            let backup = left.clone();
+            f.store
+                .update(move |s| {
+                    s.enhanced_backup = Some(backup);
+                    // a close that could not undo it says so here
+                    s.features.enhanced_mode = true;
+                })
+                .await;
+            *f.backend.fail.lock().unwrap() = Some("routes".to_string());
+            let error = f.mode.enable(wanted()).await.unwrap_err();
+            assert_eq!(error, "routes failed (test)", "{left}");
+            let state = f.store.snapshot().await;
+            assert_eq!(
+                state.enhanced_backup,
+                Some(left.clone()),
+                "the open never reached the stage that undoes it: {left}"
+            );
+            assert!(state.features.enhanced_mode, "{left}");
+            assert!(
+                !f.backend
+                    .calls
+                    .list()
+                    .iter()
+                    .any(|step| step.starts_with("undo ")),
+                "{left}: {:?}",
+                f.backend.calls.list()
+            );
+            assert!(!f.mode.enabled(), "{left}");
+        }
+    }
+
+    /// A backup an open cannot read stops it before it asks the system
+    /// anything: appending to a backup this version does not understand would
+    /// lose it.
+    #[tokio::test]
+    async fn an_unreadable_backup_stops_an_open_before_it_starts() {
+        let mut f = fixture(true).await;
+        let backup = json!({"x": 1});
+        let left = backup.clone();
+        f.store
+            .update(move |s| s.enhanced_backup = Some(left))
+            .await;
+        let error = f.mode.enable(wanted()).await.unwrap_err();
+        assert!(
+            error.starts_with("state.json's enhanced backup cannot be read"),
+            "{error}"
+        );
+        assert!(
+            f.backend.calls.list().is_empty(),
+            "nothing was asked of the system: {:?}",
+            f.backend.calls.list()
+        );
+        assert_eq!(f.store.snapshot().await.enhanced_backup, Some(backup));
+        assert!(!f.mode.enabled());
     }
 
     #[tokio::test]

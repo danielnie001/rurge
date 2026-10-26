@@ -23,7 +23,7 @@ pub struct Wanted {
 ///
 /// `explicit_space` is the caller's `cfg!(target_os = "macos")` (P22): this
 /// function does not know what platform it is on.
-#[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 9
+#[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
 pub fn wanted(
     general: &General,
     external: &[IpAddr],

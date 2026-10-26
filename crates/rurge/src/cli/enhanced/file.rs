@@ -116,7 +116,10 @@ impl Backend for FileBackend {
     }
 
     fn configure_ipv6(&self, _dev: &Opened) -> Result<bool, String> {
-        let mut map = self.step("configure_ipv6")?;
+        // the file asks for no IPv6: the caller goes on without it, and
+        // nothing of the step is done or recorded (a failed action is not
+        // among `actions`)
+        let mut map = self.read();
         if self.fails(&map, "configure_ipv6") {
             return Ok(false);
         }
@@ -374,6 +377,31 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written["ipv6"], false);
         assert_eq!(written["actions"], json!(["configure"]));
+    }
+
+    /// The IPv6 half on its own: it can be had (the step is done and recorded)
+    /// or not (nothing is done, nothing is recorded, and the caller goes on
+    /// without IPv6).
+    #[test]
+    fn the_ipv6_half_on_an_adapter_that_is_up_can_be_had_or_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enhanced.json");
+        let backend = FileBackend::new(path.clone());
+        let dev = backend.open().unwrap();
+        // the file asks for no IPv6 at first
+        std::fs::write(&path, json!({"fail": "configure_ipv6"}).to_string()).unwrap();
+        assert!(!backend.configure_ipv6(&dev).unwrap());
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_ne!(written["ipv6"], Value::Bool(true), "IPv6 is not on");
+        assert_eq!(written["actions"], Value::Null, "nothing was done");
+        // and then it can
+        std::fs::write(&path, json!({}).to_string()).unwrap();
+        assert!(backend.configure_ipv6(&dev).unwrap());
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["ipv6"], true);
+        assert_eq!(written["actions"], json!(["configure_ipv6"]));
     }
 
     /// An undo puts the field back and is recorded; the one the file names in
