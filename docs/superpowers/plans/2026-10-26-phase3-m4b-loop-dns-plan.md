@@ -553,7 +553,6 @@ pub fn subnets(exclude: &[String]) -> io::Result<Vec<(IpNet, String)>>;
 | 20 | 2 | 执行者的裁定（签名）：`finish_udp(socket, family)` 比派工写的多一个地址族（未指定地址按族取），`open_packet` 的每个地址族经私有 `open_base(family) -> io::Result<(Arc<UdpSocket>, bool)>`；对外的 `bind_udp(family, dst: Option<IpAddr>)`、`direct_socket(connector, remote: SocketAddr)`（`quic/mod.rs` 的两个调用者给出 `remote` 与 `SocketAddr::new(server, 0)`）与 `open_socket(family, dst, kind, opts, hook, fallback_logged)` 照计划 | 本提交 |
 | 21 | 2 | 订正第 19 行末句与任务 2 的判据：`git grep -n "fn open_socket" crates/rurge-net` 现在回两行——`:414` 的定义与任务 2 新用例 `async fn open_socket_asks_egress_for_the_destination_and_binds_there`（计划给的名字）——定义仍只有一处；判据要带括号（`git grep -n "fn open_socket("`）才是一行。用例名照计划抄，没有改 | 本提交 |
 | 22 | 2 | 修正第 1 轮（评审 F1）：唤醒的用例原来用 `Waker::noop()` 先 poll 一次 `waiting`，之后的 `timeout(…, &mut waiting)` 会立刻再 poll 一次——那一次会在新套接字上登记 waker，所以把 `Sockets::add` 里的 `waking.wake()` 去掉它照样通过，钉不住唤醒。现在第一次 poll 用一个记下“被唤醒过”的 waker（`Woken`，实现 `std::task::Wake`，一个 `AtomicBool`），并断言 `send_to` 之后、再 poll 之前它已经被唤醒（信息是 `adding a socket wakes the waiting receive`）；红是把 `waking.wake()` 临时去掉、跑这一条用例，在新断言上失败（工作区的 `task-2-fix-1-red.log`），之后恢复。数据报只在回环上的测试回显服务端与载体之间来往，不离开回环、不写用例临时目录之外的东西 | 本提交 |
-
 | 23 | 3 | 派工第 1 条（协调者的建议；一对里的名字是执行者选的）：接管期间没有物理服务器可问时，错误用现有的 `DnsError::AllFailed`，那一对是（`system DNS servers`，`no DNS server outside the enhanced mode`），显示为 `all upstreams failed (system DNS servers: no DNS server outside the enhanced mode)`；`system_upstreams` 为空时在 `system_lookup` 里先判空再返回它，不交给扇出——`From<FanoutError>` 会把空的 `AllFailed` 变成 `NoUpstream`，文字就不是这一句了。用例断言显示里的这句原话与变体 | 本提交 |
 | 24 | 3 | 派工第 2 条（协调者的裁定）：`reread_system_servers` 也清 `vias`——`via_set` 的上游是用"那一刻的系统服务器"建的，只重建别处会留下旧服务器做的上游；清掉也丢掉它们各自的缓存，下一次经接口的查找用新的服务器重建。`on_network_change` 改成"清缓存（`flush` 本来就清 `vias`，再清一次无害）、读 `has_ipv6`、`reread_system_servers`、清 `host_upstreams`"，行为不变 | 本提交 |
 | 25 | 3 | 执行者的裁定（结构）：`UdpUpstream` 的 `Socket` 枚举只剩"连接器的载体"一种，整个去掉；`Shared` 直接存 `BoxedDatagram`，收发是两个私有函数 `send` / `recv`。`new` 与 `via` 只差名字，`connector` 一个字段 | 本提交 |
@@ -567,3 +566,4 @@ pub fn subnets(exclude: &[String]) -> io::Result<Vec<(IpNet, String)>>;
 
 | # | 事项 | 去向 |
 | - | ---- | ---- |
+| 1 | `crates/rurge/tests/cli.rs` 的 `run::remote_sources::the_copy_takes_over_from_a_local_file_once_a_check_has_succeeded` 在任务 4 的第一次全量门禁里失败过一次：`wait_for` 里的 `api_call` 连 API 端口得到 `ConnectionRefused`（`api_call` 不重试，闭包因此 panic）；单独重跑与之后两次全量都通过（一台机器上的运行，不是 CI）。任务 4 没有改 API 与重载的时序，原因没有查明：可能是副本接管时的重载与轮询相撞，也可能是机器满载 | 再见到时查（任何会话）：看重载期间 API 的监听是否换手 |
