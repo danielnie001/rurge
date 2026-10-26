@@ -33,6 +33,9 @@ pub struct State {
     /// profile file name → group name → selected member
     pub group_selections: HashMap<String, HashMap<String, String>>,
     pub system_proxy_backup: Option<serde_json::Value>,
+    /// What the enhanced mode leaves behind when it is interrupted; the manager
+    /// owns the shape, the engine does not read it (same as `system_proxy_backup`).
+    pub enhanced_backup: Option<serde_json::Value>,
     pub current_profile: Option<String>,
 }
 
@@ -45,6 +48,7 @@ impl Default for State {
             features: Features::default(),
             group_selections: HashMap::new(),
             system_proxy_backup: None,
+            enhanced_backup: None,
             current_profile: None,
         }
     }
@@ -67,7 +71,7 @@ pub fn profile_key(main: &Path) -> String {
 }
 
 /// The single writer of `state.json`: keeps an in-memory copy and rewrites
-/// the file atomically (temp file + rename) on every `update`, serialized
+/// the file atomically (temp file + rename) on every write, serialized
 /// by one async mutex.
 pub struct StateStore {
     path: PathBuf,
@@ -115,6 +119,22 @@ impl StateStore {
             Err(e) => tracing::error!(error = %e, "state.json writer task failed"),
         }
         snapshot
+    }
+
+    /// Applies `f` to a copy of the state and writes the copy to disk; only once
+    /// it is written does the copy become the state. A write that fails leaves
+    /// the state as it was, and is the error.
+    pub async fn try_update(&self, f: impl FnOnce(&mut State)) -> io::Result<State> {
+        let mut guard = self.state.lock().await;
+        let mut next = guard.clone();
+        f(&mut next);
+        let path = self.path.clone();
+        let text = serde_json::to_string_pretty(&next).expect("State serializes");
+        tokio::task::spawn_blocking(move || write_atomic(&path, &text))
+            .await
+            .map_err(io::Error::other)??;
+        *guard = next.clone();
+        Ok(next)
     }
 }
 
@@ -206,6 +226,71 @@ mod tests {
         assert_eq!(from_garbage, State::default());
         assert!(path.with_extension("json.broken").exists());
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn try_update_changes_nothing_when_the_file_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let (store, _) = StateStore::open(path.clone()).await;
+        // a state.json to leave alone: written by an update that succeeds
+        store
+            .update(|s| s.outbound_mode = Some("direct".into()))
+            .await;
+        let before = store.snapshot().await;
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        // the temporary file's name taken by a directory: writing it fails
+        let tmp = path.with_extension("json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let expected = std::fs::write(&tmp, "x").unwrap_err();
+        let error = store
+            .try_update(|s| s.global_policy = Some("HK".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), expected.kind());
+        assert_eq!(store.snapshot().await, before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), on_disk);
+    }
+
+    #[tokio::test]
+    async fn try_update_writes_before_it_changes_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let (store, _) = StateStore::open(path.clone()).await;
+        store
+            .update(|s| s.outbound_mode = Some("direct".into()))
+            .await;
+        // f sees the state as it was, not a default
+        let after = store
+            .try_update(|s| {
+                s.global_policy = Some("HK".into());
+                assert_eq!(s.outbound_mode.as_deref(), Some("direct"));
+            })
+            .await
+            .unwrap();
+        assert_eq!(after.global_policy.as_deref(), Some("HK"));
+        assert_eq!(store.snapshot().await, after);
+        let on_disk: State =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk, after);
+    }
+
+    #[tokio::test]
+    async fn enhanced_backup_round_trips_and_an_old_file_reads_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        // a file from before the field existed
+        std::fs::write(&path, r#"{"version":1,"outbound_mode":"direct"}"#).unwrap();
+        let (store, old) = StateStore::open(path.clone()).await;
+        assert_eq!(old.enhanced_backup, None);
+        let backup = serde_json::json!({"undo": [{"rp_filter": 1}]});
+        let after = store
+            .try_update(|s| s.enhanced_backup = Some(backup.clone()))
+            .await
+            .unwrap();
+        assert_eq!(after.enhanced_backup, Some(backup.clone()));
+        let (_, reread) = StateStore::open(path).await;
+        assert_eq!(reread.enhanced_backup, Some(backup));
     }
 
     #[tokio::test]
