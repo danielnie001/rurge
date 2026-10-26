@@ -79,7 +79,7 @@ cargo run -p rurge -- status -c config.conf --data-dir ./data   # 查看运行�
 cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印开机自启的安装计划（去掉 --dry-run 才真正写入 / 执行）
 ```
 
-各模块的测试命令（按 crate 与功能的过滤词、基准、互操作的参照服务端）在 `docs/testing.md`。只供测试的后端 `RURGE_SYSTEM_PROXY_BACKEND`、`RURGE_NETWORK_BACKEND`、`RURGE_PROCESS_BACKEND` 与隐藏的 `--network-backend` 不要在正常使用中设置，取值见同一份文件。
+各模块的测试命令（按 crate 与功能的过滤词、基准、互操作的参照服务端）在 `docs/testing.md`。只供测试的后端 `RURGE_SYSTEM_PROXY_BACKEND`、`RURGE_NETWORK_BACKEND`、`RURGE_PROCESS_BACKEND`、`RURGE_ENHANCED_BACKEND` 与隐藏的 `--network-backend` 不要在正常使用中设置，取值见同一份文件。
 
 `Cargo.lock` 需要提交（`.gitignore` 已注明）。
 
@@ -90,7 +90,7 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 - 测试只用回环地址和端口 0，失败时也不离开回环、不离开自己的临时目录。Profile 里写了主机名的用例另给第二道防线（一条按地址的规则、一行把名字钉到 `127.0.0.1` 的 `[Host]`，或一个会拒绝的连接器）；回环之外的地址（文档地址也算）不写成可能被拨的目标。
 - 缺省的 `cargo test` 不改系统设置：系统代理走文件后端，从不执行路由与 DNS 的命令、从不建网卡；要特权的用例只在 CI 虚拟机里、由环境变量放开（阶段 3 总设计第 13 节）。
 - 要先于主人绑定就写进配置的端口、或必须一直关着的端口，取自 20000–29999 并现场试绑一次（`closed_tcp_port()` / `closed_udp_port()`、`free_port()`、`free_tcp_port()`）；"一个没有应答的地方"是测试自己持有的监听器，不是某个固定端口。
-- 起 `rurge` 二进制的用例一律经 `crates/rurge/tests/cli.rs` 的 `rurge_command()` 或 `rurge_process()`（它们隔开缺省的数据与配置目录，把网络指到一个不存在的文件，设 `RURGE_PROCESS_BACKEND=off`），并给 `--data-dir`。`external` 策略拉起的嵌套 `rurge run` 拿不到以 `RURGE_` 开头的变量，要在 `args` 里带 `--network-backend file:<一个不存在的文件>`。
+- 起 `rurge` 二进制的用例一律经 `crates/rurge/tests/cli.rs` 的 `rurge_command()` 或 `rurge_process()`（它们隔开缺省的数据与配置目录，把网络指到一个不存在的文件，设 `RURGE_PROCESS_BACKEND=off`，设 `RURGE_ENHANCED_BACKEND=off`），并给 `--data-dir`。`external` 策略拉起的嵌套 `rurge run` 拿不到以 `RURGE_` 开头的变量，要在 `args` 里带 `--network-backend file:<一个不存在的文件>`。
 - 在线跑起来的引擎或守护进程把 GeoIP 的两个下载地址指到回环（引擎用例的 `geo_urls`，命令行的 `--geoip-url` / `--geoip-asn-url`）。建资源管理器的测试照 `crates/rurge-net/src/resource/mod.rs` 的 `manager()` 与 `NoNames` 来建；真的下载的用例用回环上的 `TestServer`。
 - 调真正的系统解析库的用例只问 `localhost`（现有五条），新的用例不把别的名字交给它。
 - 做"改一行代码看用例变红"的验证之前，先说清这一改会让哪些会话、查找、下载与文件去哪里；可能离开回环或写到用例的临时目录之外的，不做。
