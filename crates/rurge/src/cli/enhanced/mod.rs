@@ -236,6 +236,8 @@ fn table(routes: &RouteSet, wanted: &Wanted) -> EgressTable {
     EgressTable {
         routes: routes.clone(),
         primary: wanted.primary.clone(),
+        // M4b's task 6 puts the physical interfaces' subnets here
+        subnets: Vec::new(),
     }
 }
 
@@ -732,6 +734,8 @@ impl EnhancedMode {
             Some(EgressTable {
                 routes: wanted.routes.clone(),
                 primary: wanted.primary.clone(),
+                // M4b's task 6 puts the physical interfaces' subnets here
+                subnets: Vec::new(),
             }),
         );
         on.egress = true;
