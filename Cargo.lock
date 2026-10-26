@@ -3218,6 +3218,7 @@ dependencies = [
  "rurge-platform",
  "rurge-proto",
  "rurge-rules",
+ "rurge-tun",
  "serde",
  "serde_json",
  "socket2",

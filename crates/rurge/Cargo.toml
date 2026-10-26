@@ -20,6 +20,7 @@ rurge-platform.workspace = true
 rurge-proto.workspace = true
 rurge-engine.workspace = true
 rurge-api.workspace = true
+rurge-tun.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true

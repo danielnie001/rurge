@@ -9,6 +9,22 @@ use std::sync::{Arc, Mutex};
 #[cfg(any(target_os = "macos", windows, test))]
 use std::time::{Duration, Instant};
 
+pub mod egress {
+    //! Where rurge's own sockets go while the enhanced mode is on (M4 design
+    //! 7.1). This version has the data only: the decision and the subnets are
+    //! M4b's, and so is the reader.
+
+    use crate::route::RouteSet;
+
+    /// What decides where rurge's own sockets go while the enhanced mode is on
+    /// (M4 design 7.1). The decision and the subnets are M4b's.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct EgressTable {
+        pub routes: RouteSet,
+        pub primary: Option<String>,
+    }
+}
+
 /// A value worth keeping for a short while: the interface table costs a
 /// system call in the millisecond range, and `bind_interface` runs once per
 /// connection attempt.

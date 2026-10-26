@@ -47,23 +47,32 @@ fn unknown_network() -> (&'static str, String) {
 /// the test is about processes or not. A test that wants the real lookup
 /// removes the variable after the constructor
 /// (`env_remove("RURGE_PROCESS_BACKEND")`).
+///
+/// The enhanced mode has no backend either (`RURGE_ENHANCED_BACKEND=off`), for
+/// the same reason and one more: its platform backend takes over the machine's
+/// routes and DNS, and no test that is not about it may get near that. A test
+/// that wants the file backend sets the variable after the constructor
+/// (`.env("RURGE_ENHANCED_BACKEND", format!("file:{}", path.display()))`).
 fn rurge_command() -> Command {
     let mut cmd = Command::cargo_bin("rurge").unwrap();
     cmd.envs(default_directories())
         .envs([unknown_network()])
         .env("RURGE_PROCESS_BACKEND", "off")
+        .env("RURGE_ENHANCED_BACKEND", "off")
         .env_remove("RURGE_DATA_DIR")
         .env_remove("RURGE_LOG_FILE");
     cmd
 }
 
 /// `rurge` for a test that starts it as a process of its own; it does not
-/// look up processes either, as `rurge_command` explains.
+/// look up processes or have an enhanced mode either, as `rurge_command`
+/// explains.
 fn rurge_process() -> std::process::Command {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("rurge"));
     cmd.envs(default_directories())
         .envs([unknown_network()])
         .env("RURGE_PROCESS_BACKEND", "off")
+        .env("RURGE_ENHANCED_BACKEND", "off")
         .env_remove("RURGE_DATA_DIR")
         .env_remove("RURGE_LOG_FILE");
     cmd
@@ -2466,6 +2475,10 @@ mod run {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    /// The enhanced mode's start-up and recovery, end to end (M4a task 7):
+    /// everything there is to see of it before it can be turned on.
+    mod enhanced_mode;
+
     struct Daemon {
         child: Child,
         http: u16,
@@ -2514,6 +2527,7 @@ mod run {
                 format!("file:{}", sysproxy_file(data).display()),
             )
             .env_remove("RURGE_SYSTEM_PROXY")
+            .env_remove("RURGE_ENHANCED_MODE")
             .env_remove("RURGE_EMPTY_GROUP_REJECT")
             .env_remove("RURGE_LISTEN_HTTP")
             .env_remove("RURGE_LISTEN_SOCKS5");

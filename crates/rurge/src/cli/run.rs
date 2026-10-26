@@ -1046,23 +1046,42 @@ fn lock_data_dir(dir: &Path) -> Result<Option<File>, String> {
     }
 }
 
-/// Whether `state.json` holds a system proxy backup. Read here rather than
+/// What `state.json` says a dead run left behind. Read here rather than
 /// through `StateStore`, which moves a file it cannot parse aside and says
 /// so in the log: where this is asked there is no log, and without a backup
 /// nothing there has any business with the file.
-fn holds_a_backup(state: &Path) -> bool {
-    std::fs::read_to_string(state)
+#[derive(Default)]
+struct Left {
+    system_proxy: bool,
+    enhanced: bool,
+}
+
+impl Left {
+    fn any(&self) -> bool {
+        self.system_proxy || self.enhanced
+    }
+}
+
+fn left_to_undo(state: &Path) -> Left {
+    let Some(state) = std::fs::read_to_string(state)
         .ok()
         .and_then(|text| serde_json::from_str::<State>(&text).ok())
-        .is_some_and(|state| state.system_proxy_backup.is_some())
+    else {
+        return Left::default();
+    };
+    Left {
+        system_proxy: state.system_proxy_backup.is_some(),
+        enhanced: state.enhanced_backup.is_some(),
+    }
 }
 
 /// Crash recovery for a start that ends before it has a log: at a profile
 /// that does not load, or at a log file that cannot be opened. A run that
-/// died with the system proxy pointing at it is undone by the next start, but
-/// only by one that gets as far as its own recovery: a start that ends here
-/// every time would leave the machine pointing at a dead port until whatever
-/// stops it is repaired.
+/// died with the system proxy pointing at it, or with the enhanced mode's
+/// changes out in the world, is undone by the next start, but only by one that
+/// gets as far as its own recovery: a start that ends here every time would
+/// leave the machine pointing at a dead port, or its DNS at a responder that is
+/// gone, until whatever stops it is repaired.
 ///
 /// Unlike a start, this leaves a directory rurge keeps no state in exactly as
 /// it finds it: the data directory is not created, and `state.json` is looked
@@ -1087,9 +1106,56 @@ fn recover_without_a_log(args: &RuntimeArgs) {
 }
 
 /// What `recover_without_a_log` does once it holds the lock: for a start that
-/// holds it already, which cannot take it a second time.
+/// holds it already, which cannot take it a second time. The enhanced mode
+/// goes first: what it leaves behind is the machine's DNS.
 fn restore_what_a_crash_left(path: &Path) {
-    if !holds_a_backup(path) {
+    if !left_to_undo(path).any() {
+        return;
+    }
+    restore_the_enhanced_mode(path);
+    restore_the_system_proxy(path);
+}
+
+/// The enhanced mode's half of `restore_what_a_crash_left`.
+fn restore_the_enhanced_mode(path: &Path) {
+    if !left_to_undo(path).enhanced {
+        return;
+    }
+    let backend = match super::enhanced::backend() {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("warning: {e}; the enhanced mode's changes were not undone");
+            return;
+        }
+    };
+    let recovered = match tokio::runtime::Builder::new_current_thread().build() {
+        Ok(runtime) => runtime.block_on(async {
+            let (store, _) = StateStore::open(path.to_path_buf()).await;
+            super::enhanced::EnhancedMode::recover(&backend, &store).await
+        }),
+        Err(e) => Some(Err(e.to_string())),
+    };
+    match recovered {
+        // Forgetting a backup is a rewrite of `state.json`, and one that fails
+        // reaches nothing but the log. A backup still there is undone again by
+        // the next start, which is harmless: undoing twice is as undoing once.
+        Some(Ok(())) if left_to_undo(path).enhanced => eprintln!(
+            "warning: a previous run left changes of the enhanced mode; they were undone, but state.json could not be updated: the next start undoes them again"
+        ),
+        Some(Ok(())) => {
+            eprintln!("warning: a previous run left changes of the enhanced mode; they were undone")
+        }
+        Some(Err(e)) => eprintln!(
+            "warning: cannot undo what the enhanced mode left: {e}; it stays in state.json and is tried on the next start"
+        ),
+        // not under the lock: the store has just read the file looked at above
+        None => {}
+    }
+}
+
+/// The system proxy's half of `restore_what_a_crash_left`.
+fn restore_the_system_proxy(path: &Path) {
+    if !left_to_undo(path).system_proxy {
         return;
     }
     let backend = match super::sysproxy::backend() {
@@ -1110,7 +1176,7 @@ fn restore_what_a_crash_left(path: &Path) {
         // Forgetting the backup is a rewrite of `state.json`, and one that
         // fails reaches nothing but the log. A backup still there is restored
         // again by the next start, over whatever has been set since.
-        Some(Ok(())) if holds_a_backup(path) => eprintln!(
+        Some(Ok(())) if left_to_undo(path).system_proxy => eprintln!(
             "warning: a previous run left the system proxy pointing at rurge; the saved settings were restored, but state.json could not be updated: the next start restores them again"
         ),
         Some(Ok(())) => eprintln!(
@@ -1273,6 +1339,17 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 return Ok(ExitCode::from(2));
             }
         };
+    // What the enhanced mode may touch is a matter of a variable as well, and a
+    // value that names nothing ends a start as an unknown network backend
+    // does: a typo must not let a start take over the machine's DNS.
+    let enhanced_backend = match super::enhanced::backend() {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("error: {e}");
+            recover_without_a_log(&args.runtime);
+            return Ok(ExitCode::from(2));
+        }
+    };
     let platform = args.platform.unwrap_or_else(Platform::current);
     let data_dir = args.runtime.data_dir();
     let mut opts = LoadOptions {
@@ -1371,7 +1448,16 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         // it left behind may be exactly why this start fails to bind. Putting
         // the pre-crash settings back is right whether or not this run starts.
         // We hold the data directory lock by now, so a backup left in
-        // `state.json` belongs to a dead run, never to a live instance.
+        // `state.json` belongs to a dead run, never to a live instance. The
+        // enhanced mode goes first: what it leaves behind is the machine's DNS.
+        match super::enhanced::EnhancedMode::recover(&enhanced_backend, &store).await {
+            Some(Ok(())) => tracing::info!("restored what the enhanced mode left last time"),
+            Some(Err(e)) => tracing::error!(
+                error = %e,
+                "cannot undo what the enhanced mode left; it stays in state.json and is tried on the next start"
+            ),
+            None => {}
+        }
         let mut sysproxy = SystemProxyManager::new(super::sysproxy::backend()?, store.clone());
         sysproxy.recover().await;
         let outbound_mode = initial_mode(explicit_mode, &store, &state).await;
