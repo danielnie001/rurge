@@ -1227,6 +1227,36 @@ mod tests {
         );
     }
 
+    /// A backup a close cannot read is not guessed at: everything else of the
+    /// close still happens, and the backup is left as it is (it may be a later
+    /// version's).
+    #[tokio::test]
+    async fn a_backup_a_close_cannot_read_is_left_alone() {
+        let mut f = fixture(true).await;
+        f.mode.enable(wanted()).await.unwrap();
+        let foreign = json!({"x": 1});
+        let left = foreign.clone();
+        f.store
+            .update(move |s| s.enhanced_backup = Some(left))
+            .await;
+        f.mode.disable().await.unwrap();
+        let calls = f.backend.calls.list();
+        for step in ["routes off", "stop", "close"] {
+            assert!(calls.contains(&step.to_string()), "{step}: {calls:?}");
+        }
+        assert!(
+            !calls.iter().any(|step| step.starts_with("undo ")),
+            "nothing is guessed at: {calls:?}"
+        );
+        assert_eq!(
+            f.store.snapshot().await.enhanced_backup,
+            Some(foreign),
+            "the backup is left as it is"
+        );
+        assert!(!filled(&f.egress));
+        assert!(!f.mode.enabled());
+    }
+
     #[tokio::test]
     async fn recovering_undoes_what_a_dead_run_left_last_first() {
         let f = fixture(true).await;
