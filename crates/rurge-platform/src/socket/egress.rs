@@ -66,14 +66,19 @@ pub fn subnets_of(addrs: &[(String, IpAddr, u8)], exclude: &[String]) -> Vec<(Ip
             continue;
         }
         // a prefix longer than the address is no subnet of it
-        if let Ok(net) = IpNet::new(*ip, *prefix) {
-            out.push((net.trunc(), interface.clone()));
+        let Ok(net) = IpNet::new(*ip, *prefix) else {
+            continue;
+        };
+        // each subnet once: the first address that names it keeps it, whether
+        // or not the two end up as neighbours once the list is sorted
+        let net = net.trunc();
+        if !out.iter().any(|(known, _)| *known == net) {
+            out.push((net, interface.clone()));
         }
     }
     // A stable sort, so that subnets of the same length keep the addresses'
-    // order; the deduplication then keeps the first of each.
+    // order.
     out.sort_by_key(|(net, _)| std::cmp::Reverse(net.prefix_len()));
-    out.dedup_by(|later, earlier| later.0 == earlier.0);
     out
 }
 
@@ -270,8 +275,10 @@ mod tests {
     fn subnets_of_lists_each_subnet_once_longest_first() {
         let addrs = [
             // the same subnet on two adapters (a cable and Wi-Fi on one LAN):
-            // the one that comes first stays
+            // the one that comes first stays — with another /24 in between, so
+            // that the two are no neighbours once the subnets are sorted
             ("eth0", "192.168.1.5", 24),
+            ("eth0", "10.9.9.9", 24),
             ("wlan0", "192.168.1.20", 24),
             // the address is written as the subnet's network address
             ("eth0", "10.1.2.3", 16),
@@ -286,6 +293,7 @@ mod tests {
             subnets_of(&addrs, &[]),
             vec![
                 (net("192.168.1.0/24"), "eth0".to_string()),
+                (net("10.9.9.0/24"), "eth0".to_string()),
                 (net("10.1.0.0/16"), "eth0".to_string()),
                 (net("10.0.0.0/8"), "eth0".to_string()),
             ]
