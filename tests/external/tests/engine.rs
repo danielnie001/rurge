@@ -57,6 +57,7 @@ async fn runtime(dir: &Path, text: &str, shared: EngineShared) -> Runtime {
                 dns_connector: None,
                 socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
                 dns_override: Default::default(),
+                resource_resolve: None,
             },
             outbound_mode: OutboundMode::Rule,
             idle_timeout: Duration::from_secs(600),

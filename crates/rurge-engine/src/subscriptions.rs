@@ -405,6 +405,7 @@ Remote = select, DIRECT, policy-path=https://sub.test/nodes?token=t0k3n\n[Rule]\
             wait: Duration::ZERO,
             dns_connector: None,
             socket_hook: Arc::new(NoopSocketHook),
+            resource_resolve: None,
             dns_override: Default::default(),
         };
         let opts = RuntimeOptions {

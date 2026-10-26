@@ -3,6 +3,7 @@
 use crate::owner::OwnerLookup;
 use arc_swap::ArcSwapOption;
 use rurge_config::{NetworkCell, NetworkFacts};
+use rurge_dns::system::SystemDns;
 use rurge_net::BoxFuture;
 use rurge_net::connector::{Resolve, Via};
 use rurge_policy::auto::AutoGroups;
@@ -30,6 +31,48 @@ impl ResolverCell {
 
     pub fn store(&self, resolver: Arc<dyn Resolve>) {
         self.0.store(Some(Arc::new(resolver)));
+    }
+
+    /// Whether a generation has published its resolver yet.
+    pub fn active(&self) -> bool {
+        self.0.load().is_some()
+    }
+}
+
+/// How rurge looks up the names it dials itself — downloads, the profile's
+/// sources: through `library` (the system's), except while the enhanced
+/// mode is on, when the library may answer with fake addresses and the
+/// current generation's resolver is asked instead (M4 design 7.6). The
+/// generation's resolver is not asked before one is published.
+pub struct OwnResolve {
+    system: Arc<dyn SystemDns>,
+    cell: Arc<ResolverCell>,
+    library: Arc<dyn Resolve>,
+}
+
+impl OwnResolve {
+    pub fn new(
+        system: Arc<dyn SystemDns>,
+        cell: Arc<ResolverCell>,
+        library: Arc<dyn Resolve>,
+    ) -> OwnResolve {
+        OwnResolve {
+            system,
+            cell,
+            library,
+        }
+    }
+}
+
+impl Resolve for OwnResolve {
+    fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+        Box::pin(async move {
+            if self.system.enhanced_mode() && self.cell.active() {
+                self.cell.resolve(host).await
+            } else {
+                self.library.resolve(host).await
+            }
+        })
     }
 }
 
@@ -171,10 +214,12 @@ impl Default for EngineShared {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rurge_dns::system::StaticSystemDns;
     use rurge_net::BoxFuture;
     use rurge_net::connector::Resolve;
     use std::io;
     use std::net::IpAddr;
+    use std::sync::atomic::Ordering;
 
     struct Fixed(IpAddr);
 
@@ -182,6 +227,89 @@ mod tests {
         fn resolve<'a>(&'a self, _host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
             Box::pin(std::future::ready(Ok(vec![self.0])))
         }
+    }
+
+    /// A resolver that notes every name it is asked, and answers one address.
+    struct Recording {
+        asked: Arc<Mutex<Vec<String>>>,
+        answer: IpAddr,
+    }
+
+    impl Recording {
+        fn new(answer: &str) -> (Recording, Arc<Mutex<Vec<String>>>) {
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            (
+                Recording {
+                    asked: asked.clone(),
+                    answer: answer.parse().expect("an address"),
+                },
+                asked,
+            )
+        }
+    }
+
+    impl Resolve for Recording {
+        fn resolve<'a>(&'a self, host: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
+            Box::pin(async move {
+                self.asked.lock().expect("asked").push(host.to_string());
+                Ok(vec![self.answer])
+            })
+        }
+    }
+
+    /// Outside the enhanced mode the system library is what rurge's own names
+    /// go to, even with a generation published.
+    #[tokio::test]
+    async fn own_resolve_asks_the_library_outside_the_enhanced_mode() {
+        let cell = ResolverCell::new();
+        let (generation, generation_asked) = Recording::new("192.0.2.1");
+        cell.store(Arc::new(generation));
+        let (library, library_asked) = Recording::new("192.0.2.9");
+        let own = OwnResolve::new(
+            Arc::new(StaticSystemDns::default()),
+            cell,
+            Arc::new(library),
+        );
+        assert_eq!(
+            own.resolve("a.test").await.unwrap(),
+            ["192.0.2.9".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(*library_asked.lock().unwrap(), ["a.test"]);
+        assert!(generation_asked.lock().unwrap().is_empty());
+    }
+
+    /// While the enhanced mode is on the library may answer with a fake
+    /// address: the generation's resolver is asked instead.
+    #[tokio::test]
+    async fn own_resolve_asks_the_generation_while_the_enhanced_mode_is_on() {
+        let system = StaticSystemDns::default();
+        system.enhanced.store(true, Ordering::Relaxed);
+        let cell = ResolverCell::new();
+        let (generation, generation_asked) = Recording::new("192.0.2.1");
+        cell.store(Arc::new(generation));
+        let (library, library_asked) = Recording::new("192.0.2.9");
+        let own = OwnResolve::new(Arc::new(system), cell, Arc::new(library));
+        assert_eq!(
+            own.resolve("a.test").await.unwrap(),
+            ["192.0.2.1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(*generation_asked.lock().unwrap(), ["a.test"]);
+        assert!(library_asked.lock().unwrap().is_empty());
+    }
+
+    /// Before the first generation is published there is no resolver to ask:
+    /// the library answers, even when the enhanced mode is said to be on.
+    #[tokio::test]
+    async fn own_resolve_asks_the_library_before_any_generation_is_published() {
+        let system = StaticSystemDns::default();
+        system.enhanced.store(true, Ordering::Relaxed);
+        let (library, library_asked) = Recording::new("192.0.2.9");
+        let own = OwnResolve::new(Arc::new(system), ResolverCell::new(), Arc::new(library));
+        assert_eq!(
+            own.resolve("a.test").await.unwrap(),
+            ["192.0.2.9".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(*library_asked.lock().unwrap(), ["a.test"]);
     }
 
     #[tokio::test]

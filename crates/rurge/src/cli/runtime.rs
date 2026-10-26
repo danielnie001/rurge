@@ -126,6 +126,7 @@ impl Runtime {
             // build the stack without an engine, so they stay direct.
             dns_connector: None,
             socket_hook: Arc::new(PlatformSockets),
+            resource_resolve: None,
             // `Runtime::build` works out the network's own; the commands that
             // build a stack without an engine set nothing unless they work
             // one out themselves.

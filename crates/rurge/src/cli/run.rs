@@ -3,7 +3,10 @@
 use super::enhanced::{EnhancedMode, wanted::Wanted};
 use super::network;
 use super::rule::{parse_mode, print_diagnostics};
-use super::runtime::{PlatformOwners, PlatformProcesses, RuntimeArgs, owners_backend};
+use super::runtime::{
+    PlatformOwners, PlatformProcesses, PlatformSockets, PlatformSystemDns, RuntimeArgs,
+    owners_backend,
+};
 use super::switch;
 use super::sysproxy::{SystemProxyManager, describe, proxy_settings};
 use crate::capabilities;
@@ -18,12 +21,14 @@ use rurge_config::rule::PolicyRef;
 use rurge_config::session::ListenerKind;
 use rurge_engine::control::{Control, EnhancedStatus, LogLevel as ApiLogLevel, Mode, ReloadReport};
 use rurge_engine::profile::{Boot, BootLimits, ProfileSources, boot_need, disk_remote};
-use rurge_engine::stack::DnsOverride;
+use rurge_engine::shared::OwnResolve;
+use rurge_engine::stack::{DnsOverride, resource_client, resource_client_with};
 use rurge_engine::state::{STATE_FILE, State, StateStore, profile_key};
 use rurge_engine::{
     EmptyGroup, Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions,
 };
 use rurge_net::BoxFuture;
+use rurge_net::connector::SystemResolve;
 use rurge_platform::sysproxy::ProxySettings;
 use rurge_rules::OutboundMode;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -1403,7 +1408,13 @@ fn wait_for_the_sources(
             .enable_all()
             .build()?;
         let done = runtime.block_on(async {
-            let sources = ProfileSources::production(&args.config, opts, data_dir, false)?;
+            let sources = ProfileSources::production(
+                &args.config,
+                opts,
+                data_dir,
+                false,
+                resource_client()?,
+            )?;
             let loaded = sources.bootstrap(first, need, limits).await;
             // what the sources say of `strict` now is what the engine begins by
             let reason = sources.strict().map(|suspended| suspended.why);
@@ -1611,16 +1622,12 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let mut sysproxy = SystemProxyManager::new(super::sysproxy::backend()?, store.clone());
         sysproxy.recover().await;
         let outbound_mode = initial_mode(explicit_mode, &store, &state).await;
-        // The sources of the profile that are downloaded, which this run
-        // follows. What a wait before the log downloaded is on the disk, and
-        // that is all they need to know of it. Every reload, and the API's
-        // check of the profile, read the profile as they do, which also says
-        // why a download failed.
-        let sources =
-            ProfileSources::production(&args.config, &opts, &rt.data_dir, rt.no_network)?;
-        opts.remote = Some(sources.remote());
-        sources.track(&cfg.source);
-        // `cfg` is moved into `build_engine_runtime` next, so read its source path now.
+        // `cfg` is moved into `build_engine_runtime` next, so read its source
+        // path now.
+        // What is downloaded is dialled the way an engine dials: through the
+        // platform's sockets and, in the enhanced mode, through rurge's own
+        // resolver (M4 design 7.2, 7.6). The hook and the platform DNS are
+        // made here for now; task 6 gives them the runtime's shared ones.
         let mut shared = EngineShared::new(state.selections_for(&profile_key(&cfg.source.main)));
         if args.empty_group_reject {
             shared.empty_group = EmptyGroup::Reject;
@@ -1629,6 +1636,27 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         if look_up_processes {
             shared.owners = Some(Arc::new(PlatformOwners::new()));
         }
+        // The sources of the profile that are downloaded, which this run
+        // follows. What a wait before the log downloaded is on the disk, and
+        // that is all they need to know of it. Every reload, and the API's
+        // check of the profile, read the profile as they do, which also says
+        // why a download failed.
+        let sources = ProfileSources::production(
+            &args.config,
+            &opts,
+            &rt.data_dir,
+            rt.no_network,
+            resource_client_with(
+                Arc::new(PlatformSockets),
+                Arc::new(OwnResolve::new(
+                    Arc::new(PlatformSystemDns),
+                    shared.resolver.clone(),
+                    Arc::new(SystemResolve),
+                )),
+            )?,
+        )?;
+        opts.remote = Some(sources.remote());
+        sources.track(&cfg.source);
         // The network before the first generation, which is built on it: its
         // `subnet` groups and `SUBNET` rules look at it from the first
         // session on, and the DNS `[SSID Setting]` sets for it is the DNS of

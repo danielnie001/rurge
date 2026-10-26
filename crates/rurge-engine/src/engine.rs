@@ -569,6 +569,14 @@ impl Engine {
         registry.network_changed();
     }
 
+    /// The enhanced mode took the system's DNS or gave it back: the resolver in
+    /// use reads the system's servers again (`Resolver::reread_system_servers`),
+    /// keeping its cache. Not a change of network: `network_changed` is that.
+    pub fn system_dns_changed(&self) {
+        let (runtime, _) = self.snapshot();
+        runtime.stack.resolver.reread_system_servers();
+    }
+
     /// Makes `next` the generation that outlives-a-reload objects see: chain
     /// connectors and dials resolve against its registry, direct connectors
     /// through its resolver; the automatic groups keep what still applies

@@ -256,19 +256,23 @@ impl ProfileSources {
     }
 
     /// The sources of the executable: downloads the way the other resources
-    /// are downloaded, with a back-off of ten minutes at the most.
+    /// are downloaded, with a back-off of ten minutes at the most. `client`
+    /// says who dials: the commands that run an engine give the platform's
+    /// sockets and rurge's own name resolution, a command that runs none
+    /// `resource_client`'s.
     pub fn production(
         profile: &Path,
         load: &LoadOptions,
         data_dir: &Path,
         offline: bool,
+        client: Arc<HttpClient>,
     ) -> anyhow::Result<Arc<ProfileSources>> {
         Ok(ProfileSources::new(SourcesOptions {
             profile: profile.to_path_buf(),
             load: load.clone(),
             data_dir: data_dir.to_path_buf(),
             offline,
-            client: crate::stack::resource_client()?,
+            client,
             resources: ResourceOptions {
                 max_backoff: MAX_BACKOFF,
                 ..ResourceOptions::default()

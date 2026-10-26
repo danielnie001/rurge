@@ -369,6 +369,7 @@ mod tests {
                     wait: Duration::ZERO,
                     dns_connector: None,
                     socket_hook: Arc::new(NoopSocketHook),
+                    resource_resolve: None,
                     dns_override: Default::default(),
                 },
                 outbound_mode: OutboundMode::Rule,

@@ -74,6 +74,7 @@ pub fn stack_options(dir: &std::path::Path) -> StackOptions {
         wait: Duration::ZERO,
         dns_connector: None,
         socket_hook: Arc::new(NoopSocketHook),
+        resource_resolve: None,
         dns_override: Default::default(),
     }
 }

@@ -2,10 +2,11 @@
 
 use crate::outbounds::EngineFactory;
 use crate::prematch::Recorded;
-use crate::shared::EngineShared;
+use crate::shared::{EngineShared, OwnResolve};
 use crate::stack::{DnsOverride, Stack, StackOptions, build_stack};
 use crate::subscriptions::Subscriptions;
 use rurge_config::{Config, Diagnostics};
+use rurge_net::connector::SystemResolve;
 use rurge_policy::PolicyRegistry;
 use rurge_rules::{OutboundMode, RuleEngine};
 use rurge_tun::TunSettings;
@@ -64,11 +65,25 @@ impl Runtime {
         // generation remembers it
         let dns_override = DnsOverride::for_network(&config, &opts.shared.network.load());
         opts.stack.dns_override = dns_override.clone();
+        // the names rurge dials itself go to the system's library, or to this
+        // engine's generation while the enhanced mode is on (M4 design 7.6);
+        // a caller that gives its own keeps it
+        if opts.stack.resource_resolve.is_none() {
+            opts.stack.resource_resolve = Some(Arc::new(OwnResolve::new(
+                opts.stack.system.clone(),
+                opts.shared.resolver.clone(),
+                Arc::new(SystemResolve),
+            )));
+        }
         let dns_pipeline = if config.general.encrypted_dns_follow_outbound_mode {
+            // the sockets of the fallback are rurge's own: the platform's hook
+            // binds them outside the virtual adapter (M4 design 7.2)
             let fallback: Arc<dyn rurge_net::connector::Connector> =
-                Arc::new(rurge_net::connector::DirectConnector::new(Arc::new(
-                    rurge_net::connector::SystemResolve,
-                )));
+                Arc::new(rurge_net::connector::DirectConnector::with_opts(
+                    Arc::new(SystemResolve),
+                    rurge_net::socket::SocketOpts::default(),
+                    opts.stack.socket_hook.clone(),
+                ));
             let pc = crate::dns_pipeline::PipelineConnector::new(fallback);
             opts.stack.dns_connector = Some(pc.connectors());
             Some(pc)

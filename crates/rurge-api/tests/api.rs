@@ -255,6 +255,7 @@ Locked = trojan, 1.2.3.4, 443, password=x\n\
                 },
                 dns_connector: None,
                 socket_hook: Arc::new(rurge_net::socket::NoopSocketHook),
+                resource_resolve: None,
                 dns_override: Default::default(),
             },
             outbound_mode: OutboundMode::Rule,

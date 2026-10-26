@@ -1084,9 +1084,14 @@ async fn the_production_sources_do_not_download_offline() {
     let w = World::new().await;
     w.server.set("/inc", COPY);
     w.write_including(&["/inc"]);
-    let sources =
-        ProfileSources::production(&w.profile(), &LoadOptions::for_tests(), &w.data(), true)
-            .unwrap();
+    let sources = ProfileSources::production(
+        &w.profile(),
+        &LoadOptions::for_tests(),
+        &w.data(),
+        true,
+        resource_client().unwrap(),
+    )
+    .unwrap();
     sources.track(&w.load());
     assert!(sources.settle(Duration::from_secs(5)).await);
     assert_eq!(

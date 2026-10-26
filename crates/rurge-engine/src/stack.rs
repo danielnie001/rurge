@@ -6,9 +6,10 @@ use rurge_config::general::{DnsServer, EncryptedDns};
 use rurge_config::{Config, Diagnostic, Diagnostics, NetworkFacts, codes};
 use rurge_dns::system::SystemDns;
 use rurge_dns::{DnsConnectors, Resolver, ResolverConfig, ResolverDeps};
-use rurge_net::connector::{DirectConnector, SystemResolve};
+use rurge_net::connector::{Connector, DirectConnector, Resolve, SystemResolve};
 use rurge_net::http::{HttpClient, HttpClientConfig};
 use rurge_net::resource::{ResourceManager, ResourceOptions, ResourceStatus};
+use rurge_net::socket::{NoopSocketHook, SocketHook, SocketOpts};
 use rurge_rules::{GeoDb, GeoUpdater, GeoUrls, SetRegistry, SetStatus};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +34,11 @@ pub struct StackOptions {
     /// Interface binding and TOS for outbound sockets (the bin injects
     /// `rurge-platform`; everything else uses `NoopSocketHook`).
     pub socket_hook: Arc<dyn rurge_net::socket::SocketHook>,
+    /// How the downloads of this stack look names up (external resources and
+    /// the profile's sources). `None`: the system's library. `Runtime::build`
+    /// puts rurge's own resolution here (`OwnResolve`), which asks the current
+    /// generation's resolver while the enhanced mode is on.
+    pub resource_resolve: Option<Arc<dyn Resolve>>,
     /// How the network the machine is on changes the DNS the profile asks
     /// for; applied to the resolver's configuration before the hook of
     /// `build_stack_with` sees it. `Runtime::build` replaces it with the one
@@ -114,10 +120,18 @@ pub async fn build_stack_with(
     opts: &StackOptions,
     customize: impl FnOnce(&mut ResolverConfig),
 ) -> anyhow::Result<Stack> {
-    let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
+    let resolver: Arc<dyn Resolve> = opts
+        .resource_resolve
+        .clone()
+        .unwrap_or_else(|| Arc::new(SystemResolve));
+    let direct: Arc<dyn Connector> = Arc::new(DirectConnector::with_opts(
+        Arc::new(SystemResolve),
+        SocketOpts::default(),
+        opts.socket_hook.clone(),
+    ));
     let resources = ResourceManager::with_options(
         opts.data_dir.clone(),
-        resource_client()?,
+        resource_client_with(opts.socket_hook.clone(), resolver)?,
         ResourceOptions {
             offline: opts.no_network,
             ..ResourceOptions::default()
@@ -148,13 +162,13 @@ pub async fn build_stack_with(
     customize(&mut resolver_cfg);
     let resolver_connectors = match &opts.dns_connector {
         Some(connectors) => connectors.clone(),
-        None => DnsConnectors::all(connector.clone()),
+        None => DnsConnectors::all(direct.clone()),
     };
     let (resolver, dns_diags) = Resolver::new(
         resolver_cfg,
         ResolverDeps {
             connectors: resolver_connectors,
-            direct: connector,
+            direct,
             sets: registry.clone(),
             system: opts.system.clone(),
             resources: resources.clone(),
@@ -183,11 +197,20 @@ pub async fn build_stack_with(
     })
 }
 
-/// The HTTP client that downloads external resources and the sources of the
-/// profile: direct connections, never through the pipeline, so that an
-/// engine that refuses sessions can still update.
-pub fn resource_client() -> anyhow::Result<Arc<HttpClient>> {
-    let connector = Arc::new(DirectConnector::new(Arc::new(SystemResolve)));
+/// The HTTP client of downloads (external resources, the profile's
+/// sources): direct connections with `hook`, names looked up by `resolve`.
+///
+/// Never through the pipeline, so that an engine that refuses sessions can
+/// still update.
+pub fn resource_client_with(
+    hook: Arc<dyn SocketHook>,
+    resolve: Arc<dyn Resolve>,
+) -> anyhow::Result<Arc<HttpClient>> {
+    let connector = Arc::new(DirectConnector::with_opts(
+        resolve,
+        SocketOpts::default(),
+        hook,
+    ));
     Ok(Arc::new(HttpClient::new(
         connector,
         HttpClientConfig {
@@ -197,6 +220,12 @@ pub fn resource_client() -> anyhow::Result<Arc<HttpClient>> {
             ..HttpClientConfig::default()
         },
     )?))
+}
+
+/// `resource_client_with` with no hook and the system's library: for the
+/// commands that run no engine, and tests.
+pub fn resource_client() -> anyhow::Result<Arc<HttpClient>> {
+    resource_client_with(Arc::new(NoopSocketHook), Arc::new(SystemResolve))
 }
 
 /// How long `settle` waits for what may not come at all: a set whose resource
@@ -274,6 +303,7 @@ mod tests {
     use rurge_net::resource::{ResourceKind, ResourceSource, resource_key};
     use rurge_net::testing::TestServer;
     use rurge_rules::set_format::SetKind;
+    use std::net::IpAddr;
 
     fn set(key: Option<&str>, version: u64) -> SetStatus {
         SetStatus {
@@ -664,6 +694,79 @@ mod tests {
         DnsOverride::default().apply(&mut elsewhere);
         assert_eq!(elsewhere.servers, own.servers);
         assert_eq!(elsewhere.encrypted, own.encrypted);
+    }
+
+    /// A socket hook that records the destination of every egress question.
+    struct EgressLog {
+        asked: std::sync::Mutex<Vec<IpAddr>>,
+    }
+
+    impl rurge_net::socket::SocketHook for EgressLog {
+        fn bind_interface(
+            &self,
+            _: &socket2::Socket,
+            _: &str,
+            _: rurge_net::socket::Family,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn set_tos(
+            &self,
+            _: &socket2::Socket,
+            _: rurge_net::socket::Family,
+            _: u8,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn egress(&self, dst: IpAddr) -> std::io::Result<Option<String>> {
+            self.asked.lock().expect("egress asked").push(dst);
+            Ok(None)
+        }
+    }
+
+    /// The resolver's connectors carry the stack's socket hook: a lookup of a
+    /// plain UDP server asks the hook for the egress of the server's address
+    /// before the socket is made.
+    #[tokio::test]
+    async fn the_stack_s_connectors_carry_the_socket_hook() {
+        // a server that takes the query and never answers: the hook is asked
+        // before the socket to it is made, and the query ends on its own
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("[General]\ndns-server = {addr}\n[Rule]\nFINAL,DIRECT\n");
+        let loaded = from_text(&text, &dir.path().join("t.conf"), &LoadOptions::for_tests());
+        assert!(!loaded.diagnostics.has_errors());
+        let hook = Arc::new(EgressLog {
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let opts = StackOptions {
+            data_dir: dir.path().to_path_buf(),
+            no_network: true,
+            geo_urls: GeoUrls::default(),
+            dns_cache_size: 100,
+            system: Arc::new(rurge_dns::system::NoSystemDns),
+            wait: Duration::ZERO,
+            dns_connector: None,
+            socket_hook: hook.clone(),
+            dns_override: DnsOverride::default(),
+            resource_resolve: None,
+        };
+        let stack = build_stack(&loaded.config, &opts).await.unwrap();
+        // `hook.test` is asked of the profile's server alone: it is not
+        // `.local`, not a single label, and `[Host]` names it not
+        // (`Resolver::lookup_inner`)
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            stack
+                .resolver
+                .lookup("hook.test", rurge_dns::LookupOpts::default()),
+        )
+        .await
+        .expect("the query ends");
+        assert_eq!(*hook.asked.lock().unwrap(), [addr.ip()]);
     }
 
     /// The URL of an encrypted DNS server can carry a user name and a

@@ -348,3 +348,151 @@ async fn the_hook_of_a_stack_is_applied_after_the_override() {
     .unwrap();
     assert_eq!(stack.resolver.primary_upstreams(), [udp(&hooked)]);
 }
+
+/// A system whose DNS servers the test swaps while the engine runs: the
+/// physical network's servers in the enhanced mode, and a library that is
+/// never to be asked (it would answer with fake addresses).
+struct SwapSystemDns {
+    servers: std::sync::Mutex<Vec<SocketAddr>>,
+    library_asked: std::sync::Mutex<Vec<String>>,
+}
+
+impl SwapSystemDns {
+    fn new(servers: Vec<SocketAddr>) -> SwapSystemDns {
+        SwapSystemDns {
+            servers: std::sync::Mutex::new(servers),
+            library_asked: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_servers(&self, servers: Vec<SocketAddr>) {
+        *self.servers.lock().expect("servers") = servers;
+    }
+
+    fn library_asked(&self) -> Vec<String> {
+        self.library_asked.lock().expect("library asked").clone()
+    }
+}
+
+impl rurge_dns::system::SystemDns for SwapSystemDns {
+    fn servers(&self) -> Vec<SocketAddr> {
+        self.servers.lock().expect("servers").clone()
+    }
+
+    fn search_domains(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn hosts_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn has_ipv6(&self) -> bool {
+        false
+    }
+
+    /// The enhanced mode took the system's DNS: the library is not to be asked.
+    fn enhanced_mode(&self) -> bool {
+        true
+    }
+
+    fn library_lookup<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> rurge_net::BoxFuture<'a, std::io::Result<Vec<std::net::IpAddr>>> {
+        Box::pin(async move {
+            self.library_asked
+                .lock()
+                .expect("library asked")
+                .push(name.to_string());
+            Err(std::io::Error::other("the library is not to be asked"))
+        })
+    }
+}
+
+/// The enhanced mode took the system's DNS and then gave it back with other
+/// servers: `system_dns_changed` reads them again and keeps the cache, and
+/// the old servers are asked no more.
+#[tokio::test]
+async fn system_dns_changed_rereads_the_servers_and_keeps_the_cache() {
+    let own = MockDns::spawn().await;
+    own.set("cached.test", &["10.0.0.1"], &[], 60);
+    let physical = MockDns::spawn().await;
+    for name in ["before.test", "after.test"] {
+        physical.set(name, &["10.0.0.2"], &[], 60);
+    }
+    let other = MockDns::spawn().await;
+    other.set("after.test", &["10.0.0.3"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = format!(
+        "[General]\ndns-server = {}\nipv6 = false\n[Host]\n\
+         before.test = server:system\nafter.test = server:system\n[Rule]\nFINAL,DIRECT\n",
+        own.addr()
+    );
+    std::fs::write(dir.path().join("t.conf"), &profile).unwrap();
+    let loaded = from_text(
+        &profile,
+        &dir.path().join("t.conf"),
+        &LoadOptions::for_tests(),
+    );
+    assert!(!loaded.diagnostics.has_errors());
+    let system = Arc::new(SwapSystemDns::new(vec![physical.addr()]));
+    let mut stack = stack_options(dir.path());
+    stack.system = system.clone();
+    let engine = Engine::new(
+        Runtime::build(
+            loaded.config,
+            RuntimeOptions {
+                stack,
+                outbound_mode: OutboundMode::Rule,
+                idle_timeout: Duration::from_secs(600),
+                shared: EngineShared::default(),
+                request_log_size: 100,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let resolver = engine.resolver();
+
+    // a name the profile's own server answers is kept
+    resolver
+        .lookup("cached.test", LookupOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(own.query_count("cached.test", Qtype::A), 1);
+
+    // `server:system` asks the physical network's servers while the enhanced
+    // mode is on, and here they are the ones the test gave
+    resolver
+        .lookup("before.test", LookupOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(physical.query_count("before.test", Qtype::A), 1);
+
+    // the machine's DNS changed hands and came back with another server
+    system.set_servers(vec![other.addr()]);
+    engine.system_dns_changed();
+
+    // the cache is what it was: the same name is answered from it, and the
+    // profile's server is asked no second time
+    resolver
+        .lookup("cached.test", LookupOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(own.query_count("cached.test", Qtype::A), 1);
+
+    // the new server is what `server:system` asks now, and the old one is
+    // asked no more
+    resolver
+        .lookup("after.test", LookupOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(other.query_count("after.test", Qtype::A), 1);
+    assert_eq!(physical.query_count("after.test", Qtype::A), 0);
+    assert_eq!(physical.query_count("before.test", Qtype::A), 1);
+
+    // the system resolver library was never asked: it would answer with fake
+    // addresses
+    assert!(system.library_asked().is_empty());
+}
