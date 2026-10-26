@@ -636,6 +636,8 @@
 
 2026-10-18 的更新：CI 的运行 39022550224（`7bd6589`，2026-10-17）是第一次读得到失败清单的一次。Linux 跑完了全部测试二进制；macOS 与 Windows 停在 `rurge-proto` 的单元测试二进制里（各有三条用例没有结束），只跑到排在它前面的各包（`rurge`、`rurge-api`、`rurge-config`、`rurge-dns`、`rurge-engine`、`rurge-external-tests`、`rurge-inbound`、`rurge-interop`、`rurge-net`、`rurge-platform`、`rurge-policy`）；三个平台都有失败，CI 仍没有绿过（六类失败与它们的修正见 `docs/acceptance/phase2-acceptance.md` 第 8 节的更新）。下面各项在那一次运行里的结果（通过是指那一次运行的失败清单里没有它）：只在 Unix 上编译的 `run_shuts_down_gracefully_on_sigint`、`sighup_reloads_the_profile` 与 `tests/interop/tests/sshd.rs` 的 2 个用例在 Linux 与 macOS 上编译、运行，通过了；只在 Windows 上编译的各条在 CI 的 Windows 上也通过了；`crates/rurge/src/cli/run.rs` 里 Unix 的信号处理，`SIGINT` 与 `SIGHUP` 由前两条用例走到了，`SIGTERM` 没有用例；`sysinfo.rs` 的 Unix 读取里，系统版本由 `rurge-platform` 的 `this_system_says_its_version` 与 `rurge` 的 `check_reads_the_system_version_from_the_operating_system` 在 Linux 与 macOS 上读到了，型号、语言与名字读了，没有用例断言它们的取值；真的拉起 `networksetup`、`gsettings`、`kwriteconfig` 的 `SystemRunner`、`service.rs::execute` 与读 `/etc/resolv.conf` 的那一步，没有用例在真实的系统上断言，照旧；`the_log_file_is_rolled_daily_and_seven_files_are_kept` 在三个平台上都通过了。
 
+2026-10-26 的更新：CI 的运行 40283632986（`ac0a98a`，2026-10-26）三个平台的 `check` 与 `bench` 都通过，这是 CI 第一次全绿（运行与任务的结论读自公开的 API；任务日志要登录才能读，各平台跑了多少个用例没有读到）。所以下面列的各项在 Linux、macOS 与 Windows 上都编译了，有用例的都通过了；上面一段说没有用例在真实的系统上断言的那几处，照旧没有。阶段 1 的手工验收清单仍一行也没有做过。
+
 **只在 Unix 上编译的用例**（用 `git grep` 找 `cfg(unix)` 与 `cfg(target_os` 得到的）：
 
 - `crates/rurge/tests/cli.rs`：`run_shuts_down_gracefully_on_sigint`（SIGINT 之后的优雅退出）、`sighup_reloads_the_profile`（FR-CFG-16 的 `SIGHUP` 重载）；它们用 `nix`（`crates/rurge/Cargo.toml` 里只在 Unix 上的开发依赖）发信号。
