@@ -4,12 +4,14 @@
 //! or that builds a direct connector with no socket hook, is traffic that
 //! could go back into the virtual interface while the enhanced mode is on. So
 //! this test reads the production code under `crates/*/src` and holds those
-//! places to a list: one more than the list, one less, is a failure.
+//! places to a list: one row for each place it finds, and one more place than
+//! the rows, or one less, is a failure.
 //!
 //! Adding a place that makes a socket, asks the system resolver or builds a
-//! connector without a hook means adding a row to the list and saying why.
-//! M4c and M4d have to do the same for the sockets they add for a device (the
-//! utun control socket on macOS).
+//! connector without a hook means adding a row to the list and saying why —
+//! which function it is in, so that the row of the second place in a file is
+//! not taken for the row of the first. M4c and M4d have to do the same for the
+//! sockets they add for a device (the utun control socket on macOS).
 //!
 //! Test code is skipped. A file is read up to the line of its first inline
 //! test module, `#[cfg(test)]` followed by `mod name {`: the repository's
@@ -29,7 +31,7 @@ use std::path::{Path, PathBuf};
 /// without a hook that the list below accounts for. A pattern is matched where
 /// the character before it does not continue a name (`[A-Za-z0-9_]`), so
 /// `TosSocket::new(` is not `Socket::new(` and `socket2::Socket::new(` is.
-const PATTERNS: [&str; 11] = [
+const PATTERNS: [&str; 15] = [
     "UdpSocket::bind(",
     "TcpStream::connect",
     "TcpSocket::new_v4(",
@@ -40,33 +42,43 @@ const PATTERNS: [&str; 11] = [
     "build_http(",
     "lookup_host(",
     "DirectConnector::new(",
-    "Arc::new(NoopSocketHook)",
+    "NoopSocketHook)",
+    "Endpoint::client(",
+    "libc::socket(",
+    "socket::socket(",
+    "resource_client(",
 ];
 
 /// The file, the pattern and why it is not an outbound socket that skips the
-/// egress decision, in the order they sort in.
+/// egress decision, in the order they sort in — one row for each place, so a
+/// function that makes a second socket of the same kind has a row of its own.
 ///
 /// Adding a row means changing this list; so does removing one.
-const LISTED: [(&str, &str, &str); 17] = [
+const LISTED: [(&str, &str, &str); 24] = [
     (
         "crates/rurge-api/src/lib.rs",
         "TcpListener::bind(",
-        "the HTTP API's listener, which does not go out",
+        "`serve`: the HTTP API's listener, which does not go out",
     ),
     (
         "crates/rurge-engine/src/outbounds.rs",
-        "Arc::new(NoopSocketHook)",
+        "NoopSocketHook)",
         "`EngineFactory::dry`, whose empty build never dials",
     ),
     (
         "crates/rurge-engine/src/stack.rs",
-        "Arc::new(NoopSocketHook)",
+        "NoopSocketHook)",
         "`resource_client()`: the commands that do not run an engine (`check` and the like) and the tests; the daemon's two download clients use `resource_client_with`",
+    ),
+    (
+        "crates/rurge-engine/src/stack.rs",
+        "resource_client(",
+        "`resource_client` itself: the one place a client with no hook is built",
     ),
     (
         "crates/rurge-inbound/src/listener.rs",
         "TcpListener::bind(",
-        "a listener, which does not go out",
+        "`run`: a listener, which does not go out",
     ),
     (
         "crates/rurge-inbound/src/socks5.rs",
@@ -75,13 +87,13 @@ const LISTED: [(&str, &str, &str); 17] = [
     ),
     (
         "crates/rurge-net/src/connector.rs",
-        "Arc::new(NoopSocketHook)",
+        "NoopSocketHook)",
         "`DirectConnector::new` itself: a direct connection with no hook; its callers are covered by the `DirectConnector::new(` rows",
     ),
     (
         "crates/rurge-net/src/connector.rs",
         "Socket::new(",
-        "`open_socket`: the only way an outbound socket is made, and where the egress is asked",
+        "`new_socket`: the only way an outbound socket is made, and where the egress is asked",
     ),
     (
         "crates/rurge-net/src/connector.rs",
@@ -91,7 +103,22 @@ const LISTED: [(&str, &str, &str); 17] = [
     (
         "crates/rurge-platform/src/icmp.rs",
         "Socket::new(",
-        "the ICMP socket, which `PlatformPinger` binds by egress",
+        "`open` on Linux / Android: the datagram ICMP socket, which `PlatformPinger` binds by egress",
+    ),
+    (
+        "crates/rurge-platform/src/icmp.rs",
+        "Socket::new(",
+        "`open` on Linux / Android: the raw ICMP socket, when the datagram one is not allowed",
+    ),
+    (
+        "crates/rurge-platform/src/icmp.rs",
+        "Socket::new(",
+        "`open` on macOS: the datagram ICMP socket",
+    ),
+    (
+        "crates/rurge-platform/src/icmp.rs",
+        "Socket::new(",
+        "`open` on Windows: the raw ICMP socket",
     ),
     (
         "crates/rurge-platform/src/netenv/watch.rs",
@@ -101,7 +128,17 @@ const LISTED: [(&str, &str, &str); 17] = [
     (
         "crates/rurge-proto-wireguard/src/stack.rs",
         "Socket::new(",
-        "smoltcp's sockets, not the system's",
+        "`connect`: smoltcp's TCP socket, not the system's",
+    ),
+    (
+        "crates/rurge-proto-wireguard/src/stack.rs",
+        "Socket::new(",
+        "`udp_open`: smoltcp's UDP socket, not the system's",
+    ),
+    (
+        "crates/rurge-proto-wireguard/src/stack.rs",
+        "Socket::new(",
+        "`udp_bind`: smoltcp's UDP carrier socket, not the system's",
     ),
     (
         "crates/rurge-proto/src/direct.rs",
@@ -127,6 +164,11 @@ const LISTED: [(&str, &str, &str); 17] = [
         "crates/rurge/src/cli/api_client.rs",
         "build_http(",
         "the process of `rurge status` / `reload` / `stop`, not the daemon",
+    ),
+    (
+        "crates/rurge/src/cli/run.rs",
+        "resource_client(",
+        "`waiting`: the run that has not built its engine yet, which asks nothing of the network with it",
     ),
     (
         "crates/rurge/src/cli/runtime.rs",
@@ -170,19 +212,31 @@ fn every_outbound_socket_is_made_in_one_place() {
         }
     }
     found.sort();
-    found.dedup();
 
-    let listed: Vec<(String, String)> = LISTED
+    let mut listed: Vec<(String, String)> = LISTED
         .iter()
         .map(|(file, pattern, _)| (file.to_string(), pattern.to_string()))
         .collect();
-    let missing: Vec<&(String, String)> =
-        listed.iter().filter(|row| !found.contains(row)).collect();
-    let extra: Vec<&(String, String)> = found.iter().filter(|row| !listed.contains(row)).collect();
+    listed.sort();
+    // One row for each place: a file with the same pattern twice needs two
+    // rows, so the comparison is of the whole list over the whole list, not
+    // of what each names once (the phase 3 / M4b plan's execution record row
+    // 73).
+    let mut left = found.clone();
+    let mut missing: Vec<(String, String)> = Vec::new();
+    for row in &listed {
+        match left.iter().position(|found| found == row) {
+            Some(at) => {
+                left.remove(at);
+            }
+            None => missing.push(row.clone()),
+        }
+    }
+    let extra = left;
     assert!(
         missing.is_empty() && extra.is_empty(),
         "the places that make a socket, ask for a name or build a connector without a hook \
-         are not the ones on the list\nfound but not listed: {extra:?}\n\
+         are not the ones on the list, one row for each\nfound but not listed: {extra:?}\n\
          listed but not found: {missing:?}"
     );
 }
@@ -310,9 +364,10 @@ fn is_inline_module(text: &str) -> bool {
 
 /// Whether `line`, which begins in the first column, declares an item that
 /// would be production code after the tests: `fn`, `impl`, `struct`, `enum`,
-/// `union`, `const`, `static`, `use`, `type`, `trait`, `mod` or
-/// `macro_rules!`, after any of `pub …`, `async`, `unsafe` or `extern`. A
-/// `mod` that follows `#[cfg(test)]` is another test module.
+/// `union`, `const`, `static`, `use`, `type`, `trait`, `mod`, `extern` or
+/// `macro_rules!`, after any of `pub …`, `pub(…)`, `async`, `unsafe` or
+/// `default`, and `const` before `fn`. A `mod` that follows `#[cfg(test)]` is
+/// another test module.
 fn starts_an_item(lines: &[&str], at: usize) -> bool {
     let line = lines[at];
     if line.is_empty()
@@ -332,8 +387,9 @@ fn starts_an_item(lines: &[&str], at: usize) -> bool {
 /// The keyword of the item `line` declares, in the first column, past the
 /// modifiers it may begin with.
 fn item_keyword(line: &str) -> Option<&str> {
-    const ITEMS: [&str; 11] = [
+    const ITEMS: [&str; 12] = [
         "fn", "impl", "struct", "enum", "union", "const", "static", "use", "type", "trait", "mod",
+        "extern",
     ];
     let mut rest = line;
     loop {
@@ -423,6 +479,28 @@ fn after() {}
 ";
     let (line, item) = found_in(text).unwrap_err();
     assert_eq!((line, item.as_str()), (6, "fn after() {}"));
+    // an `extern` item is an item too, however it is written
+    for item in [
+        "extern \"C\" fn after() {}",
+        "extern crate after;",
+        "extern \"C\" {",
+    ] {
+        let text = format!("#[cfg(test)]\nmod tests {{\n    fn inside() {{}}\n}}\n\n{item}\n");
+        let (line, found) = found_in(&text).unwrap_err();
+        assert_eq!((line, found.as_str()), (6, item), "{item}");
+    }
+}
+
+#[test]
+fn a_connector_without_a_hook_is_found_however_it_is_written() {
+    assert_eq!(
+        found_in("let hook = Arc::new(NoopSocketHook);\n"),
+        Ok(vec!["NoopSocketHook)"])
+    );
+    assert_eq!(
+        found_in("let hook = Arc::new(rurge_net::socket::NoopSocketHook);\n"),
+        Ok(vec!["NoopSocketHook)"])
+    );
 }
 
 #[test]

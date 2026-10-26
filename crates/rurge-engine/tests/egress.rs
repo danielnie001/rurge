@@ -362,6 +362,67 @@ async fn resource_downloads_ask_the_hook() {
     );
 }
 
+/// The Profile sources of a generation — the managed profile, the remote
+/// includes — ask the hook as well: `ProfileSources::production` dials
+/// through the client it is given and makes no client of its own (M4 design
+/// 7.6; the phase 3 / M4b plan's execution record row 72).
+#[tokio::test]
+async fn profile_sources_ask_the_hook() {
+    use rurge_config::Remote;
+    use rurge_config::config::load;
+    use rurge_engine::profile::{ProfileSources, disk_remote};
+    use rurge_engine::stack::resource_client_with;
+    use rurge_net::connector::SystemResolve;
+
+    let server = TestServer::spawn().await;
+    server.set("/inc.list", "[Rule]\nDOMAIN,two.example,DIRECT\n");
+    let log = EgressLog::recording();
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("t.conf");
+    let data = dir.path().join("data");
+    // the address of the include is an IP address: no name reaches the
+    // system's resolver library
+    let text = format!(
+        "[General]\nproxy-test-url = {NO_TEST}\ninternet-test-url = {NO_TEST}\n\
+         [Rule]\n#!include {}\nFINAL,DIRECT\n",
+        server.url("/inc.list")
+    );
+    std::fs::write(&profile, &text).unwrap();
+
+    let sources = ProfileSources::production(
+        &profile,
+        &LoadOptions::for_tests(),
+        &data,
+        false,
+        resource_client_with(hook(&log), Arc::new(SystemResolve)).unwrap(),
+    )
+    .unwrap();
+
+    // what a generation's load comes across, with nothing downloaded yet
+    let mut opts = LoadOptions::for_tests();
+    opts.remote = Some(disk_remote(&data));
+    let info = load(&profile, &opts).unwrap().config.source;
+    sources.track(&info);
+    // the download is the sources' own task: the copy is what says it arrived
+    let copy = || disk_remote(&data).get(&server.url("/inc.list"));
+    wait_until("the include to be downloaded", || {
+        matches!(copy(), Remote::Text { .. })
+    })
+    .await;
+
+    assert!(
+        log.asked().contains(&loopback()),
+        "the hook was asked {:?}",
+        log.asked()
+    );
+    match copy() {
+        Remote::Text { text, .. } => {
+            assert!(text.contains("two.example"), "{text}");
+        }
+        other => panic!("the include was not downloaded: {other:?}"),
+    }
+}
+
 /// A hook that refuses a destination stops the connection before anything is
 /// sent: no connection reaches the listener, no datagram the socket.
 #[tokio::test]
