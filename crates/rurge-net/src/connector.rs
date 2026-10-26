@@ -145,6 +145,12 @@ pub trait Connector: Send + Sync {
     /// under it (a policy group's member as the underlying proxy): a
     /// connection made before it changed goes elsewhere. `None`: always the
     /// same way.
+    ///
+    /// A connector that dials directly answers with the egress table its own
+    /// sockets are bound to while the enhanced mode is on (`Route::egress`,
+    /// M4 design 7.1): the sockets it made before the table changed are the
+    /// ones that have to be made again (the phase 3 / M4b plan's execution
+    /// record row 68).
     fn route(&self) -> Option<Route> {
         None
     }
@@ -162,9 +168,17 @@ pub trait Connector: Send + Sync {
 /// policy's outbound. Two are equal when they stand for the same object;
 /// one keeps its object alive, so no newer one can take its place in memory
 /// while it is compared.
+///
+/// One kind of object is not an outbound: the egress table of the enhanced
+/// mode (`Route::egress`). Such a route says which table rurge's own sockets
+/// are bound to, for a socket that outlives one connection — a WireGuard
+/// carrier, a QUIC connection — to be made again when that table changes
+/// (M4 design 7.1, 7.2; the phase 3 / M4b plan's execution record row 68).
 #[derive(Clone)]
 pub struct Route {
     at: usize,
+    /// Whether this route is an egress table, not an outbound.
+    egress: bool,
     _alive: Arc<dyn Send + Sync>,
 }
 
@@ -172,12 +186,32 @@ impl Route {
     pub fn of<T: ?Sized + Send + Sync + 'static>(object: &Arc<T>) -> Route {
         Route {
             at: Arc::as_ptr(object) as *const () as usize,
+            egress: false,
             _alive: Arc::new(object.clone()),
         }
+    }
+
+    /// The egress table rurge's own sockets are bound to now (`SocketHook::
+    /// egress_route`): kept by pointer, as `of` keeps its object, so a table
+    /// the manager writes again is another route and the same one is not.
+    pub fn egress<T: ?Sized + Send + Sync + 'static>(table: &Arc<T>) -> Route {
+        Route {
+            at: Arc::as_ptr(table) as *const () as usize,
+            egress: true,
+            _alive: Arc::new(table.clone()),
+        }
+    }
+
+    /// Whether this route stands for the egress table rurge's own sockets are
+    /// bound to, rather than for an outbound.
+    pub fn is_egress(&self) -> bool {
+        self.egress
     }
 }
 
 impl PartialEq for Route {
+    /// The object, not how the route was made: two routes to the same table
+    /// are equal whether they name it as an egress or as an outbound.
     fn eq(&self, other: &Route) -> bool {
         self.at == other.at
     }
@@ -639,6 +673,14 @@ impl Connector for DirectConnector {
 
     fn as_direct(&self) -> Option<&DirectConnector> {
         Some(self)
+    }
+
+    /// The egress table this connector's sockets are bound to now, as its
+    /// hook reads it: another table means the sockets it made are bound to
+    /// the one that is gone (the phase 3 / M4b plan's execution record row
+    /// 68).
+    fn route(&self) -> Option<Route> {
+        self.hook.egress_route()
     }
 }
 
@@ -2194,5 +2236,74 @@ mod tests {
             display_target(&Target::new(HostName::parse("a.test"), 443)),
             "a.test:443"
         );
+    }
+
+    /// A route built from an egress table is the one kind that can say what
+    /// rurge's own sockets are bound to; equality is still the table it stands
+    /// for, not how the route was built (the phase 3 / M4b plan's execution
+    /// record row 68).
+    #[test]
+    fn only_a_route_built_from_an_egress_table_says_it_is_one() {
+        let table = Arc::new(7u8);
+        assert!(Route::egress(&table).is_egress());
+        assert!(!Route::of(&table).is_egress());
+        assert_eq!(Route::egress(&table), Route::egress(&table));
+        assert_eq!(
+            Route::egress(&table),
+            Route::of(&table),
+            "the same table, however the route was built"
+        );
+        assert_ne!(Route::egress(&table), Route::egress(&Arc::new(7u8)));
+    }
+
+    /// A hook whose table changes under it, as the manager's does: the answer
+    /// to `egress_route` is the table there is now.
+    #[derive(Default)]
+    struct EgressRouting {
+        table: Mutex<Option<Arc<u8>>>,
+    }
+
+    impl SocketHook for EgressRouting {
+        fn bind_interface(&self, _: &socket2::Socket, _: &str, _: Family) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_tos(&self, _: &socket2::Socket, _: Family, _: u8) -> io::Result<()> {
+            Ok(())
+        }
+        fn egress_route(&self) -> Option<Route> {
+            self.table.lock().unwrap().as_ref().map(Route::egress)
+        }
+    }
+
+    /// A direct connector routes to the egress table its hook names: `None`
+    /// while there is none, one route while it is the same table, and another
+    /// once the hook names another table. A connector without a hook says
+    /// nothing, so nothing is rebuilt for it (the phase 3 / M4b plan's
+    /// execution record row 68).
+    #[test]
+    fn a_direct_connector_routes_to_the_egress_table_its_hook_names() {
+        let hook = Arc::new(EgressRouting::default());
+        let connector = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts::default(),
+            hook.clone(),
+        );
+        assert!(connector.route().is_none(), "no table, no route");
+
+        let first = Arc::new(1u8);
+        *hook.table.lock().unwrap() = Some(first.clone());
+        let route = connector.route().expect("the table is the route");
+        assert!(route.is_egress());
+        assert_eq!(Some(route), connector.route(), "the same table twice");
+
+        *hook.table.lock().unwrap() = Some(Arc::new(2u8));
+        assert_ne!(
+            connector.route(),
+            Some(Route::egress(&first)),
+            "another table is another route"
+        );
+
+        let plain = DirectConnector::new(Arc::new(SystemResolve));
+        assert!(plain.route().is_none(), "a hook that says nothing");
     }
 }

@@ -82,6 +82,16 @@ pub trait SocketHook: Send + Sync {
         let _ = dst;
         Ok(None)
     }
+    /// The egress table `egress` is answered from right now (M4 design 7.1,
+    /// 7.2): one `Route` while there is a table, another once the manager
+    /// writes another, `None` while the enhanced mode is off. A socket that
+    /// outlives one connection — a WireGuard carrier, a QUIC connection —
+    /// was bound to the table of the moment it was made, so whatever makes
+    /// such a socket asks this (`Connector::route`) and makes it again under
+    /// another table (the phase 3 / M4b plan's execution record row 68).
+    fn egress_route(&self) -> Option<crate::connector::Route> {
+        None
+    }
 }
 
 /// Does nothing: for commands that never dial (`check`, `rule match`) and tests.

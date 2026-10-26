@@ -47,9 +47,20 @@ pub fn egress_slot() -> EgressSlot {
     Arc::new(std::sync::RwLock::new(None))
 }
 
-fn set_egress(slot: &EgressSlot, table: Option<EgressTable>) {
+/// Writes the egress table the manager wants in the slot, unless the slot
+/// already holds that table: `false` then, the same `Arc` left in place, and
+/// `true` once another table went in. The `Arc` is what a socket that
+/// outlives one connection compares (`Route::egress`, by pointer), so a table
+/// whose content did not change must not be written again: every WireGuard
+/// carrier and every QUIC connection would be made again on every reload
+/// otherwise (the phase 3 / M4b plan's execution record rows 68 and 69).
+fn set_egress(slot: &EgressSlot, table: Option<EgressTable>) -> bool {
     let mut slot = slot.write().unwrap_or_else(|e| e.into_inner());
+    if slot.as_deref() == table.as_ref() {
+        return false;
+    }
     *slot = table.map(Arc::new);
+    true
 }
 
 /// Whether the egress table is in the slot: the mock backend and the tests ask
@@ -70,6 +81,11 @@ pub struct Links {
     /// The interfaces the network task leaves out of what it reads.
     pub exclude: Exclude,
     /// The system's DNS changed hands: `Engine::system_dns_changed` in a run.
+    /// The manager calls it as the enhanced mode takes the DNS over and gives
+    /// it back, and after it wrote another egress table without taking the
+    /// DNS over again: the resolver's upstreams are bound to the table there
+    /// was, so they are built again on the new one (M4 design 7.2; the phase
+    /// 3 / M4b plan's execution record row 69).
     pub system_dns_changed: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -525,12 +541,15 @@ impl EnhancedMode {
         }
         let old = on.routes.clone().unwrap_or_default();
         let (add, remove) = RouteSet::diff(&old, &next);
+        // whether this follow wrote another table, whose sockets are not the
+        // ones the resolver's upstreams were bound to
+        let mut table_changed = false;
         if add.is_empty() && remove.is_empty() {
             // nothing to add or remove, and the table takes the new primary
-            set_egress(&self.links.egress, Some(table(&next, &wanted, &subnets)));
+            table_changed |= set_egress(&self.links.egress, Some(table(&next, &wanted, &subnets)));
             on.routes = Some(next);
         } else {
-            set_egress(
+            table_changed |= set_egress(
                 &self.links.egress,
                 Some(table(&union(&old, &next), &wanted, &subnets)),
             );
@@ -561,7 +580,8 @@ impl EnhancedMode {
                             ipv6 = false;
                         }
                     }
-                    set_egress(&self.links.egress, Some(table(&next, &wanted, &subnets)));
+                    table_changed |=
+                        set_egress(&self.links.egress, Some(table(&next, &wanted, &subnets)));
                     on.routes = Some(next);
                 }
                 Err(e) => {
@@ -574,8 +594,17 @@ impl EnhancedMode {
 
         // IPv6 coming, or another network: the DNS, once. IPv6 going has taken
         // it over already, and one follow takes it over at most once.
-        if !dns_taken && (ipv6 != was_ipv6 || network_changed) {
+        let taking_the_dns = !dns_taken && (ipv6 != was_ipv6 || network_changed);
+        if taking_the_dns {
             self.take_the_dns_again(&dev, ipv6).await;
+        } else if table_changed {
+            // Another table went in and no takeover follows: the resolver's
+            // upstreams are bound to the table there was, and a DNS server's
+            // address that the new routes send into the adapter would take a
+            // lookup with them. Telling it the system's DNS changed hands
+            // makes it build them again on the new table (the phase 3 / M4b
+            // plan's execution record row 69).
+            (self.links.system_dns_changed)();
         }
 
         // IPv6 going: the address last, after its routes
@@ -2123,6 +2152,77 @@ mod tests {
         assert_eq!(table.routes, moved.routes);
         assert_eq!(table.primary.as_deref(), Some("eth1"));
         assert!(f.mode.enabled());
+    }
+
+    /// A follow that writes the table the slot already holds leaves that
+    /// table in it, the same `Arc`: the sockets that outlive one connection
+    /// compare routes by pointer, so only a table whose content changed may
+    /// have them made again (the phase 3 / M4b plan's execution record row
+    /// 69).
+    #[tokio::test]
+    async fn a_follow_that_writes_the_same_table_keeps_the_one_in_the_slot() {
+        let mut f = fixture(true).await;
+        f.mode.enable(wanted()).await.unwrap();
+        let before = f
+            .egress
+            .read()
+            .unwrap()
+            .clone()
+            .expect("the table is there");
+
+        f.mode.follow(wanted(), false).await;
+
+        let after = f
+            .egress
+            .read()
+            .unwrap()
+            .clone()
+            .expect("the table is there");
+        assert_eq!(*after, *before, "the same content");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the table the slot held is the one it holds"
+        );
+    }
+
+    /// A follow whose routes change writes another table, and with no DNS
+    /// takeover to come — the network did not change and the IPv6 half did
+    /// not —, the resolver is still told the system's DNS changed hands: its
+    /// upstreams are bound to the table there was, and the next lookup builds
+    /// them on the new one (the phase 3 / M4b plan's execution record row
+    /// 69). A follow that changes nothing tells it nothing.
+    #[tokio::test]
+    async fn a_follow_that_writes_another_table_rebuilds_the_resolvers_upstreams() {
+        let mut f = fixture_recording_system_dns(true).await;
+        f.mode.enable(wanted()).await.unwrap();
+        let after_open = f.backend.calls.list().len();
+
+        // nothing changed: no step, and no callback
+        f.mode.follow(wanted(), false).await;
+        assert_eq!(
+            f.backend.calls.list()[after_open..],
+            [] as [String; 0],
+            "{:?}",
+            f.backend.calls.list()
+        );
+
+        // the routes only
+        let mut next = wanted();
+        let excluded = ["1.2.3.0/24".parse().unwrap()];
+        next.routes = RouteSet::compute(&RouteInputs {
+            ipv6: true,
+            excluded: &excluded,
+            included: &[],
+            external: &[],
+            explicit_space: false,
+        });
+        assert_ne!(next.routes, wanted().routes);
+        f.mode.follow(next, false).await;
+        assert_eq!(
+            f.backend.calls.list()[after_open..],
+            lines(&["routes", "system_dns_changed on"]),
+            "the callback comes after the routes that put the table in"
+        );
     }
 
     /// What the egress table holds while the routes cannot be installed: the

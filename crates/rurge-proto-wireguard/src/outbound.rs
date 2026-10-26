@@ -1384,10 +1384,12 @@ mod tests {
     }
 
     /// Dials through `inner`; its route is what `route` holds now, as the
-    /// member of a group that is the underlying proxy.
+    /// member of a group that is the underlying proxy — or, with `egress`,
+    /// the egress table of the enhanced mode.
     struct Rerouted {
         inner: Arc<dyn Connector>,
         route: Arc<StdMutex<Arc<u8>>>,
+        egress: bool,
     }
 
     impl Connector for Rerouted {
@@ -1408,7 +1410,12 @@ mod tests {
         }
 
         fn route(&self) -> Option<Route> {
-            Some(Route::of(&self.route.lock().unwrap()))
+            let route = self.route.lock().unwrap();
+            Some(if self.egress {
+                Route::egress(&route)
+            } else {
+                Route::of(&route)
+            })
         }
     }
 
@@ -1422,6 +1429,7 @@ mod tests {
         let rerouted: Arc<dyn Connector> = Arc::new(Rerouted {
             inner: direct(),
             route: route.clone(),
+            egress: false,
         });
         let (peer, wg) = tunnel_with(PeerOpts::default(), |_| {}, no_names(), rerouted).await;
         let mut stream = wg
@@ -1436,6 +1444,56 @@ mod tests {
         until(|| peer.clients().len() == 2).await;
         assert_eq!(echo(&mut stream, b"after").await, b"after");
         assert_eq!(peer.core().handshakes, 2);
+    }
+
+    /// The egress table of the enhanced mode changes under the carriers —
+    /// rurge wrote a new one, and the carriers made under the old one are
+    /// bound to what is gone: every carrier is dialled anew, the connections
+    /// carry on, and the log says the egress changed rather than that an
+    /// underlying policy did (the phase 3 / M4b plan's execution record row
+    /// 68).
+    #[tokio::test]
+    async fn an_egress_table_change_underneath_dials_every_peer_anew() {
+        let (log, _logging, _second) = Log::capture();
+        let route = Arc::new(StdMutex::new(Arc::new(1u8)));
+        let rerouted: Arc<dyn Connector> = Arc::new(Rerouted {
+            inner: direct(),
+            route: route.clone(),
+            egress: true,
+        });
+        let (peer, wg) = tunnel_with(PeerOpts::default(), |_| {}, no_names(), rerouted).await;
+        let mut stream = wg
+            .connect_tcp(&at("10.0.0.1", ECHO_PORT), &within(5))
+            .await
+            .expect("a connection");
+        assert_eq!(echo(&mut stream, b"before").await, b"before");
+        assert_eq!(peer.clients().len(), 1);
+
+        *route.lock().unwrap() = Arc::new(2u8);
+        until(|| peer.clients().len() == 2).await;
+        assert_eq!(echo(&mut stream, b"after").await, b"after");
+        assert_eq!(peer.core().handshakes, 2);
+
+        let egress = log.with("the egress of rurge's own sockets changed");
+        assert_eq!(egress.len(), 1, "{egress:?}");
+        assert!(
+            egress[0].starts_with("INFO "),
+            "one INFO line: {}",
+            egress[0]
+        );
+        assert!(
+            egress[0].contains(
+                "wireguard: the egress of rurge's own sockets changed; \
+                                 the peers are dialled anew"
+            ),
+            "{}",
+            egress[0]
+        );
+        assert!(
+            log.with("the underlying policy changed").is_empty(),
+            "{:?}",
+            log.with("the underlying policy changed")
+        );
     }
 
     /// Dials through `inner` and counts the dials; once `broken` is set,

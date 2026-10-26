@@ -696,16 +696,33 @@ impl Driver {
         }
     }
 
-    /// Whether the underlying policy leads elsewhere than when every carrier
-    /// was last dialled — a group's member changed, a reload rebuilt it —
-    /// and so every carrier is to be dialled anew: "a change of the
-    /// effective policy resets the WireGuard transport sockets" (manual).
+    /// Whether what the carriers go through leads elsewhere than when every
+    /// carrier was last dialled — a group's member changed, a reload rebuilt
+    /// it, rurge wrote another egress table (and a carrier was bound to the
+    /// one that is gone) — and so every carrier is to be dialled anew: "a
+    /// change of the effective policy resets the WireGuard transport
+    /// sockets" (manual). The log names which of the two it was (the phase
+    /// 3 / M4b plan's execution record row 68).
     fn rerouted(&mut self) -> bool {
         let route = self.connector.route();
         if route == self.route {
             return false;
         }
-        tracing::info!(policy = %self.policy, "wireguard: the underlying policy changed; the peers are dialled anew");
+        if route
+            .as_ref()
+            .or(self.route.as_ref())
+            .is_some_and(Route::is_egress)
+        {
+            tracing::info!(
+                policy = %self.policy,
+                "wireguard: the egress of rurge's own sockets changed; the peers are dialled anew"
+            );
+        } else {
+            tracing::info!(
+                policy = %self.policy,
+                "wireguard: the underlying policy changed; the peers are dialled anew"
+            );
+        }
         self.route = route;
         true
     }

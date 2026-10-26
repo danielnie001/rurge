@@ -29,7 +29,9 @@
 //!   under way on it go on; their leases keep it.
 //! - So does a connection dialled through an underlying policy that leads
 //!   elsewhere now (`Connector::route`: a group's member changed, a reload
-//!   rebuilt the policy), for good: the next request dials the new way.
+//!   rebuilt the policy), or through sockets bound to another egress table
+//!   than the one rurge has now (the enhanced mode wrote a new one), for
+//!   good: the next request dials the new way.
 //!   Looked at whenever a connection is picked — by a request, or by a UDP
 //!   session for its next datagram, which compares the route at most once
 //!   a second (`Session::serves`, else `serves_without_route`) —, never by
@@ -619,8 +621,11 @@ impl<P: Protocol> Shared<P> {
 
     /// Whether `conn` goes the way the connector leads now (`route`). Once
     /// it does not — a group's member changed under it, a reload rebuilt
-    /// the underlying policy —, it takes nothing new again, whichever way
-    /// the connector leads later; the first to see it says so.
+    /// the underlying policy, rurge wrote another egress table (its socket
+    /// was bound to the one that is gone) —, it takes nothing new again,
+    /// whichever way the connector leads later; the first to see it says so,
+    /// naming which of the two it was (the phase 3 / M4b plan's execution
+    /// record row 68).
     fn on_route(&self, conn: &Conn<P::State>, route: Option<&Route>) -> bool {
         if conn.rerouted.load(Ordering::Relaxed) {
             return false;
@@ -629,11 +634,19 @@ impl<P: Protocol> Shared<P> {
             return true;
         }
         if !conn.rerouted.swap(true, Ordering::Relaxed) {
-            tracing::info!(
-                policy = %self.policy,
-                "{}: the underlying policy changed; a new connection is made",
-                P::NAME
-            );
+            if route.or(conn.route.as_ref()).is_some_and(Route::is_egress) {
+                tracing::info!(
+                    policy = %self.policy,
+                    "{}: the egress of rurge's own sockets changed; a new connection is made",
+                    P::NAME
+                );
+            } else {
+                tracing::info!(
+                    policy = %self.policy,
+                    "{}: the underlying policy changed; a new connection is made",
+                    P::NAME
+                );
+            }
         }
         false
     }
@@ -785,6 +798,7 @@ fn copy_error(e: &OutboundError) -> OutboundError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_log::Log;
     use crate::testing::ServerPort;
     use quinn::crypto::rustls::HandshakeData;
     use quinn::{ReadError, ReadToEndError, WriteError};
@@ -1360,10 +1374,12 @@ mod tests {
     }
 
     /// Dials through `inner`; where it leads is what `route` holds now, as
-    /// a group that is the `underlying-proxy` leads to its member.
+    /// a group that is the `underlying-proxy` leads to its member — or, with
+    /// `egress`, the egress table of the enhanced mode.
     struct Rerouted {
         inner: Arc<dyn Connector>,
         route: Mutex<Arc<u8>>,
+        egress: bool,
     }
 
     impl Connector for Rerouted {
@@ -1384,7 +1400,12 @@ mod tests {
         }
 
         fn route(&self) -> Option<Route> {
-            Some(Route::of(&self.route.lock().unwrap()))
+            let route = self.route.lock().unwrap();
+            Some(if self.egress {
+                Route::egress(&route)
+            } else {
+                Route::of(&route)
+            })
         }
     }
 
@@ -1400,6 +1421,7 @@ mod tests {
         let rerouted = Arc::new(Rerouted {
             inner: chain.clone(),
             route: Mutex::new(Arc::new(1)),
+            egress: false,
         });
         let dialer = dialer_via(
             rerouted.clone(),
@@ -1431,6 +1453,54 @@ mod tests {
         assert_eq!(session.shared.protocol.handshakes(), 3);
         drop((send, recv, lease));
         closed_by_us(&server.accepted(1).await[0]).await;
+    }
+
+    /// The egress table of the enhanced mode changes under a connection —
+    /// rurge wrote a new one, and the socket was bound to what is gone: the
+    /// connection takes no new requests, the next one is dialled under the
+    /// new table, and the log says the egress changed rather than that an
+    /// underlying policy did (the phase 3 / M4b plan's execution record row
+    /// 68).
+    #[tokio::test]
+    async fn a_connection_dialled_under_another_egress_table_takes_no_new_requests() {
+        let (log, _logging, _second) = Log::capture();
+        let server = Server::spawn();
+        let chain = Arc::new(Chain::default());
+        let rerouted = Arc::new(Rerouted {
+            inner: chain.clone(),
+            route: Mutex::new(Arc::new(1)),
+            egress: true,
+        });
+        let dialer = dialer_via(
+            rerouted.clone(),
+            server.port.addr().port(),
+            "127.0.0.1",
+            &TlsOpts::default(),
+            server.cert.roots(),
+        );
+        let session = Session::new("P", dialer, Plain::default());
+        let lease = session.lease(&ConnectOpts::default()).await.unwrap();
+        assert_eq!(echo(&session, b"same way").await.unwrap(), b"same way");
+        assert!(session.serves(&lease));
+
+        *rerouted.route.lock().unwrap() = Arc::new(2);
+        assert!(!session.serves(&lease));
+        assert_eq!(echo(&session, b"new way").await.unwrap(), b"new way");
+        assert_eq!(chain.flows.lock().unwrap().len(), 2, "dialled anew");
+        assert_eq!(session.shared.protocol.handshakes(), 2);
+
+        let text = log.text();
+        assert_eq!(
+            text.matches("the egress of rurge's own sockets changed")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("the underlying policy changed").count(),
+            0,
+            "{text}"
+        );
     }
 
     /// Held, a connection stays past the idle time; let go of, it is closed
@@ -1949,6 +2019,7 @@ mod tests {
         let rerouted = Arc::new(Rerouted {
             inner: chain.clone(),
             route: Mutex::new(Arc::new(1)),
+            egress: false,
         });
         let dialer = dialer_via(
             rerouted.clone(),

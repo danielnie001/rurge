@@ -334,6 +334,17 @@ impl rurge_net::socket::SocketHook for PlatformSockets {
             )),
         }
     }
+
+    /// The table `egress` answers from, as a route: `None` while the enhanced
+    /// mode is off. The manager writes a table again only when its content
+    /// changes, so the same `Arc` says the same egress and a socket that
+    /// outlives one connection — a WireGuard carrier, a QUIC connection — is
+    /// made again only when it really moved (the phase 3 / M4b plan's
+    /// execution record rows 68 and 69).
+    fn egress_route(&self) -> Option<rurge_net::connector::Route> {
+        let table = self.egress.read().unwrap_or_else(|e| e.into_inner());
+        table.as_ref().map(rurge_net::connector::Route::egress)
+    }
 }
 
 /// `rurge-platform::process` behind the `ProcessHook` trait (AR-02): an
@@ -615,6 +626,50 @@ mod tests {
         // and the empty slot again, as a close leaves it
         *egress.write().unwrap() = None;
         assert_eq!(hook.egress(inside).unwrap(), None);
+    }
+
+    /// The hook also says which egress table it answers `egress` from, for a
+    /// socket that outlives one connection: nothing while the enhanced mode
+    /// is off, one route while it is the same table, another once the manager
+    /// has written another (the phase 3 / M4b plan's execution record row
+    /// 68).
+    #[test]
+    fn platform_sockets_say_which_egress_table_they_answer_from() {
+        use rurge_platform::route::RouteSet;
+        use rurge_platform::socket::egress::EgressTable;
+
+        let egress = super::super::enhanced::egress_slot();
+        let hook = PlatformSockets::new(egress.clone());
+        assert!(hook.egress_route().is_none(), "the enhanced mode is off");
+
+        let table = |first: &str| {
+            Some(Arc::new(EgressTable {
+                routes: RouteSet {
+                    v4: vec![first.parse().unwrap()],
+                    v6: Vec::new(),
+                },
+                primary: Some("eth0".to_string()),
+                subnets: Vec::new(),
+            }))
+        };
+        *egress.write().unwrap() = table("10.0.0.0/8");
+        let first = hook.egress_route().expect("the table is the route");
+        assert!(first.is_egress());
+        assert_eq!(
+            Some(first.clone()),
+            hook.egress_route(),
+            "the same table twice"
+        );
+
+        *egress.write().unwrap() = table("10.9.0.0/16");
+        assert_ne!(
+            hook.egress_route(),
+            Some(first.clone()),
+            "another table is another route"
+        );
+
+        *egress.write().unwrap() = None;
+        assert!(hook.egress_route().is_none(), "the table is gone again");
     }
 
     /// The system DNS adapter is in the enhanced mode while the manager's flag
