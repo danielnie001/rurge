@@ -90,7 +90,7 @@ impl PlatformPinger {
     }
 
     /// A socket for echo requests of `family`, bound where rurge's own sockets
-    /// to `egress` go, in non-blocking mode.
+    /// to `egress` go.
     fn make(&self, family: Family, egress: Option<&str>) -> io::Result<(UdpSocket, Kind)> {
         let (socket, kind) = icmp::open(family)?;
         match egress {
@@ -117,7 +117,6 @@ impl PlatformPinger {
             // do not mind
             None => socket.bind(&unspecified(family).into())?,
         }
-        socket.set_nonblocking(true)?;
         let socket = UdpSocket::from_std(std::net::UdpSocket::from(socket))?;
         Ok((socket, kind))
     }
@@ -165,6 +164,7 @@ struct Carrier {
 /// Reads the replies off one socket until the pinger is gone, and hands each
 /// to the echo waiting for its sequence number.
 async fn receive(waiters: Arc<Mutex<Waiters>>, socket: Arc<UdpSocket>, family: Family, kind: Kind) {
+    let keeps_ident = kind.keeps_ident();
     let mut buffer = vec![0u8; RECV_BUFFER];
     let mut consecutive_errors = 0u32;
     loop {
@@ -187,7 +187,7 @@ async fn receive(waiters: Arc<Mutex<Waiters>>, socket: Arc<UdpSocket>, family: F
         let Some(reply) = icmp::reply(family, &buffer[..len]) else {
             continue;
         };
-        deliver(&waiters, kind, reply);
+        deliver(&waiters, keeps_ident, reply);
     }
 }
 
@@ -237,11 +237,13 @@ impl Waiters {
     }
 
     /// Hands `reply` to the echo waiting for its sequence number, and to its
-    /// identifier too on a raw socket: a datagram socket only ever sees the
-    /// answers to its own requests, and Linux gives them an identifier of the
-    /// kernel's (P14). `false` when nobody waits for it.
-    fn deliver(&mut self, kind: Kind, reply: icmp::Reply) -> bool {
-        if kind == Kind::Raw && reply.ident != self.ident {
+    /// identifier too where the socket keeps it (P14, corrected by R22): raw
+    /// sockets and macOS's datagram ones hear every ICMP message the machine
+    /// gets, and carry the identifier the request went out with; a Linux
+    /// datagram socket only ever sees the answers to its own requests, with an
+    /// identifier the kernel gave them. `false` when nobody waits for it.
+    fn deliver(&mut self, keeps_ident: bool, reply: icmp::Reply) -> bool {
+        if keeps_ident && reply.ident != self.ident {
             return false;
         }
         let Some(sender) = self.waiting.remove(&reply.seq) else {
@@ -307,11 +309,11 @@ impl Drop for Waiting {
 
 /// Hands `reply` to whoever waits for its sequence number, through the lock the
 /// table is kept in.
-fn deliver(waiters: &Mutex<Waiters>, kind: Kind, reply: icmp::Reply) -> bool {
+fn deliver(waiters: &Mutex<Waiters>, keeps_ident: bool, reply: icmp::Reply) -> bool {
     waiters
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .deliver(kind, reply)
+        .deliver(keeps_ident, reply)
 }
 
 #[cfg(test)]
@@ -334,7 +336,7 @@ mod tests {
         assert_ne!(first.seq, second.seq);
 
         assert!(
-            deliver(&waiters, Kind::Datagram, reply(7, second.seq, b"second")),
+            deliver(&waiters, true, reply(7, second.seq, b"second")),
             "the second one's reply"
         );
         assert_eq!(
@@ -347,30 +349,35 @@ mod tests {
         );
 
         // a reply to a number nobody waits for is dropped
-        assert!(!deliver(&waiters, Kind::Datagram, reply(7, 0xbeef, b"no")));
+        assert!(!deliver(&waiters, true, reply(7, 0xbeef, b"no")));
         assert_eq!(first.seq, 0);
     }
 
+    /// A socket that keeps the identifier only hands over a reply that carries
+    /// this pinger's own; the Linux datagram socket gives the kernel's instead,
+    /// and hands over its own requests' replies only (P14, corrected by R22).
     #[test]
-    fn a_raw_socket_matches_the_identifier_too() {
+    fn the_identifier_matters_where_the_socket_keeps_it() {
         let waiters = Arc::new(Mutex::new(Waiters::new(0x1234)));
         let mut waiting = Waiting::new(&waiters).expect("a place");
 
         assert!(
-            !deliver(&waiters, Kind::Raw, reply(0x4321, waiting.seq, b"not mine")),
-            "another pinger's reply"
+            !deliver(&waiters, true, reply(0x4321, waiting.seq, b"not mine")),
+            "another program's reply to the same sequence number"
         );
         assert!(waiting.reply.as_mut().unwrap().try_recv().is_err());
 
-        // a datagram socket sees its own requests' answers only, and Linux
-        // gives them an identifier of the kernel's (P14)
         assert!(
-            deliver(
-                &waiters,
-                Kind::Datagram,
-                reply(0x4321, waiting.seq, b"mine")
-            ),
-            "the sequence number alone matches on a datagram socket"
+            deliver(&waiters, true, reply(0x1234, waiting.seq, b"mine")),
+            "the identifier and the sequence number both match"
+        );
+        assert_eq!(waiting.reply.as_mut().unwrap().try_recv().unwrap(), b"mine");
+
+        let waiters = Arc::new(Mutex::new(Waiters::new(0x1234)));
+        let mut waiting = Waiting::new(&waiters).expect("a place");
+        assert!(
+            deliver(&waiters, false, reply(0x4321, waiting.seq, b"mine")),
+            "the sequence number alone matches where the identifier is the kernel's"
         );
         assert_eq!(waiting.reply.as_mut().unwrap().try_recv().unwrap(), b"mine");
     }
@@ -383,7 +390,7 @@ mod tests {
         assert_eq!(waiters.lock().unwrap().waiting.len(), 1);
         drop(waiting);
         assert_eq!(waiters.lock().unwrap().waiting.len(), 0, "given back");
-        assert!(!deliver(&waiters, Kind::Datagram, reply(7, seq, b"late")));
+        assert!(!deliver(&waiters, true, reply(7, seq, b"late")));
     }
 
     #[test]

@@ -18,6 +18,26 @@ pub enum Kind {
     Raw,
 }
 
+impl Kind {
+    /// Whether a reply on this kind of socket still carries the identifier its
+    /// request went out with, so that the identifier tells this pinger's
+    /// replies from another program's. Linux (and Android) rewrite it on their
+    /// datagram sockets, and hand each such socket only its own replies. A raw
+    /// socket keeps it, and so does macOS's datagram socket: xnu's
+    /// `icmp_dgram_send` leaves `icmp_id` as written, and every ICMP socket
+    /// hears every reply through `rip_input`.
+    pub fn keeps_ident(self) -> bool {
+        self == Kind::Raw || !cfg!(any(target_os = "linux", target_os = "android"))
+    }
+}
+
+/// `socket` in non-blocking mode, which is what `open` promises: the binary
+/// makes it asynchronous.
+fn nonblocking(socket: Socket) -> io::Result<Socket> {
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
 /// An ICMP (ICMPv6) socket for echo requests, non-blocking: Linux tries a
 /// datagram socket (no privilege, within `net.ipv4.ping_group_range`) and
 /// then a raw one; macOS a datagram socket; Windows a raw one (Administrator).
@@ -25,9 +45,11 @@ pub enum Kind {
 pub fn open(family: Family) -> io::Result<(Socket, Kind)> {
     let (domain, protocol) = domain_and_protocol(family);
     match Socket::new(domain, Type::DGRAM, Some(protocol)) {
-        Ok(socket) => Ok((socket, Kind::Datagram)),
+        Ok(socket) => nonblocking(socket).map(|socket| (socket, Kind::Datagram)),
         // not within `ping_group_range`: a raw socket is the root's
-        Err(_) => Socket::new(domain, Type::RAW, Some(protocol)).map(|s| (s, Kind::Raw)),
+        Err(_) => Socket::new(domain, Type::RAW, Some(protocol))
+            .and_then(nonblocking)
+            .map(|socket| (socket, Kind::Raw)),
     }
 }
 
@@ -35,7 +57,9 @@ pub fn open(family: Family) -> io::Result<(Socket, Kind)> {
 pub fn open(family: Family) -> io::Result<(Socket, Kind)> {
     let (domain, protocol) = domain_and_protocol(family);
     // macOS's datagram ICMP sockets need no privilege
-    Socket::new(domain, Type::DGRAM, Some(protocol)).map(|socket| (socket, Kind::Datagram))
+    Socket::new(domain, Type::DGRAM, Some(protocol))
+        .and_then(nonblocking)
+        .map(|socket| (socket, Kind::Datagram))
 }
 
 #[cfg(windows)]
@@ -43,7 +67,9 @@ pub fn open(family: Family) -> io::Result<(Socket, Kind)> {
     let (domain, protocol) = domain_and_protocol(family);
     // Windows has no unprivileged ICMP socket: the enhanced mode's raw one is
     // the Administrator's, as the virtual adapter is (M4 design 8.5)
-    Socket::new(domain, Type::RAW, Some(protocol)).map(|socket| (socket, Kind::Raw))
+    Socket::new(domain, Type::RAW, Some(protocol))
+        .and_then(nonblocking)
+        .map(|socket| (socket, Kind::Raw))
 }
 
 #[cfg(not(any(
@@ -207,6 +233,19 @@ mod tests {
         // IPv6 sockets never hand over an IPv6 header
         let answer = as_answer(Family::V6, &request(Family::V6, 0x1234, 9, b"rurge"));
         assert_eq!(reply(Family::V6, &answer).expect("an echo reply").seq, 9);
+    }
+
+    #[test]
+    fn only_linux_datagram_sockets_lose_the_identifier() {
+        assert!(
+            Kind::Raw.keeps_ident(),
+            "a raw socket keeps the identifier its request went out with"
+        );
+        assert_eq!(
+            Kind::Datagram.keeps_ident(),
+            !cfg!(any(target_os = "linux", target_os = "android")),
+            "only Linux's datagram sockets hand out an identifier of the kernel's"
+        );
     }
 
     #[test]

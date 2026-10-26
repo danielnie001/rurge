@@ -576,6 +576,7 @@ pub fn subnets(exclude: &[String]) -> io::Result<Vec<(IpNet, String)>>;
 | 43 | 7 | 执行者的裁定（范围）：`NoPinger`（`crates/rurge/src/cli/enhanced/mod.rs`）与唯一用它的一条用例 `no_echo_request_goes_out_in_this_version` 一起删掉——那条用例钉的是"这一版不发回显"，现在反了；`pings_the_loopback` 接上它的位置。用例数 −1 | 本提交 |
 | 44 | 7 | 执行者的裁定（依赖）：`rurge` 的 `Cargo.toml` 加 `getrandom.workspace = true`——P14 要每个 `PlatformPinger` 一个随机的标识符，取法照 `rurge-tun` / `rurge-proto` 的 `getrandom::u32()`；`getrandom` 本来就在工作区里，`Cargo.lock` 的包数不变，只有 `rurge` 的依赖列表多一行 | 本提交 |
 | 45 | 7 | 执行者的观察（判据）：`pings_the_loopback` 在本机没有跳过——这台 Windows 上 `icmp::open` 的原始套接字开得起来，`127.0.0.1` 与 `::1` 的回显都真的来回了一次、载荷相等（5 秒时限，循环 20 次全过）。Linux 的 `DGRAM`、macOS 的 `DGRAM` 与"不是管理员所以跳过"这条路径仍没有任何平台跑过 | 本提交 |
+| 46 | 7 | 协调者的裁定（R22，订正 P14）：只有 Linux / Android 的数据报套接字只按序号对；原始套接字与 macOS 的数据报套接字都按标识符与序号对——xnu 的 `icmp_dgram_send` 不改 `icmp_id`，而每一个 ICMP 套接字都经 `rip_input` 听得到这台机器收到的每一个回显应答，只按序号对会把别的程序序号相同的应答交给 TUN 里等着的那个回显。`Kind::keeps_ident`（`crates/rurge-platform/src/icmp.rs`）表达这条分别，`Waiters::deliver` 改收布尔值，用例 `the_identifier_matters_where_the_socket_keeps_it` 把两种规则都测到。这一条没有在 macOS 上观察过，第一次在 CI 的 macOS 上跑 `pings_the_loopback` 时核对 | 本提交 |
 
 ## 延后事项
 
