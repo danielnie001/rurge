@@ -9,13 +9,13 @@
 //! Not every datagram is a session's: [`receive`] decides where each goes (see
 //! [`destination`]), and the DNS responder takes the queries to its own port 53
 //! and to the servers `hijack-dns` names. The bytes that wait in the queues of
-//! all the sessions are one budget (`bytes`).
+//! all the sessions are one budget (`crate::bytes`; `udp_bytes`).
 
-pub(crate) mod bytes;
 mod client;
 mod targets;
 
 use crate::TunOptions;
+use crate::bytes::Reserved;
 use crate::context::Context;
 use crate::dns::udp::offer;
 use crate::dns::{Ask, DNS_PORT};
@@ -23,7 +23,6 @@ use crate::icmp;
 use crate::packet::{Parsed, Reason, Transport};
 use crate::space::{self, Place, STACK_V4, STACK_V6};
 use crate::stats::Stats;
-use bytes::Reserved;
 use client::TunUdpClient;
 use rurge_config::{HostName, ListenerKind, SessionInfo};
 use rurge_dns::fakeip::Lease;

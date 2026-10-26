@@ -12,8 +12,8 @@
 use super::hazards::{app4, open_by_hand};
 use super::log_capture::LogCapture;
 use super::support::{
-    Extras, Lone, WITHIN, addr, eventually, hello, is_reset, lone_shard, lone_shard_with_pool,
-    rig_extras, sock, syn_v4, syn_v6, tcp_packet, tcp_repr, within,
+    Extras, Lone, WITHIN, addr, eventually, hello, ingress, is_reset, lone_shard,
+    lone_shard_with_pool, rig_extras, sock, syn_v4, syn_v6, tcp_packet, tcp_repr, within,
 };
 use super::udp::NOTHING;
 use crate::packet::segment;
@@ -92,7 +92,7 @@ fn a_refused_syn_holds_no_lease() {
         let turn = lone
             .shard
             .state()
-            .turn(epoch, &mut vec![syn_v4(app4(40_000), fake)]);
+            .turn(epoch, &mut ingress(vec![syn_v4(app4(40_000), fake)]));
         assert!(turn.opened.is_empty(), "{kind:?}: a connection was made");
         assert_eq!(
             turn.out.len(),
@@ -133,7 +133,7 @@ fn a_syn_the_stack_does_not_take_gives_its_lease_back() {
     let turn = lone
         .shard
         .state()
-        .turn(epoch, &mut vec![tcp_packet(app, fake, &repr)]);
+        .turn(epoch, &mut ingress(vec![tcp_packet(app, fake, &repr)]));
     assert!(turn.opened.is_empty());
     assert!(
         turn.out.is_empty(),
@@ -169,7 +169,7 @@ fn the_rules_are_asked_before_the_stack_is() {
     let turn = lone
         .shard
         .state()
-        .turn(epoch, &mut vec![tcp_packet(app, dst, &repr)]);
+        .turn(epoch, &mut ingress(vec![tcp_packet(app, dst, &repr)]));
     assert!(turn.opened.is_empty());
     assert_eq!(turn.out.len(), 1, "a reset");
     assert!(is_reset(&turn.out[0]));
@@ -190,7 +190,7 @@ fn a_dropped_syn_is_said_once_at_debug_level_and_counted_nowhere() {
     syn_layer(&lone.hooks, HostName::Ip(real.ip()), RejectKind::Drop);
     let turn = lone.shard.state().turn(
         epoch,
-        &mut vec![syn_v4(app4(40_000), fake), syn_v4(app4(40_001), real)],
+        &mut ingress(vec![syn_v4(app4(40_000), fake), syn_v4(app4(40_001), real)]),
     );
     assert!(turn.opened.is_empty());
     assert!(turn.out.is_empty(), "nothing is sent: {:?}", turn.out);
@@ -207,7 +207,7 @@ fn a_dropped_syn_is_said_once_at_debug_level_and_counted_nowhere() {
     let turn = lone
         .shard
         .state()
-        .turn(epoch, &mut vec![syn_v4(app4(40_002), real)]);
+        .turn(epoch, &mut ingress(vec![syn_v4(app4(40_002), real)]));
     assert_eq!(turn.out.len(), 1);
     assert!(is_reset(&turn.out[0]));
     assert_eq!(log.lines().len(), 2, "something was said of a reset");
@@ -230,7 +230,7 @@ fn a_syn_turned_away_before_the_rules_is_not_asked_of_them() {
     let turn = lone
         .shard
         .state()
-        .turn(epoch, &mut vec![syn_v4(app4(40_000), real)]);
+        .turn(epoch, &mut ingress(vec![syn_v4(app4(40_000), real)]));
     assert_eq!(turn.out.len(), 1, "a reset, not silence");
     assert!(asked_at_syn(&lone.hooks).is_empty(), "stopping");
     // the caps: the half-open one, and the sockets'
@@ -249,7 +249,7 @@ fn a_syn_turned_away_before_the_rules_is_not_asked_of_them() {
         let turn = lone
             .shard
             .state()
-            .turn(epoch, &mut vec![syn_v4(app4(40_000), real)]);
+            .turn(epoch, &mut ingress(vec![syn_v4(app4(40_000), real)]));
         assert_eq!(turn.out.len(), 1, "a reset, not silence: {options:?}");
         assert!(asked_at_syn(&lone.hooks).is_empty(), "{options:?}");
         assert_eq!(lone.stats.counters().busy, 1, "{options:?}");
@@ -270,7 +270,7 @@ fn a_syn_turned_away_before_the_rules_is_not_asked_of_them() {
         syn_layer(&lone.hooks, HostName::Ip(dst.ip()), RejectKind::Drop);
         syns.push(syn_v4(app4(40_000 + i as u16), dst));
     }
-    let turn = lone.shard.state().turn(epoch, &mut syns);
+    let turn = lone.shard.state().turn(epoch, &mut ingress(syns));
     assert_eq!(turn.out.len(), 4, "a reset for each");
     assert!(asked_at_syn(&lone.hooks).is_empty());
     assert_eq!(
@@ -302,7 +302,7 @@ fn a_syn_to_the_responders_port_53_is_not_asked_of_the_rules() {
             SocketAddr::V6(_) => syn_v6(sock(ADAPTER_V6, port), dst),
         });
     }
-    let turn = lone.shard.state().turn(epoch, &mut syns);
+    let turn = lone.shard.state().turn(epoch, &mut ingress(syns));
     let opened: HashSet<Tuple> = turn.opened.iter().map(|opened| opened.tuple).collect();
     let wanted: HashSet<Tuple> = turn
         .out

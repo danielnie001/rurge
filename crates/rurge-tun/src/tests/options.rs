@@ -188,6 +188,19 @@ fn options_out_of_range_are_refused() {
     );
 }
 
+/// A budget of no bytes holds no packet at all: it is refused as a queue of no
+/// places is.
+#[test]
+fn queue_bytes_must_be_more_than_zero() {
+    refused(
+        TunOptions {
+            queue_bytes: 0,
+            ..TunOptions::default()
+        },
+        "queue_bytes must be more than zero",
+    );
+}
+
 /// The first that cannot be run with, in the order of the fields.
 #[test]
 fn the_first_option_out_of_range_is_the_one_reported() {
@@ -215,7 +228,24 @@ fn the_first_option_out_of_range_is_the_one_reported() {
         },
         TIMEOUT,
     );
-    // what comes after the seven there were: `writer_queue` is the last of
+    // `queue_bytes` comes right after `shard_queue`, and before `writer_queue`
+    refused(
+        TunOptions {
+            shard_queue: 0,
+            queue_bytes: 0,
+            ..TunOptions::default()
+        },
+        "shard_queue must be more than zero",
+    );
+    refused(
+        TunOptions {
+            queue_bytes: 0,
+            writer_queue: 0,
+            ..TunOptions::default()
+        },
+        "queue_bytes must be more than zero",
+    );
+    // what comes after the eight there were: `writer_queue` is the last of
     // those, then the rest in the order of the fields, each of them refused
     // before every one that comes after it
     refused(
@@ -363,6 +393,7 @@ fn the_edges_of_the_ranges_pass() {
             echo_timeout: time,
             udp_queue: 1,
             udp_bytes: 1,
+            queue_bytes: 1,
             max_udp_targets: 1,
             dns_queue: 1,
             dns_tcp_max: 1,

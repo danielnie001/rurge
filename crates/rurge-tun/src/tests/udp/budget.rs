@@ -4,8 +4,8 @@
 //! queue is dropped with it in it.
 
 use super::{APP4, FAR4, NOTHING, lab};
+use crate::bytes::QueuedBytes;
 use crate::tests::support::{WITHIN, addr, eventually};
-use crate::udp::bytes::QueuedBytes;
 use crate::{Counters, TunOptions};
 use rurge_inbound::UdpAdmission;
 use std::sync::Arc;

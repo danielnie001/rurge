@@ -3,13 +3,13 @@
 //! so that `dispatch`, `udp`, `icmp` and `dns` all take it from here, and none
 //! of them has to name another to get at it.
 
+use crate::bytes::QueuedBytes;
 use crate::dns::Responder;
 use crate::dns::udp::Query;
 use crate::fragment::Ids;
 use crate::limit::Limiter;
 use crate::stats::Stats;
 use crate::udp::Sessions;
-use crate::udp::bytes::QueuedBytes;
 use crate::{Hooks, Life, Pinger, TunOptions};
 use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
@@ -57,6 +57,6 @@ pub(crate) struct Context {
     /// `dns::udp`).
     pub(crate) dns_queue: mpsc::Sender<Query>,
     /// The bytes of the datagrams that wait in the UDP sessions' queues (see
-    /// `udp::bytes`).
+    /// `crate::bytes`, which holds the budget of the shards' queues too).
     pub(crate) udp_bytes: Arc<QueuedBytes>,
 }

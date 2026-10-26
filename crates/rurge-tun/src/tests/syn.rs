@@ -9,8 +9,8 @@
 use super::filter::warning;
 use super::log_capture::LogCapture;
 use super::support::{
-    WITHIN, addr, checksum, eventually, hello, is_reset, is_syn, lone_shard, rig, segment_v4, sock,
-    syn_v4, syn_v6, tcp_header, tcp_packet, tcp_repr, with_ip_options, within,
+    WITHIN, addr, checksum, eventually, hello, ingress, is_reset, is_syn, lone_shard, rig,
+    segment_v4, sock, syn_v4, syn_v6, tcp_header, tcp_packet, tcp_repr, with_ip_options, within,
 };
 use crate::limit::Limiter;
 use crate::packet::{Reason, rst_for, segment};
@@ -370,7 +370,10 @@ fn stopping_answers_a_syn_with_a_reset() {
     let lone = lone_shard(&TunOptions::default(), epoch);
     lone.life.end(Ending::Stopped);
     let (app, dst) = (app4(40000), addr(DST));
-    let turn = lone.shard.state().turn(epoch, &mut vec![syn_v4(app, dst)]);
+    let turn = lone
+        .shard
+        .state()
+        .turn(epoch, &mut ingress(vec![syn_v4(app, dst)]));
     assert!(turn.opened.is_empty(), "no connection is made");
     assert_eq!(turn.out.len(), 1, "one packet is sent");
     assert_reset(&turn.out[0], dst, app);
@@ -392,9 +395,10 @@ fn the_resets_of_a_stopping_tun_are_limited_too() {
     let lone = lone_shard(&TunOptions::default(), epoch);
     lone.life.end(Ending::Stopped);
     let dst = addr(DST);
-    let mut syns: Vec<Vec<u8>> = (0..101).map(|i| syn_v4(app4(40000 + i), dst)).collect();
-    let turn = lone.shard.state().turn(epoch, &mut syns);
-    assert!(syns.is_empty(), "all 101 were taken in this turn");
+    let syns: Vec<Vec<u8>> = (0..101).map(|i| syn_v4(app4(40000 + i), dst)).collect();
+    let mut incoming = ingress(syns);
+    let turn = lone.shard.state().turn(epoch, &mut incoming);
+    assert!(incoming.is_empty(), "all 101 were taken in this turn");
     assert_eq!(turn.out.len(), 100);
     for (i, reset) in turn.out.iter().enumerate() {
         assert_reset(reset, dst, app4(40000 + i as u16));
@@ -438,7 +442,7 @@ fn the_caps_are_met_before_the_address_is_looked_at() {
                 SocketAddr::V6(_) => syn_v6(sock(ADAPTER_V6, port), *dst),
             });
         }
-        let turn = lone.shard.state().turn(epoch, &mut syns);
+        let turn = lone.shard.state().turn(epoch, &mut ingress(syns));
         assert!(turn.opened.is_empty());
         assert_eq!(turn.out.len(), destinations.len());
         assert_eq!(
@@ -463,7 +467,7 @@ fn syns_turned_away_are_said_like_any_other_drop() {
     let (app, far) = (app4(40000), addr(DST));
     let take = |options: TunOptions, syns: Vec<Vec<u8>>| {
         let lone = lone_shard(&options, epoch);
-        lone.shard.state().turn(epoch, &mut { syns });
+        lone.shard.state().turn(epoch, &mut ingress(syns));
     };
     // two SYNs over the cap, then two to a name nobody knows
     take(
@@ -517,7 +521,7 @@ fn a_syn_with_another_flag_is_not_answered() {
             segments.push(segment_v4(app, dst, 1, 0, flags));
         }
     }
-    let turn = lone.shard.state().turn(epoch, &mut segments);
+    let turn = lone.shard.state().turn(epoch, &mut ingress(segments));
     assert!(turn.opened.is_empty());
     assert!(turn.out.is_empty(), "nothing is sent: {:?}", turn.out);
     assert_eq!(lone.shard.state().socket_count(), 0);
@@ -542,7 +546,7 @@ fn a_syn_smoltcp_does_not_take_leaves_nothing() {
     let turn = lone
         .shard
         .state()
-        .turn(epoch, &mut vec![tcp_packet(app, dst, &repr)]);
+        .turn(epoch, &mut ingress(vec![tcp_packet(app, dst, &repr)]));
     assert!(turn.opened.is_empty());
     assert!(turn.out.is_empty());
     assert_eq!(lone.shard.state().socket_count(), 0);
@@ -568,10 +572,10 @@ fn a_syn_to_the_responder_over_dns_tcp_max_is_reset_and_holds_nothing() {
     let responder = addr("198.18.0.2:53");
     let mut first = lone.shard.state().turn(
         epoch,
-        &mut vec![
+        &mut ingress(vec![
             syn_v4(app4(40000), responder),
             syn_v4(app4(40001), responder),
-        ],
+        ]),
     );
     assert_eq!(first.opened.len(), 2);
     assert_eq!(lone.admission.dns_tcp(), 2);
@@ -580,7 +584,7 @@ fn a_syn_to_the_responder_over_dns_tcp_max_is_reset_and_holds_nothing() {
     let turn = lone
         .shard
         .state()
-        .turn(epoch, &mut vec![syn_v4(app, responder)]);
+        .turn(epoch, &mut ingress(vec![syn_v4(app, responder)]));
     assert!(turn.opened.is_empty());
     assert_eq!(turn.out.len(), 1);
     assert_reset(&turn.out[0], responder, app);
@@ -602,7 +606,7 @@ fn a_syn_to_the_responder_over_dns_tcp_max_is_reset_and_holds_nothing() {
     let turn = lone
         .shard
         .state()
-        .turn(epoch, &mut vec![syn_v4(app, responder)]);
+        .turn(epoch, &mut ingress(vec![syn_v4(app, responder)]));
     assert_eq!(turn.opened.len(), 1);
     assert_eq!(lone.admission.dns_tcp(), 2);
     assert_eq!(lone.stats.counters().busy, 1);
@@ -626,24 +630,27 @@ fn only_connections_to_the_responders_port_53_take_a_dns_place() {
         addr("198.18.0.2:54"),
         addr("192.0.2.53:53"),
     );
-    let mut syns = vec![
+    let syns = vec![
         syn_v4(app4(40000), other_port),
         syn_v4(app4(40001), far),
         syn_v4(app4(40002), far),
     ];
-    let turn = lone.shard.state().turn(epoch, &mut syns);
+    let turn = lone.shard.state().turn(epoch, &mut ingress(syns));
     assert_eq!(turn.opened.len(), 2, "the two to the far address");
     assert_eq!(lone.admission.dns_tcp(), 0);
     // and with the one place taken, those still go through
     let dns = lone
         .shard
         .state()
-        .turn(epoch, &mut vec![syn_v4(app4(40003), responder)]);
+        .turn(epoch, &mut ingress(vec![syn_v4(app4(40003), responder)]));
     assert_eq!(dns.opened.len(), 1);
     assert_eq!(lone.admission.dns_tcp(), 1);
     let more = lone.shard.state().turn(
         epoch,
-        &mut vec![syn_v4(app4(40004), far), syn_v4(app4(40005), other_port)],
+        &mut ingress(vec![
+            syn_v4(app4(40004), far),
+            syn_v4(app4(40005), other_port),
+        ]),
     );
     assert_eq!(more.opened.len(), 1, "the far address is still let in");
     assert_eq!(lone.admission.dns_tcp(), 1);
@@ -671,7 +678,7 @@ fn a_syn_to_the_responder_smoltcp_does_not_take_gives_its_place_back() {
     let turn = lone
         .shard
         .state()
-        .turn(epoch, &mut vec![tcp_packet(app, responder, &repr)]);
+        .turn(epoch, &mut ingress(vec![tcp_packet(app, responder, &repr)]));
     assert!(turn.opened.is_empty());
     assert_eq!(lone.admission.dns_tcp(), 0);
     assert_eq!(lone.admission.sockets(), 0);
@@ -680,7 +687,7 @@ fn a_syn_to_the_responder_smoltcp_does_not_take_gives_its_place_back() {
     let turn = lone
         .shard
         .state()
-        .turn(epoch, &mut vec![syn_v4(app4(40001), responder)]);
+        .turn(epoch, &mut ingress(vec![syn_v4(app4(40001), responder)]));
     assert_eq!(turn.opened.len(), 1, "the place was given back");
     assert_eq!(lone.admission.dns_tcp(), 1);
 }
@@ -693,8 +700,8 @@ fn syns_to_one_endpoint_in_one_batch_open_a_connection_each() {
     let lone = lone_shard(&TunOptions::default(), epoch);
     let dst = addr("192.0.2.1:443");
     let sources: Vec<SocketAddr> = (0..8).map(|i| app4(40000 + i)).collect();
-    let mut syns: Vec<Vec<u8>> = sources.iter().map(|&app| syn_v4(app, dst)).collect();
-    let turn = lone.shard.state().turn(epoch, &mut syns);
+    let syns: Vec<Vec<u8>> = sources.iter().map(|&app| syn_v4(app, dst)).collect();
+    let turn = lone.shard.state().turn(epoch, &mut ingress(syns));
     let opened: HashSet<Tuple> = turn.opened.iter().map(|opened| opened.tuple).collect();
     let expected: HashSet<Tuple> = sources.iter().map(|&src| Tuple { src, dst }).collect();
     assert_eq!(turn.opened.len(), 8);
@@ -722,13 +729,16 @@ fn a_socket_back_in_listen_is_gone_before_the_next_packet() {
     let at = |ms: u64| epoch + Duration::from_millis(ms);
     let lone = lone_shard(&TunOptions::default(), epoch);
     let (a, b, dst) = (app4(40000), app4(40001), addr(DST));
-    let first = lone.shard.state().turn(at(0), &mut vec![syn_v4(a, dst)]);
+    let first = lone
+        .shard
+        .state()
+        .turn(at(0), &mut ingress(vec![syn_v4(a, dst)]));
     assert_eq!(first.opened.len(), 1);
     // A's reset (the sequence number is the SYN's plus one) and B's SYN in
     // one batch
     let second = lone.shard.state().turn(
         at(1),
-        &mut vec![segment_v4(a, dst, 2, 0, 0x04), syn_v4(b, dst)],
+        &mut ingress(vec![segment_v4(a, dst, 2, 0, 0x04), syn_v4(b, dst)]),
     );
     assert_eq!(second.opened.len(), 1, "B's SYN made a connection");
     assert_eq!(second.opened[0].tuple, Tuple { src: b, dst });
@@ -763,7 +773,10 @@ fn the_half_open_timeout_aborts_the_socket_and_lets_it_go_after_its_reset() {
     let at = |ms: u64| epoch + Duration::from_millis(ms);
     let lone = lone_shard(&options, epoch);
     let (app, dst) = (app4(40000), addr(DST));
-    let turn = lone.shard.state().turn(at(0), &mut vec![syn_v4(app, dst)]);
+    let turn = lone
+        .shard
+        .state()
+        .turn(at(0), &mut ingress(vec![syn_v4(app, dst)]));
     let opened = &turn.opened[0];
     assert!(turn.out.iter().any(|packet| is_syn(packet)), "the SYN-ACK");
     assert_eq!(
@@ -773,12 +786,12 @@ fn the_half_open_timeout_aborts_the_socket_and_lets_it_go_after_its_reset() {
     );
     assert_eq!(lone.admission.half_open(), 1);
     // just before its time nothing happens
-    let turn = lone.shard.state().turn(at(299), &mut Vec::new());
+    let turn = lone.shard.state().turn(at(299), &mut ingress(Vec::new()));
     assert!(turn.out.is_empty());
     assert_eq!(turn.wake_at, Some(at(300)));
     assert_eq!(lone.admission.half_open(), 1);
     // its time: the socket is aborted, its reset is not out yet
-    let turn = lone.shard.state().turn(at(300), &mut Vec::new());
+    let turn = lone.shard.state().turn(at(300), &mut ingress(Vec::new()));
     assert!(!turn.out.iter().any(|packet| is_reset(packet)));
     assert_eq!(lone.shard.state().socket_count(), 1, "kept for its reset");
     assert_eq!(
@@ -793,7 +806,7 @@ fn the_half_open_timeout_aborts_the_socket_and_lets_it_go_after_its_reset() {
     );
     assert_eq!(opened.shared.outcome(), None);
     // the next turn sends the reset and lets the connection go
-    let turn = lone.shard.state().turn(at(301), &mut Vec::new());
+    let turn = lone.shard.state().turn(at(301), &mut ingress(Vec::new()));
     let resets: Vec<&Vec<u8>> = turn.out.iter().filter(|p| is_reset(p)).collect();
     assert_eq!(resets.len(), 1, "one reset");
     let reset = segment(resets[0]).expect("a segment");

@@ -7,9 +7,9 @@
 //! by hand, at the edge of the window.
 
 use super::support::{
-    Lone, Rig, WITHIN, addr, data_segment_v4, echo_packet, eventually, hello, is_syn, lone_shard,
-    refresh, rig, segment_v4, sock, syn_v4, tcp_header, tcp_packet, tcp_payload_len, tcp_repr,
-    udp_packet, with_ip_options, within, write_pattern,
+    Lone, Rig, WITHIN, addr, data_segment_v4, echo_packet, eventually, hello, ingress, is_syn,
+    lone_shard, refresh, rig, segment_v4, sock, syn_v4, tcp_header, tcp_packet, tcp_payload_len,
+    tcp_repr, udp_packet, with_ip_options, within, write_pattern,
 };
 use crate::packet::{Segment, strip_sack_permitted};
 use crate::space::ADAPTER_V4;
@@ -872,7 +872,9 @@ pub(super) fn open_by_hand(
     ms: u64,
 ) -> (Opened, u32) {
     let at = |ms: u64| epoch + Duration::from_millis(ms);
-    let mut turn = shard.state().turn(at(ms), &mut vec![syn_v4(app, dst)]);
+    let mut turn = shard
+        .state()
+        .turn(at(ms), &mut ingress(vec![syn_v4(app, dst)]));
     let opened = turn.opened.pop().expect("the SYN opens a connection");
     let syn_ack = turn
         .out
@@ -881,7 +883,7 @@ pub(super) fn open_by_hand(
         .expect("the SYN-ACK");
     let isn = fields(syn_ack).expect("a TCP segment").seq;
     let ack = segment_v4(app, dst, 2, isn.wrapping_add(1), ACK);
-    shard.state().turn(at(ms + 1), &mut vec![ack]);
+    shard.state().turn(at(ms + 1), &mut ingress(vec![ack]));
     (opened, isn)
 }
 
@@ -913,12 +915,12 @@ fn send_data(
             &vec![0xaa; piece],
         );
         now += 20;
-        let turn = lone.shard.state().turn(at(now), &mut vec![data]);
+        let turn = lone.shard.state().turn(at(now), &mut ingress(vec![data]));
         turn.out.iter().for_each(|packet| told.take(packet));
         sent += piece;
     }
     now += 20;
-    let turn = lone.shard.state().turn(at(now), &mut Vec::new());
+    let turn = lone.shard.state().turn(at(now), &mut ingress(Vec::new()));
     turn.out.iter().for_each(|packet| told.take(packet));
     (told, now)
 }
@@ -952,9 +954,18 @@ async fn a_probe_after_a_read_is_inside_the_new_window() {
     // and the probe is the first packet of the turn after it
     let probe = data_segment_v4(app, dst, told.ack, told.seq, PSH_ACK, &[0xab]);
     now += 20;
-    let mut out = lone.shard.state().turn(at(now), &mut vec![probe]).out;
+    let mut out = lone
+        .shard
+        .state()
+        .turn(at(now), &mut ingress(vec![probe]))
+        .out;
     now += 20;
-    out.extend(lone.shard.state().turn(at(now), &mut Vec::new()).out);
+    out.extend(
+        lone.shard
+            .state()
+            .turn(at(now), &mut ingress(Vec::new()))
+            .out,
+    );
     let read: Vec<Fields> = out.iter().filter_map(|packet| fields(packet)).collect();
     assert!(
         read.first()
@@ -1010,12 +1021,14 @@ async fn a_segment_past_the_edge_into_room_is_dropped() {
         .expect("bytes to read");
     now += 20;
     let edge = told.edge();
-    let quiet = lone.shard.state().turn(at(now), &mut Vec::new());
+    let quiet = lone.shard.state().turn(at(now), &mut ingress(Vec::new()));
     quiet.out.iter().for_each(|packet| told.take(packet));
     assert_eq!(told.edge(), edge, "no segment tells of a new edge");
     let segment = data_segment_v4(app, dst, told.ack, told.seq, PSH_ACK, &[0xee; SEGMENT]);
     now += 20;
-    lone.shard.state().turn(at(now), &mut vec![segment]);
+    lone.shard
+        .state()
+        .turn(at(now), &mut ingress(vec![segment]));
     assert_eq!(
         lone.stats.counters(),
         Counters {
@@ -1034,7 +1047,7 @@ async fn a_segment_past_the_edge_into_room_is_dropped() {
     // take in the room's worth of it, and the end of that is past the edge
     let longer = data_segment_v4(app, dst, told.ack, told.seq, PSH_ACK, &[0xdd; LONGER]);
     now += 20;
-    lone.shard.state().turn(at(now), &mut vec![longer]);
+    lone.shard.state().turn(at(now), &mut ingress(vec![longer]));
     assert_eq!(
         lone.stats.counters(),
         Counters {
@@ -1083,16 +1096,18 @@ fn a_connection_that_ends_leaves_no_edge() {
     // the app resets it: the shard lets it go in the same turn
     lone.shard.state().turn(
         at(5),
-        &mut vec![segment_v4(app, dst, 2, isn.wrapping_add(1), RST)],
+        &mut ingress(vec![segment_v4(app, dst, 2, isn.wrapping_add(1), RST)]),
     );
     assert_eq!(lone.shard.state().socket_count(), 0);
     assert_eq!(lone.shard.state().edge_count(), 0);
     // a connection a reset in SYN-RECEIVED took leaves none either
-    lone.shard.state().turn(at(10), &mut vec![syn_v4(app, dst)]);
+    lone.shard
+        .state()
+        .turn(at(10), &mut ingress(vec![syn_v4(app, dst)]));
     assert_eq!(lone.shard.state().edge_count(), 1);
     lone.shard
         .state()
-        .turn(at(11), &mut vec![segment_v4(app, dst, 2, 0, RST)]);
+        .turn(at(11), &mut ingress(vec![segment_v4(app, dst, 2, 0, RST)]));
     assert_eq!(lone.shard.state().socket_count(), 0);
     assert_eq!(lone.shard.state().edge_count(), 0);
 }

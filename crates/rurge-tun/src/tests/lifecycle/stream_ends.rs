@@ -7,7 +7,7 @@ use crate::tcp::shard::Records;
 use crate::tcp::{Outcome, TunStream};
 use crate::tests::hazards::{ACK, PSH_ACK};
 use crate::tests::support::{
-    addr, is_reset, is_syn, lone_shard, segment_v4, syn_v4, tcp_header, within,
+    addr, ingress, is_reset, is_syn, lone_shard, segment_v4, syn_v4, tcp_header, within,
 };
 use std::io;
 use std::sync::Arc;
@@ -31,7 +31,9 @@ async fn a_shutdown_after_the_stacks_own_timeout_is_a_reset() {
     let at = |ms| epoch + Duration::from_millis(ms);
     let shard = lone_shard(&options, epoch).shard;
     let (app, dst) = (addr("198.18.0.1:40000"), addr("192.0.2.1:80"));
-    let mut turn = shard.state().turn(at(0), &mut vec![syn_v4(app, dst)]);
+    let mut turn = shard
+        .state()
+        .turn(at(0), &mut ingress(vec![syn_v4(app, dst)]));
     let opened = turn.opened.pop().expect("the SYN opens a connection");
     let syn_ack = turn
         .out
@@ -46,13 +48,13 @@ async fn a_shutdown_after_the_stacks_own_timeout_is_a_reset() {
     );
     // the app's ACK ends the handshake
     let ack = segment_v4(app, dst, 2, isn.wrapping_add(1), 0x10);
-    shard.state().turn(at(1), &mut vec![ack]);
+    shard.state().turn(at(1), &mut ingress(vec![ack]));
     let mut stream = TunStream::new(shard.clone(), opened.id, opened.shared);
     within("the handshake", stream.established())
         .await
         .expect("the connection is established");
     // past the timeout, before the shard's next look at every connection
-    let turn = shard.state().turn(at(200), &mut Vec::new());
+    let turn = shard.state().turn(at(200), &mut ingress(Vec::new()));
     assert!(
         turn.out.iter().any(|packet| is_reset(packet)),
         "smoltcp's timeout resets the connection"
@@ -71,7 +73,7 @@ async fn a_shutdown_after_the_stacks_own_timeout_is_a_reset() {
         .expect_err("a reset");
     assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
     // the next look at every connection lets it go, a reset
-    shard.state().turn(at(1_100), &mut Vec::new());
+    shard.state().turn(at(1_100), &mut ingress(Vec::new()));
     assert_eq!(
         shard.state().socket_count(),
         0,

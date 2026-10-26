@@ -12,7 +12,7 @@ mod unread;
 
 use crate::tcp::{ConnId, ConnShared, Shard, TunStream};
 use crate::tests::hazards::{app4, open_by_hand};
-use crate::tests::support::{addr, data_segment_v4, tcp_payload_len, within};
+use crate::tests::support::{addr, data_segment_v4, ingress, tcp_payload_len, within};
 use smoltcp::socket::tcp;
 use std::io;
 use std::net::SocketAddr;
@@ -36,7 +36,7 @@ fn payloads(out: &[Vec<u8>]) -> Vec<u8> {
 
 /// One turn of `shard` at `at`, handed `packets`: what the stack sent in it.
 fn turn(shard: &Shard, at: Instant, packets: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-    shard.state().turn(at, &mut { packets }).out
+    shard.state().turn(at, &mut ingress(packets)).out
 }
 
 /// The state of the socket of connection `id`, if the shard still has it.

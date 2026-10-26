@@ -9,7 +9,7 @@ use crate::tcp::{Outcome, Shard, TunStream};
 use crate::testing::pattern;
 use crate::tests::hazards::{ACK, PSH_ACK, open_by_hand};
 use crate::tests::support::{
-    is_fin, is_reset, lone_shard, read_pattern, read_pattern_from, syn_v4, within,
+    ingress, is_fin, is_reset, lone_shard, read_pattern, read_pattern_from, syn_v4, within,
 };
 use smoltcp::socket::tcp;
 use std::io;
@@ -94,7 +94,7 @@ async fn unread_bytes_outlive_the_time_wait() {
     );
     let again = shard
         .state()
-        .turn(at(10_200), &mut vec![syn_v4(app.app, app.dst)]);
+        .turn(at(10_200), &mut ingress(vec![syn_v4(app.app, app.dst)]));
     assert_eq!(
         again.opened.len(),
         1,

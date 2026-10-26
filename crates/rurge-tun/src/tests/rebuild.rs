@@ -9,8 +9,8 @@
 use super::hazards::{ACK, PSH_ACK, app4, fields, open_by_hand, watch};
 use super::log_capture::LogCapture;
 use super::support::{
-    WITHIN, addr, data_segment_v4, eventually, hello, is_syn, lone_shard, lone_shard_with_pool,
-    rig, segment_v4, sock, syn_v4, tcp_packet, tcp_repr, within,
+    WITHIN, addr, data_segment_v4, eventually, hello, ingress, is_syn, lone_shard,
+    lone_shard_with_pool, rig, segment_v4, sock, syn_v4, tcp_packet, tcp_repr, within,
 };
 use crate::session::Purpose;
 use crate::tcp::shard::Turn;
@@ -32,11 +32,16 @@ use tokio::net::TcpListener;
 const REBUILT: &str =
     "WARN tun: the TCP stack of a shard panicked; its connections are reset shard=0";
 
+/// The same words at DEBUG, which is what a shard that is rebuilt twice within
+/// a minute says the second time.
+const REBUILT_QUIETLY: &str =
+    "DEBUG tun: the TCP stack of a shard panicked; its connections are reset shard=0";
+
 /// Turns `shard` by hand at `at` with `incoming`, and whether the turn
 /// panicked.
 fn panics(shard: &Shard, at: Instant, incoming: Vec<Vec<u8>>) -> bool {
     catch_unwind(AssertUnwindSafe(|| {
-        shard.state().turn(at, &mut { incoming });
+        shard.state().turn(at, &mut ingress(incoming));
     }))
     .is_err()
 }
@@ -52,7 +57,7 @@ fn a_shard_that_panicked_is_rebuilt_by_the_next_to_take_its_lock() {
     let mut turn = lone
         .shard
         .state()
-        .turn(at(5), &mut vec![syn_v4(app4(40001), dst)]);
+        .turn(at(5), &mut ingress(vec![syn_v4(app4(40001), dst)]));
     let second = turn
         .opened
         .pop()
@@ -111,7 +116,7 @@ fn a_rebuilt_shard_keeps_its_pool() {
     let before = lone
         .shard
         .state()
-        .turn(at(0), &mut vec![syn_v4(app4(40000), fake)]);
+        .turn(at(0), &mut ingress(vec![syn_v4(app4(40000), fake)]));
     assert_eq!(name_of(&before).as_deref(), Some("a.test"));
     // a segment that panics the stack
     let marker = data_segment_v4(app4(40000), fake, 2, 0, PSH_ACK, PANIC_MARKER);
@@ -120,7 +125,7 @@ fn a_rebuilt_shard_keeps_its_pool() {
     let after = lone
         .shard
         .state()
-        .turn(at(20), &mut vec![syn_v4(app4(40001), fake)]);
+        .turn(at(20), &mut ingress(vec![syn_v4(app4(40001), fake)]));
     assert_eq!(lone.stats.counters().stack_panics, 1);
     assert_eq!(name_of(&after).as_deref(), Some("a.test"));
     assert_eq!(lone.stats.counters().unknown_fake, 0);
@@ -170,6 +175,36 @@ fn a_rebuilt_shard_does_not_repeat_its_initial_sequence_numbers() {
     ));
     let (_, after) = open_by_hand(&lone.shard, epoch, app4(40000), dst, 10);
     assert_ne!(before, after, "the first connection of the new stack");
+}
+
+/// A shard that is rebuilt twice within a minute says so at WARN once, and the
+/// second time at DEBUG with the same words: a stack that keeps panicking must
+/// not fill the log, and `stack_panics` counts both.
+#[test]
+fn a_shard_rebuilt_twice_in_a_minute_warns_once() {
+    let log = LogCapture::start();
+    let epoch = Instant::now();
+    let at = |ms: u64| epoch + Duration::from_millis(ms);
+    let lone = lone_shard(&TunOptions::default(), epoch);
+    let dst = addr("192.0.2.1:80");
+    // a connection whose segment panics the stack; the shard is rebuilt by
+    // whoever takes the lock next
+    let panic_the_stack = |app: u16, ms: u64| {
+        open_by_hand(&lone.shard, epoch, app4(app), dst, ms);
+        let marker = data_segment_v4(app4(app), dst, 2, 0, PSH_ACK, PANIC_MARKER);
+        assert!(panics(&lone.shard, at(ms + 2), vec![marker]));
+        assert_eq!(lone.shard.state().socket_count(), 0);
+    };
+    panic_the_stack(40_000, 0);
+    assert_eq!(lone.stats.counters().stack_panics, 1);
+    panic_the_stack(40_001, 10);
+    assert_eq!(lone.stats.counters().stack_panics, 2);
+    let lines = log.lines();
+    let rebuilt: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("the TCP stack of a shard panicked"))
+        .collect();
+    assert_eq!(rebuilt, [REBUILT, REBUILT_QUIETLY], "{lines:?}");
 }
 
 #[test]
@@ -226,7 +261,10 @@ fn a_half_open_timeout_too_long_to_add_does_not_panic() {
     let epoch = Instant::now();
     let lone = lone_shard(&options, epoch);
     let (app, dst) = (app4(40000), addr("192.0.2.1:80"));
-    let turn = lone.shard.state().turn(epoch, &mut vec![syn_v4(app, dst)]);
+    let turn = lone
+        .shard
+        .state()
+        .turn(epoch, &mut ingress(vec![syn_v4(app, dst)]));
     assert_eq!(turn.opened.len(), 1);
     assert_eq!(lone.admission.half_open(), 1);
     // the handshake still completes, whenever its time would have been
@@ -239,7 +277,7 @@ fn a_half_open_timeout_too_long_to_add_does_not_panic() {
         .seq;
     lone.shard.state().turn(
         epoch + Duration::from_millis(1),
-        &mut vec![segment_v4(app, dst, 2, isn.wrapping_add(1), ACK)],
+        &mut ingress(vec![segment_v4(app, dst, 2, isn.wrapping_add(1), ACK)]),
     );
     assert_eq!(lone.admission.half_open(), 0);
     assert_eq!(lone.admission.sockets(), 1);

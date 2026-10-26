@@ -1,6 +1,7 @@
 //! One shard's task, run by hand with channels of the test's own in place of the
 //! reader's queue and the writer's: the stop is a last turn of the shard.
 
+use crate::dispatch::Ingress;
 use crate::dns::Responder;
 use crate::packet::segment;
 use crate::session::Serving;
@@ -24,7 +25,7 @@ use tokio_util::task::TaskTracker;
 fn spawn_shard(
     lone: &Lone,
     options: &TunOptions,
-    packets: mpsc::Receiver<Vec<u8>>,
+    packets: mpsc::Receiver<Ingress>,
     to_writer: mpsc::Sender<Vec<Vec<u8>>>,
 ) -> TaskTracker {
     let tasks = TaskTracker::new();
@@ -73,7 +74,7 @@ async fn the_last_turn_takes_in_what_is_queued() {
     let dst = addr("192.0.2.1:80");
     for port in 40_000..40_003u16 {
         to_shard
-            .try_send(syn_v4(app4(port), dst))
+            .try_send(Ingress::unheld(syn_v4(app4(port), dst)))
             .expect("room in the queue");
     }
     lone.life.end(Ending::Stopped);
@@ -107,7 +108,14 @@ async fn a_panic_in_the_last_turn_rebuilds_the_shard_and_the_task_ends() {
     let (to_writer, mut from_shard) = mpsc::channel(16);
     // a segment of the connection that panics the stack as it is taken in
     to_shard
-        .try_send(data_segment_v4(app, dst, 2, 0, PSH_ACK, PANIC_MARKER))
+        .try_send(Ingress::unheld(data_segment_v4(
+            app,
+            dst,
+            2,
+            0,
+            PSH_ACK,
+            PANIC_MARKER,
+        )))
         .expect("room in the queue");
     lone.life.end(Ending::Stopped);
     let tasks = spawn_shard(&lone, &options, packets, to_writer);
@@ -178,7 +186,7 @@ async fn a_send_the_stop_finds_in_progress_is_not_given_up() {
     let tasks = spawn_shard(&lone, &options, packets, to_writer);
     // the SYN is taken, and its SYN-ACK waits for room in the queue
     to_shard
-        .try_send(syn_v4(app, dst))
+        .try_send(Ingress::unheld(syn_v4(app, dst)))
         .expect("room in the queue");
     eventually("the SYN to be taken", WITHIN, || {
         lone.admission.sockets() == 1

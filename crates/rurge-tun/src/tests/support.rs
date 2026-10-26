@@ -3,6 +3,7 @@
 //! packets they make by hand.
 
 use crate::device::{AppEnd, Device, MemoryDevice};
+use crate::dispatch::Ingress;
 use crate::stats::Stats;
 use crate::tcp::{Admission, Budget, Shard};
 use crate::testing::{
@@ -209,6 +210,13 @@ impl Device for GatedDevice {
     fn mtu(&self) -> usize {
         self.inner.mtu()
     }
+}
+
+/// `packets` as the dispatcher hands them to a shard, holding none of the
+/// budget of the shards' queues: for a test that hands a shard its turns by
+/// hand.
+pub(crate) fn ingress(packets: Vec<Vec<u8>>) -> Vec<Ingress> {
+    packets.into_iter().map(Ingress::unheld).collect()
 }
 
 /// One shard on its own, for a test that takes its turns by hand, with what a

@@ -17,7 +17,9 @@ use super::{
     Admission, Budget, ConnId, ConnShared, EGRESS_PASSES, INGRESS_PER_WAKE, Outcome, SWEEP,
     TIME_WAIT_GRACE, TunStream, Tuple,
 };
+use crate::dispatch::Ingress;
 use crate::dns::DNS_PORT;
+use crate::limit::Limiter;
 use crate::packet::{self, Reason, Segment};
 use crate::session::{self, Purpose, Serving};
 use crate::space::{self, Place, STACK_V4, STACK_V6};
@@ -39,10 +41,18 @@ use tokio_util::task::TaskTracker;
 /// add to a time: some thirty years.
 const FAR_OFF: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
 
+/// What a rebuild says of the stack that panicked, at WARN once a minute for
+/// each shard and at DEBUG for the rebuilds after it.
+const REBUILT: &str = "tun: the TCP stack of a shard panicked; its connections are reset";
+
 pub(crate) struct Shard {
     /// Which of the TUN's shards this is, for what it says.
     index: usize,
     state: Mutex<ShardState>,
+    /// Lets one rebuild in a minute through at WARN; the next ones are said at
+    /// DEBUG (the phase 3 / M4a plan's P10). A leaf lock: it is taken and given
+    /// back in the same call.
+    rebuild_warns: Mutex<Limiter>,
     /// A stream did something the shard has to act on: it read (there is
     /// room in the window to tell of), wrote (there is data to send), shut
     /// its write side down, or went.
@@ -78,6 +88,7 @@ impl Shard {
                 hooks,
                 Timers::from(options),
             )),
+            rebuild_warns: Mutex::new(Limiter::new(1, Duration::from_secs(60))),
             kick: Notify::new(),
         }
     }
@@ -107,16 +118,24 @@ impl Shard {
 
     /// Starts the shard's stack over: every connection is reset, all it held
     /// is given back, and the stack is a new one with a seed of its own.
-    /// Counted, and said at WARN with the shard's number and no more; what
-    /// the panic said is said at DEBUG.
+    /// Counted, and said with the shard's number and no more: at WARN at most
+    /// once a minute for each shard, at DEBUG otherwise, so that a stack that
+    /// keeps panicking cannot fill the log; what the panic said is said at
+    /// DEBUG.
     fn rebuild(&self, state: &mut ShardState, cause: Cause<'_>) {
         let drawn = getrandom::u64().ok();
         state.rebuild(next_seed(state.seed, drawn));
         state.admission.stack_panicked();
-        tracing::warn!(
-            shard = self.index,
-            "tun: the TCP stack of a shard panicked; its connections are reset"
-        );
+        let warn = self
+            .rebuild_warns
+            .lock()
+            .expect("the limit on a shard's rebuilds said")
+            .allow(Instant::now());
+        if warn {
+            tracing::warn!(shard = self.index, "{}", REBUILT);
+        } else {
+            tracing::debug!(shard = self.index, "{}", REBUILT);
+        }
         tracing::debug!(
             shard = self.index,
             %cause,
@@ -362,13 +381,16 @@ impl ShardState {
     /// until the stack has nothing more to send, at most `EGRESS_PASSES`
     /// passes; then the connections that are over go. It starts no task and
     /// reads no clock: `now` is the caller's.
-    pub(crate) fn turn(&mut self, now: Instant, incoming: &mut Vec<Vec<u8>>) -> Turn {
+    pub(crate) fn turn(&mut self, now: Instant, incoming: &mut Vec<Ingress>) -> Turn {
         let at = self.at(now);
         self.iface
             .poll_egress(at, &mut self.device, &mut self.sockets);
         let taken = incoming.len().min(INGRESS_PER_WAKE);
         let mut opened = Vec::new();
-        for packet in incoming.drain(..taken) {
+        for ingress in incoming.drain(..taken) {
+            // the packet goes into the stack, and what it held of the queues'
+            // bytes is given back afterwards, with the `Ingress`
+            let Ingress { packet, _held } = ingress;
             self.ingest(packet, now, at, &mut opened);
         }
         let mut drained = false;
@@ -415,10 +437,11 @@ impl ShardState {
     /// in any turn, before it can reach the stack's window arithmetic. The
     /// function of the same name below, in the shard's task, calls this one with
     /// the lock held and hands what it gave to the writer.
-    pub(crate) fn last_turn(&mut self, now: Instant, incoming: &mut Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    pub(crate) fn last_turn(&mut self, now: Instant, incoming: &mut Vec<Ingress>) -> Vec<Vec<u8>> {
         let at = self.at(now);
         let mut opened = Vec::new();
-        for packet in incoming.drain(..) {
+        for ingress in incoming.drain(..) {
+            let Ingress { packet, _held } = ingress;
             self.ingest(packet, now, at, &mut opened);
         }
         debug_assert!(opened.is_empty(), "a stopping TUN makes no connection");
@@ -1088,7 +1111,7 @@ fn carries_panic_marker(packet: &[u8]) -> bool {
 /// are there for the next turn.
 pub(crate) async fn run(
     shard: Arc<Shard>,
-    mut packets: mpsc::Receiver<Vec<u8>>,
+    mut packets: mpsc::Receiver<Ingress>,
     writer: mpsc::Sender<Vec<Vec<u8>>>,
     serving: Arc<Serving>,
     life: Arc<Life>,
@@ -1185,8 +1208,8 @@ pub(crate) async fn run(
 /// rebuilt, which resets its connections too.
 async fn last_turn(
     shard: &Shard,
-    packets: &mut mpsc::Receiver<Vec<u8>>,
-    incoming: &mut Vec<Vec<u8>>,
+    packets: &mut mpsc::Receiver<Ingress>,
+    incoming: &mut Vec<Ingress>,
     writer: &mpsc::Sender<Vec<Vec<u8>>>,
 ) {
     packets.close();

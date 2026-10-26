@@ -5,10 +5,11 @@
 
 use super::log_capture::LogCapture;
 use super::support::{
-    Rig, WITHIN, addr, checksum, echo_bytes, echo_bytes_with, echo_packet, eventually, ip_around,
-    ipv4_packet, ipv6_packet, refresh, rig, sock, syn_v4, syn_v6, tcp_bytes, tcp_packet, tcp_repr,
-    udp_bytes, udp_packet, udp_v4, with_fragment_field, with_ip_options, within,
+    Rig, WITHIN, addr, checksum, echo_bytes, echo_bytes_with, echo_packet, eventually, ingress,
+    ip_around, ipv4_packet, ipv6_packet, refresh, rig, sock, syn_v4, syn_v6, tcp_bytes, tcp_packet,
+    tcp_repr, udp_bytes, udp_packet, udp_v4, with_fragment_field, with_ip_options, within,
 };
+use crate::bytes::QueuedBytes;
 use crate::dispatch::route;
 use crate::packet::{Parsed, Reason, Segment, Transport, classify, segment};
 use crate::stats::{Stats, Warnings};
@@ -16,7 +17,9 @@ use crate::tcp::Tuple;
 use crate::testing::{Script, Upstream};
 use crate::{Counters, TunOptions};
 use smoltcp::wire::{TcpControl, TcpRepr, TcpSeqNumber};
+use std::hash::RandomState;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -46,6 +49,13 @@ const ALL_REASONS: [Reason; 10] = [
     Reason::RstLimited,
     Reason::IcmpLimited,
 ];
+
+/// The bytes the shards' queues may hold together, and the key that chooses a
+/// shard: what the dispatcher is given besides the packets, for a test that
+/// calls it itself and cares about neither.
+fn queues() -> (Arc<QueuedBytes>, RandomState) {
+    (Arc::new(QueuedBytes::new(usize::MAX)), RandomState::new())
+}
 
 /// A SYN from `src` to `dst` (any addresses), the checksums right.
 fn syn4(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
@@ -531,7 +541,8 @@ fn bad_udp_and_icmp_checksums_are_malformed() {
         let stats = Stats::default();
         let mut damaged = packet.clone();
         damaged[field_at] ^= 0x01;
-        assert!(route(damaged, true, &[], &stats).is_none());
+        let (queue_bytes, key) = queues();
+        assert!(route(damaged, true, &[], &stats, &queue_bytes, &key).is_none());
         assert_eq!(
             stats.counters(),
             Counters {
@@ -964,7 +975,9 @@ fn a_shard_given_what_classify_turned_away_says_so() {
 
     let shard = lone_shard(&TunOptions::default(), Instant::now()).shard;
     let to_loopback = syn_v4(addr("198.18.0.1:40000"), addr("127.0.0.1:80"));
-    shard.state().turn(Instant::now(), &mut vec![to_loopback]);
+    shard
+        .state()
+        .turn(Instant::now(), &mut ingress(vec![to_loopback]));
 }
 
 /// Nothing a damaged packet holds makes `classify` panic or promise more than
@@ -1019,10 +1032,14 @@ fn the_bytes_after_the_ip_packet_do_not_reach_the_shard() {
     for packet in [good4(), good6(), with_ip_options(&good4(), &[1, 1, 1, 0])] {
         let (to_shard, mut shard) = mpsc::channel(4);
         let stats = Stats::default();
+        let (queue_bytes, key) = queues();
         let mut padded = packet.clone();
         padded.extend([0xaa; 9]);
-        assert!(route(padded, true, &[to_shard], &stats).is_none());
-        assert_eq!(shard.try_recv().expect("the shard is given it"), packet);
+        assert!(route(padded, true, &[to_shard], &stats, &queue_bytes, &key).is_none());
+        assert_eq!(
+            shard.try_recv().expect("the shard is given it").packet,
+            packet
+        );
         assert_eq!(stats.counters(), Counters::default());
     }
 }
@@ -1276,6 +1293,7 @@ fn a_debug_line_has_the_addresses_that_were_read() {
     let mut bad_sum = good4();
     bad_sum[10] ^= 0x01;
     let (src, dst) = (sock(APP4, 0), sock(FAR4, SERVICE));
+    let (queue_bytes, key) = queues();
     let port0 = tcp_packet(src, dst, &tcp_repr(src, dst, &[]));
     let fragment = with_fragment_field(good4(), MORE_FRAGMENTS);
     let unhandled = ipv4_packet(47, APP4, FAR4, &[0; 8]);
@@ -1289,7 +1307,17 @@ fn a_debug_line_has_the_addresses_that_were_read() {
         (unhandled, true),
         (good6(), false),
     ] {
-        assert!(route(packet, ipv6, std::slice::from_ref(&to_shard), &stats).is_none());
+        assert!(
+            route(
+                packet,
+                ipv6,
+                std::slice::from_ref(&to_shard),
+                &stats,
+                &queue_bytes,
+                &key
+            )
+            .is_none()
+        );
     }
     let ends = "src=198.18.0.1 dst=192.0.2.1";
     assert_eq!(
@@ -1315,13 +1343,16 @@ fn a_full_shard_queue_drops_and_says_so() {
     let (to_shard, mut shard) = mpsc::channel(1);
     let stats = Stats::default();
     let packet = good4();
+    let (queue_bytes, key) = queues();
     for _ in 0..3 {
         assert!(
             route(
                 packet.clone(),
                 true,
                 std::slice::from_ref(&to_shard),
-                &stats
+                &stats,
+                &queue_bytes,
+                &key
             )
             .is_none()
         );
@@ -1334,7 +1365,7 @@ fn a_full_shard_queue_drops_and_says_so() {
             ..Counters::default()
         }
     );
-    assert_eq!(shard.try_recv().expect("the first packet"), packet);
+    assert_eq!(shard.try_recv().expect("the first packet").packet, packet);
     assert!(shard.try_recv().is_err());
     let lines = log.lines();
     assert_eq!(lines.len(), 2, "{lines:?}");

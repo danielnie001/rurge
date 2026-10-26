@@ -8,7 +8,7 @@ use crate::TunOptions;
 use crate::tcp::Outcome;
 use crate::tcp::shard::Records;
 use crate::tests::hazards::{ACK, PSH_ACK};
-use crate::tests::support::{is_fin, is_reset, lone_shard, within};
+use crate::tests::support::{ingress, is_fin, is_reset, lone_shard, within};
 use smoltcp::socket::tcp;
 use std::io;
 use std::time::{Duration, Instant};
@@ -218,9 +218,10 @@ async fn a_dropped_stream_is_given_its_linger_and_then_reset() {
     assert_eq!(state_of(shard, app.id), Some(tcp::State::LastAck));
     // a millisecond short of the earliest the deadline can be: nothing happens
     // and the shard knows when to come back
-    let early = shard
-        .state()
-        .turn(before + linger - Duration::from_millis(1), &mut Vec::new());
+    let early = shard.state().turn(
+        before + linger - Duration::from_millis(1),
+        &mut ingress(Vec::new()),
+    );
     assert!(!early.out.iter().any(|packet| is_reset(packet)));
     assert_eq!(state_of(shard, app.id), Some(tcp::State::LastAck));
     // the next thing the stack itself has to do is to send the FIN again,
@@ -235,7 +236,7 @@ async fn a_dropped_stream_is_given_its_linger_and_then_reset() {
     // not out in this turn, so the shard keeps the connection and comes back
     // at once
     let due = after + linger;
-    let aborting = shard.state().turn(due, &mut Vec::new());
+    let aborting = shard.state().turn(due, &mut ingress(Vec::new()));
     assert!(!aborting.out.iter().any(|packet| is_reset(packet)));
     assert_eq!(state_of(shard, app.id), Some(tcp::State::Closed));
     assert_eq!(
@@ -244,7 +245,7 @@ async fn a_dropped_stream_is_given_its_linger_and_then_reset() {
         "the reset is to go out at once"
     );
     // the next turn sends the reset, and the connection goes with it
-    let reset = shard.state().turn(due, &mut Vec::new());
+    let reset = shard.state().turn(due, &mut ingress(Vec::new()));
     assert!(
         reset.out.iter().any(|packet| is_reset(packet)),
         "the app is told"
@@ -343,7 +344,9 @@ async fn a_second_drop_of_one_connection_leaves_no_second_entry() {
     );
     // the deadline comes with no connection to find, and the shard has nothing
     // to wake for
-    let late = shard.state().turn(before + linger * 3, &mut Vec::new());
+    let late = shard
+        .state()
+        .turn(before + linger * 3, &mut ingress(Vec::new()));
     assert!(late.out.is_empty());
     assert_eq!(late.wake_at, None);
     assert_eq!(lone.admission.sockets(), 0);

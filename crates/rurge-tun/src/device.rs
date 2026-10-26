@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, mpsc};
 pub trait Device: Send + Sync {
     /// Waits for at least one packet, then moves at most `max` whole IP packets into `into`.
     /// An error ends the TUN.
+    /// Each packet is allocated to its length: the TUN counts what a waiting packet holds by its capacity (`TunOptions::queue_bytes`).
     fn recv<'a>(&'a self, into: &'a mut Vec<Vec<u8>>, max: usize) -> BoxFuture<'a, io::Result<()>>;
     /// Writes `packets` in order and leaves it empty. The memory device waits for room.
     fn send<'a>(&'a self, packets: &'a mut Vec<Vec<u8>>) -> BoxFuture<'a, io::Result<()>>;

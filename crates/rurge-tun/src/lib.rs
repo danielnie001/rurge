@@ -13,6 +13,7 @@
 //! the apps send over UDP off their queue and one for each of them answers it
 //! (`dns`), and one writes to the device what all of them send (`writer`).
 
+mod bytes;
 mod context;
 pub mod device;
 mod dispatch;
@@ -33,12 +34,14 @@ mod writer;
 
 pub use hooks::{Hooks, Pinger, TunDns, TunSettings};
 
+use bytes::QueuedBytes;
 use device::Device;
 use dns::Responder;
 use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
 use session::Serving;
 use stats::Stats;
+use std::hash::RandomState;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -46,7 +49,6 @@ use tcp::{Admission, Budget, Shard};
 use tokio::sync::mpsc;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use tokio_util::task::TaskTracker;
-use udp::bytes::QueuedBytes;
 
 /// The largest receive buffer of any TCP socket on either side of the
 /// adapter. With 65535 bytes the window scale is 0 (smoltcp tcp.rs 538: the
@@ -120,6 +122,10 @@ impl Tun {
         let serving = Arc::new(Serving::new(dialer.clone(), responder.clone(), &options));
         let (to_responder, queries) = mpsc::channel(options.dns_queue);
         let udp_bytes = Arc::new(QueuedBytes::new(options.udp_bytes));
+        let queue_bytes = Arc::new(QueuedBytes::new(options.queue_bytes));
+        // one key for the TUN: the shard of a connection is its own while the
+        // TUN runs, and two TUNs do not choose alike
+        let shard_key = RandomState::new();
         let writer_queue = options.writer_queue;
         let (to_writer, from_shards) = mpsc::channel(writer_queue);
         #[cfg(test)]
@@ -191,7 +197,13 @@ impl Tun {
             life.clone(),
         ));
         tasks.spawn(dns::udp::run(ctx.clone(), queries));
-        tasks.spawn(dispatch::run(device, to_shards, ctx));
+        tasks.spawn(dispatch::run(
+            device,
+            to_shards,
+            ctx,
+            queue_bytes.clone(),
+            shard_key,
+        ));
         // what is spawned later, the sessions, is waited for all the same
         tasks.close();
         TunHandle {
@@ -208,6 +220,8 @@ impl Tun {
                 admission,
                 #[cfg(test)]
                 udp_bytes,
+                #[cfg(test)]
+                queue_bytes,
             }),
         }
     }
@@ -242,6 +256,8 @@ pub struct TunOptions {
     pub timeout: Duration,
     /// How many packets the device's reader can queue for one shard. A packet for a shard whose queue is full is dropped and counted (`queue_full`). More than zero.
     pub shard_queue: usize,
+    /// The bytes of packets that can wait in all the shards' queues together, counted by the memory each packet holds (its capacity). A packet that does not fit is dropped and counted (`queue_full`). More than zero.
+    pub queue_bytes: usize,
     /// How many batches of packets (one for each turn of a shard) can wait for the writer. A shard whose batch finds the queue full waits for room. More than zero.
     pub writer_queue: usize,
     /// How long a UDP session, and each destination in it, can go without a packet either way before it ends. The default is the engine's own: its flows end after 60 seconds of quiet. At least 1 ms and at most 24 hours.
@@ -282,6 +298,7 @@ impl Default for TunOptions {
             keep_alive: Duration::from_secs(30),
             timeout: Duration::from_secs(600),
             shard_queue: 1_024,
+            queue_bytes: 32 << 20,
             writer_queue: 256,
             udp_idle: Duration::from_secs(60),
             udp_dns_idle: Duration::from_secs(10),
@@ -332,6 +349,9 @@ impl TunOptions {
         }
         if self.shard_queue == 0 {
             return Err("shard_queue must be more than zero".into());
+        }
+        if self.queue_bytes == 0 {
+            return Err("queue_bytes must be more than zero".into());
         }
         if self.writer_queue == 0 {
             return Err("writer_queue must be more than zero".into());
@@ -447,6 +467,8 @@ struct Inner {
     admission: Arc<Admission>,
     #[cfg(test)]
     udp_bytes: Arc<QueuedBytes>,
+    #[cfg(test)]
+    queue_bytes: Arc<QueuedBytes>,
 }
 
 /// A running TUN. Clone it to share it. It has no `Drop`: dropping every handle
@@ -550,6 +572,13 @@ impl TunHandle {
         self.inner.udp_bytes.queued()
     }
 
+    /// The bytes of the packets that wait in the shards' queues, which the
+    /// budget `queue_bytes` counts.
+    #[cfg(test)]
+    pub(crate) fn queue_bytes_queued(&self) -> usize {
+        self.inner.queue_bytes.queued()
+    }
+
     /// The TCP sockets of every shard.
     #[cfg(test)]
     pub(crate) fn sockets_in_use(&self) -> usize {
@@ -634,7 +663,7 @@ pub struct Counters {
     pub martian: u64,
     /// Packets nothing handles: IPv6 while it is off, extension headers, protocols other than TCP, UDP and ICMP, an ICMP that is no echo request, and echo requests while `icmp-forwarding` is off; UDP datagrams when the dialer carries no UDP; replies from an address of the other family than the app's.
     pub unsupported: u64,
-    /// Packets for a shard whose queue was full; datagrams for a UDP session whose queue was full, or that did not fit the bytes the sessions' queues may hold (`udp_bytes`); DNS queries that found the responder's queue full; the messages that the writer's queue had no room for and that are made without waiting: ICMP messages for refused UDP flows, ICMP messages for datagrams to rurge's own addresses, the local replies to echo requests to those addresses, and the answers of the DNS responder.
+    /// Packets for a shard whose queue was full, or that did not fit the bytes the shards' queues may hold (`queue_bytes`); datagrams for a UDP session whose queue was full, or that did not fit the bytes the sessions' queues may hold (`udp_bytes`); DNS queries that found the responder's queue full; the messages that the writer's queue had no room for and that are made without waiting: ICMP messages for refused UDP flows, ICMP messages for datagrams to rurge's own addresses, the local replies to echo requests to those addresses, and the answers of the DNS responder.
     pub queue_full: u64,
     /// SYNs, UDP datagrams and echo requests to an address of rurge's own space that names nothing; replies from a name that has no address.
     pub unknown_fake: u64,
