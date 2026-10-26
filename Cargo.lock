@@ -3419,6 +3419,7 @@ version = "0.1.0"
 dependencies = [
  "if-addrs",
  "ipconfig",
+ "ipnet",
  "nix",
  "resolv-conf",
  "serde",

@@ -6,6 +6,7 @@ pub mod dns;
 pub mod netenv;
 pub mod process;
 pub mod procinfo;
+pub mod route;
 pub mod service;
 pub mod socket;
 pub mod sysinfo;
