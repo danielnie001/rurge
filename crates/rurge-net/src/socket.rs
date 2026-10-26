@@ -74,6 +74,14 @@ pub trait SocketHook: Send + Sync {
         family: Family,
     ) -> io::Result<()>;
     fn set_tos(&self, socket: &socket2::Socket, family: Family, tos: u8) -> io::Result<()>;
+    /// The interface rurge's own socket to `dst` has to be bound to, so that it
+    /// does not go into the virtual adapter of the enhanced mode (M4 design 7.1).
+    /// `Ok(None)`, the default: no binding. `Err`: this connection is not to be
+    /// made, and its error is what the caller sees.
+    fn egress(&self, dst: IpAddr) -> io::Result<Option<String>> {
+        let _ = dst;
+        Ok(None)
+    }
 }
 
 /// Does nothing: for commands that never dial (`check`, `rule match`) and tests.

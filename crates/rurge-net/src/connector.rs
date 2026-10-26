@@ -7,9 +7,9 @@ use rurge_config::HostName;
 use rurge_config::spec::IpVersion;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
@@ -312,16 +312,16 @@ impl DirectConnector {
     }
 }
 
-/// A non-blocking socket of `addr`'s family with the policy's socket
-/// options on it.
-fn open_socket(
-    addr: SocketAddr,
+/// A non-blocking socket of `family` with the options that have to go on it
+/// before anything binds it: the IP TOS, and a UDP socket of IPv6 that takes
+/// IPv6 only. The one place rurge makes an outbound socket (M4 design 3.2,
+/// 7.2).
+fn new_socket(
+    family: Family,
     kind: socket2::Type,
     opts: &SocketOpts,
     hook: &dyn SocketHook,
-    fallback_logged: &AtomicBool,
 ) -> io::Result<socket2::Socket> {
-    let family = Family::of(&addr.ip());
     let domain = match family {
         Family::V4 => socket2::Domain::IPV4,
         Family::V6 => socket2::Domain::IPV6,
@@ -343,20 +343,112 @@ fn open_socket(
     {
         tracing::debug!(error = %e, tos = opts.tos, "cannot set the IP TOS; connecting without it");
     }
-    if let Some(interface) = &opts.interface
-        && let Err(e) = hook.bind_interface(&socket, interface, family)
-    {
-        if !opts.allow_other_interface {
-            return Err(io::Error::new(
-                e.kind(),
-                format!("cannot use interface {interface}: {e}"),
-            ));
+    Ok(socket)
+}
+
+/// Binds `socket` to the policy's `interface`, when it names one. `Ok(true)`:
+/// bound to it, which is the interface the user chose. `Ok(false)`: nothing to
+/// bind, or the binding failed and `allow-other-interface` took the failure —
+/// the caller then asks for an egress. `Err`: the interface cannot be used and
+/// may not be left.
+fn bind_policy_interface(
+    socket: &socket2::Socket,
+    family: Family,
+    opts: &SocketOpts,
+    hook: &dyn SocketHook,
+    fallback_logged: &AtomicBool,
+) -> io::Result<bool> {
+    let Some(interface) = &opts.interface else {
+        return Ok(false);
+    };
+    match hook.bind_interface(socket, interface, family) {
+        Ok(()) => Ok(true),
+        Err(e) if opts.allow_other_interface => {
+            if !fallback_logged.swap(true, Ordering::Relaxed) {
+                tracing::warn!(interface = %interface, error = %e, "interface unavailable; using the default one (allow-other-interface)");
+            }
+            Ok(false)
         }
-        if !fallback_logged.swap(true, Ordering::Relaxed) {
-            tracing::warn!(interface = %interface, error = %e, "interface unavailable; using the default one (allow-other-interface)");
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("cannot use interface {interface}: {e}"),
+        )),
+    }
+}
+
+/// Binds `socket` to the interface `egress` answered for `dst`: rurge's own
+/// connection must not go into the virtual adapter of the enhanced mode. A
+/// binding that fails fails the connection — not binding would send it there
+/// (M4 plan P2).
+fn bind_egress(
+    socket: &socket2::Socket,
+    family: Family,
+    dst: IpAddr,
+    interface: &str,
+    hook: &dyn SocketHook,
+) -> io::Result<()> {
+    match hook.bind_interface(socket, interface, family) {
+        Ok(()) => {
+            tracing::debug!(%dst, interface, "rurge's own connection leaves through the egress interface");
+            Ok(())
+        }
+        Err(e) => {
+            // the names and the system's own words stay in DEBUG; what goes
+            // into request records and the API is only the kind of failure
+            // (M4 plan P3)
+            tracing::debug!(%dst, interface, error = %e, "rurge's own connection cannot leave through the egress interface");
+            Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot bind to the network outside the enhanced mode: {}",
+                    e.kind()
+                ),
+            ))
         }
     }
+}
+
+/// A non-blocking socket of `family` with the policy's socket options on it,
+/// bound to the policy's `interface` or to the egress the hook answers for
+/// `dst` — the interface rurge's own connection to `dst` leaves through.
+fn open_socket(
+    family: Family,
+    dst: Option<IpAddr>,
+    kind: socket2::Type,
+    opts: &SocketOpts,
+    hook: &dyn SocketHook,
+    fallback_logged: &AtomicBool,
+) -> io::Result<socket2::Socket> {
+    let socket = new_socket(family, kind, opts, hook)?;
+    if bind_policy_interface(&socket, family, opts, hook, fallback_logged)? {
+        return Ok(socket);
+    }
+    let Some(dst) = dst else {
+        return Ok(socket);
+    };
+    if let Some(interface) = hook.egress(dst)? {
+        bind_egress(&socket, family, dst, &interface, hook)?;
+    }
     Ok(socket)
+}
+
+/// The unspecified address of `family`, port 0.
+fn unspecified(family: Family) -> SocketAddr {
+    match family {
+        Family::V4 => SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+        Family::V6 => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
+    }
+}
+
+/// An unconnected UDP socket out of `socket`: room for a burst, and bound to
+/// the unspecified address unless binding it to an interface bound it already
+/// (Windows binds to an interface by binding to its address).
+fn finish_udp(socket: socket2::Socket, family: Family) -> io::Result<std::net::UdpSocket> {
+    make_room(&socket);
+    if !is_bound(&socket) {
+        socket.bind(&unspecified(family).into())?;
+    }
+    Ok(socket.into())
 }
 
 async fn connect_one(
@@ -365,7 +457,14 @@ async fn connect_one(
     hook: &dyn SocketHook,
     fallback_logged: &AtomicBool,
 ) -> io::Result<TcpStream> {
-    let socket = open_socket(addr, socket2::Type::STREAM, opts, hook, fallback_logged)?;
+    let socket = open_socket(
+        Family::of(&addr.ip()),
+        Some(addr.ip()),
+        socket2::Type::STREAM,
+        opts,
+        hook,
+        fallback_logged,
+    )?;
     let std_stream: std::net::TcpStream = socket.into();
     let stream = tokio::net::TcpSocket::from_std_stream(std_stream)
         .connect(addr)
@@ -424,30 +523,27 @@ impl DirectConnector {
         Ok(SocketAddr::new(primary[0], target.port))
     }
 
-    /// An unconnected UDP socket of `family` with the policy's socket
-    /// options and room for a burst, bound to the unspecified address —
-    /// unless binding to the policy's interface bound it already (Windows
-    /// binds to an interface by binding to its address). DIRECT's UDP
-    /// carrier and a direct QUIC connection send from these.
-    pub(crate) fn bind_udp(&self, family: Family) -> io::Result<std::net::UdpSocket> {
-        let unspecified = match family {
-            Family::V4 => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            Family::V6 => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-        };
+    /// An unconnected UDP socket of `family` with the policy's socket options
+    /// and room for a burst, bound to the unspecified address — unless binding
+    /// to the policy's interface bound it already (Windows binds to an
+    /// interface by binding to its address). `dst`, when given, is the
+    /// destination the socket is made for: the hook is asked for the egress
+    /// that does not go into the virtual adapter — an unconnected socket for
+    /// DIRECT's carrier asks per datagram instead (`DirectPacket`).
+    pub(crate) fn bind_udp(
+        &self,
+        family: Family,
+        dst: Option<IpAddr>,
+    ) -> io::Result<std::net::UdpSocket> {
         let socket = open_socket(
-            SocketAddr::new(unspecified, 0),
+            family,
+            dst,
             socket2::Type::DGRAM,
             &self.opts,
             self.hook.as_ref(),
             &self.fallback_logged,
         )?;
-        make_room(&socket);
-        // `interface` has bound it already on Windows (to the interface's
-        // address): a second bind fails
-        if !is_bound(&socket) {
-            socket.bind(&SocketAddr::new(unspecified, 0).into())?;
-        }
-        Ok(socket.into())
+        finish_udp(socket, family)
     }
 
     /// The policy's `tos`; `0` leaves the kernel default.
@@ -513,7 +609,8 @@ impl Connector for DirectConnector {
         Box::pin(within(target, opts.timeout, async move {
             let addr = self.udp_peer(target).await?;
             let socket = open_socket(
-                addr,
+                Family::of(&addr.ip()),
+                Some(addr.ip()),
                 socket2::Type::DGRAM,
                 &self.opts,
                 self.hook.as_ref(),
@@ -557,7 +654,7 @@ impl DirectConnector {
         };
         let (mut v4, mut v6, mut failure) = (None, None, None);
         for family in families {
-            let opened = self.bind_udp(*family).and_then(UdpSocket::from_std);
+            let opened = self.open_base(*family);
             match (opened, family) {
                 (Ok(socket), Family::V4) => v4 = Some(socket),
                 (Ok(socket), Family::V6) => v6 = Some(socket),
@@ -568,30 +665,99 @@ impl DirectConnector {
             return Err(failure.unwrap_or_else(no_udp));
         }
         Ok(DirectPacket {
-            v4,
-            v6,
+            inner: Mutex::new(Sockets {
+                v4,
+                v6,
+                bound: Vec::new(),
+                waiting: None,
+            }),
+            hook: self.hook.clone(),
             resolver: self.resolver.clone(),
             opts: self.opts.clone(),
         })
     }
+
+    /// One socket of the carrier for `family`: no egress is asked (the carrier
+    /// sends anywhere, so there is no destination yet), and the answer to
+    /// whether it is bound to the policy's `interface` — those datagrams ask
+    /// for no egress either (M4 plan P2).
+    fn open_base(&self, family: Family) -> io::Result<(Arc<UdpSocket>, bool)> {
+        let socket = new_socket(family, socket2::Type::DGRAM, &self.opts, self.hook.as_ref())?;
+        let bound = bind_policy_interface(
+            &socket,
+            family,
+            &self.opts,
+            self.hook.as_ref(),
+            &self.fallback_logged,
+        )?;
+        let socket = finish_udp(socket, family)?;
+        Ok((Arc::new(UdpSocket::from_std(socket)?), bound))
+    }
 }
 
-/// DIRECT's UDP carrier: unconnected sockets, one per address family.
+/// DIRECT's UDP carrier: unconnected sockets, one per address family, and one
+/// more for each egress a datagram has to leave through — an interface rurge's
+/// own connection is bound to, so that it does not go into the virtual adapter
+/// of the enhanced mode (M4 design 3.2).
 struct DirectPacket {
-    v4: Option<UdpSocket>,
-    v6: Option<UdpSocket>,
+    inner: Mutex<Sockets>,
+    hook: Arc<dyn SocketHook>,
     resolver: Arc<dyn Resolve>,
     opts: SocketOpts,
 }
 
-impl DirectPacket {
-    fn socket_for(&self, ip: &IpAddr) -> Option<&UdpSocket> {
-        match Family::of(ip) {
-            Family::V4 => self.v4.as_ref(),
-            Family::V6 => self.v6.as_ref(),
+/// The carrier's sockets under one lock: the ones opened with it and the ones
+/// made later for an egress.
+struct Sockets {
+    /// Each family's socket, bound to no egress; and whether it is bound to the
+    /// policy's `interface` (then its datagrams ask no egress).
+    v4: Option<(Arc<UdpSocket>, bool)>,
+    v6: Option<(Arc<UdpSocket>, bool)>,
+    /// The sockets bound to an egress, made on first use, never dropped: the
+    /// carrier lives as long as its UDP flow, which the engine ends itself.
+    bound: Vec<(Family, String, Arc<UdpSocket>)>,
+    /// The `recv_from` waiting for a datagram: woken when a socket is added,
+    /// whose datagrams it would not see until another socket's came.
+    waiting: Option<Waker>,
+}
+
+impl Sockets {
+    /// The family's own socket, and whether the policy's `interface` bound it.
+    fn base(&self, family: Family) -> Option<(Arc<UdpSocket>, bool)> {
+        match family {
+            Family::V4 => self.v4.clone(),
+            Family::V6 => self.v6.clone(),
         }
     }
 
+    /// The socket bound to `interface` for `family`, when one was made.
+    fn bound_to(&self, family: Family, interface: &str) -> Option<Arc<UdpSocket>> {
+        self.bound
+            .iter()
+            .find(|(f, name, _)| *f == family && name == interface)
+            .map(|(_, _, socket)| socket.clone())
+    }
+
+    /// Adds `socket` for `interface`, waking the `recv_from` waiting for a
+    /// datagram that would come on it.
+    fn add(&mut self, family: Family, interface: String, socket: Arc<UdpSocket>) {
+        self.bound.push((family, interface, socket));
+        if let Some(waking) = self.waiting.take() {
+            waking.wake();
+        }
+    }
+
+    /// Every socket the carrier receives on, the opened ones first.
+    fn all(&self) -> impl Iterator<Item = &Arc<UdpSocket>> {
+        [self.v4.as_ref(), self.v6.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|(socket, _)| socket)
+            .chain(self.bound.iter().map(|(_, _, socket)| socket))
+    }
+}
+
+impl DirectPacket {
     /// The first address of `name` the policy's `ip-version` allows and
     /// this carrier has a socket for.
     async fn address_of(&self, name: &str) -> io::Result<IpAddr> {
@@ -600,13 +766,44 @@ impl DirectPacket {
         primary
             .into_iter()
             .chain(secondary)
-            .find(|ip| self.socket_for(ip).is_some())
+            .find(|ip| self.inner.lock().unwrap().base(Family::of(ip)).is_some())
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("no usable address for {name}"),
                 )
             })
+    }
+
+    /// The socket a datagram to `ip` goes out from: the family's own when the
+    /// policy's `interface` bound it, otherwise one bound to the interface the
+    /// hook answers for `ip` — asked once for this datagram, the socket made on
+    /// first use. `Err`: the datagram is not sent — sending it unbound would
+    /// put it into the virtual adapter (M4 plan P2). `Ok(None)`: the policy's
+    /// `ip-version` allows no socket of this family.
+    fn socket_for(&self, ip: IpAddr) -> io::Result<Option<Arc<UdpSocket>>> {
+        let family = Family::of(&ip);
+        let Some((base, policy_bound)) = self.inner.lock().unwrap().base(family) else {
+            return Ok(None);
+        };
+        if policy_bound {
+            return Ok(Some(base));
+        }
+        let Some(interface) = self.hook.egress(ip)? else {
+            return Ok(Some(base));
+        };
+        // one lock span: the egress's socket is looked up and, when it is not
+        // there yet, made — so that two datagrams at once make one socket, and
+        // its key is the interface it was bound to
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(socket) = inner.bound_to(family, &interface) {
+            return Ok(Some(socket));
+        }
+        let socket = new_socket(family, socket2::Type::DGRAM, &self.opts, self.hook.as_ref())?;
+        bind_egress(&socket, family, ip, &interface, self.hook.as_ref())?;
+        let socket = Arc::new(UdpSocket::from_std(finish_udp(socket, family)?)?);
+        inner.add(family, interface, socket.clone());
+        Ok(Some(socket))
     }
 }
 
@@ -629,12 +826,12 @@ impl PacketSocket for DirectPacket {
                 HostName::Ip(ip) => *ip,
                 HostName::Domain(name) => self.address_of(name).await?,
             };
-            let socket = self.socket_for(&ip).ok_or_else(|| {
-                io::Error::new(
+            let Some(socket) = self.socket_for(ip)? else {
+                return Err(io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
                     format!("this policy sends no UDP to {}", display_target(to)),
-                )
-            })?;
+                ));
+            };
             socket.send_to(buf, SocketAddr::new(ip, to.port)).await?;
             Ok(())
         })
@@ -642,8 +839,9 @@ impl PacketSocket for DirectPacket {
 
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
         Box::pin(std::future::poll_fn(move |cx| {
+            let mut inner = self.inner.lock().unwrap();
             let mut read = ReadBuf::new(buf);
-            for socket in [&self.v4, &self.v6].into_iter().flatten() {
+            for socket in inner.all() {
                 loop {
                     match socket.poll_recv_from(cx, &mut read) {
                         // an ICMP "unreachable" for an earlier datagram, which
@@ -660,6 +858,8 @@ impl PacketSocket for DirectPacket {
                     }
                 }
             }
+            // nothing to read: a socket added under this lock wakes it
+            inner.waiting = Some(cx.waker().clone());
             Poll::Pending
         }))
     }
@@ -866,6 +1066,82 @@ mod tests {
                 .push(format!("tos {tos:#04x} {family:?}"));
             Ok(())
         }
+        fn egress(&self, dst: IpAddr) -> io::Result<Option<String>> {
+            self.calls.lock().unwrap().push(format!("egress {dst}"));
+            Ok(None)
+        }
+    }
+
+    /// What `EgressHook` answers to `egress`.
+    #[derive(Clone, Default, PartialEq)]
+    enum Egress {
+        /// No binding.
+        #[default]
+        None,
+        /// Bind this interface.
+        Interface(String),
+        /// Do not make the connection: this error, as it is.
+        Fail(String),
+    }
+
+    /// Answers `egress` with what the test set, and records every question and
+    /// every binding. An interface it is told to refuse fails binding the way
+    /// the macOS and Windows hooks do: naming the interface.
+    #[derive(Default)]
+    struct EgressHook {
+        calls: Mutex<Vec<String>>,
+        answer: Mutex<Egress>,
+        refuse: Mutex<Vec<String>>,
+    }
+
+    impl EgressHook {
+        fn answer(&self, answer: Egress) {
+            *self.answer.lock().unwrap() = answer;
+        }
+        fn refuse(&self, interface: &str) {
+            self.refuse.lock().unwrap().push(interface.into());
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl SocketHook for EgressHook {
+        fn bind_interface(
+            &self,
+            _: &socket2::Socket,
+            interface: &str,
+            family: Family,
+        ) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("bind {interface} {family:?}"));
+            if self.refuse.lock().unwrap().iter().any(|x| x == interface) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no such interface: {interface}"),
+                ));
+            }
+            Ok(())
+        }
+        fn set_tos(&self, _: &socket2::Socket, family: Family, tos: u8) -> io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("tos {tos:#04x} {family:?}"));
+            Ok(())
+        }
+        fn egress(&self, dst: IpAddr) -> io::Result<Option<String>> {
+            self.calls.lock().unwrap().push(format!("egress {dst}"));
+            match self.answer.lock().unwrap().clone() {
+                Egress::None => Ok(None),
+                Egress::Interface(interface) => Ok(Some(interface)),
+                Egress::Fail(message) => {
+                    Err(io::Error::new(io::ErrorKind::NetworkUnreachable, message))
+                }
+            }
+        }
     }
 
     async fn listener() -> (tokio::net::TcpListener, u16) {
@@ -940,6 +1216,178 @@ mod tests {
             .connect(&target, &ConnectOpts::default())
             .await
             .unwrap();
+    }
+
+    /// Without an `interface`, rurge asks the hook where its own connection
+    /// has to leave, and binds the socket there (M4 design 3.2).
+    #[tokio::test]
+    async fn open_socket_asks_egress_for_the_destination_and_binds_there() {
+        let (_l, port) = listener().await;
+        let hook = Arc::new(EgressHook::default());
+        hook.answer(Egress::Interface("test0".into()));
+        let connector = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts::default(),
+            hook.clone(),
+        );
+        connector
+            .connect(
+                &Target::new(HostName::parse("127.0.0.1"), port),
+                &ConnectOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hook.calls(), ["egress 127.0.0.1", "bind test0 V4"]);
+    }
+
+    /// An egress of `None`: the connection is not bound anywhere.
+    #[tokio::test]
+    async fn no_egress_no_binding() {
+        let (_l, port) = listener().await;
+        let hook = Arc::new(EgressHook::default());
+        let connector = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts::default(),
+            hook.clone(),
+        );
+        connector
+            .connect(
+                &Target::new(HostName::parse("127.0.0.1"), port),
+                &ConnectOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hook.calls(), ["egress 127.0.0.1"]);
+    }
+
+    /// The interface the user named wins: with a policy `interface` the egress
+    /// is not asked (M4 plan P2).
+    #[tokio::test]
+    async fn a_policy_interface_is_used_and_egress_is_not_asked() {
+        let (_l, port) = listener().await;
+        let hook = Arc::new(EgressHook::default());
+        hook.answer(Egress::Interface("test0".into()));
+        let connector = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts {
+                interface: Some("policy0".into()),
+                ..SocketOpts::default()
+            },
+            hook.clone(),
+        );
+        connector
+            .connect(
+                &Target::new(HostName::parse("127.0.0.1"), port),
+                &ConnectOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hook.calls(), ["bind policy0 V4"]);
+    }
+
+    /// `allow-other-interface` gives up the policy's `interface` but not the
+    /// binding: the socket takes the egress the hook answers. Not binding at
+    /// all would send it into the virtual adapter (M4 plan P2).
+    #[tokio::test]
+    async fn allow_other_interface_falls_back_to_egress() {
+        let (_l, port) = listener().await;
+        let hook = Arc::new(EgressHook::default());
+        hook.refuse("gone0");
+        hook.answer(Egress::Interface("test0".into()));
+        let connector = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts {
+                interface: Some("gone0".into()),
+                allow_other_interface: true,
+                ..SocketOpts::default()
+            },
+            hook.clone(),
+        );
+        connector
+            .connect(
+                &Target::new(HostName::parse("127.0.0.1"), port),
+                &ConnectOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hook.calls(),
+            ["bind gone0 V4", "egress 127.0.0.1", "bind test0 V4"]
+        );
+    }
+
+    /// An egress of `Err` fails the dial with the hook's error, and nothing
+    /// reaches the server — not over TCP, not over UDP.
+    #[tokio::test]
+    async fn an_egress_error_fails_the_dial_and_nothing_reaches_the_server() {
+        let (l, port) = listener().await;
+        let hook = Arc::new(EgressHook::default());
+        hook.answer(Egress::Fail(
+            "no network outside the enhanced mode to reach 127.0.0.1".into(),
+        ));
+        let connector = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts::default(),
+            hook.clone(),
+        );
+        let target = Target::new(HostName::parse("127.0.0.1"), port);
+        let err = connector
+            .connect(&target, &ConnectOpts::default())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no network outside the enhanced mode to reach 127.0.0.1"
+        );
+        // a window for a connection that was made after all to be accepted
+        let wait = tokio::time::timeout(Duration::from_millis(200), l.accept());
+        assert!(wait.await.is_err(), "a connection reached the listener");
+
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let target = Target::new(HostName::Ip(addr.ip()), addr.port());
+        let err = connector
+            .connect_udp(&target, &ConnectOpts::default())
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NetworkUnreachable);
+        // a window for a datagram that went out anyway to arrive
+        let mut buf = [0u8; 8];
+        let wait = tokio::time::timeout(Duration::from_millis(200), server.recv_from(&mut buf));
+        assert!(wait.await.is_err(), "a datagram reached the server");
+    }
+
+    /// What the system said about a failed binding goes no further than DEBUG:
+    /// the error of a connection is in request records and the API, where the
+    /// hook's interface name does not belong (M4 plan P3).
+    #[tokio::test]
+    async fn a_binding_that_fails_fails_the_dial_with_no_interface_name_in_the_error() {
+        let (_l, port) = listener().await;
+        let hook = Arc::new(EgressHook::default());
+        hook.answer(Egress::Interface("gone1".into()));
+        hook.refuse("gone1");
+        let connector = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts::default(),
+            hook.clone(),
+        );
+        let err = connector
+            .connect(
+                &Target::new(HostName::parse("127.0.0.1"), port),
+                &ConnectOpts::default(),
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(
+            err.to_string()
+                .starts_with("cannot bind to the network outside the enhanced mode: "),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("gone1"), "{err}");
     }
 
     #[tokio::test]
@@ -1103,6 +1551,23 @@ mod tests {
         addr
     }
 
+    /// Answers every datagram with itself and notes where each came from: a
+    /// source port per socket the carrier sends from.
+    async fn udp_echo_from() -> (SocketAddr, Arc<Mutex<Vec<SocketAddr>>>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<SocketAddr>>> = Arc::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                log.lock().unwrap().push(from);
+                let _ = socket.send_to(&buf[..n], from).await;
+            }
+        });
+        (addr, seen)
+    }
+
     #[tokio::test]
     async fn a_udp_flow_reaches_its_peer_by_address_and_by_name() {
         let echo = udp_echo().await;
@@ -1168,7 +1633,7 @@ mod tests {
             hook.clone(),
         );
         let addr = connector
-            .bind_udp(Family::V4)
+            .bind_udp(Family::V4, None)
             .unwrap()
             .local_addr()
             .unwrap();
@@ -1177,6 +1642,25 @@ mod tests {
             *hook.calls.lock().unwrap(),
             ["tos 0x10 V4", "bind test0 V4"]
         );
+    }
+
+    /// A socket made for a destination asks the hook for the egress; one made
+    /// without one (DIRECT's carrier opens its own before any destination is
+    /// known) asks nothing.
+    #[test]
+    fn bind_udp_passes_the_destination_to_egress() {
+        let hook = Arc::new(EgressHook::default());
+        let connector = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts::default(),
+            hook.clone(),
+        );
+        connector.bind_udp(Family::V4, None).unwrap();
+        assert!(hook.calls().is_empty());
+        connector
+            .bind_udp(Family::V4, Some(ip("127.0.0.1")))
+            .unwrap();
+        assert_eq!(hook.calls(), ["egress 127.0.0.1"]);
     }
 
     /// Whatever the system allows of `UDP_BUFFER`: more than it gives a
@@ -1359,6 +1843,184 @@ mod tests {
             from,
             Target::new(HostName::Ip(stranger_addr.ip()), stranger_addr.port())
         );
+    }
+
+    /// The carrier asks the egress once for every datagram and keeps a socket
+    /// per egress: as if the enhanced mode came on and the network changed
+    /// between two datagrams (M4 plan P4). A receive that was already waiting
+    /// hears the answer that comes on a socket made after it started waiting.
+    #[tokio::test]
+    async fn direct_packet_opens_a_socket_for_each_egress_and_hears_on_all() {
+        let (echo, seen) = udp_echo_from().await;
+        let hook = Arc::new(EgressHook::default());
+        let c = DirectConnector::with_opts(
+            Arc::new(Fixed(vec![ip("127.0.0.1")])),
+            SocketOpts::default(),
+            hook.clone(),
+        );
+        let carrier = c.open_udp(&ConnectOpts::default()).await.unwrap();
+        let to = Target::new(HostName::Ip(echo.ip()), echo.port());
+        let mut buf = [0u8; 64];
+
+        hook.answer(Egress::Interface("a".into()));
+        carrier.send_to(b"one", &to).await.unwrap();
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+            .await
+            .expect("the echo of the first datagram")
+            .unwrap();
+        assert_eq!((&buf[..n], from), (&b"one"[..], to.clone()));
+
+        // the network changed: the next datagram has another egress
+        hook.answer(Egress::Interface("b".into()));
+        let mut other = [0u8; 64];
+        let mut waiting = carrier.recv_from(&mut other);
+        {
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                std::pin::Pin::new(&mut waiting).poll(&mut cx).is_pending(),
+                "nothing has come yet"
+            );
+        }
+        carrier.send_to(b"two", &to).await.unwrap();
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), &mut waiting)
+            .await
+            .expect("the echo on the socket made after the receive started")
+            .unwrap();
+        drop(waiting);
+        assert_eq!((&other[..n], from), (&b"two"[..], to.clone()));
+
+        assert_eq!(
+            hook.calls(),
+            [
+                "egress 127.0.0.1",
+                "bind a V4",
+                "egress 127.0.0.1",
+                "bind b V4"
+            ]
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_ne!(
+            seen[0].port(),
+            seen[1].port(),
+            "a socket per egress: {seen:?}"
+        );
+    }
+
+    /// An egress of `Err` fails the datagram — it does not go out unbound into
+    /// the virtual adapter (M4 plan P2).
+    #[tokio::test]
+    async fn direct_packet_fails_a_datagram_whose_egress_is_an_error() {
+        let (echo, seen) = udp_echo_from().await;
+        let hook = Arc::new(EgressHook::default());
+        hook.answer(Egress::Fail(
+            "no network outside the enhanced mode to reach 127.0.0.1".into(),
+        ));
+        let c = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts::default(),
+            hook.clone(),
+        );
+        let carrier = c.open_udp(&ConnectOpts::default()).await.unwrap();
+        let to = Target::new(HostName::Ip(echo.ip()), echo.port());
+        let err = carrier.send_to(b"lost", &to).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no network outside the enhanced mode to reach 127.0.0.1"
+        );
+        // a window for a datagram that went out anyway to arrive
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(seen.lock().unwrap().is_empty(), "nothing went out");
+    }
+
+    /// The policy's `interface` bound the carrier's sockets: its datagrams ask
+    /// no egress and go out from the one socket the carrier opened (M4 plan
+    /// P2).
+    #[tokio::test]
+    async fn direct_packet_keeps_the_policy_interface_and_does_not_ask_egress() {
+        let (echo, seen) = udp_echo_from().await;
+        let hook = Arc::new(EgressHook::default());
+        hook.answer(Egress::Interface("test0".into()));
+        let c = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts {
+                interface: Some("policy0".into()),
+                ..SocketOpts::default()
+            },
+            hook.clone(),
+        );
+        let carrier = c.open_udp(&ConnectOpts::default()).await.unwrap();
+        let to = Target::new(HostName::Ip(echo.ip()), echo.port());
+        let mut buf = [0u8; 64];
+        for _ in 0..2 {
+            carrier.send_to(b"ping", &to).await.unwrap();
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+                    .await
+                    .expect("the echo comes back")
+                    .unwrap();
+            assert_eq!((&buf[..n], from), (&b"ping"[..], to.clone()));
+        }
+        assert!(
+            !hook.calls().iter().any(|c| c.starts_with("egress")),
+            "{:?}",
+            hook.calls()
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], seen[1], "one socket carried both datagrams");
+    }
+
+    /// The policy's `interface` cannot be bound and `allow-other-interface`
+    /// takes the failure: every datagram asks the egress and goes out bound to
+    /// the answer (M4 plan P2).
+    #[tokio::test]
+    async fn direct_packet_asks_egress_when_the_policy_interface_falls_back() {
+        let (echo, seen) = udp_echo_from().await;
+        let hook = Arc::new(EgressHook::default());
+        hook.refuse("gone0");
+        hook.answer(Egress::Interface("test0".into()));
+        let c = DirectConnector::with_opts(
+            Arc::new(SystemResolve),
+            SocketOpts {
+                interface: Some("gone0".into()),
+                allow_other_interface: true,
+                ..SocketOpts::default()
+            },
+            hook.clone(),
+        );
+        let carrier = c.open_udp(&ConnectOpts::default()).await.unwrap();
+        let to = Target::new(HostName::Ip(echo.ip()), echo.port());
+        let mut buf = [0u8; 64];
+        for _ in 0..2 {
+            carrier.send_to(b"ping", &to).await.unwrap();
+            let (n, from) =
+                tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))
+                    .await
+                    .expect("the echo comes back")
+                    .unwrap();
+            assert_eq!((&buf[..n], from), (&b"ping"[..], to.clone()));
+        }
+        let calls = hook.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.as_str() == "egress 127.0.0.1")
+                .count(),
+            2,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.as_str() == "bind test0 V4")
+                .count(),
+            1,
+            "one egress socket carried both datagrams: {calls:?}"
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], seen[1], "one socket carried both datagrams");
     }
 
     /// A datagram to a port nobody listens on does not stop the carrier:

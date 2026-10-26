@@ -25,7 +25,6 @@ pub mod testing;
 pub use dial::{Transport, client_config, connect, connection_error};
 
 use crate::connector::{ConnectOpts, Connector, Target};
-use crate::socket::Family;
 use quinn::AsyncUdpSocket;
 use rurge_config::spec::{PortHopping, Tristate};
 use std::io;
@@ -63,7 +62,7 @@ impl Path {
             (Some(direct), None) => {
                 let remote = direct.udp_peer(server).await?;
                 Path {
-                    socket: socket::direct_socket(direct, Family::of(&remote.ip()))?,
+                    socket: socket::direct_socket(direct, remote)?,
                     remote,
                     carrier: None,
                 }
@@ -71,7 +70,8 @@ impl Path {
             (Some(direct), Some(hopping)) => {
                 let server = direct.udp_peer(server).await?.ip();
                 let direct = direct.clone();
-                let open = move || socket::direct_socket(&direct, Family::of(&server));
+                // the egress is the server's, which only the port hops
+                let open = move || socket::direct_socket(&direct, SocketAddr::new(server, 0));
                 let hopping =
                     hop::Hopping::start(server, &hopping.ports, hopping.interval, Box::new(open))?;
                 Path {
@@ -123,7 +123,7 @@ mod tests {
         BoxedDatagram, BoxedStream, Datagram, DirectConnector, PacketSocket, Resolve,
     };
     use crate::packet_datagram::packet_datagram;
-    use crate::socket::{SocketHook, SocketOpts};
+    use crate::socket::{Family, SocketHook, SocketOpts};
     use bytes::Bytes;
     use quinn::udp::{RecvMeta, Transmit};
     use quinn::{Connection, ConnectionError, Runtime, TokioRuntime, UdpPoller};
@@ -309,6 +309,59 @@ mod tests {
             let connection = dial(path, &cert, &Transport::STANDARD).await.unwrap();
             echoes(&connection).await;
         }
+    }
+
+    /// Notes what it is asked: the egress per destination, and every binding.
+    #[derive(Default)]
+    struct EgressHook(Mutex<Vec<String>>);
+
+    impl SocketHook for EgressHook {
+        fn bind_interface(
+            &self,
+            _: &socket2::Socket,
+            interface: &str,
+            family: Family,
+        ) -> io::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("bind {interface} {family:?}"));
+            Ok(())
+        }
+
+        fn set_tos(&self, _: &socket2::Socket, _: Family, _: u8) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn egress(&self, dst: IpAddr) -> io::Result<Option<String>> {
+            self.0.lock().unwrap().push(format!("egress {dst}"));
+            Ok(Some("test0".into()))
+        }
+    }
+
+    /// A direct QUIC connection's socket is bound to the egress of its server,
+    /// asked for the server's address before the socket is made (M4 design
+    /// 3.2).
+    #[tokio::test]
+    async fn quic_direct_socket_asks_egress_for_the_server() {
+        let cert = TestCert::new();
+        let server = EchoServer::spawn(cert.server_config(ALPN));
+        let hook = Arc::new(EgressHook::default());
+        let connector =
+            DirectConnector::with_opts(Arc::new(Loopback), SocketOpts::default(), hook.clone());
+        let path = open(
+            &connector,
+            &at("127.0.0.1", server.addr().port()),
+            None,
+            Tristate::Auto,
+        )
+        .await;
+        assert_eq!(
+            *hook.0.lock().unwrap(),
+            ["egress 127.0.0.1", "bind test0 V4"]
+        );
+        let connection = dial(path, &cert, &Transport::STANDARD).await.unwrap();
+        echoes(&connection).await;
     }
 
     #[tokio::test]

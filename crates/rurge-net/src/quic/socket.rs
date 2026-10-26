@@ -12,15 +12,18 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use tokio::io::Interest;
 
-/// A socket of `family` made as DIRECT's UDP carrier makes its own
-/// (`DirectConnector::bind_udp`: the policy's socket options, the binding
-/// to its interface kept), ready for quinn: quinn-udp's own — segmentation
-/// offload, per-packet ECN — unless the policy sets `tos`.
+/// A socket of `remote`'s family made as DIRECT's UDP carrier makes its own
+/// (`DirectConnector::bind_udp`: the policy's socket options, the binding to
+/// its interface kept), bound to the egress the hook answers for `remote` —
+/// the server's address, which `port-hopping` keeps (M4 design 3.2) — and
+/// ready for quinn: quinn-udp's own — segmentation offload, per-packet ECN —
+/// unless the policy sets `tos`.
 pub(crate) fn direct_socket(
     connector: &DirectConnector,
-    family: Family,
+    remote: SocketAddr,
 ) -> io::Result<Arc<dyn AsyncUdpSocket>> {
-    let socket = connector.bind_udp(family)?;
+    let family = Family::of(&remote.ip());
+    let socket = connector.bind_udp(family, Some(remote.ip()))?;
     if connector.tos() == 0 {
         TokioRuntime.wrap_udp_socket(socket)
     } else {
