@@ -238,7 +238,8 @@ fn table(routes: &RouteSet, wanted: &Wanted) -> EgressTable {
 }
 
 /// The routes of `a` and `b` together, each once, sorted: what may be in the
-/// adapter while a change of routes is being made (R25).
+/// adapter while a change of routes is being made (the phase 3 / M4a plan's
+/// execution record row 75).
 fn union(a: &RouteSet, b: &RouteSet) -> RouteSet {
     let mut together = a.clone();
     for net in &b.v4 {
@@ -426,15 +427,23 @@ impl EnhancedMode {
     /// the network say, the routes only by what differs, and after a change of
     /// network the DNS and the system's own adjustments once more.
     ///
+    /// The order is the one an open and a close go in (design 9.3, 9.4): IPv6
+    /// that comes on is the adapter's address, then its routes, then the DNS;
+    /// IPv6 that goes is the reverse, the DNS handed back while the address it
+    /// points at is still there, then the routes, then the address. A system's
+    /// DNS that names an address the adapter no longer has waits out its
+    /// lookups until it does, and a program is one of those per lookup.
+    ///
     /// A step that fails is logged, and the rest still goes on: the enhanced
     /// mode keeps what it has and stays on (M4 design 9.7). A set of routes
     /// that did not go in is no reason to go back to one that is out of date,
     /// and `GET` goes on saying `enabled: true`.
     ///
     /// The egress table is always the superset of what goes into the adapter
-    /// (R25): while the routes change it is the old set and the new one
-    /// together, so that a connection of rurge's to a route that is already in
-    /// the adapter does not come back into it (M4b's reader).
+    /// (the phase 3 / M4a plan's execution record row 75): while the routes
+    /// change it is the old set and the new one together, so that a connection
+    /// of rurge's to a route that is already in the adapter does not come back
+    /// into it (M4b's reader).
     pub async fn follow(&mut self, wanted: Wanted, network_changed: bool) {
         let Some(mut on) = self.on.take() else {
             return;
@@ -444,32 +453,35 @@ impl EnhancedMode {
             return;
         };
 
-        // the IPv6 half: the adapter's address, then its routes, then the DNS
+        let was_ipv6 = on.ipv6;
         let mut ipv6 = wanted.ipv6;
-        if ipv6 != on.ipv6 {
-            if ipv6 {
-                let backend = self.backend.clone();
-                let with = dev.clone();
-                match call(move || backend.configure_ipv6(&with)).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        // as at an open: this one goes on without it
-                        tracing::warn!(
-                            "IPv6 could not be configured; the enhanced mode goes on without it"
-                        );
-                        ipv6 = false;
-                    }
-                    Err(e) => {
-                        // what the adapter has of IPv6 is unknown: count it off
-                        self.failed("configure_ipv6", &e);
-                        ipv6 = false;
-                    }
+        let turning_off = was_ipv6 && !ipv6;
+        let turning_on = !was_ipv6 && ipv6;
+
+        // IPv6 going: the DNS first, while the address it points at is still
+        // there (design 9.4, 9.7). The address goes at the end, below.
+        let dns_taken = turning_off;
+        if dns_taken {
+            self.take_the_dns_again(&dev, false).await;
+        }
+
+        // IPv6 coming: the adapter's address first
+        if turning_on {
+            let backend = self.backend.clone();
+            let with = dev.clone();
+            match call(move || backend.configure_ipv6(&with)).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // as at an open: this one goes on without it
+                    tracing::warn!(
+                        "IPv6 could not be configured; the enhanced mode goes on without it"
+                    );
+                    ipv6 = false;
                 }
-            } else {
-                let backend = self.backend.clone();
-                let with = dev.clone();
-                if let Err(e) = call(move || backend.unconfigure_ipv6(&with)).await {
-                    self.failed("unconfigure_ipv6", &e);
+                Err(e) => {
+                    // what the adapter has of IPv6 is unknown: count it off
+                    self.failed("configure_ipv6", &e);
+                    ipv6 = false;
                 }
             }
         }
@@ -506,11 +518,21 @@ impl EnhancedMode {
             }
         }
 
-        // the DNS, once: a change of the IPv6 half or of the network both mean
-        // the system's DNS is read again (R24)
-        if ipv6 != on.ipv6 || network_changed {
+        // IPv6 coming, or another network: the DNS, once. IPv6 going has taken
+        // it over already, and one follow takes it over at most once.
+        if !dns_taken && (ipv6 != was_ipv6 || network_changed) {
             self.take_the_dns_again(&dev, ipv6).await;
         }
+
+        // IPv6 going: the address last, after its routes
+        if turning_off {
+            let backend = self.backend.clone();
+            let with = dev.clone();
+            if let Err(e) = call(move || backend.unconfigure_ipv6(&with)).await {
+                self.failed("unconfigure_ipv6", &e);
+            }
+        }
+
         if network_changed {
             self.adjust_again(wanted.primary.as_deref()).await;
         }
@@ -1767,8 +1789,9 @@ mod tests {
     }
 
     /// A reload that changes nothing asks the system for nothing: no `routes
-    /// +0 -0`, no DNS takeover, no adjustment (R24). The egress table takes
-    /// the new primary all the same.
+    /// +0 -0`, no DNS takeover, no adjustment (the phase 3 / M4a plan's
+    /// execution record row 75). The egress table takes the new primary all
+    /// the same.
     #[tokio::test]
     async fn a_follow_that_changes_nothing_asks_for_no_routes() {
         let mut f = fixture(true).await;
@@ -1797,7 +1820,8 @@ mod tests {
 
     /// What the egress table holds while the routes cannot be installed: the
     /// old set and the new one together, so that a connection of rurge's to a
-    /// route that is already in the adapter does not come back into it (R25).
+    /// route that is already in the adapter does not come back into it (the
+    /// phase 3 / M4a plan's execution record row 75).
     #[tokio::test]
     async fn a_follow_that_cannot_install_keeps_the_table_a_superset() {
         let mut f = fixture(true).await;
@@ -1843,7 +1867,8 @@ mod tests {
     }
 
     /// A change of the IPv6 half and of the network together take the DNS over
-    /// once, with the IPv6 the change ended with (R24).
+    /// once, with the IPv6 the change ended with (the phase 3 / M4a plan's
+    /// execution record row 75).
     #[tokio::test]
     async fn a_follow_takes_the_dns_over_once_for_ipv6_and_the_network() {
         let mut f = fixture(true).await;
@@ -1873,8 +1898,10 @@ mod tests {
         assert!(f.mode.enabled());
     }
 
-    /// A reload that turns IPv6 off gives the adapter's IPv6 half back, removes
-    /// its routes and takes the DNS over once more without it.
+    /// A reload that turns IPv6 off hands the DNS back while the address it
+    /// points at is still there, removes its routes and gives the adapter's
+    /// IPv6 half back last (M4 design 9.4, 9.7; the phase 3 / M4a plan's
+    /// execution record row 79).
     #[tokio::test]
     async fn a_follow_that_turns_ipv6_off_gives_the_half_back() {
         let mut f = fixture(true).await;
@@ -1884,7 +1911,7 @@ mod tests {
         assert_eq!(
             f.backend.calls.list()[after_open..],
             // the mock says `routes off` for a call that only removes
-            lines(&["unconfigure_ipv6", "routes off", "dns_undo", "take_dns"])
+            lines(&["dns_undo", "take_dns", "routes off", "unconfigure_ipv6"])
         );
         assert_eq!(
             f.backend.dns.lock().unwrap().last(),

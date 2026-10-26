@@ -764,6 +764,10 @@ fn a_post_during_the_pause_is_noted_and_done_when_it_ends() {
 
     // the pause ends: what was asked for is done
     world.move_to(&wifi("Home"));
+    // The line comes once the enhanced mode is done, and is read here so that
+    // the last `takeover resumed` of this test is the last one the daemon
+    // says: one that is never read hides what the daemon did after it.
+    wait_for_log(&daemon, "takeover resumed");
     wait_until("the enhanced mode to open when the pause ends", || {
         enhanced_on(api)
     });
@@ -771,6 +775,7 @@ fn a_post_during_the_pause_is_noted_and_done_when_it_ends() {
 
     // on, and the machine goes back to the paused network: it closes
     world.move_to(&wifi("Office"));
+    wait_for_log(&daemon, "takeover paused on this network");
     wait_until("the enhanced mode to close for the pause", || {
         !enhanced_on(api)
     });
@@ -866,11 +871,11 @@ fn a_reload_turns_ipv6_on_and_off() {
     assert_eq!(
         actions(&file)[after_ipv6..],
         [
-            "unconfigure_ipv6".to_string(),
-            format!("routes +0 -{}", routes_set(true, None).v6.len()),
             "take_dns".to_string(),
+            format!("routes +0 -{}", routes_set(true, None).v6.len()),
+            "unconfigure_ipv6".to_string(),
         ],
-        "the IPv6 half given back, its routes, and the DNS once more"
+        "the DNS given back while the address is still there, then its routes, then the half"
     );
     drop(daemon);
 }
@@ -893,17 +898,45 @@ fn ipv6_auto_follows_the_network() {
     let mut with_ipv6 = wifi("Home");
     with_ipv6["primary"]["routers"] = json!(["192.0.2.1", "fe80::1"]);
     with_ipv6["addresses"] = json!(["192.0.2.10", "2001:db8:1::"]);
+    // A change of network asks for the whole of what a follow does, and the
+    // file backend rewrites its file once a step: wait for the last step, and
+    // read the file only then (a read that meets half a file is no read).
+    let before = actions(&file).len();
+    let coming_on = [
+        "configure_ipv6".to_string(),
+        format!("routes +{} -0", routes_set(true, None).v6.len()),
+        "take_dns".to_string(),
+        "adjust".to_string(),
+    ];
     world.move_to(&with_ipv6);
     wait_until("IPv6 to come on with the network", || {
-        installed(&file) == routes_of(true) && backend_json(&file)["ipv6"] == true
+        actions(&file).get(before..) == Some(&coming_on[..])
     });
-    assert_eq!(done(&file, "configure_ipv6"), 1, "{:?}", actions(&file));
+    assert_eq!(installed(&file), routes_of(true));
+    assert_eq!(backend_json(&file)["ipv6"], true);
+    assert_eq!(done(&file, "configure_ipv6"), 1);
+    assert_eq!(done(&file, "take_dns"), 2, "the open took it over once");
 
+    // and loses it again: the DNS goes while its address is still there
+    let before = actions(&file).len();
+    let going_off = [
+        "take_dns".to_string(),
+        format!("routes +0 -{}", routes_set(true, None).v6.len()),
+        "unconfigure_ipv6".to_string(),
+        "adjust".to_string(),
+    ];
     world.move_to(&wifi("Home"));
     wait_until("IPv6 to go off with the network", || {
-        installed(&file) == routes_of(false) && backend_json(&file)["ipv6"] == false
+        actions(&file).get(before..) == Some(&going_off[..])
     });
-    assert_eq!(done(&file, "unconfigure_ipv6"), 1, "{:?}", actions(&file));
+    assert_eq!(installed(&file), routes_of(false));
+    assert_eq!(backend_json(&file)["ipv6"], false);
+    assert_eq!(
+        done(&file, "take_dns"),
+        3,
+        "one for each change of the IPv6 half, and no more"
+    );
+    assert_eq!(done(&file, "unconfigure_ipv6"), 1);
     drop(daemon);
 }
 
