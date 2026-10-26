@@ -551,6 +551,7 @@ pub fn subnets(exclude: &[String]) -> io::Result<Vec<(IpNet, String)>>;
 | 18 | 2 | 派工的第 3 条（协调者的裁定），依据 P2、P4 与设计第 3.2 节：`DirectPacket` 也守 P2——`open_packet` 经 `open_base` 把策略的 `interface` 绑在基础套接字上并记下绑上了没有（`Sockets::v4` / `v6` 的第二项），绑上了的这个地址族不问出口；没有策略的 `interface`，或绑不上而 `allow-other-interface` 退回时，每个数据报都问出口、绑它答的网卡（不问不绑的话，增强模式开着、策略的网卡又不在时，UDP 会不绑网卡地出去、进虚拟网卡成环）。另加的两条用例：`direct_packet_keeps_the_policy_interface_and_does_not_ask_egress`、`direct_packet_asks_egress_when_the_policy_interface_falls_back` | 本提交 |
 | 19 | 2 | 执行者的裁定（结构）：`socket2::Socket::new(` 只在私有函数 `new_socket` 一处；`open_socket` 由 `new_socket`、`bind_policy_interface`（回 `bool`：绑上策略的网卡了没有）、`bind_egress` 组成；`DirectPacket` 的套接字不经 `open_socket`（它一个数据报一个套接字，而 `open_socket` 是一个目的地一个套接字），但同样只有两条路——`open_base` 里“绑策略的网卡”、`socket_for` 里“绑问到的出口”——收尾都在 `finish_udp` 一处。`git grep -n "fn open_socket" crates/rurge-net` 仍只有一处 | 本提交 |
 | 20 | 2 | 执行者的裁定（签名）：`finish_udp(socket, family)` 比派工写的多一个地址族（未指定地址按族取），`open_packet` 的每个地址族经私有 `open_base(family) -> io::Result<(Arc<UdpSocket>, bool)>`；对外的 `bind_udp(family, dst: Option<IpAddr>)`、`direct_socket(connector, remote: SocketAddr)`（`quic/mod.rs` 的两个调用者给出 `remote` 与 `SocketAddr::new(server, 0)`）与 `open_socket(family, dst, kind, opts, hook, fallback_logged)` 照计划 | 本提交 |
+| 21 | 2 | 订正第 19 行末句与任务 2 的判据：`git grep -n "fn open_socket" crates/rurge-net` 现在回两行——`:414` 的定义与任务 2 新用例 `async fn open_socket_asks_egress_for_the_destination_and_binds_there`（计划给的名字）——定义仍只有一处；判据要带括号（`git grep -n "fn open_socket("`）才是一行。用例名照计划抄，没有改 | 本提交 |
 
 ## 延后事项
 
