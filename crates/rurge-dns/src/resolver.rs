@@ -599,7 +599,6 @@ impl Resolver {
         self.has_ipv6
             .store(self.system.has_ipv6(), Ordering::Relaxed);
         self.reread_system_servers();
-        self.host_upstreams.lock().expect("host upstreams").clear();
     }
 
     /// Reads the system's DNS servers again and rebuilds what is made of them
@@ -608,6 +607,12 @@ impl Resolver {
     /// back. The upstream sets of the lookups through a `Via` are made of the
     /// system's servers too, so they go as well, with their answers: the next
     /// lookup through the interface builds them from the new servers.
+    ///
+    /// The upstreams of the `[Host]` `server:` values go with them: their
+    /// sockets are bound to the egress table of the moment they were made,
+    /// and the enhanced mode reads the servers again after it has written a
+    /// new table (M4 design 7.1, 7.2), so the next lookup builds them on the
+    /// table there is now (the phase 3 / M4b plan's execution record row 67).
     pub fn reread_system_servers(&self) {
         let system_specs: Vec<UpstreamSpec> = self
             .system
@@ -618,6 +623,7 @@ impl Resolver {
         self.apply_system_servers(&system_specs);
         // Their upstreams and caches hold the old servers' answers.
         self.vias.lock().expect("vias").clear();
+        self.host_upstreams.lock().expect("host upstreams").clear();
     }
 
     fn want_v6(&self, opts: &LookupOpts) -> bool {
@@ -1496,6 +1502,17 @@ mod tests {
         system: Arc<dyn SystemDns>,
         fanout: FanoutOpts,
     ) -> (Arc<Resolver>, Diagnostics) {
+        resolver_asking_through(e, system, fanout, direct())
+    }
+
+    /// `resolver_with_fanout`, the plain UDP servers asked through `direct`
+    /// instead of the module's own connector.
+    fn resolver_asking_through(
+        e: &Env,
+        system: Arc<dyn SystemDns>,
+        fanout: FanoutOpts,
+        direct: Arc<dyn Connector>,
+    ) -> (Arc<Resolver>, Diagnostics) {
         let mut cfg = ResolverConfig::from_config(&e.cfg);
         cfg.fanout = fanout;
         Resolver::new(
@@ -1504,7 +1521,7 @@ mod tests {
                 connectors: DnsConnectors::all(Arc::new(DirectConnector::new(Arc::new(
                     SystemResolve,
                 )))),
-                direct: direct(),
+                direct,
                 sets: e.sets.clone(),
                 system,
                 resources: e.resources.clone(),
@@ -2211,6 +2228,80 @@ mod tests {
             first.query_count("sys.test", Qtype::A),
             1,
             "the old server is not asked again"
+        );
+    }
+
+    /// A direct connector that counts the UDP carriers it was asked for: one
+    /// carrier is one socket, made when an upstream first needs it and kept
+    /// while that upstream lives.
+    struct Counting {
+        inner: DirectConnector,
+        carriers: Mutex<usize>,
+    }
+
+    impl Counting {
+        fn new() -> Arc<Counting> {
+            Arc::new(Counting {
+                inner: DirectConnector::new(Arc::new(SystemResolve)),
+                carriers: Mutex::new(0),
+            })
+        }
+
+        fn carriers(&self) -> usize {
+            *self.carriers.lock().expect("carriers")
+        }
+    }
+
+    impl Connector for Counting {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            *self.carriers.lock().expect("carriers") += 1;
+            self.inner.connect_udp(target, opts)
+        }
+    }
+
+    /// Re-reading the system's servers rebuilds the `[Host]` `server:`
+    /// upstreams as well: their carriers are bound to the egress table of the
+    /// moment they were made, and the enhanced mode reads the servers again
+    /// after it wrote a new table (M4 design 7.2). The cache is kept (the
+    /// phase 3 / M4b plan's execution record row 67).
+    #[tokio::test]
+    async fn rereading_the_system_servers_rebuilds_the_host_upstreams() {
+        let corp = MockDns::spawn().await;
+        corp.set("x.test", &["10.0.0.1"], &[], 60);
+        corp.set("y.test", &["10.0.0.2"], &[], 60);
+        let e = env(&profile("", &format!("*.test = server:{}\n", corp.addr())));
+        let counting = Counting::new();
+        let (r, _) = resolver_asking_through(
+            &e,
+            Arc::new(StaticSystemDns::default()),
+            once(),
+            counting.clone(),
+        );
+
+        let x = r.lookup("x.test", LookupOpts::default()).await.unwrap();
+        assert_eq!(x.v4, vec![v4("10.0.0.1")]);
+        assert_eq!(counting.carriers(), 1, "one carrier for the one upstream");
+
+        r.reread_system_servers();
+
+        let y = r.lookup("y.test", LookupOpts::default()).await.unwrap();
+        assert_eq!(y.v4, vec![v4("10.0.0.2")]);
+        assert_eq!(
+            counting.carriers(),
+            2,
+            "the upstream is built again, on the egress table there is now"
         );
     }
 
