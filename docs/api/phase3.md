@@ -402,7 +402,7 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 
 ## M4　增强模式（平台接入）
 
-阶段 3 / M4（平台接入，设计 `docs/superpowers/specs/2026-10-26-phase3-m4-platform-design.md`）分四份计划：M4a「平台无关的骨架」、M4b「防环与接管期间的 DNS」、M4c「Linux 与 macOS」、M4d「Windows 与收尾」。**这一节随它们写成，这里是 M4a 做到的**；M4b ～ M4d 写进来时各补各的（出口表的读者、接管期间的 `system` 一类、三个平台的设备与权限、真实的 `Pinger`）。
+阶段 3 / M4（平台接入，设计 `docs/superpowers/specs/2026-10-26-phase3-m4-platform-design.md`）分四份计划：M4a「平台无关的骨架」、M4b「防环与接管期间的 DNS」、M4c「Linux 与 macOS」、M4d「Windows 与收尾」。**这一节随它们写成：M4a 与 M4b 做到的写在这里**（M4b 的在下面「M4b：防环与接管期间的 DNS」一节）；M4c ～ M4d 写进来时各补各的（三个平台的设备与权限）。
 
 **这一版开不了增强模式。** 缺省的后端（平台后端）对每一个动作都答同一句：`the enhanced mode is not available on this platform in this version`。所以：
 
@@ -539,12 +539,95 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 
 `RURGE_ENHANCED_BACKEND` 把这个管理器的"系统"换掉：不设时是平台后端（这一版对每个动作答"不可用"），`off` 是一个打开即失败的后端，`file:<路径>` 是把系统当一个 JSON 文件读写、设备什么也不运的后端。取值、文件的形状、`fail` 一类键、动作名与写进文件的东西见 `docs/testing.md` 的「只供测试的后端」一节。
 
+### M4b：防环与接管期间的 DNS
+
+阶段 3 / M4b（计划 `docs/superpowers/plans/2026-10-26-phase3-m4b-loop-dns-plan.md`，下面写“M4b 记录第 N 行”“M4b 延后第 N 行”指它末尾的两张表）做的是两件事：增强模式开着时，rurge 自己建的每一个出站套接字都不回到虚拟网卡；接管系统 DNS 的那段时间，`server:system` 一类的名字去问物理网卡的服务器。**平台后端仍然答“这一版还不能”，所以使用者仍然开不了增强模式**（本节开头那三句照旧）；下面这些行为只在用例里看得到：单元用例、`crates/rurge/tests/sockets.rs` 的源码扫描、`crates/rurge-engine/tests/egress.rs` 的运行时用例，以及经文件后端起的守护进程。
+
+#### 出口的判定（防环）
+
+出口是一个纯函数 `rurge_platform::socket::egress::decide`（`crates/rurge-platform/src/socket/egress.rs`），表是 `EgressTable`（`routes`、`primary`、`subnets`），由管理器在打开、关闭、重载与网络变化时重建，可执行文件的 `PlatformSockets::egress`（`crates/rurge/src/cli/runtime.rs`）读那一个槽。`rurge-net` 里出站套接字只有 `open_socket` 一处建法：它先照策略的 `interface` 绑，没有（或绑不上而 `allow-other-interface` 退回）时才问出口，按回答绑那块网卡。次序（设计第 7.1 节）：
+
+| # | 目的地址 | 绑哪 |
+| - | -------- | ---- |
+| 1 | 增强模式没开（槽里没有表） | 不绑 |
+| 2 | 回环、未指定、组播、链路本地、`255.255.255.255` | 不绑 |
+| 3 | 落在某块非虚拟网卡的直连子网里（取最长前缀） | 那块网卡 |
+| 4 | 落在装进网卡的路由集里（含 rurge 自己的 `198.18.0.0/15` 与 `fd00:6152::/64`） | 主网卡；没有主网卡时这次连接失败，错误是 `no network outside the enhanced mode to reach <目的地址>`（种类 `NetworkUnreachable`） |
+| 5 | 其余（被排除的、`external` 的地址、IPv6 没开时的 IPv6） | 不绑，照系统的路由走 |
+
+第 3 条在第 4 条之前：`tun-included-routes` 把一段局域网送进虚拟网卡时，rurge 自己到局域网的连接仍走局域网的网卡。绑上出口的网卡失败时这次连接失败、不退回不绑（退回就会进虚拟网卡），错误是 `cannot bind to the network outside the enhanced mode: <错误种类>`。
+
+问出口的地方：`open_socket`；`DirectPacket` 的每个数据报（套接字按（地址族，出口）各一个，用到才建）；QUIC 直连的套接字（按服务端的地址）；`rurge-dns` 的纯 UDP 上游（经 `ResolverDeps::direct`，见下）；流水线回退的连接器；资源下载与 Profile 来源（`resource_client_with`）；ICMP 的回显套接字。建套接字的地方查得住的证据是 `crates/rurge/tests/sockets.rs` 的 `every_outbound_socket_is_made_in_one_place`：它读 `crates/*/src` 的生产代码，把建套接字、问系统解析库、建不带钩子的连接器的写法与一张 17 行的名单比对，多一处少一处都变红（名单与改法见 `docs/testing.md`）。
+
+日志（网卡名与地址只在 DEBUG；两种错误文本不带网卡名）：
+
+| 级别 | 文本 | 字段 | 什么时候 |
+| ---- | ---- | ---- | -------- |
+| DEBUG | `rurge's own connection leaves through the egress interface` | `dst`、`interface` | 绑上了出口判定的网卡（`rurge-net` 的 `bind_egress`） |
+| DEBUG | `rurge's own connection cannot leave through the egress interface` | `dst`、`interface`、`error` | 绑不上；系统的原话与网卡名只在这一行 |
+| WARN | `cannot read the subnets of the physical interfaces; rurge's own connections to them follow the primary interface` | `error` | 打开或跟随时读不到直连子网：表照写、子网是空的（第 3 条不起作用，第 4、5 条照旧） |
+| WARN | `interface unavailable; using the default one (allow-other-interface)` | `interface`、`error` | 策略的 `interface` 绑不上而 `allow-other-interface` 退回时（M4b 之前就有，不是新的）：退回之后才问出口、由出口决定绑哪块网卡。每个 `DirectConnector` 只报一次 |
+
+#### 非直连的 VPN 路由（登记的限制）
+
+出口判定不读操作系统的整张路由表，只看直连子网（`if_addrs`）与装进网卡的路由集。所以**不是直连的 VPN 路由**上的目的地（VPN 推下来的 `10.0.0.0/8 via 10.8.0.1 dev tun0` 就是一例）：应用的流量照系统的路由进 VPN（那条路由比基础前缀更具体），rurge 自己到那里的连接却按第 4 条绑到主网卡、到不了。办法是把那一段写进 `tun-excluded-routes`——它落在第 5 条，不绑、照系统的路由走，rurge 自己的下载与 DNS 因此也进 VPN。
+
+#### 接管期间的名字去哪里问
+
+系统解析库在接管期间可能答假地址（系统的 DNS 指着 rurge，或 `hijack-dns` 把查询收走），所以 `SystemDns::enhanced_mode()` 为真的那段时间里，去处分四种（设计第 6.2 节）：
+
+| 查找 | 不接管时（不变） | 接管期间 |
+| ---- | ---------------- | -------- |
+| `[Host]` 的 `server:system` / `server:syslib` | 系统解析库 | 物理网卡的服务器（纯 UDP、经直连连接器）；没有已知的服务器时这次查找失败，**不退回系统解析库** |
+| `[Host]` 的 `server:force-syslib` | 系统解析库 | 系统解析库（照手册，会拿到假地址；加载时 `W0038` 说过） |
+| 单标签名字（加上搜索域之后）、`primary` 为空时的普通查找 | 系统的服务器，没有时系统解析库 | 物理网卡的服务器，没有时失败 |
+| `.local` | 系统解析库 | 系统解析库（mDNS 不经单播 DNS） |
+
+没有服务器可问时的错误是 `all upstreams failed (system DNS servers: no DNS server outside the enhanced mode)`（`DnsError::AllFailed` 的一对，`crates/rurge-dns/src/resolver.rs` 的 `no_server_outside`）。物理网卡的服务器是 `PlatformSystemDns::servers()`：增强模式开着且 `physical` 有值就是它，否则是 `rurge_platform::dns::servers()`。**`physical` 今天没有人写**（M4c 的 macOS 写备份里的原值与 `ipconfig getpacket`，Linux 写 resolved 的上游名单；Windows 不需要它），所以两边给出的是同一份名单。
+
+系统的 DNS 名单一律去掉 rurge 的地址空间：`rurge_platform::dns::without_rurge_space`（`servers()` 的每一项）与网络环境的快照（`netenv` 读到的 `dns`）都经过它，**不只在接管期间**。理由：没有真的 DNS 服务器在 `198.18.0.0/15` 或 `fd00:6152::/64` 里，而崩溃之后系统 DNS 还指着应答器的那段时间，这样它也不会把查询送回一个不在的应答器。
+
+接管与交还之后解析器要重读系统的服务器：`Engine::system_dns_changed` 调 `Resolver::reread_system_servers`（重建系统那一组、引导与“主服务器就是系统的”那一组，**不清缓存**；经接口建的上游随之清掉，下一次按新服务器重建）。管理器在增强模式的标志变了、接管之后、交还之后各调一次。它与 `network_changed` 是两件事：后者是网络真的变了（清缓存、读 IPv6、重读服务器、清 `[Host]` 的上游），照旧只在网络真的变了时调。
+
+#### 资源下载与 Profile 来源
+
+守护进程下载外部资源与 Profile 来源用的是 `resource_client_with(钩子, OwnResolve)`：直连带平台钩子（所以按出口绑网卡），名字由 `OwnResolve` 查——平时是系统解析库，接管期间（`enhanced_mode()` 为真、且这一代的解析器已经发布）改问这一代的解析器，于是拿到真地址。不起引擎的命令（`rurge check` 一类）与用例用 `resource_client()`，不绑、走系统解析库。
+
+#### ICMP 回显
+
+TUN 的 `Pinger` 现在是可执行文件的 `PlatformPinger`（`crates/rurge/src/cli/pinger.rs`），套接字由 `rurge_platform::icmp` 建：每个（地址族，出口）一个、用到才建；标识符是这个 Pinger 自己的随机数，序号逐个加。套接字的种类按平台：Linux 先数据报（不要特权，受 `net.ipv4.ping_group_range` 管）、不行退原始；macOS 数据报；Windows 原始（**要管理员**，增强模式本来也要）。原始套接字与 macOS 的数据报套接字按标识符与序号对号，Linux / Android 的数据报套接字只按序号对（内核改写了标识符）；macOS 这一条没有在 macOS 上观察过（M4b 记录第 46 行）。建不出套接字时一行 WARN 说回显不可用（这次运行的第一条，之后每次 DEBUG），`ping` 经虚拟网卡因此不通，别的照旧。
+
+日志：
+
+| 级别 | 文本 | 字段 | 什么时候 |
+| ---- | ---- | ---- | -------- |
+| WARN | `icmp: echo requests are unavailable, so pings go unanswered` | `family`、`reason` | 建不出套接字；一个 `PlatformPinger` 只报一次（之后的失败是 DEBUG） |
+| DEBUG | `icmp: no socket for an echo request` | `family`、`error` | 同上，第一条之后 |
+| DEBUG | `icmp: the echo socket could not be bound` | `interface`、`error` | 绑出口的网卡失败；进连接的错误文本照出口那一句 |
+| DEBUG | `icmp: echo requests leave through an interface` | `interface`、`family` | 绑上了出口的网卡 |
+| DEBUG | `icmp: reading a reply failed` | `error` | 收包出错（下一个之前退避 50 毫秒） |
+
+#### 外部程序一律 DIRECT
+
+`external` 策略拉起的程序（以及 Unix 上它起的子进程）的会话不看规则与出站模式，一律 `DIRECT`（设计第 11 节）：引擎的 `choose_policy` 在看出站模式之前先看“有没有外部程序在跑”（`ExternalPrograms::any_running`），有才等这个会话的进程（上限照旧 `PROCESS_WAIT`，200 毫秒），PID 在某个程序的进程树里（`ExternalOutbound::runs`，进程树是 `ProcessTree::contains`）就走 DIRECT；请求记录的 `notes` 写 `Requested by an external program: always DIRECT`，另有一行 DEBUG 带 `session` 与 `pid`。没有程序在跑时一个字也不多等；进程的槽已经等过时规则评估复用同一个，不等两次。
+
+登记的限制：
+
+- **预匹配先于它**：预匹配规则在 DNS 与 SYN 两层先判，外部程序自己发往被预匹配拒绝的名字或地址的查询与连接照旧被拒绝，会话不成为一条请求。
+- **`setsid` 的子进程不算**：Unix 上认的是“与程序同一个进程组”，自己 `setsid` 出去的子进程不在里面，它的会话照规则走。
+- **进程查找超时照规则走**：等进程超过 `PROCESS_WAIT` 时不把会话当外部程序的，照规则走，`notes` 里照旧是 `Process not known within 200 ms: PROCESS-NAME did not match`。
+- **Windows 上 M4d 之前只认程序本身**：`ProcessTree::contains` 在 Windows 上恒答 `false`（`in_job` 是 M4d 的），所以 `runs(pid)` 只认程序自己的 PID；程序拉起的子进程的会话要等 M4d 的 `in_job` 才认得出来。
+
 ### 没有覆盖的
 
-- **没有真实的设备**：这一版没有任何代码执行系统命令、建虚拟网卡、改路由或系统 DNS。三个平台的步骤只生成为数据（`rurge-platform::route::{linux,macos,windows}`，任何平台上都编译、都测），执行它们、建真的设备、拿权限都在 M4c / M4d。`RURGE_ENHANCED_BACKEND` 缺省时 `rurge run --enhanced-mode` 在每个平台上都以 1 退出，见本节开头。
-- **出口表没有读的人**：M4a 写出口表（`EgressSlot`），判定的那一半（`PlatformSockets` 的 `egress`）是 M4b。所以这一版没有防环：rurge 自己的出站连接若真进了虚拟网卡，没有谁拦它。文件后端不起真设备，碰不到；M4c / M4d 之前也不会碰到，因为那时平台后端仍答"不可用"。
-- **ICMP 回显不转发**：这一版 TUN 的 `Pinger` 是 `NoPinger`，每个回显请求都立刻失败（`ICMP forwarding is not available in this version`），`ping` 经虚拟网卡不通。M4b 换成真的套接字。
+- **没有真实的设备**：这一版没有任何代码执行系统命令、建虚拟网卡、改路由或系统 DNS。三个平台的步骤只生成为数据（`rurge-platform::route::{linux,macos,windows}`，任何平台上都编译、都测），执行它们、建真的设备、拿权限都在 M4c / M4d。`RURGE_ENHANCED_BACKEND` 缺省时 `rurge run --enhanced-mode` 在每个平台上都以 1 退出，见本节开头。M4b 之后仍是。
+- **防环没有在真机上验过**：出口判定与绑网卡是 M4b 做的，但“绑上真网卡”这一事只用记下不真绑的假钩子与数据用例测过；`rurge-platform::socket::egress::subnets` 读本机网卡（`if_addrs`）的那一步没有用例走到——它要真的网卡与出口表，随 M4c 接上平台后端。经虚拟网卡的一个往返、rurge 自己的 DNS 查询不进虚拟网卡这些事要在特权虚拟机里验（设计第 14 节 L2，今天还没有写）。
+- **接管期间的去处只在单元用例里**：`server:system` 一类、单标签名字、`force-syslib`、`.local` 的四条路由 `crates/rurge-dns/src/resolver.rs` 的用例钉住；`physical` 今天没有人写（M4c），所以真机上接管期间拿到的是本机配置的那一份。
+- **`PlatformPinger` 的两种情形没有用例**：出口是 `Some(网卡)` 的 ICMP 套接字（要真的网卡与出口表）与收包出错后的退避（`RECV_ERROR_BACKOFF`）都没有用例走到。
+- **Windows 的 `ProcessTree::contains` 恒假**：外部程序拉起的子进程在 Windows 上要等 M4d 的 `in_job` 才认得出来。
+- **本机没有编译过的 Unix 代码**：`rurge-platform::icmp::open` 的 Linux / Android 一份、macOS 一份与“其余平台”一份，`ProcessTree::contains` 的 Unix 一段与它的用例 `a_process_tree_contains_its_leader_and_what_it_started_and_nothing_else`，`crates/rurge-proto/src/external.rs` 的测试助手 `long_runner` 的 Unix 一支，与端到端用例 `what_the_program_started_goes_direct_too`。第一次 CI 的 Linux / macOS 核对。
+- **`pings_the_loopback` 只在本机的那一条路上跑过**：这台 Windows 上原始套接字开得起来，`127.0.0.1` 与 `::1` 都真的来回了一次；Linux / Android 的数据报套接字与它退到原始套接字的那一路、macOS 的数据报套接字、“开不了套接字所以跳过”那条路没有任何平台跑过，macOS 的数据报套接字按标识符与序号对号（M4b 记录第 46 行）也没有在 macOS 上观察过。
 - **Linux 与 macOS 的 `0600` 用例只在 CI 上编译运行**：池的文件 `fake-ip.txt` 在 Unix 上以 `0600` 建出（M4a 的任务 2），那条 `#[cfg(unix)]` 的用例在这台 Windows 开发机上没有编译过。
 - **三个平台的步骤没有在机器上跑过**：`netsh` 与 `ip` 的写法是按文档与手册页核对出来的（M4a 计划 P2 ～ P5），没有一条在真机上执行过；`rurge check` 的四个码只对着 Profile 的解析测过。
 - **手工验收没有做**：增强模式在真机上的开与关、路由表的样子、系统 DNS 的接管与交还、`kill -9` 之后的恢复、防环、睡眠唤醒与换网络、`ping`、接管暂停，都要等 M4c / M4d 之后；`docs/acceptance/phase3-manual.md` 里还没有 M4 一节（只有 M1、M2、M3），M4d 写它，要验的东西列在设计第 16 节，今天一项也没有做过。
-- 全部用例只在一台 Windows 11 x86-64 的开发机上跑过，`rurge run --enhanced-mode` 的每一种行为都只经文件后端端到端测过；CI 没有见过 M4a 的提交。
+- 全部用例只在一台 Windows 11 x86-64 的开发机上跑过，`rurge run --enhanced-mode` 的每一种行为都只经文件后端端到端测过；CI 没有见过 M4a 与 M4b 的提交。

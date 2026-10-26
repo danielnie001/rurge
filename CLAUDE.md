@@ -59,6 +59,7 @@ rurge 是用 Rust 复刻 Surge（macOS / iOS 网络代理工具）全部功能�
 - **网络与进程**：`Engine::network_changed` 总是清缓存、不比较前后的网络，只在网络真的变了时调（调用方是可执行文件的网络任务）。会话的进程在 `SessionHandle` 的进程槽里（`process()`），要看进程的东西读同一个槽，不另起查找。
 - **`rurge-tun`**：停止取消正在转发的会话，不取消正在进行的拨号；结束一个会话靠取消它的令牌，不靠丢掉拨号或转发的 future（丢掉的话请求记录会一直开着），所以 M4 的可执行文件给等 `join` 的那一步一个自己的时限。起 TUN 之前先调 `TunOptions::check`（`Tun::start` 对不合格的选项 panic）。接收缓冲不超过 `RX_MAX`（65535）：窗口边缘的守卫靠窗口缩放为 0。TIME-WAIT 里没读的数据交给流（`Leftover`），不要只修结局——那会把看得见的丢失变成悄悄的截断。其余的（保活与超时、DNS over TCP 的关法、`udp_dns_idle` 不大于 `udp_idle`、一个 TUN 一个应答器等）写在 `docs/status.md` M3a、M3b、M3c 各节"必须知道的事"里，改那一块代码之前读对应的一节。
 - **`rurge-proto-wireguard` 的协议栈**：`stack.rs` 的 `TCP_BUFFER` 有一个读源码得出、没有观察过的 panic 风险（M3a 计划延后第 1 行），修法归项目所有者选，后来的会话不要自己动。
+- **出站套接字只有一处建法**：rurge 自建的出站套接字一律经 `rurge-net` 的 `open_socket`（它向平台问出口，按回答绑网卡）；新加建套接字、问系统解析库或建不带钩子的连接器（`Arc::new(NoopSocketHook)`）的地方，进 `crates/rurge/tests/sockets.rs` 的名单并写理由。那一条扫描用例按（文件，写法）比对，少了多了都变红（M4b 任务 9、协调者的裁定 R19）。
 
 ## 常用命令
 
