@@ -552,6 +552,7 @@ pub fn subnets(exclude: &[String]) -> io::Result<Vec<(IpNet, String)>>;
 | 19 | 2 | 执行者的裁定（结构）：`socket2::Socket::new(` 只在私有函数 `new_socket` 一处；`open_socket` 由 `new_socket`、`bind_policy_interface`（回 `bool`：绑上策略的网卡了没有）、`bind_egress` 组成；`DirectPacket` 的套接字不经 `open_socket`（它一个数据报一个套接字，而 `open_socket` 是一个目的地一个套接字），但同样只有两条路——`open_base` 里“绑策略的网卡”、`socket_for` 里“绑问到的出口”——收尾都在 `finish_udp` 一处。`git grep -n "fn open_socket" crates/rurge-net` 仍只有一处 | 本提交 |
 | 20 | 2 | 执行者的裁定（签名）：`finish_udp(socket, family)` 比派工写的多一个地址族（未指定地址按族取），`open_packet` 的每个地址族经私有 `open_base(family) -> io::Result<(Arc<UdpSocket>, bool)>`；对外的 `bind_udp(family, dst: Option<IpAddr>)`、`direct_socket(connector, remote: SocketAddr)`（`quic/mod.rs` 的两个调用者给出 `remote` 与 `SocketAddr::new(server, 0)`）与 `open_socket(family, dst, kind, opts, hook, fallback_logged)` 照计划 | 本提交 |
 | 21 | 2 | 订正第 19 行末句与任务 2 的判据：`git grep -n "fn open_socket" crates/rurge-net` 现在回两行——`:414` 的定义与任务 2 新用例 `async fn open_socket_asks_egress_for_the_destination_and_binds_there`（计划给的名字）——定义仍只有一处；判据要带括号（`git grep -n "fn open_socket("`）才是一行。用例名照计划抄，没有改 | 本提交 |
+| 22 | 2 | 修正第 1 轮（评审 F1）：唤醒的用例原来用 `Waker::noop()` 先 poll 一次 `waiting`，之后的 `timeout(…, &mut waiting)` 会立刻再 poll 一次——那一次会在新套接字上登记 waker，所以把 `Sockets::add` 里的 `waking.wake()` 去掉它照样通过，钉不住唤醒。现在第一次 poll 用一个记下“被唤醒过”的 waker（`Woken`，实现 `std::task::Wake`，一个 `AtomicBool`），并断言 `send_to` 之后、再 poll 之前它已经被唤醒（信息是 `adding a socket wakes the waiting receive`）；红是把 `waking.wake()` 临时去掉、跑这一条用例，在新断言上失败（工作区的 `task-2-fix-1-red.log`），之后恢复。数据报只在回环上的测试回显服务端与载体之间来往，不离开回环、不写用例临时目录之外的东西 | 本提交 |
 
 ## 延后事项
 

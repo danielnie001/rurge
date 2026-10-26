@@ -766,7 +766,13 @@ impl DirectPacket {
         primary
             .into_iter()
             .chain(secondary)
-            .find(|ip| self.inner.lock().unwrap().base(Family::of(ip)).is_some())
+            .find(|ip| {
+                self.inner
+                    .lock()
+                    .expect("the carrier's sockets")
+                    .base(Family::of(ip))
+                    .is_some()
+            })
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
@@ -783,7 +789,12 @@ impl DirectPacket {
     /// `ip-version` allows no socket of this family.
     fn socket_for(&self, ip: IpAddr) -> io::Result<Option<Arc<UdpSocket>>> {
         let family = Family::of(&ip);
-        let Some((base, policy_bound)) = self.inner.lock().unwrap().base(family) else {
+        let Some((base, policy_bound)) = self
+            .inner
+            .lock()
+            .expect("the carrier's sockets")
+            .base(family)
+        else {
             return Ok(None);
         };
         if policy_bound {
@@ -795,7 +806,7 @@ impl DirectPacket {
         // one lock span: the egress's socket is looked up and, when it is not
         // there yet, made — so that two datagrams at once make one socket, and
         // its key is the interface it was bound to
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().expect("the carrier's sockets");
         if let Some(socket) = inner.bound_to(family, &interface) {
             return Ok(Some(socket));
         }
@@ -839,7 +850,7 @@ impl PacketSocket for DirectPacket {
 
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
         Box::pin(std::future::poll_fn(move |cx| {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().expect("the carrier's sockets");
             let mut read = ReadBuf::new(buf);
             for socket in inner.all() {
                 loop {
@@ -1551,6 +1562,18 @@ mod tests {
         addr
     }
 
+    /// Records that it was woken, so that a receive waiting for a socket that
+    /// is added later has to be woken by that: polling it again would hide the
+    /// missing wake-up.
+    #[derive(Default)]
+    struct Woken(AtomicBool);
+
+    impl std::task::Wake for Woken {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Answers every datagram with itself and notes where each came from: a
     /// source port per socket the carrier sends from.
     async fn udp_echo_from() -> (SocketAddr, Arc<Mutex<Vec<SocketAddr>>>) {
@@ -1874,14 +1897,20 @@ mod tests {
         hook.answer(Egress::Interface("b".into()));
         let mut other = [0u8; 64];
         let mut waiting = carrier.recv_from(&mut other);
+        let woken = Arc::new(Woken::default());
         {
-            let mut cx = Context::from_waker(Waker::noop());
+            let waker = Waker::from(woken.clone());
+            let mut cx = Context::from_waker(&waker);
             assert!(
                 std::pin::Pin::new(&mut waiting).poll(&mut cx).is_pending(),
                 "nothing has come yet"
             );
         }
         carrier.send_to(b"two", &to).await.unwrap();
+        assert!(
+            woken.0.load(Ordering::SeqCst),
+            "adding a socket wakes the waiting receive"
+        );
         let (n, from) = tokio::time::timeout(Duration::from_secs(5), &mut waiting)
             .await
             .expect("the echo on the socket made after the receive started")
