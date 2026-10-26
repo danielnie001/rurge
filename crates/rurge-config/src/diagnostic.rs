@@ -262,6 +262,17 @@ pub mod codes {
     /// updated: it carries no `#!MANAGED-CONFIG` line of its own, or the lines
     /// of the copies lead through too many addresses.
     pub const W_MANAGED_NOT_UPDATED: &str = "W0034";
+    /// `ipv6-vif = always`: IPv6 on every network, including the ones that
+    /// have none.
+    pub const W_IPV6_VIF_ALWAYS: &str = "W0035";
+    /// A `tun-included-routes` item that takes in a whole private range.
+    pub const W_INCLUDED_PRIVATE_RANGE: &str = "W0036";
+    /// A `tun-excluded-routes` item that overlaps rurge's own address space,
+    /// which always goes through the virtual adapter.
+    pub const W_EXCLUDED_RURGE_SPACE: &str = "W0037";
+    /// A `[Host]` entry that asks for `server:force-syslib`, which answers
+    /// with fake addresses while the enhanced mode is on.
+    pub const W_FORCE_SYSLIB: &str = "W0038";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.
@@ -375,6 +386,16 @@ pub mod codes {
                 "remove the reference to this set from the set that nests it, or flatten the sets"
             }
             W_GROUP_CYCLE => "remove one of the group references on the loop",
+            W_IPV6_VIF_ALWAYS => {
+                "use `ipv6-vif = auto` to turn IPv6 on only where the network has it"
+            }
+            W_INCLUDED_PRIVATE_RANGE => "include only the addresses that have to go through rurge",
+            W_EXCLUDED_RURGE_SPACE => {
+                "exclude only addresses outside 198.18.0.0/15 and fd00:6152::/64"
+            }
+            W_FORCE_SYSLIB => {
+                "use `server:system` to keep real addresses while the enhanced mode is on"
+            }
             _ => return None,
         })
     }
@@ -425,6 +446,10 @@ mod tests {
         codes::W_SET_NESTING,
         codes::W_GROUP_CYCLE,
         codes::W_SET_KIND_CONFLICT,
+        codes::W_IPV6_VIF_ALWAYS,
+        codes::W_INCLUDED_PRIVATE_RANGE,
+        codes::W_EXCLUDED_RURGE_SPACE,
+        codes::W_FORCE_SYSLIB,
     ];
 
     /// The codes whose every site carries a hint of its own.

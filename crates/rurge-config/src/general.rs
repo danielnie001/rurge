@@ -7,9 +7,9 @@ use crate::span::Span;
 use crate::spec::secret::Secret;
 use crate::text::Section;
 use crate::value::{parse_bool, split_definition, split_list};
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -709,6 +709,42 @@ fn parse_nets(diags: &mut Diagnostics, span: &Span, key: &str, value: &str) -> V
     out
 }
 
+/// rurge's own address space (M4 design 4.5): the virtual adapter, the DNS
+/// responder, the stack and the fake addresses. A copy of
+/// `rurge_platform::route::SPACE_V4` / `SPACE_V6`, written out here because
+/// `rurge-config` depends on no other crate of the workspace; a test in the
+/// binary holds the two together.
+pub const RURGE_SPACE_V4: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15);
+/// The IPv6 half of rurge's space, there when `ipv6-vif` is on.
+pub const RURGE_SPACE_V6: Ipv6Net =
+    Ipv6Net::new_assert(Ipv6Addr::new(0xfd00, 0x6152, 0, 0, 0, 0, 0, 0), 64);
+
+/// The private ranges of RFC 1918, in the order `W0036` names them.
+const PRIVATE_RANGES: [Ipv4Net; 3] = [
+    Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 8),
+    Ipv4Net::new_assert(Ipv4Addr::new(172, 16, 0, 0), 12),
+    Ipv4Net::new_assert(Ipv4Addr::new(192, 168, 0, 0), 16),
+];
+
+/// The first range of RFC 1918 that `item` contains whole, its own self
+/// included, in the order `W0036` names them. Only IPv4 is judged: the three
+/// ranges are IPv4, and an IPv6 item can contain none of them.
+fn whole_private_range(item: &IpNet) -> Option<Ipv4Net> {
+    let IpNet::V4(item) = item else {
+        return None;
+    };
+    PRIVATE_RANGES
+        .iter()
+        .find(|range| item.contains(*range))
+        .copied()
+}
+
+/// Whether `item` and `space` share an address: one of them contains the
+/// other. Two networks of different families never do.
+fn overlaps(item: &IpNet, space: &IpNet) -> bool {
+    item.contains(space) || space.contains(item)
+}
+
 fn parse_host_list(
     diags: &mut Diagnostics,
     span: &Span,
@@ -918,7 +954,18 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
                 g.ipv6_vif = match value.to_ascii_lowercase().as_str() {
                     "disabled" => Ipv6Vif::Disabled,
                     "auto" => Ipv6Vif::Auto,
-                    "always" => Ipv6Vif::Always,
+                    "always" => {
+                        // the manual warns about this during profile
+                        // verification (M4 design 4.6, 12)
+                        diags.push(
+                            Diagnostic::warning(
+                                codes::W_IPV6_VIF_ALWAYS,
+                                "`ipv6-vif = always` may break apps on networks without IPv6 connectivity",
+                            )
+                            .at(span.clone()),
+                        );
+                        Ipv6Vif::Always
+                    }
                     "off" => {
                         migrated(diags, span, "ipv6-vif = off", "ipv6-vif = disabled");
                         Ipv6Vif::Disabled
@@ -929,8 +976,45 @@ pub fn parse_general(section: Option<&Section>, diags: &mut Diagnostics) -> Gene
                     }
                 }
             }
-            "tun-excluded-routes" => g.tun_excluded_routes = parse_nets(diags, span, key, value),
-            "tun-included-routes" => g.tun_included_routes = parse_nets(diags, span, key, value),
+            "tun-excluded-routes" => {
+                g.tun_excluded_routes = parse_nets(diags, span, key, value);
+                // an item that overlaps rurge's space would take the responder
+                // and the fake addresses off the virtual adapter (M4 design
+                // 4.5, 12): one warning per item, and only for the items that
+                // could be read (the others have a warning of their own)
+                let space = [IpNet::V4(RURGE_SPACE_V4), IpNet::V6(RURGE_SPACE_V6)];
+                for item in &g.tun_excluded_routes {
+                    if space.iter().any(|space| overlaps(item, space)) {
+                        diags.push(
+                            Diagnostic::warning(
+                                codes::W_EXCLUDED_RURGE_SPACE,
+                                format!(
+                                    "`tun-excluded-routes`: {item} overlaps rurge's own range (198.18.0.0/15 or fd00:6152::/64), which always goes through the virtual adapter"
+                                ),
+                            )
+                            .at(span.clone()),
+                        );
+                    }
+                }
+            }
+            "tun-included-routes" => {
+                g.tun_included_routes = parse_nets(diags, span, key, value);
+                // taking in a whole private range is normally unnecessary and
+                // can cause system issues (M4 design 12): one warning per item
+                for item in &g.tun_included_routes {
+                    if let Some(range) = whole_private_range(item) {
+                        diags.push(
+                            Diagnostic::warning(
+                                codes::W_INCLUDED_PRIVATE_RANGE,
+                                format!(
+                                    "`tun-included-routes` takes in the whole private range {range} ({item}); this is normally unnecessary and can cause system issues"
+                                ),
+                            )
+                            .at(span.clone()),
+                        );
+                    }
+                }
+            }
             "icmp-forwarding" => set_bool!(icmp_forwarding),
             "skip-proxy" => g.skip_proxy = parse_host_list(diags, span, key, value, None),
             "exclude-simple-hostnames" => set_bool!(exclude_simple_hostnames),
@@ -1332,8 +1416,8 @@ mod tests {
             }),
             // IPv6 & Virtual Network Interface
             ("ipv6", "true", |g| g.ipv6),
-            ("ipv6-vif", "always", |g| g.ipv6_vif == Ipv6Vif::Always),
-            ("tun-excluded-routes", "10.0.0.0/8, fd00::/8", |g| {
+            ("ipv6-vif", "auto", |g| g.ipv6_vif == Ipv6Vif::Auto),
+            ("tun-excluded-routes", "10.0.0.0/8, 2001:db8::/32", |g| {
                 g.tun_excluded_routes.len() == 2
             }),
             ("tun-included-routes", "192.168.1.12/32", |g| {
@@ -1881,5 +1965,122 @@ ca-passphrase = S3CR3T3\nhttp, h.example, 8080, alice, S3CR3T4, tfo=true\nSS = s
             "{shown}"
         );
         assert!(shown.contains("ca-passphrase = ***"), "{shown}");
+    }
+
+    /// The codes of the lines `[General]` warns about because of what the
+    /// enhanced mode would do with them, one entry per diagnostic.
+    fn said(text: &str) -> Vec<(&'static str, String)> {
+        let (_, d) = parse(text);
+        d.iter().map(|x| (x.code, x.message.clone())).collect()
+    }
+
+    /// `ipv6-vif = always` turns IPv6 on where the network has none, which
+    /// the manual says Surge warns about during profile verification (M4
+    /// design 4.6, 12).
+    #[test]
+    fn ipv6_vif_always_warns() {
+        let (g, d) = parse("[General]\nipv6-vif = always\n");
+        assert_eq!(g.ipv6_vif, Ipv6Vif::Always);
+        assert_eq!(
+            said("[General]\nipv6-vif = always\n"),
+            [(
+                codes::W_IPV6_VIF_ALWAYS,
+                "`ipv6-vif = always` may break apps on networks without IPv6 connectivity"
+                    .to_string()
+            )]
+        );
+        assert_eq!(
+            d.iter().next().unwrap().hint,
+            codes::hint(codes::W_IPV6_VIF_ALWAYS)
+        );
+    }
+
+    /// The other two values of `ipv6-vif`, and the one that is migrated:
+    /// nothing is said of them (`off` is told of its new name).
+    #[test]
+    fn ipv6_vif_auto_and_disabled_say_nothing() {
+        for value in ["auto", "disabled"] {
+            let (g, d) = parse(&format!("[General]\nipv6-vif = {value}\n"));
+            assert!(codes_of(&d).is_empty(), "{value}: {:?}", codes_of(&d));
+            assert_ne!(g.ipv6_vif, Ipv6Vif::Always, "{value}");
+        }
+        let (g, d) = parse("[General]\nipv6-vif = off\n");
+        assert_eq!(codes_of(&d), [codes::I_LEGACY_MIGRATED]);
+        assert_eq!(g.ipv6_vif, Ipv6Vif::Disabled);
+    }
+
+    /// A `tun-included-routes` item that takes in a whole RFC 1918 range is
+    /// normally unnecessary and can cause system issues (M4 design 12): one
+    /// warning per item, naming the first of the three ranges it contains.
+    #[test]
+    fn including_a_whole_private_range_warns() {
+        let warning = |range: &str, item: &str| {
+            (
+                codes::W_INCLUDED_PRIVATE_RANGE,
+                format!(
+                    "`tun-included-routes` takes in the whole private range {range} ({item}); this is normally unnecessary and can cause system issues"
+                ),
+            )
+        };
+        for (value, range) in [
+            ("192.168.0.0/16", "192.168.0.0/16"),
+            ("10.0.0.0/8", "10.0.0.0/8"),
+            ("8.0.0.0/5", "10.0.0.0/8"),
+            ("0.0.0.0/0", "10.0.0.0/8"),
+        ] {
+            assert_eq!(
+                said(&format!("[General]\ntun-included-routes = {value}\n")),
+                [warning(range, value)],
+                "{value}"
+            );
+        }
+        // one item one warning: two of them are two
+        assert_eq!(
+            said("[General]\ntun-included-routes = 10.0.0.0/8, 192.168.0.0/16\n"),
+            [
+                warning("10.0.0.0/8", "10.0.0.0/8"),
+                warning("192.168.0.0/16", "192.168.0.0/16"),
+            ]
+        );
+        for value in ["192.168.1.0/24", "172.16.5.0/24"] {
+            assert!(
+                said(&format!("[General]\ntun-included-routes = {value}\n")).is_empty(),
+                "{value}"
+            );
+        }
+    }
+
+    /// An item of `tun-excluded-routes` that overlaps rurge's own space would
+    /// take the responder and the fake addresses off the virtual adapter (M4
+    /// design 4.5, 12): one warning per item, whether it sits inside the
+    /// space or covers it.
+    #[test]
+    fn excluding_into_rurges_space_warns() {
+        let warning = |item: &str| {
+            (
+                codes::W_EXCLUDED_RURGE_SPACE,
+                format!(
+                    "`tun-excluded-routes`: {item} overlaps rurge's own range (198.18.0.0/15 or fd00:6152::/64), which always goes through the virtual adapter"
+                ),
+            )
+        };
+        for value in ["198.18.0.0/16", "198.0.0.0/8", "fd00::/8"] {
+            assert_eq!(
+                said(&format!("[General]\ntun-excluded-routes = {value}\n")),
+                [warning(value)],
+                "{value}"
+            );
+        }
+        for value in ["198.20.0.0/16", "fd01::/16"] {
+            assert!(
+                said(&format!("[General]\ntun-excluded-routes = {value}\n")).is_empty(),
+                "{value}"
+            );
+        }
+        // one item one warning, one for each half of the space
+        assert_eq!(
+            said("[General]\ntun-excluded-routes = 198.18.0.0/16, fd00:6152::/64\n"),
+            [warning("198.18.0.0/16"), warning("fd00:6152::/64"),]
+        );
     }
 }

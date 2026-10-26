@@ -595,11 +595,10 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         PolicyKind::External => {
             let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
             let external = external::read_external(&mut r, &mut common);
-            // `tfo` does not apply at all (`W0028`): no second word on it
+            // `tfo` does not apply at all (`W0028`): no second word on it.
+            // `addresses` keeps the enhanced mode off those addresses, so it
+            // is in no "no effect yet" list (M4-D21)
             notes.inert.retain(|name| *name != "tfo");
-            if !external.addresses.is_empty() && !r.rejected("addresses") {
-                notes.inert.push("addresses");
-            }
             (common, ProtoSpec::External(external))
         }
         _ => return SpecOutcome::default(),
@@ -991,9 +990,10 @@ mod tests {
         );
     }
 
-    /// An `external` line: no server, no port; what does not work yet is said
-    /// once per load (`W0029`), and `tfo` and `ecn` only as not applicable
-    /// (M4 design 4.4).
+    /// An `external` line: no server, no port; `tfo` and `ecn` are the only
+    /// things said of it, as not applicable (M4 design 4.4), and `addresses`
+    /// is in no "no effect yet" list: it takes effect while the enhanced
+    /// mode is on (M4-D21).
     #[test]
     fn an_external_line() {
         let o = outcome(
@@ -1024,7 +1024,7 @@ mod tests {
         };
         assert_eq!(external.args.expose(), &["-D", "1080"]);
         assert_eq!((spec.server, spec.port), (None, None));
-        assert_eq!(o.inert, ["addresses"]);
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
         assert!(external.udp_relay);
         assert_eq!(spec.proto.keystore_item(), None);
         let o = outcome(
@@ -1036,6 +1036,23 @@ mod tests {
             o.diagnostics[0].message,
             "policy `X`: Shadow TLS cannot be combined with a `external` policy"
         );
+    }
+
+    /// `addresses` takes effect while the enhanced mode is on (M4-D21), so
+    /// the line no longer reports it as parsed but without effect.
+    #[test]
+    fn external_addresses_are_no_longer_inert() {
+        let o = outcome(
+            "X",
+            "external, exec=/bin/p, local-port=1080, addresses=10.0.0.1, addresses=fd00::1",
+        );
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert!(o.inert.is_empty(), "{:?}", o.inert);
+        let spec = o.spec.expect("an external spec");
+        let ProtoSpec::External(external) = &spec.proto else {
+            panic!("{:?}", spec.proto);
+        };
+        assert_eq!(external.addresses.len(), 2);
     }
 
     /// A chain carries UDP since M5: a `wireguard` policy over one loads

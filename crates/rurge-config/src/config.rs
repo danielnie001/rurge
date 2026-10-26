@@ -3,7 +3,7 @@
 use crate::deferred::DeferredSections;
 use crate::diagnostic::{Diagnostic, Diagnostics, ParseError, codes};
 use crate::general::{General, parse_general};
-use crate::host::{HostEntry, HostKey, parse_host_entry};
+use crate::host::{HostEntry, HostKey, HostValue, SystemMode, parse_host_entry};
 use crate::keystore::{KeystoreItem, parse_keystore_item, unknown_field};
 use crate::managed::{self, ManagedConfig, parse_managed};
 use crate::network::NetworkFacts;
@@ -31,6 +31,7 @@ use base64::Engine as _;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -295,6 +296,19 @@ impl Config {
                 .map(|key| (key, external.local_port)),
             _ => None,
         })
+    }
+
+    /// The addresses the `external` policies of the profile name (`addresses`),
+    /// which the enhanced mode keeps out of the virtual adapter (M4 design 11).
+    /// A policy that is not started (`W0033`) names none.
+    pub fn external_addresses(&self) -> Vec<IpAddr> {
+        let mut addresses = Vec::new();
+        for spec in &self.specs {
+            if let ProtoSpec::External(external) = &spec.proto {
+                addresses.extend(external.addresses.iter().copied());
+            }
+        }
+        addresses
     }
 
     /// What `name` refers to, as a policy or group line sees it.
@@ -823,7 +837,21 @@ pub fn from_profile(
     if let Some(sec) = profile.section("Host") {
         for e in sec.active_entries() {
             match parse_host_entry(&e.raw, &ctx_for(&e.origin), &e.span) {
-                Ok(h) => hosts.push(h),
+                Ok(h) => {
+                    // `force-syslib` asks the system's resolver, which answers
+                    // with fake addresses while the enhanced mode is on (M4
+                    // design 6.2, 12); the entry is kept, as asked
+                    if h.value == HostValue::System(SystemMode::ForceSyslib) {
+                        diags.push(
+                            Diagnostic::warning(
+                                codes::W_FORCE_SYSLIB,
+                                "`server:force-syslib` asks the system's resolver, which answers with fake addresses while the enhanced mode is on",
+                            )
+                            .at(h.span.clone()),
+                        );
+                    }
+                    hosts.push(h);
+                }
                 Err(err) => diags.push(line_failure(err, e.span.clone())),
             }
         }
@@ -2442,6 +2470,35 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         assert_eq!(names.len(), 1);
     }
 
+    /// `server:force-syslib` asks the system's resolver, which answers with
+    /// fake addresses while the enhanced mode is on (M4 design 6.2, 12): the
+    /// entry is kept and warned about; `server:system` and `server:syslib`,
+    /// which are pointed at rurge's own servers then, are not.
+    #[test]
+    fn force_syslib_warns_and_system_and_syslib_do_not() {
+        let l = load_text(
+            "[Host]\nforce.test = server:force-syslib\na.test = server:system\nb.test = server:syslib\nc.test = 10.0.0.1\n[Rule]\nFINAL,DIRECT\n",
+        );
+        let found: Vec<(&str, &str, Option<u32>)> = l
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.message.as_str(), d.span.as_ref().map(|s| s.line)))
+            .collect();
+        assert_eq!(
+            found,
+            [(
+                codes::W_FORCE_SYSLIB,
+                "`server:force-syslib` asks the system's resolver, which answers with fake addresses while the enhanced mode is on",
+                Some(2)
+            )]
+        );
+        assert_eq!(
+            l.diagnostics.iter().next().unwrap().hint,
+            codes::hint(codes::W_FORCE_SYSLIB)
+        );
+        assert_eq!(l.config.hosts.len(), 4, "the entry is kept");
+    }
+
     /// A server written in Unicode is looked up by its A-labels: that is
     /// the name `[Host]` must not apply to. The spelling it was written in
     /// stays in the list as well.
@@ -3611,11 +3668,7 @@ H = trust-tunnel, h.test, 443, username=u, password=pw, h3=maybe, ecn=on\n{}[Rul
             ),
             on(
                 "P = external, exec=/bin/x, local-port=1080, addresses=192.0.2.1, addresses=192.0.2.2",
-                vec![(
-                    codes::W_PARAM_NOT_EFFECTIVE,
-                    "policy parameter `addresses` is parsed but has no effect in this version"
-                        .to_string(),
-                )],
+                Vec::new(),
             ),
         ]);
     }
@@ -3756,16 +3809,11 @@ H = trust-tunnel, h.test, 443, username=u, password=pw, h3=maybe, ecn=on\n{}[Rul
                     not_applicable("`udp-port` only applies with `udp-relay=true`; ignored"),
                 ],
             ),
+            // `addresses` takes effect in the enhanced mode, so an error in
+            // another parameter leaves only its own sentence (M4-D21)
             on(
                 "P = external, exec=/bin/x, local-port=0, addresses=192.0.2.1",
-                vec![
-                    bad_value("local-port", "0", "a port, 1-65535"),
-                    (
-                        codes::W_PARAM_NOT_EFFECTIVE,
-                        "policy parameter `addresses` is parsed but has no effect in this version"
-                            .to_string(),
-                    ),
-                ],
+                vec![bad_value("local-port", "0", "a port, 1-65535")],
             ),
             // a valid chain is something every `port-hopping` conflicts with
             on(
@@ -4376,6 +4424,37 @@ RULE-SET,LAN,DIRECT\nDOMAIN-SET,LAN,REJECT\nRULE-SET,X,DIRECT\nDOMAIN-SET,X,REJE
         }
         assert_eq!(config.groups[0].members.len(), 5);
         assert_eq!(config.external_on_own_listener(), None);
+    }
+
+    /// The addresses every `external` policy the profile starts names, in the
+    /// profile's order and as often as written (M4 design 11, M4-D21). A
+    /// policy that `W0033` does not start names none, and one without
+    /// `addresses` contributes nothing.
+    #[test]
+    fn external_addresses_lists_the_addresses_of_every_external_policy() {
+        let link = "https://example.com/externals.conf";
+        let fake = Arc::new(crate::remote::fake::Fake::new().text(
+            link,
+            "[Proxy]\nNotStarted = external, exec=/bin/true, local-port=1083, addresses=192.0.2.9\n",
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_with_remote(
+            dir.path(),
+            &format!(
+                "[Proxy]\n#!include {link}\n\
+A = external, exec=/bin/a, local-port=1080, addresses=10.0.0.1, addresses=fd00::1\n\
+B = external, exec=/bin/b, local-port=1081\n\
+C = external, exec=/bin/c, local-port=1082, addresses=10.0.0.1\n\
+[Proxy Group]\nG = select, A, B, C, NotStarted\n[Rule]\nFINAL,G\n"
+            ),
+            &fake,
+        );
+        assert_eq!(codes_of(&l), [codes::W_REMOTE_LOCAL_ACCESS]);
+        let address = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            l.config.external_addresses(),
+            [address("10.0.0.1"), address("fd00::1"), address("10.0.0.1"),]
+        );
     }
 
     /// The same lines in the profile itself and in a file of its own, which
