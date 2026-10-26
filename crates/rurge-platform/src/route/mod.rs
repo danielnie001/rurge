@@ -7,7 +7,11 @@
 //! come are pure translations, so all three platforms are compiled and tested
 //! on every host. Running them belongs to the platform layer (M4c / M4d).
 
+pub mod linux;
+pub mod macos;
 pub mod set;
+pub mod steps;
+pub mod windows;
 
 pub use set::{RouteInputs, RouteSet};
 
