@@ -565,6 +565,13 @@ pub fn subnets(exclude: &[String]) -> io::Result<Vec<(IpNet, String)>>;
 | 32 | 5 | 派工第 4 条（协调者的裁定）：`run.rs` 建一份空的 `network::Exclude`（`:1662`），`network::start(&network_backend, &exclude)` 之后把同一个 `Arc` 交给 `network::spawn`（`:1862`）；任务 6 把这一份给管理器，它设的就是这里读的那一份 | 本提交 |
 | 33 | 5 | 执行者的裁定（结构）：`netenv` 的去掉放在 `quick_on`（`:194`）与 `file_snapshot`（`:236`）两处——这两处就是 DNS 名单的两个来路（三个平台的读取器之后、文件之后），所以 `read` / `read_quick` 与三种后端都经过它，`ReadOpts` 不加新项（P12）。用例除了计划要求的文件后端，还经 `FakeHost` 的 `/etc/resolv.conf` 走了一遍平台那一路（`read_on` 与 `quick_on` 各断言一次）——只在文件后端断言的话，平台那一路的去掉没有用例 | 本提交 |
 | 34 | 5 | 执行者的裁定（签名）：`look` 收 owned 的 `Exclude`（读之前 `read_opts` 取一份，锁不跨 `await`），因为 `start` 与 `spawn` 交出去的 future 要 `Send + 'static`；`start` 收 `&Exclude` 并在里面 `clone`，`spawn` 收 `Exclude`。`read_once` 的签名不变、内部传 `Exclude::default()`——`rurge dns lookup` 与 `rurge rule match` 不起引擎、没有管理器，也没有虚拟网卡要排除 | 本提交 |
+| 35 | 6 | 派工第 1 条（协调者的裁定）：`PlatformSockets` 与 `PlatformSystemDns` 放进可执行文件的 `Runtime`，`RuntimeArgs::resolve` 各建一次（`PlatformSockets::new(egress.clone())`、`PlatformSystemDns::new()`），`stack_options` 克隆同一份 `Arc`；`Runtime` 仍派生 `Debug`（两个新类型也派生它） | 本提交 |
+| 36 | 6 | 执行者的裁定（依赖）：`Backend::subnets` 的签名要写 `ipnet::IpNet`，而 `rurge` 这个 crate 此前没有这个依赖，给它加 `ipnet.workspace = true`（`rurge-config` / `rurge-platform` / `rurge-rules` / `rurge-proto-wireguard` 都是这个写法）；`Cargo.lock` 的包数不变，只多 `rurge` 的一条依赖 | 本提交 |
+| 37 | 6 | 派工第 3 条（协调者的裁定）：管理器的 `new` 参数个数不变，`egress: EgressSlot` 换成 `links: Links`——`Links` 装出口槽、增强模式的标志、排除名单与 `system_dns_changed` 回调（绕过 `too_many_arguments`）。测试的 `fixture_on` 给一个什么都不做的回调；要读回调次序的用例经 `fixture_recording_system_dns` 把回调记进同一个 `Calls` | 本提交 |
+| 38 | 6 | 派工第 7 条（协调者的裁定）：判据从 `git grep -n "Arc::new(PlatformSockets)\|Arc::new(PlatformSystemDns)" crates/rurge/src` 改成搜 `PlatformSockets::new\|PlatformSystemDns::new`（构造改成 `new(…)` 之后，前者什么都搜不到）。现在的输出 6 行：`RuntimeArgs::resolve` 两行（生产里唯一的构造处），`#[cfg(test)] mod tests` 里 4 行 | 本提交 |
+| 39 | 6 | 派工第 6 条（协调者的裁定，R15）：守护进程的 `ProfileSources::production` 换成 `rt.sockets.clone()` / `rt.system_dns.clone()`；任务 4 放在 `EngineShared::new` 上面那段“下载走平台套接字与 rurge 的解析器”的注释挪到了调用旁边，“The hook and the platform DNS are made here for now…”那句删掉 | 本提交 |
+| 40 | 6 | 执行者的裁定（用例）：端到端用例没有用 `World`（`World::run` 走 `--no-network`，下载不可能发生），自己写 profile / 数据目录 / 网络文件，网络取值用 `the_network::wifi("Home")`，并用 `rurge_run_online` 把两个 GeoIP 地址指到回环。下载要让它在增强模式开着的时候发生：打开之后改写 profile 加一个从未下载过的 `RULE-SET`，再经 API reload（新资源没有缓存，下载必定发生在开着的期间） | 本提交 |
+| 41 | 6 | 执行者的裁定（用例）：`Platform::subnets` 没有用例走到它（它读本机的网卡与地址，全局约束明说这一份不测它）；`Off::subnets` 在现有 `the_off_backend_says_it_is_off` 里加了一条断言；文件后端的 `subnets` 另有 `the_subnets_come_from_the_file_and_are_not_an_action` | 本提交 |
 
 ## 延后事项
 

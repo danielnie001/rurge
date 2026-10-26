@@ -14,9 +14,11 @@ mod file;
 mod undo;
 pub(crate) mod wanted;
 
+use super::network::Exclude;
 pub use backend::backend;
 use backend::{Backend, Opened};
 pub use engine::starter;
+use ipnet::IpNet;
 use rurge_engine::state::StateStore;
 use rurge_net::BoxFuture;
 use rurge_platform::route::RouteSet;
@@ -53,10 +55,24 @@ fn set_egress(slot: &EgressSlot, table: Option<EgressTable>) {
 }
 
 /// Whether the egress table is in the slot: the mock backend and the tests ask
-/// (M4b's reader is the one that reads it for a decision).
-#[cfg_attr(not(test), allow(dead_code))] // wired up by M4b
+/// (the reader that decides, `PlatformSockets`, reads the slot itself).
+#[cfg_attr(not(test), allow(dead_code))]
 fn filled(slot: &EgressSlot) -> bool {
     slot.read().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// What the manager tells the rest of rurge as the enhanced mode opens and
+/// closes (M4 design 3.7, 6.3, 7.1). Given once, when the manager is made: the
+/// manager writes it and the rest of the run reads it.
+pub struct Links {
+    /// The egress table, which `PlatformSockets` reads.
+    pub egress: EgressSlot,
+    /// Up while the egress table is written: `PlatformSystemDns::enhanced_mode`.
+    pub enhanced: Arc<AtomicBool>,
+    /// The interfaces the network task leaves out of what it reads.
+    pub exclude: Exclude,
+    /// The system's DNS changed hands: `Engine::system_dns_changed` in a run.
+    pub system_dns_changed: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// Starts the TUN the manager runs: the engine's, or a test's (P6: the engine
@@ -147,7 +163,8 @@ pub struct EnhancedMode {
     backend: Arc<dyn Backend>,
     store: Arc<StateStore>,
     starter: Arc<dyn Starter>,
-    egress: EgressSlot,
+    /// What the rest of rurge is told as the mode opens and closes.
+    links: Links,
     shared: Arc<Shared>,
     /// Where a TUN that failed is told (P24).
     ended: TunEnded,
@@ -231,13 +248,13 @@ fn backup_value(undo: &[Undo]) -> Option<serde_json::Value> {
     )
 }
 
-/// The egress table for these routes and the network's primary interface.
-fn table(routes: &RouteSet, wanted: &Wanted) -> EgressTable {
+/// The egress table for these routes, the network's primary interface and the
+/// physical interfaces' subnets (the manager reads them, most specific first).
+fn table(routes: &RouteSet, wanted: &Wanted, subnets: &[(IpNet, String)]) -> EgressTable {
     EgressTable {
         routes: routes.clone(),
         primary: wanted.primary.clone(),
-        // M4b's task 6 puts the physical interfaces' subnets here
-        subnets: Vec::new(),
+        subnets: subnets.to_vec(),
     }
 }
 
@@ -341,14 +358,14 @@ impl EnhancedMode {
         backend: Arc<dyn Backend>,
         store: Arc<StateStore>,
         starter: Arc<dyn Starter>,
-        egress: EgressSlot,
+        links: Links,
         ended: TunEnded,
     ) -> EnhancedMode {
         EnhancedMode {
             backend,
             store,
             starter,
-            egress,
+            links,
             shared: Arc::new(Shared::new()),
             ended,
             opens: 0,
@@ -516,7 +533,9 @@ impl EnhancedMode {
             }
         }
 
-        // the routes: only what differs
+        // the routes: only what differs. The subnets are read once for this
+        // follow, and every table it writes names the same ones.
+        let subnets = self.physical_subnets(&dev.name).await;
         let mut next = wanted.routes.clone();
         if !ipv6 {
             next.v6.clear();
@@ -525,10 +544,13 @@ impl EnhancedMode {
         let (add, remove) = RouteSet::diff(&old, &next);
         if add.is_empty() && remove.is_empty() {
             // nothing to add or remove, and the table takes the new primary
-            set_egress(&self.egress, Some(table(&next, &wanted)));
+            set_egress(&self.links.egress, Some(table(&next, &wanted, &subnets)));
             on.routes = Some(next);
         } else {
-            set_egress(&self.egress, Some(table(&union(&old, &next), &wanted)));
+            set_egress(
+                &self.links.egress,
+                Some(table(&union(&old, &next), &wanted, &subnets)),
+            );
             // What the adapter still has of the old IPv6 routes if the new
             // half cannot go in: the backend takes back only the half it
             // added, and removes what it was asked to, so what is left is the
@@ -556,7 +578,7 @@ impl EnhancedMode {
                             ipv6 = false;
                         }
                     }
-                    set_egress(&self.egress, Some(table(&next, &wanted)));
+                    set_egress(&self.links.egress, Some(table(&next, &wanted, &subnets)));
                     on.routes = Some(next);
                 }
                 Err(e) => {
@@ -587,6 +609,37 @@ impl EnhancedMode {
         }
         on.ipv6 = ipv6;
         self.on = Some(on);
+    }
+
+    /// The directly connected subnets of the physical interfaces, the virtual
+    /// adapter `adapter` left out (M4 design 7.1, rule 3): what an open and a
+    /// follow put in the egress table, most specific first. A read that fails
+    /// is a WARN and an empty list — the table is written all the same, so
+    /// that rule 3 does not apply while rules 4 and 5 do — and the adapter's
+    /// name is not the log's.
+    async fn physical_subnets(&self, adapter: &str) -> Vec<(IpNet, String)> {
+        let backend = self.backend.clone();
+        let exclude = vec![adapter.to_string()];
+        match call(move || backend.subnets(&exclude)).await {
+            Ok(subnets) => subnets,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cannot read the subnets of the physical interfaces; rurge's own connections to them follow the primary interface"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// The interfaces the network task leaves out of what it reads: the
+    /// virtual adapter while it is up, and nothing once it is gone.
+    fn set_exclude(&self, interfaces: Vec<String>) {
+        *self
+            .links
+            .exclude
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = interfaces;
     }
 
     /// One step of a follow that did not happen: the step and its reason are
@@ -632,7 +685,10 @@ impl EnhancedMode {
         }
         let backend = self.backend.clone();
         let with = dev.clone();
-        if let Err(e) = call(move || backend.take_dns(&with, ipv6)).await {
+        let taken = call(move || backend.take_dns(&with, ipv6)).await;
+        // a takeover changes hands whether or not it failed half way
+        (self.links.system_dns_changed)();
+        if let Err(e) = taken {
             self.failed("take_dns", &e);
         }
     }
@@ -703,10 +759,12 @@ impl EnhancedMode {
         // that read it are told what is there already, so nothing is saved twice
         let mut undo = saved.to_vec();
 
-        // 1. the device
+        // 1. the device, and with it the name the network task leaves out of
+        // what it reads (M4 design 3.7)
         let backend = self.backend.clone();
         let dev = call(move || backend.open()).await?;
         on.dev = Some(dev.clone());
+        self.set_exclude(vec![dev.name.clone()]);
 
         // 2. the adapter, with its IPv6 half when it is wanted. It is always
         // asked: its address, MTU and link are wanted whether or not IPv6 is,
@@ -729,15 +787,15 @@ impl EnhancedMode {
 
         // 4. the egress table, before the routes: once they are in, rurge's
         // own connections must leave by the physical adapter
+        let subnets = self.physical_subnets(&dev.name).await;
         set_egress(
-            &self.egress,
-            Some(EgressTable {
-                routes: wanted.routes.clone(),
-                primary: wanted.primary.clone(),
-                // M4b's task 6 puts the physical interfaces' subnets here
-                subnets: Vec::new(),
-            }),
+            &self.links.egress,
+            Some(table(&wanted.routes, wanted, &subnets)),
         );
+        // the flag and the callback go with the table: from here on the
+        // system's DNS may answer with fake addresses
+        self.links.enhanced.store(true, Ordering::SeqCst);
+        (self.links.system_dns_changed)();
         on.egress = true;
 
         // 5. the routes. A set that loses its IPv6 half takes the open on as
@@ -775,11 +833,14 @@ impl EnhancedMode {
         }
 
         // 7. the takeover: a takeover that fails may have changed half of it,
-        // so it is undone as if it had
+        // so it is undone as if it had — and the callback comes whether it
+        // succeeded or not
         on.dns = true;
         let backend = self.backend.clone();
         let with = dev.clone();
-        call(move || backend.take_dns(&with, ipv6)).await?;
+        let taken = call(move || backend.take_dns(&with, ipv6)).await;
+        (self.links.system_dns_changed)();
+        taken?;
 
         // 8. the system's own adjustments, the same way
         let backend = self.backend.clone();
@@ -824,6 +885,9 @@ impl EnhancedMode {
                     self.undo(index, undo, &mut closing).await;
                 }
             }
+            // The DNS is handed back, whether or not each step went back: from
+            // here on what the system answers may be its own again.
+            (self.links.system_dns_changed)();
         }
         // the routes: the traffic goes back to the physical adapter first
         if let Some(routes) = on.routes.take() {
@@ -835,7 +899,10 @@ impl EnhancedMode {
             }
         }
         if on.egress {
-            set_egress(&self.egress, None);
+            set_egress(&self.links.egress, None);
+            // the table is gone, so the machine's DNS is its own again
+            self.links.enhanced.store(false, Ordering::SeqCst);
+            (self.links.system_dns_changed)();
         }
         // the TUN: stopped, and waited for, but not for ever
         if let Some(tun) = on.tun.take() {
@@ -879,6 +946,9 @@ impl EnhancedMode {
                 })
                 .await;
         }
+        // the network task reads the virtual adapter again. A close that never
+        // got a device returned above and leaves the list as it is.
+        self.set_exclude(Vec::new());
         self.shared.set_off();
         match closing.first {
             None => Ok(()),
@@ -952,6 +1022,11 @@ mod tests {
         configured: Arc<Mutex<Vec<bool>>>,
         dns: Arc<Mutex<Vec<bool>>>,
         closes: Arc<AtomicUsize>,
+        /// The subnets `subnets` answers with.
+        subnets: Arc<Mutex<Vec<(IpNet, String)>>>,
+        /// The `exclude` of each `subnets` call, in order: a read, so not among
+        /// `calls`.
+        subnets_asked: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     impl Mock {
@@ -1057,6 +1132,15 @@ mod tests {
                 return Ok(false);
             }
             Ok(true)
+        }
+
+        fn subnets(&self, exclude: &[String]) -> Result<Vec<(IpNet, String)>, String> {
+            // a read: what is asked is kept apart from what was done
+            self.subnets_asked.lock().unwrap().push(exclude.to_vec());
+            if self.fails("subnets") {
+                return Err("subnets failed (test)".to_string());
+            }
+            Ok(self.subnets.lock().unwrap().clone())
         }
 
         fn dns_undo(&self, _dev: &Opened, saved: &[Undo]) -> Result<Vec<Undo>, String> {
@@ -1229,6 +1313,10 @@ mod tests {
         backend: Arc<Mock>,
         starter: Arc<MockStarter>,
         egress: EgressSlot,
+        /// Whether the rest of rurge is told the enhanced mode is on.
+        enhanced: Arc<AtomicBool>,
+        /// The interfaces the network task leaves out of what it reads.
+        exclude: Exclude,
         /// The open numbers the manager told the loop about (P24).
         told: tokio::sync::mpsc::UnboundedReceiver<u64>,
         mode: EnhancedMode,
@@ -1242,11 +1330,24 @@ mod tests {
 
     /// `fixture`, and whether the TUN's device fails at once (P24).
     async fn fixture_with(ends: bool, failing: bool) -> Fixture {
+        fixture_on(ends, failing, false).await
+    }
+
+    /// `fixture`, with `system_dns_changed` recorded among the calls the
+    /// backend's steps are, so a test can read the order of the two.
+    async fn fixture_recording_system_dns(ends: bool) -> Fixture {
+        fixture_on(ends, false, true).await
+    }
+
+    /// `fixture_with`, and whether `system_dns_changed` is recorded.
+    async fn fixture_on(ends: bool, failing: bool, record_dns: bool) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.json");
         let (store, _) = StateStore::open(state.clone()).await;
         let calls = Calls::default();
         let egress = egress_slot();
+        let enhanced = Arc::new(AtomicBool::new(false));
+        let exclude: Exclude = Exclude::default();
         let backend = Arc::new(Mock {
             calls: calls.clone(),
             egress: egress.clone(),
@@ -1254,17 +1355,36 @@ mod tests {
             ..Mock::default()
         });
         let starter = Arc::new(MockStarter {
-            calls,
+            calls: calls.clone(),
             ends,
             failing,
             ..MockStarter::default()
         });
         let (tell, told) = tokio::sync::mpsc::unbounded_channel();
+        let system_dns_changed: Arc<dyn Fn() + Send + Sync> = if record_dns {
+            let calls = calls.clone();
+            let enhanced = enhanced.clone();
+            Arc::new(move || {
+                let on = if enhanced.load(Ordering::SeqCst) {
+                    "on"
+                } else {
+                    "off"
+                };
+                calls.push(format!("system_dns_changed {on}"));
+            })
+        } else {
+            Arc::new(|| {})
+        };
         let mode = EnhancedMode::new(
             backend.clone(),
             store.clone(),
             starter.clone(),
-            egress.clone(),
+            Links {
+                egress: egress.clone(),
+                enhanced: enhanced.clone(),
+                exclude: exclude.clone(),
+                system_dns_changed,
+            },
             Arc::new(move |sequence| {
                 let _ = tell.send(sequence);
             }),
@@ -1276,6 +1396,8 @@ mod tests {
             backend,
             starter,
             egress,
+            enhanced,
+            exclude,
             told,
             mode,
         }
@@ -1368,6 +1490,150 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "ICMP forwarding is not available in this version"
+        );
+    }
+
+    /// The egress table names the physical interfaces' subnets, read once for
+    /// the open with the virtual adapter itself left out (M4 design 7.1, rule
+    /// 3), and a close takes the table away with it.
+    #[tokio::test]
+    async fn opening_writes_the_egress_table_with_the_subnets_and_closing_clears_it() {
+        let mut f = fixture(true).await;
+        let lan: Vec<(IpNet, String)> = vec![
+            ("192.168.1.0/24".parse().unwrap(), "eth0".to_string()),
+            ("10.0.0.0/8".parse().unwrap(), "eth0".to_string()),
+        ];
+        *f.backend.subnets.lock().unwrap() = lan.clone();
+
+        f.mode.enable(wanted()).await.unwrap();
+        let table = f
+            .egress
+            .read()
+            .unwrap()
+            .clone()
+            .expect("the egress table is written");
+        assert_eq!(table.subnets, lan, "the subnets are the ones read");
+        assert_eq!(
+            f.backend.subnets_asked.lock().unwrap().clone(),
+            vec![lines(&["rurge-test"])],
+            "read once, with the adapter's own name left out"
+        );
+
+        f.mode.disable().await.unwrap();
+        assert!(
+            f.egress.read().unwrap().is_none(),
+            "a close clears the table"
+        );
+    }
+
+    /// Subnets that cannot be read are a WARN and nothing else: the table is
+    /// written without them — rule 3 does not apply, rules 4 and 5 do — and
+    /// the enhanced mode opens all the same.
+    #[tokio::test]
+    async fn subnets_that_cannot_be_read_leave_rule_three_out_and_open_all_the_same() {
+        use rurge_net::testing::Lines;
+
+        let lines = Lines::default();
+        // held across the awaits: the manager runs on this thread
+        let _capturing = lines.capture();
+        let mut f = fixture(true).await;
+        *f.backend.fail.lock().unwrap() = Some("subnets".to_string());
+
+        f.mode.enable(wanted()).await.unwrap();
+        assert!(f.mode.enabled(), "the open goes on");
+        let table = f
+            .egress
+            .read()
+            .unwrap()
+            .clone()
+            .expect("the egress table is written");
+        assert!(table.subnets.is_empty(), "rule 3 is left out");
+        assert_eq!(table.routes, wanted().routes, "rules 4 and 5 go on");
+        assert_eq!(table.primary.as_deref(), Some("eth0"));
+        let said = lines.said("cannot read the subnets of the physical interfaces");
+        assert_eq!(said.len(), 1, "one WARN: {said:?}");
+        assert!(said[0].contains("error="), "{}", said[0]);
+        assert!(
+            !said[0].contains("rurge-test"),
+            "the adapter's name is not the log's: {}",
+            said[0]
+        );
+    }
+
+    /// The enhanced-mode flag is up from the moment the egress table is in its
+    /// slot until the close takes it away: what `PlatformSystemDns` reads.
+    #[tokio::test]
+    async fn the_enhanced_flag_is_up_from_the_egress_table_until_it_is_cleared() {
+        let mut f = fixture(true).await;
+        assert!(!f.enhanced.load(Ordering::SeqCst), "off at the start");
+        f.mode.enable(wanted()).await.unwrap();
+        assert!(f.enhanced.load(Ordering::SeqCst), "up with the table");
+        f.mode.disable().await.unwrap();
+        assert!(!f.enhanced.load(Ordering::SeqCst), "down with the table");
+    }
+
+    /// The network task reads the machine without the virtual adapter while the
+    /// enhanced mode is on: the manager puts the adapter's name in the list
+    /// once the device is opened, and a close empties it again — an open that
+    /// failed, undone by the same close, leaves it empty as well.
+    #[tokio::test]
+    async fn the_virtual_adapter_is_left_out_of_the_network_reads_while_open() {
+        let mut f = fixture(true).await;
+        assert!(f.exclude.read().unwrap().is_empty(), "nothing is left out");
+        f.mode.enable(wanted()).await.unwrap();
+        assert_eq!(
+            *f.exclude.read().unwrap(),
+            ["rurge-test".to_string()],
+            "the adapter the device opened"
+        );
+        f.mode.disable().await.unwrap();
+        assert!(f.exclude.read().unwrap().is_empty(), "a close empties it");
+
+        // an open that fails goes back through the same close
+        let mut f = fixture(true).await;
+        *f.backend.fail.lock().unwrap() = Some("routes".to_string());
+        let error = f.mode.enable(wanted()).await.unwrap_err();
+        assert_eq!(error, "routes failed (test)");
+        assert!(
+            f.exclude.read().unwrap().is_empty(),
+            "an open that failed leaves the list as it was"
+        );
+    }
+
+    /// The system's DNS changed hands: the callback comes after the flag goes
+    /// up, after the takeover, after the giving back and after the flag goes
+    /// down — once for each, in that order (M4 design 6.3, 7.1).
+    #[tokio::test]
+    async fn system_dns_changed_is_called_after_the_flag_the_takeover_and_the_giving_back() {
+        let mut f = fixture_recording_system_dns(true).await;
+        f.mode.enable(wanted()).await.unwrap();
+        f.mode.disable().await.unwrap();
+        assert_eq!(
+            f.backend.calls.list(),
+            lines(&[
+                "open",
+                "configure",
+                "start",
+                // the egress table is in its slot
+                "system_dns_changed on",
+                "egress",
+                "routes",
+                "dns_undo",
+                "take_dns",
+                // the takeover, whatever it did
+                "system_dns_changed on",
+                "adjust_undo",
+                "adjust",
+                // the close: the DNS handed back, then the table taken away
+                "give_dns_back",
+                "undo take_dns",
+                "system_dns_changed on",
+                "routes off",
+                "system_dns_changed off",
+                "stop",
+                "close",
+                "undo adjust",
+            ])
         );
     }
 

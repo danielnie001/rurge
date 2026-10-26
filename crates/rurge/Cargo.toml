@@ -37,6 +37,7 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 socket2.workspace = true
+ipnet.workspace = true
 
 [dev-dependencies]
 rurge-dns = { workspace = true, features = ["testing"] }

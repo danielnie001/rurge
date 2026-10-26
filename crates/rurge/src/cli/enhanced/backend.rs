@@ -7,6 +7,7 @@
 
 use super::file::FileBackend;
 use super::undo::Undo;
+use ipnet::IpNet;
 use rurge_platform::route::RouteSet;
 use rurge_tun::device::Device;
 use std::sync::Arc;
@@ -52,6 +53,12 @@ pub trait Backend: Send + Sync {
     /// what the adapter still has is the old set less `remove` (the phase 3 /
     /// M4a plan's execution record row 95).
     fn routes(&self, dev: &Opened, add: &RouteSet, remove: &RouteSet) -> Result<bool, String>;
+    /// The directly connected subnets of the interfaces but `exclude`, longest
+    /// prefix first (M4 design 7.1, rule 3). A read, not a change: the file
+    /// backend does not record it among its actions, and an error is a WARN
+    /// rather than the end of the open (the manager writes the table without
+    /// them).
+    fn subnets(&self, exclude: &[String]) -> Result<Vec<(IpNet, String)>, String>;
     /// The undo actions `take_dns` will need that are not among `saved` (the
     /// ones in the backup already), read before it is done (macOS: each
     /// enabled service and its servers; on a change of network, the services
@@ -113,6 +120,11 @@ impl Backend for Platform {
     fn routes(&self, _dev: &Opened, _add: &RouteSet, _remove: &RouteSet) -> Result<bool, String> {
         Err(NOT_YET.to_string())
     }
+    fn subnets(&self, exclude: &[String]) -> Result<Vec<(IpNet, String)>, String> {
+        // the one action of this backend that reads the machine: a list of
+        // interfaces and addresses (M4c is where the rest does something)
+        rurge_platform::socket::egress::subnets(exclude).map_err(|e| e.to_string())
+    }
     fn dns_undo(&self, _dev: &Opened, _saved: &[Undo]) -> Result<Vec<Undo>, String> {
         Err(NOT_YET.to_string())
     }
@@ -153,6 +165,9 @@ impl Backend for Off {
     }
     fn routes(&self, _dev: &Opened, _add: &RouteSet, _remove: &RouteSet) -> Result<bool, String> {
         Err(OFF.to_string())
+    }
+    fn subnets(&self, _exclude: &[String]) -> Result<Vec<(IpNet, String)>, String> {
+        Ok(Vec::new())
     }
     fn dns_undo(&self, _dev: &Opened, _saved: &[Undo]) -> Result<Vec<Undo>, String> {
         Err(OFF.to_string())
@@ -242,6 +257,10 @@ mod tests {
         };
         assert_eq!(error, OFF);
         assert!(OFF.contains("RURGE_ENHANCED_BACKEND=off"), "{OFF}");
+        assert!(
+            Off.subnets(&[]).unwrap().is_empty(),
+            "no subnets without any system read"
+        );
     }
 
     /// A value the variable does not know never becomes the platform's: it is

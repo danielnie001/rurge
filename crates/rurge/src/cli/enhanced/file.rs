@@ -11,6 +11,7 @@
 
 use super::backend::{Backend, Opened};
 use super::undo::Undo;
+use ipnet::IpNet;
 use rurge_net::BoxFuture;
 use rurge_platform::route::{MTU, RouteSet};
 use rurge_tun::device::Device;
@@ -166,6 +167,27 @@ impl Backend for FileBackend {
         self.record(&mut map, format!("routes +{} -{}", add.len(), remove.len()));
         self.write(&map)?;
         Ok(true)
+    }
+
+    /// The subnets the file lists under `subnets`, as `[["192.168.1.0/24",
+    /// "eth0"], …]`; none when it lists none. `fail: "subnets"` refuses the
+    /// read as any other action is refused. It is a read, so it is not recorded
+    /// among `actions`.
+    fn subnets(&self, _exclude: &[String]) -> Result<Vec<(IpNet, String)>, String> {
+        let map = self.step("subnets")?;
+        Ok(map
+            .get("subnets")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|entry| {
+                        let net = entry.get(0)?.as_str()?.parse::<IpNet>().ok()?;
+                        let interface = entry.get(1)?.as_str()?.to_string();
+                        Some((net, interface))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     fn dns_undo(&self, _dev: &Opened, saved: &[Undo]) -> Result<Vec<Undo>, String> {
@@ -432,6 +454,42 @@ mod tests {
         assert_eq!(written["dns"], false);
         assert_eq!(written["adjusted"], true);
         assert_eq!(written["actions"], json!(["undo take_dns"]));
+    }
+
+    /// The subnets are a read: what the file lists is what comes back, in its
+    /// order, and nothing is recorded among `actions`. `fail: "subnets"`
+    /// refuses the read as any other action is refused.
+    #[test]
+    fn the_subnets_come_from_the_file_and_are_not_an_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enhanced.json");
+        std::fs::write(
+            &path,
+            json!({"subnets": [["192.168.1.0/24", "eth0"], ["10.0.0.0/8", "eth1"]]}).to_string(),
+        )
+        .unwrap();
+        let backend = FileBackend::new(path.clone());
+        assert_eq!(
+            backend.subnets(&["rurge-test".to_string()]).unwrap(),
+            vec![
+                (
+                    "192.168.1.0/24".parse::<IpNet>().unwrap(),
+                    "eth0".to_string()
+                ),
+                ("10.0.0.0/8".parse::<IpNet>().unwrap(), "eth1".to_string()),
+            ]
+        );
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["actions"], Value::Null, "a read is not an action");
+
+        // nothing listed: nothing found
+        std::fs::write(&path, json!({}).to_string()).unwrap();
+        assert!(backend.subnets(&[]).unwrap().is_empty());
+
+        // and a read the file refuses, as it refuses any action
+        std::fs::write(&path, json!({"fail": "subnets"}).to_string()).unwrap();
+        assert_eq!(backend.subnets(&[]).unwrap_err(), "subnets failed (test)");
     }
 
     /// A file that is not there, or is not JSON, is a system nothing has been

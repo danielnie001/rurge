@@ -3,10 +3,7 @@
 use super::enhanced::{EnhancedMode, wanted::Wanted};
 use super::network;
 use super::rule::{parse_mode, print_diagnostics};
-use super::runtime::{
-    PlatformOwners, PlatformProcesses, PlatformSockets, PlatformSystemDns, RuntimeArgs,
-    owners_backend,
-};
+use super::runtime::{PlatformOwners, PlatformProcesses, RuntimeArgs, owners_backend};
 use super::switch;
 use super::sysproxy::{SystemProxyManager, describe, proxy_settings};
 use crate::capabilities;
@@ -1624,10 +1621,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let outbound_mode = initial_mode(explicit_mode, &store, &state).await;
         // `cfg` is moved into `build_engine_runtime` next, so read its source
         // path now.
-        // What is downloaded is dialled the way an engine dials: through the
-        // platform's sockets and, in the enhanced mode, through rurge's own
-        // resolver (M4 design 7.2, 7.6). The hook and the platform DNS are
-        // made here for now; task 6 gives them the runtime's shared ones.
         let mut shared = EngineShared::new(state.selections_for(&profile_key(&cfg.source.main)));
         if args.empty_group_reject {
             shared.empty_group = EmptyGroup::Reject;
@@ -1641,15 +1634,20 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         // that is all they need to know of it. Every reload, and the API's
         // check of the profile, read the profile as they do, which also says
         // why a download failed.
+        // What is downloaded is dialled the way an engine dials: through the
+        // platform's sockets and, in the enhanced mode, through rurge's own
+        // resolver (M4 design 7.2, 7.6) — the runtime's shared ones, so that
+        // every generation and every download see the same egress table and
+        // the same flag.
         let sources = ProfileSources::production(
             &args.config,
             &opts,
             &rt.data_dir,
             rt.no_network,
             resource_client_with(
-                Arc::new(PlatformSockets),
+                rt.sockets.clone(),
                 Arc::new(OwnResolve::new(
-                    Arc::new(PlatformSystemDns),
+                    rt.system_dns.clone(),
                     shared.resolver.clone(),
                     Arc::new(SystemResolve),
                 )),
@@ -1658,7 +1656,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         opts.remote = Some(sources.remote());
         sources.track(&cfg.source);
         // The interfaces the network is read without: the virtual adapter
-        // while the enhanced mode is on. The manager sets it (M4b task 6).
+        // while the enhanced mode is on. The manager sets it, and this is the
+        // same list the network task reads.
         let exclude = network::Exclude::default();
         // The network before the first generation, which is built on it: its
         // `subnet` groups and `SUBNET` rules look at it from the first
@@ -1716,12 +1715,22 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(4);
         // The enhanced mode's manager has to be here before the API: the API
         // reads its state. It is not opened until the listeners and the API
-        // are up (P25, below).
+        // are up (P25, below). What it tells the rest of the run goes through
+        // the runtime's own slot and flag, and the list the network task reads
+        // (M4 design 3.7, 6.3, 7.1).
         let mut enhanced = super::enhanced::EnhancedMode::new(
             enhanced_backend,
             store.clone(),
             super::enhanced::starter(engine.clone()),
-            super::enhanced::egress_slot(),
+            super::enhanced::Links {
+                egress: rt.egress.clone(),
+                enhanced: rt.system_dns.enhanced(),
+                exclude: exclude.clone(),
+                system_dns_changed: {
+                    let engine = engine.clone();
+                    Arc::new(move || engine.system_dns_changed())
+                },
+            },
             {
                 let tx = cmd_tx.clone();
                 Arc::new(move |sequence| {

@@ -6,6 +6,8 @@
 
 use super::the_network::{OFFICE, World, wait_for_log, wifi};
 use super::*;
+use rurge_dns::message::Qtype;
+use rurge_dns::testing::MockDns;
 use rurge_platform::route::{RouteInputs, RouteSet};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -1008,4 +1010,98 @@ fn a_close_that_fails_is_still_what_the_user_asked_for() {
         "the pause does not open what the user closed"
     );
     drop(daemon);
+}
+
+/// The daemon's own DNS and downloads keep working while the enhanced mode is
+/// on: a session's name is answered by the upstream the profile gives, and a
+/// rule set the daemon has never fetched is downloaded — both on the loopback,
+/// where the egress decision leaves the socket unbound (rule 2 of M4 design
+/// 7.1). The network file's primary interface is `wlan0`, which this machine
+/// does not have: a decision that bound it would fail both.
+#[test]
+fn the_daemon_s_own_dns_and_downloads_keep_working_while_the_enhanced_mode_is_on() {
+    // The daemon blocks the test's thread, so the two loopback servers get
+    // threads of their own and keep answering meanwhile.
+    let servers = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let target = servers.block_on(TestServer::spawn());
+    target.set("/hello", "hi from the target");
+    target.set("/rules.list", "DOMAIN,never.test\n");
+    let dns = servers.block_on(MockDns::spawn());
+    dns.set("hello.test", &["127.0.0.1"], &[], 60);
+    let port = target.url("/").port().unwrap();
+    let rules = target.url("/rules.list");
+
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("t.conf");
+    // `hello.test` is in no rule: it is the address the answer gives that the
+    // `IP-CIDR` rule sends direct. That rule is the second line of defence —
+    // a name that did not resolve to the loopback is rejected rather than
+    // dialled — so the name is not pinned in `[Host]`, which would skip the
+    // DNS question this test is about.
+    let profile = |rule_set: Option<&str>| {
+        std::fs::write(
+            &conf,
+            format!(
+                "[General]\n{LISTENERS_AND_API}\ndns-server = {}\nipv6 = false\n[Rule]\n{}IP-CIDR,127.0.0.0/8,DIRECT\nFINAL,REJECT\n",
+                dns.addr(),
+                rule_set
+                    .map(|url| format!("RULE-SET,{url},DIRECT\n"))
+                    .unwrap_or_default(),
+            ),
+        )
+        .unwrap();
+    };
+    profile(None);
+    let data = prepared_data(dir.path());
+    let file = enhanced_file(&data);
+    let network = dir.path().join("network.json");
+    std::fs::write(&network, wifi("Home").to_string()).unwrap();
+    let geo = servers.block_on(TestServer::spawn());
+
+    let mut cmd = rurge_run_online(&conf, &data, &geo);
+    cmd.args(["--enhanced-mode"])
+        .env("RURGE_ENHANCED_BACKEND", format!("file:{}", file.display()))
+        .env(
+            "RURGE_NETWORK_BACKEND",
+            format!("file:{}", network.display()),
+        );
+    let mut daemon = spawn_command(cmd);
+    let api = api_port(&daemon);
+    wait_until("the enhanced mode to open", || enhanced_on(api));
+    assert_eq!(actions(&file)[0], "open");
+
+    // a source the daemon has never fetched: it is downloaded now, while the
+    // egress table is in its slot
+    profile(Some(rules.as_str()));
+    let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+    assert_eq!(status, 200, "{body}");
+    wait_until("the rule set to be downloaded", || {
+        target.hits("/rules.list") >= 1
+    });
+    assert!(
+        enhanced_on(api),
+        "the enhanced mode is on while the download happens"
+    );
+
+    // the session: the name is answered by the daemon's DNS, and the address
+    // it gives is dialled direct
+    let http = daemon.http;
+    let answer = http_get(http, &format!("http://hello.test:{port}/hello"));
+    assert!(
+        answer.starts_with("HTTP/1.1 200") && answer.ends_with("hi from the target"),
+        "{answer}"
+    );
+    assert!(
+        dns.query_count("hello.test", Qtype::A) >= 1,
+        "the daemon's own DNS answered the session"
+    );
+    assert_eq!(target.hits("/hello"), 1, "the session reached the target");
+
+    assert_eq!(api_call(api, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+    assert_eq!(wait_for_exit(&mut daemon, 20), Some(0));
+    drop(servers);
 }

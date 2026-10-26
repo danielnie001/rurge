@@ -3,6 +3,7 @@
 //! objects (resource manager, set registry, GeoIP, resolver) the offline
 //! commands need.
 
+use super::enhanced::EgressSlot;
 use super::switch;
 use anyhow::Context;
 use clap::Args;
@@ -17,7 +18,8 @@ use std::ffi::OsStr;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use url::Url;
 
@@ -70,6 +72,16 @@ pub struct Runtime {
     pub geo_urls: GeoUrls,
     pub no_network: bool,
     pub dns_cache_size: usize,
+    /// Where rurge's own sockets go while the enhanced mode is on: the same
+    /// slot every generation's hook reads, and the one the manager writes.
+    pub egress: EgressSlot,
+    /// `rurge-platform::socket` behind `SocketHook`, shared by every
+    /// generation: each one sees the same egress table (M4 design 7.1).
+    pub sockets: Arc<PlatformSockets>,
+    /// `rurge-platform::dns` behind `SystemDns`, shared by every generation
+    /// and by what this run downloads: all of them see the same flag (M4
+    /// design 6.3).
+    pub system_dns: Arc<PlatformSystemDns>,
 }
 
 impl RuntimeArgs {
@@ -99,11 +111,15 @@ impl RuntimeArgs {
         if let Some(u) = &self.geoip_asn_url {
             geo_urls.asn = u.clone();
         }
+        let egress = super::enhanced::egress_slot();
         Ok(Runtime {
             data_dir,
             geo_urls,
             no_network: self.no_network,
             dns_cache_size: self.dns_cache_size.unwrap_or(DEFAULT_CAPACITY).max(1),
+            sockets: Arc::new(PlatformSockets::new(egress.clone())),
+            system_dns: Arc::new(PlatformSystemDns::new()),
+            egress,
         })
     }
 }
@@ -119,13 +135,13 @@ impl Runtime {
             no_network: self.no_network,
             geo_urls: self.geo_urls.clone(),
             dns_cache_size: self.dns_cache_size,
-            system: Arc::new(PlatformSystemDns),
+            system: self.system_dns.clone(),
             wait,
             // `Runtime::build` fills this in when the profile asks DNS to
             // follow the outbound mode; `check` / `rule match` / `dns lookup`
             // build the stack without an engine, so they stay direct.
             dns_connector: None,
-            socket_hook: Arc::new(PlatformSockets),
+            socket_hook: self.sockets.clone(),
             resource_resolve: None,
             // `Runtime::build` works out the network's own; the commands that
             // build a stack without an engine set nothing unless they work
@@ -180,11 +196,50 @@ fn stack_options_on(
 /// `rurge-platform::dns` behind the `SystemDns` trait, for the configuration
 /// (AR-02: platform code stays in rurge-platform; rurge-dns only sees the
 /// trait). The library call is tokio's `lookup_host`, not platform code.
-pub struct PlatformSystemDns;
+///
+/// The manager tells it whether the enhanced mode is on: while it is, the
+/// system's DNS may be the responder's, and what the system's own servers
+/// were is not what a query should ask (M4 design 6.3).
+#[derive(Debug, Default)]
+pub struct PlatformSystemDns {
+    /// Up while the enhanced mode's egress table is written (the manager says).
+    enhanced: Arc<AtomicBool>,
+    /// The servers the system had before the takeover, once something has
+    /// written them: M4c's macOS backup of each service's servers and of what
+    /// DHCP gave. Nothing writes it in this version; Linux's resolved upstream
+    /// list goes here as well, and Windows needs none (M4 design 6.3).
+    physical: Arc<RwLock<Option<Vec<SocketAddr>>>>,
+}
+
+impl PlatformSystemDns {
+    /// Nothing taken over: the machine's own configuration is the answer.
+    pub fn new() -> PlatformSystemDns {
+        PlatformSystemDns::default()
+    }
+
+    /// The flag the manager sets while the enhanced mode's egress table is in
+    /// its slot, and clears when it takes the table away.
+    pub fn enhanced(&self) -> Arc<AtomicBool> {
+        self.enhanced.clone()
+    }
+}
 
 impl SystemDns for PlatformSystemDns {
     fn servers(&self) -> Vec<SocketAddr> {
+        if self.enhanced.load(Ordering::SeqCst)
+            && let Some(physical) = self
+                .physical
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        {
+            return physical;
+        }
         rurge_platform::dns::servers()
+    }
+
+    fn enhanced_mode(&self) -> bool {
+        self.enhanced.load(Ordering::SeqCst)
     }
 
     fn search_domains(&self) -> Vec<String> {
@@ -223,9 +278,20 @@ fn usable(addrs: impl Iterator<Item = SocketAddr>) -> Vec<IpAddr> {
     found
 }
 
-/// `rurge-platform::socket` behind the `SocketHook` trait (AR-02: platform
-/// code stays in rurge-platform; rurge-net only sees the trait).
-pub struct PlatformSockets;
+/// `rurge-platform::socket` behind the `SocketHook` trait, and where rurge's
+/// own sockets go while the enhanced mode is on (AR-02: platform code stays in
+/// rurge-platform; rurge-net only sees the trait). The manager writes the
+/// egress table; every generation's hook reads the same slot.
+#[derive(Debug)]
+pub struct PlatformSockets {
+    egress: EgressSlot,
+}
+
+impl PlatformSockets {
+    pub fn new(egress: EgressSlot) -> PlatformSockets {
+        PlatformSockets { egress }
+    }
+}
 
 fn platform_family(family: rurge_net::socket::Family) -> rurge_platform::socket::Family {
     match family {
@@ -251,6 +317,22 @@ impl rurge_net::socket::SocketHook for PlatformSockets {
         tos: u8,
     ) -> std::io::Result<()> {
         rurge_platform::socket::set_tos(socket, platform_family(family), tos)
+    }
+
+    /// The manager's table, read once for this connection. The table is only
+    /// in the slot while the enhanced mode is on; no line is logged here, since
+    /// `rurge-net`'s `bind_egress` says the destination and the interface at
+    /// DEBUG already.
+    fn egress(&self, dst: IpAddr) -> io::Result<Option<String>> {
+        let table = self.egress.read().unwrap_or_else(|e| e.into_inner());
+        match rurge_platform::socket::egress::decide(table.as_deref(), dst) {
+            Ok(Some(name)) => Ok(Some(name.to_string())),
+            Ok(None) => Ok(None),
+            Err(rurge_platform::socket::egress::NoRoute) => Err(io::Error::new(
+                io::ErrorKind::NetworkUnreachable,
+                format!("no network outside the enhanced mode to reach {dst}"),
+            )),
+        }
     }
 }
 
@@ -419,7 +501,7 @@ mod tests {
     async fn the_platform_library_answers_localhost_with_loopback_addresses() {
         let found = tokio::time::timeout(
             Duration::from_secs(30),
-            PlatformSystemDns.library_lookup("localhost"),
+            PlatformSystemDns::new().library_lookup("localhost"),
         )
         .await
         .expect("the system resolver library did not answer for localhost within 30 seconds")
@@ -463,17 +545,116 @@ mod tests {
     }
 
     /// Socket-level only: nothing about this machine's network is changed.
+    /// The hook takes the egress slot, which no manager has written here, so
+    /// every decision is the system's own.
     #[test]
     fn platform_sockets_delegates_to_rurge_platform() {
         let socket =
             socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
-        let hook = PlatformSockets;
+        let hook = PlatformSockets::new(super::super::enhanced::egress_slot());
         assert!(
             hook.bind_interface(&socket, "rurge-no-such-if0", Family::V4)
                 .is_err()
         );
         hook.set_tos(&socket, Family::V4, 0x28).unwrap();
         assert_eq!(socket.tos_v4().unwrap(), 0x28);
+        assert_eq!(
+            hook.egress("192.0.2.5".parse().unwrap()).unwrap(),
+            None,
+            "no manager has written a table"
+        );
+    }
+
+    /// The socket hook's egress is the manager's table: no table while the
+    /// enhanced mode is off, the interface the table names inside its routes,
+    /// and an error outside them when the table names no primary interface.
+    #[test]
+    fn platform_sockets_egress_follows_the_table() {
+        use rurge_platform::route::RouteSet;
+        use rurge_platform::socket::egress::EgressTable;
+
+        let egress = super::super::enhanced::egress_slot();
+        let hook = PlatformSockets::new(egress.clone());
+        let inside: IpAddr = "10.1.2.3".parse().unwrap();
+        let outside: IpAddr = "192.0.2.5".parse().unwrap();
+        assert_eq!(
+            hook.egress(inside).unwrap(),
+            None,
+            "the enhanced mode is off"
+        );
+        let routes = RouteSet {
+            v4: vec!["10.0.0.0/8".parse().unwrap()],
+            v6: Vec::new(),
+        };
+
+        *egress.write().unwrap() = Some(Arc::new(EgressTable {
+            routes: routes.clone(),
+            primary: Some("eth0".to_string()),
+            subnets: Vec::new(),
+        }));
+        assert_eq!(hook.egress(inside).unwrap().as_deref(), Some("eth0"));
+        assert_eq!(hook.egress(outside).unwrap(), None, "outside the routes");
+
+        // a table without a primary interface reaches nothing in its routes
+        *egress.write().unwrap() = Some(Arc::new(EgressTable {
+            routes,
+            primary: None,
+            subnets: Vec::new(),
+        }));
+        let error = hook.egress(inside).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NetworkUnreachable);
+        assert_eq!(
+            error.to_string(),
+            "no network outside the enhanced mode to reach 10.1.2.3"
+        );
+
+        // and the empty slot again, as a close leaves it
+        *egress.write().unwrap() = None;
+        assert_eq!(hook.egress(inside).unwrap(), None);
+    }
+
+    /// The system DNS adapter is in the enhanced mode while the manager's flag
+    /// is up, and the servers it gives are the backup's then and the machine's
+    /// own otherwise. Nothing here sends a packet: `servers()` reads this
+    /// machine's configuration, and what it holds is not asserted (it differs
+    /// from machine to machine).
+    #[test]
+    fn platform_system_dns_is_in_the_enhanced_mode_while_the_flag_is_up() {
+        use std::sync::atomic::Ordering;
+
+        let dns = PlatformSystemDns::new();
+        let machine = || rurge_platform::dns::servers();
+        assert!(
+            !dns.enhanced_mode(),
+            "the enhanced mode is off at the start"
+        );
+        assert_eq!(
+            dns.servers(),
+            machine(),
+            "the machine's own while it is off"
+        );
+
+        // what M4c's macOS backup will hold: the servers that were there
+        let backup = vec!["192.0.2.53:53".parse::<SocketAddr>().unwrap()];
+        *dns.physical.write().unwrap() = Some(backup.clone());
+        assert_eq!(
+            dns.servers(),
+            machine(),
+            "the backup is not the answer while the mode is off"
+        );
+        dns.enhanced().store(true, Ordering::SeqCst);
+        assert!(dns.enhanced_mode());
+        assert_eq!(dns.servers(), backup, "the backup's while it is on");
+
+        // the flag the manager holds is the one this adapter reads
+        dns.enhanced().store(false, Ordering::SeqCst);
+        assert!(!dns.enhanced_mode());
+        assert_eq!(dns.servers(), machine());
+
+        // with no backup, the machine's own even while the mode is on
+        *dns.physical.write().unwrap() = None;
+        dns.enhanced().store(true, Ordering::SeqCst);
+        assert_eq!(dns.servers(), machine());
     }
 
     /// The adapter prepares the command, takes in the child it started and
