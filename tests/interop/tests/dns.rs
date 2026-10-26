@@ -111,7 +111,8 @@ fn resolver(dir: &Path, url: &str, connector: Arc<dyn Connector>) -> Arc<Resolve
     let (resolver, diagnostics) = Resolver::new(
         ResolverConfig::from_config(&cfg),
         ResolverDeps {
-            connectors: DnsConnectors::all(connector),
+            connectors: DnsConnectors::all(connector.clone()),
+            direct: connector,
             sets,
             system: Arc::new(system),
             resources,

@@ -19,12 +19,11 @@ pub enum HostAction {
     Ips(Vec<IpAddr>),
     Alias(String),
     Servers(Vec<UpstreamSpec>),
-    /// `server:system` / `server:syslib` / `server:force-syslib`. Until the
-    /// virtual interface of phase 3 there is only the normal mode, and in it
-    /// the resolver treats every mode identically: all three go to the system
-    /// resolver library. In the enhanced mode `system` and `syslib` will mean
-    /// the DNS servers the operating system is configured with and only
-    /// `force-syslib` the library; the mode is kept for that.
+    /// `server:system` / `server:syslib` / `server:force-syslib`. In the
+    /// normal mode all three are the system resolver library. In the enhanced
+    /// mode `system` and `syslib` mean the DNS servers the operating system is
+    /// configured with (the physical network's) and only `force-syslib` the
+    /// library; the mode is kept for that.
     System(SystemMode),
 }
 

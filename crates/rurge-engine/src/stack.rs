@@ -148,12 +148,13 @@ pub async fn build_stack_with(
     customize(&mut resolver_cfg);
     let resolver_connectors = match &opts.dns_connector {
         Some(connectors) => connectors.clone(),
-        None => DnsConnectors::all(connector),
+        None => DnsConnectors::all(connector.clone()),
     };
     let (resolver, dns_diags) = Resolver::new(
         resolver_cfg,
         ResolverDeps {
             connectors: resolver_connectors,
+            direct: connector,
             sets: registry.clone(),
             system: opts.system.clone(),
             resources: resources.clone(),

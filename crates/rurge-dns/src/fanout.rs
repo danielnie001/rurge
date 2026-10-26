@@ -444,7 +444,7 @@ fn is_reply_to(reply: &[u8], id: u16, asked: &(String, u16, u16)) -> bool {
 mod tests {
     use super::*;
     use crate::message::{Rcode, wire_id, wire_rcode};
-    use crate::testing::{MockDns, query_wire, txt_answers};
+    use crate::testing::{MockDns, direct, query_wire, txt_answers};
     use crate::upstream::Upstream;
     use crate::upstream::udp::UdpUpstream;
     use rurge_net::BoxFuture;
@@ -468,7 +468,7 @@ mod tests {
     /// paused clock, where no answer is late for a timer of the fanout's and
     /// a time it takes is exactly the time it waits.
     fn up(server: &MockDns) -> UpstreamRef {
-        Arc::new(UdpUpstream::new(server.addr()))
+        Arc::new(UdpUpstream::new(server.addr(), direct()))
     }
 
     #[tokio::test(start_paused = true)]

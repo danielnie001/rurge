@@ -1,17 +1,19 @@
-//! DNS over UDP (design §7.2): one connected socket per upstream, a receive
-//! loop that routes answers to waiters by message ID (so several queries can
-//! be in flight at once, each under an ID of its own: a query that comes with
-//! an ID another one in flight has is sent under another), and one retry over
-//! TCP when the answer is truncated. An upstream `via` a connector sends its
-//! questions, and the retry, through it (`dns-follow-interface`, phase 2 M5
-//! design 8.5).
+//! DNS over UDP (design §7.2): one datagram flow per upstream, opened through
+//! a connector — a direct one with the platform's socket hook for a plain
+//! server, so its questions leave on the network outside the virtual interface
+//! (M4 design 7.2); the policy interface's for an upstream `via` it
+//! (`dns-follow-interface`, phase 2 M5 design 8.5). A receive loop routes
+//! answers to waiters by message ID (so several queries can be in flight at
+//! once, each under an ID of its own: a query that comes with an ID another
+//! one in flight has is sent under another), and one retry over TCP when the
+//! answer is truncated, on a connection of the same connector.
 
 use super::tcp::exchange_framed;
 use super::{Upstream, UpstreamError};
 use crate::message::{random_id, set_wire_id, wire_id, wire_truncated};
 use rurge_config::HostName;
 use rurge_net::BoxFuture;
-use rurge_net::connector::{BoxedDatagram, BoxedStream, ConnectOpts, Connector, Target};
+use rurge_net::connector::{BoxedDatagram, ConnectOpts, Connector, Target};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::poll_fn;
@@ -19,7 +21,6 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::ReadBuf;
-use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{OnceCell, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -33,33 +34,6 @@ pub const UDP_BUFFER: usize = 4096;
 /// `WSAECONNRESET`, which is a normal one-off and must not hold up an answer
 /// already sitting in the socket buffer.
 const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(50);
-
-/// What the questions go out on: a socket of its own, or a datagram from
-/// the connector the upstream goes `via`.
-enum Socket {
-    Own(UdpSocket),
-    Via(BoxedDatagram),
-}
-
-impl Socket {
-    async fn send(&self, wire: &[u8]) -> std::io::Result<()> {
-        match self {
-            Socket::Own(socket) => socket.send(wire).await.map(|_| ()),
-            Socket::Via(datagram) => poll_fn(|cx| datagram.poll_send(cx, wire)).await.map(|_| ()),
-        }
-    }
-
-    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Socket::Own(socket) => socket.recv(buf).await,
-            Socket::Via(datagram) => {
-                let mut read = ReadBuf::new(buf);
-                poll_fn(|cx| datagram.poll_recv(cx, &mut read)).await?;
-                Ok(read.filled().len())
-            }
-        }
-    }
-}
 
 /// The queries in flight, by the ID they were sent under. An ID is taken from
 /// before the question is sent until its query is over, whichever way it ends
@@ -126,15 +100,31 @@ impl Drop for Claim<'_> {
 }
 
 struct Shared {
-    socket: Socket,
+    datagram: BoxedDatagram,
+    /// Held while a datagram is sent: the socket's write readiness keeps one
+    /// waiter, so a send parked there would never be woken once another query
+    /// sends. The questions of one upstream do go out one at a time.
+    sending: tokio::sync::Mutex<()>,
     pending: Pending,
+}
+
+async fn send(datagram: &BoxedDatagram, wire: &[u8]) -> std::io::Result<()> {
+    poll_fn(|cx| datagram.poll_send(cx, wire)).await.map(|_| ())
+}
+
+async fn recv(datagram: &BoxedDatagram, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut read = ReadBuf::new(buf);
+    poll_fn(|cx| datagram.poll_recv(cx, &mut read)).await?;
+    Ok(read.filled().len())
 }
 
 pub struct UdpUpstream {
     name: String,
     addr: SocketAddr,
-    /// What the questions go through, instead of a socket of its own.
-    via: Option<Arc<dyn Connector>>,
+    /// What the questions and their retry go through: a direct connector with
+    /// the platform's socket hook for a plain server, the interface's for an
+    /// upstream `via` it.
+    connector: Arc<dyn Connector>,
     state: OnceCell<(Arc<Shared>, JoinHandle<()>)>,
 }
 
@@ -143,11 +133,14 @@ fn io_err(e: std::io::Error) -> UpstreamError {
 }
 
 impl UdpUpstream {
-    pub fn new(addr: SocketAddr) -> UdpUpstream {
+    /// The server at `addr`, asked directly through `connector`: a direct
+    /// connector with the platform's socket hook (M4 design 7.2), never the
+    /// pipeline's. Its name is `udp://<addr>`.
+    pub fn new(addr: SocketAddr, connector: Arc<dyn Connector>) -> UdpUpstream {
         UdpUpstream {
             name: format!("udp://{addr}"),
             addr,
-            via: None,
+            connector,
             state: OnceCell::new(),
         }
     }
@@ -159,7 +152,7 @@ impl UdpUpstream {
         UdpUpstream {
             name: format!("udp://{addr} via {key}"),
             addr,
-            via: Some(connector),
+            connector,
             state: OnceCell::new(),
         }
     }
@@ -172,26 +165,14 @@ impl UdpUpstream {
         let (shared, _) = self
             .state
             .get_or_try_init(|| async {
-                let bind: SocketAddr = if self.addr.is_ipv4() {
-                    "0.0.0.0:0".parse().expect("valid")
-                } else {
-                    "[::]:0".parse().expect("valid")
-                };
-                let socket = match &self.via {
-                    None => {
-                        let socket = UdpSocket::bind(bind).await.map_err(io_err)?;
-                        socket.connect(self.addr).await.map_err(io_err)?;
-                        Socket::Own(socket)
-                    }
-                    Some(connector) => Socket::Via(
-                        connector
-                            .connect_udp(&self.target(), &ConnectOpts::default())
-                            .await
-                            .map_err(io_err)?,
-                    ),
-                };
+                let datagram = self
+                    .connector
+                    .connect_udp(&self.target(), &ConnectOpts::default())
+                    .await
+                    .map_err(io_err)?;
                 let shared = Arc::new(Shared {
-                    socket,
+                    datagram,
+                    sending: tokio::sync::Mutex::new(()),
                     pending: Pending::default(),
                 });
                 let receiver = Arc::clone(&shared);
@@ -200,7 +181,7 @@ impl UdpUpstream {
                     let mut buf = vec![0u8; UDP_BUFFER];
                     let mut consecutive_errors = 0u32;
                     loop {
-                        let n = match receiver.socket.recv(&mut buf).await {
+                        let n = match recv(&receiver.datagram, &mut buf).await {
                             Ok(n) => {
                                 consecutive_errors = 0;
                                 n
@@ -272,7 +253,10 @@ impl Upstream for UdpUpstream {
                 set_wire_id(&mut copy, id);
                 Cow::Owned(copy)
             };
-            shared.socket.send(&sent).await.map_err(io_err)?;
+            {
+                let _sending = shared.sending.lock().await;
+                send(&shared.datagram, &sent).await.map_err(io_err)?;
+            }
             let mut resp = match tokio::time::timeout_at(deadline, rx).await {
                 Ok(Ok(bytes)) => bytes,
                 Ok(Err(_)) => {
@@ -290,17 +274,10 @@ impl Upstream for UdpUpstream {
             }
             // Truncated: repeat the same query once over TCP to the same server.
             let connecting = async {
-                match &self.via {
-                    None => TcpStream::connect(self.addr)
-                        .await
-                        .map(|s| Box::new(s) as BoxedStream),
-                    Some(connector) => {
-                        let timeout = deadline.saturating_duration_since(Instant::now());
-                        connector
-                            .connect(&self.target(), &ConnectOpts { timeout })
-                            .await
-                    }
-                }
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                self.connector
+                    .connect(&self.target(), &ConnectOpts { timeout })
+                    .await
             };
             let mut tcp = match tokio::time::timeout_at(deadline, connecting).await {
                 Ok(Ok(s)) => s,
@@ -317,9 +294,58 @@ impl Upstream for UdpUpstream {
 mod tests {
     use super::*;
     use crate::message::parse_response;
-    use crate::testing::{MockDns, query_wire};
+    use crate::testing::{MockDns, direct, query_wire};
+    use rurge_net::connector::{
+        BoxedDatagram, BoxedStream, ConnectOpts, Connector, DirectConnector, SystemResolve, Target,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, UdpSocket};
+
+    /// A direct connector that records what it was asked to connect to: the
+    /// datagram of a question, the stream of a retry over TCP.
+    struct Seen {
+        inner: DirectConnector,
+        udp: Mutex<Vec<Target>>,
+        tcp: Mutex<Vec<Target>>,
+    }
+
+    impl Seen {
+        fn new() -> Seen {
+            Seen {
+                inner: DirectConnector::new(Arc::new(SystemResolve)),
+                udp: Mutex::new(Vec::new()),
+                tcp: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn udp(&self) -> Vec<Target> {
+            self.udp.lock().expect("udp").clone()
+        }
+
+        fn tcp(&self) -> Vec<Target> {
+            self.tcp.lock().expect("tcp").clone()
+        }
+    }
+
+    impl Connector for Seen {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, std::io::Result<BoxedStream>> {
+            self.tcp.lock().expect("tcp").push(target.clone());
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, std::io::Result<BoxedDatagram>> {
+            self.udp.lock().expect("udp").push(target.clone());
+            self.inner.connect_udp(target, opts)
+        }
+    }
 
     /// A 12-byte header with the given id and flags, followed by `payload`.
     fn msg(id: u16, flags: u8, payload: &[u8]) -> Vec<u8> {
@@ -372,7 +398,7 @@ mod tests {
             Some((delay, req.to_vec()))
         })
         .await;
-        let up = Arc::new(UdpUpstream::new(addr));
+        let up = Arc::new(UdpUpstream::new(addr, direct()));
         assert_eq!(up.name(), format!("udp://{addr}"));
         let a = {
             let up = Arc::clone(&up);
@@ -395,7 +421,7 @@ mod tests {
             Some((Duration::ZERO, wrong))
         })
         .await;
-        let up = UdpUpstream::new(addr);
+        let up = UdpUpstream::new(addr, direct());
         let err = up.query(&msg(7, 0, b"x"), deadline(200)).await;
         assert_eq!(
             err,
@@ -407,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn drops_time_out() {
         let addr = raw_udp(|_| None).await;
-        let up = UdpUpstream::new(addr);
+        let up = UdpUpstream::new(addr, direct());
         assert_eq!(
             up.query(&msg(3, 0, b"x"), deadline(150)).await,
             Err(UpstreamError::Timeout)
@@ -447,14 +473,14 @@ mod tests {
                 let _ = socket.send_to(&reply, peer).await;
             }
         });
-        let up = UdpUpstream::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        let up = UdpUpstream::new(SocketAddr::from(([127, 0, 0, 1], port)), direct());
         let resp = up.query(&msg(9, 0, b"big"), deadline(2000)).await.unwrap();
         assert_eq!(resp, [msg(9, 0, b"big"), b"-full".to_vec()].concat());
     }
 
     #[tokio::test]
     async fn rejects_queries_without_a_header() {
-        let up = UdpUpstream::new("127.0.0.1:9".parse().unwrap());
+        let up = UdpUpstream::new("127.0.0.1:9".parse().unwrap(), direct());
         assert!(matches!(
             up.query(b"short", deadline(100)).await,
             Err(UpstreamError::BadResponse(_))
@@ -485,7 +511,7 @@ mod tests {
         mock.set("a.test", &["10.0.0.1"], &[], 60);
         mock.set("b.test", &["10.0.0.2"], &[], 60);
         mock.set_delay(Duration::from_millis(400));
-        let up = Arc::new(UdpUpstream::new(mock.addr()));
+        let up = Arc::new(UdpUpstream::new(mock.addr(), direct()));
         let ask = |name: &'static str| {
             let up = Arc::clone(&up);
             tokio::spawn(async move {
@@ -522,7 +548,7 @@ mod tests {
     async fn a_query_that_is_dropped_gives_its_id_back() {
         let mock = MockDns::spawn().await;
         mock.set_drop_all(true);
-        let up = Arc::new(UdpUpstream::new(mock.addr()));
+        let up = Arc::new(UdpUpstream::new(mock.addr(), direct()));
         let waiting = {
             let up = Arc::clone(&up);
             tokio::spawn(async move {
@@ -586,7 +612,10 @@ mod tests {
                 });
             }
         });
-        let up = Arc::new(UdpUpstream::new(SocketAddr::from(([127, 0, 0, 1], port))));
+        let up = Arc::new(UdpUpstream::new(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            direct(),
+        ));
         let ask = |payload: &'static [u8]| {
             let up = Arc::clone(&up);
             tokio::spawn(async move { up.query(&msg(9, 0, payload), deadline(10_000)).await })
@@ -601,6 +630,32 @@ mod tests {
         let mut retried = asked_over_tcp.lock().unwrap().clone();
         retried.sort();
         assert_eq!(retried, [msg(9, 0, b"one"), msg(9, 0, b"two")]);
+    }
+
+    /// A plain UDP upstream goes through its connector: the question on a
+    /// datagram it opens, and the question again over a stream when the
+    /// answer is truncated. It opens no socket of its own — in the enhanced
+    /// mode the connector is what binds the question to the network outside
+    /// the virtual interface (M4 design 7.2).
+    #[tokio::test]
+    async fn a_udp_upstream_asks_through_its_connector() {
+        let mock = MockDns::spawn().await;
+        mock.set("a.test", &["10.0.0.1"], &[], 60);
+        mock.set_truncate_udp(true);
+        let connector = Arc::new(Seen::new());
+        let up = UdpUpstream::new(mock.addr(), connector.clone());
+        assert_eq!(up.name(), format!("udp://{}", mock.addr()));
+        let resp = up
+            .query(&query_wire(1, "a.test", 1, None), deadline(10_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_response(&resp).unwrap().v4,
+            vec![("10.0.0.1".parse().unwrap(), 60)]
+        );
+        let server = Target::new(HostName::Ip(mock.addr().ip()), mock.addr().port());
+        assert_eq!(connector.udp(), vec![server.clone()], "asked on a datagram");
+        assert_eq!(connector.tcp(), vec![server], "and again over a stream");
     }
 
     fn waiter() -> oneshot::Sender<Vec<u8>> {

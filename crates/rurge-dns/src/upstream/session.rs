@@ -603,7 +603,7 @@ impl<P: Protocol> Drop for Dialing<'_, P> {
 mod tests {
     use super::*;
     use crate::fanout::{FanoutOpts, resolve_name};
-    use crate::testing::{Doh3Script, DoqScript, FakeDoh3, FakeDoq, MockDns};
+    use crate::testing::{Doh3Script, DoqScript, FakeDoh3, FakeDoq, MockDns, direct};
     use crate::upstream::doh3::Doh3Upstream;
     use crate::upstream::doq::DoqUpstream;
     use crate::upstream::udp::UdpUpstream;
@@ -1045,7 +1045,7 @@ mod tests {
             .into_iter()
             .zip(connections)
         {
-            let fast: UpstreamRef = Arc::new(UdpUpstream::new(fast_dns.addr()));
+            let fast: UpstreamRef = Arc::new(UdpUpstream::new(fast_dns.addr(), direct()));
             let both = [fast.clone(), slow.clone()];
             let opts = FanoutOpts::default();
             let lookup = || async {

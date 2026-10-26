@@ -7,6 +7,7 @@ use rurge_net::BoxFuture;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub trait SystemDns: Send + Sync {
@@ -24,6 +25,12 @@ pub trait SystemDns: Send + Sync {
     /// not quietly get the real library. Only the executable's implementation
     /// calls the real one; the kinds here never do.
     fn library_lookup<'a>(&'a self, name: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>>;
+    /// The enhanced mode is on: the system resolver library may answer with
+    /// fake addresses (the system's DNS points at rurge, or `hijack-dns` takes
+    /// its queries). The default is `false`.
+    fn enhanced_mode(&self) -> bool {
+        false
+    }
 }
 
 /// No system information at all (tests, sandboxes).
@@ -64,6 +71,9 @@ pub struct StaticSystemDns {
     /// did not. Shared by the clones of this value, so a test keeps a handle
     /// to it before it hands the value to a resolver.
     pub library_asked: Arc<Mutex<Vec<String>>>,
+    /// Whether the enhanced mode is on, as `enhanced_mode` reports it. Shared
+    /// by the clones of this value, like `library_asked`.
+    pub enhanced: Arc<AtomicBool>,
 }
 
 impl SystemDns for StaticSystemDns {
@@ -78,6 +88,9 @@ impl SystemDns for StaticSystemDns {
     }
     fn has_ipv6(&self) -> bool {
         self.has_ipv6
+    }
+    fn enhanced_mode(&self) -> bool {
+        self.enhanced.load(Ordering::Relaxed)
     }
     fn library_lookup<'a>(&'a self, name: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
         self.library_asked

@@ -18,6 +18,7 @@ use hickory_proto::op::{Message, MessageType, OpCode};
 use hickory_proto::rr::rdata::{A, AAAA, TXT};
 use hickory_proto::rr::{RData, Record};
 use rurge_net::BoxFuture;
+use rurge_net::connector::{Connector, DirectConnector, SystemResolve};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -93,6 +94,13 @@ pub(crate) fn txt_answers(reply: &[u8]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// A direct connector without a socket hook, as tests ask plain UDP servers
+/// through: the upstreams answer on loopback and their addresses are IP
+/// addresses, so no name reaches the system resolver library.
+pub fn direct() -> Arc<dyn Connector> {
+    Arc::new(DirectConnector::new(Arc::new(SystemResolve)))
 }
 
 /// A standard query (RD set) with `id`, for `name` — in the case it is

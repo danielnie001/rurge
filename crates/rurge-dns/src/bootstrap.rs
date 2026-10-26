@@ -230,7 +230,7 @@ impl Connector for BootstrapConnector {
 mod tests {
     use super::*;
     use crate::message::Qtype;
-    use crate::testing::MockDns;
+    use crate::testing::{MockDns, direct};
     use crate::upstream::udp::UdpUpstream;
     use rurge_net::connector::{DirectConnector, SystemResolve};
     use std::future::poll_fn;
@@ -261,7 +261,11 @@ mod tests {
     async fn resolves_through_traditional_upstreams_and_caches() {
         let s = MockDns::spawn().await;
         s.set("dns.example", &["127.0.0.1"], &[], 5);
-        let b = Bootstrap::new(vec![Arc::new(UdpUpstream::new(s.addr()))], false, once());
+        let b = Bootstrap::new(
+            vec![Arc::new(UdpUpstream::new(s.addr(), direct()))],
+            false,
+            once(),
+        );
         assert_eq!(
             b.resolve("dns.example").await.unwrap(),
             vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
@@ -313,7 +317,11 @@ mod tests {
         ));
         let s = MockDns::spawn().await;
         s.set_empty("dns.example");
-        let b = Bootstrap::new(vec![Arc::new(UdpUpstream::new(s.addr()))], false, fast());
+        let b = Bootstrap::new(
+            vec![Arc::new(UdpUpstream::new(s.addr(), direct()))],
+            false,
+            fast(),
+        );
         let err = b.resolve("dns.example").await.unwrap_err();
         assert!(
             matches!(err, UpstreamError::Bootstrap(ref m) if m.contains("empty")),
@@ -332,7 +340,11 @@ mod tests {
         s.set("stale.example", &["10.0.0.1"], &[], 5);
         // `once()`: the number of questions below is the number of lookups,
         // however late an answer comes.
-        let b = Bootstrap::new(vec![Arc::new(UdpUpstream::new(s.addr()))], false, once());
+        let b = Bootstrap::new(
+            vec![Arc::new(UdpUpstream::new(s.addr(), direct()))],
+            false,
+            once(),
+        );
         assert_eq!(b.resolve("stale.example").await.unwrap(), vec![old]);
         assert_eq!(s.query_count("stale.example", Qtype::A), 1);
 
@@ -391,13 +403,17 @@ mod tests {
         // `once()` the answers may take as long as they like.
         s1.set_delay(Duration::from_millis(250));
         s2.set_delay(Duration::from_millis(250));
-        let b = Bootstrap::new(vec![Arc::new(UdpUpstream::new(s1.addr()))], false, once());
+        let b = Bootstrap::new(
+            vec![Arc::new(UdpUpstream::new(s1.addr(), direct()))],
+            false,
+            once(),
+        );
         assert_eq!(
             b.resolve("switch.example").await.unwrap(),
             vec!["10.0.0.1".parse::<IpAddr>().unwrap()]
         );
 
-        b.set_upstreams(vec![Arc::new(UdpUpstream::new(s2.addr()))]);
+        b.set_upstreams(vec![Arc::new(UdpUpstream::new(s2.addr(), direct()))]);
         b.flush();
         assert_eq!(
             b.resolve("switch.example").await.unwrap(),
@@ -422,7 +438,11 @@ mod tests {
         });
         let dns = MockDns::spawn().await;
         dns.set("dot.example", &["127.0.0.1"], &[], 60);
-        let bootstrap = Bootstrap::new(vec![Arc::new(UdpUpstream::new(dns.addr()))], false, once());
+        let bootstrap = Bootstrap::new(
+            vec![Arc::new(UdpUpstream::new(dns.addr(), direct()))],
+            false,
+            once(),
+        );
         let connector = BootstrapConnector::new(
             Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
             bootstrap,
@@ -477,7 +497,11 @@ mod tests {
         let dns = MockDns::spawn().await;
         dns.set("multi.example", &["127.0.0.2", "127.0.0.1"], &[], 60);
         dns.set("badonly.example", &["127.0.0.2"], &[], 60);
-        let bootstrap = Bootstrap::new(vec![Arc::new(UdpUpstream::new(dns.addr()))], false, fast());
+        let bootstrap = Bootstrap::new(
+            vec![Arc::new(UdpUpstream::new(dns.addr(), direct()))],
+            false,
+            fast(),
+        );
         let connector = BootstrapConnector::new(
             Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
             bootstrap,
@@ -520,7 +544,11 @@ mod tests {
         });
         let dns = MockDns::spawn().await;
         dns.set("doq.example", &["127.0.0.1"], &[], 60);
-        let bootstrap = Bootstrap::new(vec![Arc::new(UdpUpstream::new(dns.addr()))], false, once());
+        let bootstrap = Bootstrap::new(
+            vec![Arc::new(UdpUpstream::new(dns.addr(), direct()))],
+            false,
+            once(),
+        );
         let connector = BootstrapConnector::new(
             Arc::new(DirectConnector::new(Arc::new(SystemResolve))),
             bootstrap,

@@ -705,7 +705,7 @@ mod tests {
             asked: Mutex::new(Vec::new()),
         });
         let bootstrap = Bootstrap::new(
-            vec![Arc::new(UdpUpstream::new(traditional.addr()))],
+            vec![Arc::new(UdpUpstream::new(traditional.addr(), direct()))],
             false,
             FanoutOpts::default(),
         );
@@ -785,7 +785,7 @@ mod tests {
         let traditional = MockDns::spawn().await;
         traditional.set("doq.test", &["127.0.0.1"], &["::1"], 60);
         let bootstrap = Bootstrap::new(
-            vec![Arc::new(UdpUpstream::new(traditional.addr()))],
+            vec![Arc::new(UdpUpstream::new(traditional.addr(), direct()))],
             true,
             FanoutOpts::default(),
         );

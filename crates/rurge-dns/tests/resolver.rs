@@ -62,7 +62,8 @@ fn resolver_saying(
     Resolver::new(
         ResolverConfig::from_config(&cfg),
         ResolverDeps {
-            connectors: DnsConnectors::all(connector),
+            connectors: DnsConnectors::all(connector.clone()),
+            direct: connector,
             sets,
             system: Arc::new(system),
             resources,

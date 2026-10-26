@@ -18,7 +18,7 @@ use crate::upstream::{UpstreamRef, UpstreamSpec};
 use arc_swap::ArcSwap;
 use hickory_proto::rr::RecordType;
 use rurge_config::general::{DnsServer, EncryptedDns};
-use rurge_config::host::HostEntry;
+use rurge_config::host::{HostEntry, SystemMode};
 use rurge_config::{Config, Diagnostic, Diagnostics, codes};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{Connector, Resolve, Via};
@@ -102,6 +102,11 @@ impl DnsConnectors {
 
 pub struct ResolverDeps {
     pub connectors: DnsConnectors,
+    /// What plain UDP servers are asked through — the configured ones, the
+    /// system's, the bootstrap's, `[Host]`'s `server:` addresses: a direct
+    /// connector with the platform's socket hook. Never the pipeline's: plain
+    /// UDP does not follow `encrypted-dns-follow-outbound-mode`.
+    pub direct: Arc<dyn Connector>,
     pub sets: Arc<SetRegistry>,
     pub system: Arc<dyn SystemDns>,
     pub resources: Arc<ResourceManager>,
@@ -309,6 +314,8 @@ pub struct Resolver {
     cfg: ResolverConfig,
     /// The connector of each kind of upstream, behind the bootstrap.
     connectors: DnsConnectors,
+    /// What the plain UDP servers are asked through (see `ResolverDeps`).
+    direct: Arc<dyn Connector>,
     system: Arc<dyn SystemDns>,
     bootstrap: Arc<Bootstrap>,
     /// `None` when the internal HTTP client could not be built (W0026 was
@@ -454,6 +461,7 @@ impl Resolver {
 
         let resolver = Arc::new(Resolver {
             connectors,
+            direct: deps.direct.clone(),
             system: deps.system.clone(),
             bootstrap,
             http,
@@ -490,7 +498,7 @@ impl Resolver {
 
     fn build_upstream(&self, spec: &UpstreamSpec) -> Option<UpstreamRef> {
         match spec {
-            UpstreamSpec::Udp(addr) => Some(Arc::new(UdpUpstream::new(*addr))),
+            UpstreamSpec::Udp(addr) => Some(Arc::new(UdpUpstream::new(*addr, self.direct.clone()))),
             UpstreamSpec::Tcp { host, port } => Some(Arc::new(TcpUpstream::plain(
                 host,
                 *port,
@@ -529,7 +537,7 @@ impl Resolver {
 
     /// Rebuilds every upstream set that depends on the platform's server list,
     /// from the list as it reads right now. The single derivation path, shared
-    /// by `new` and `on_network_change`, so the two can never disagree.
+    /// by `new` and `reread_system_servers`, so the two can never disagree.
     fn apply_system_servers(&self, system_specs: &[UpstreamSpec]) {
         let traditional = traditional_specs(&self.configured_udp, self.wants_system, system_specs);
         // Encrypted upstreams own the primary set and do not follow the network.
@@ -544,10 +552,14 @@ impl Resolver {
                 .filter_map(|s| self.build_upstream(s))
                 .collect(),
         ));
-        self.system_upstreams
-            .store(Arc::new(system_specs.iter().map(build_plain_udp).collect()));
+        self.system_upstreams.store(Arc::new(
+            system_specs
+                .iter()
+                .map(|s| build_plain_udp(s, &self.direct))
+                .collect(),
+        ));
         self.bootstrap
-            .set_upstreams(bootstrap_set(&traditional, system_specs));
+            .set_upstreams(bootstrap_set(&traditional, system_specs, &self.direct));
     }
 
     pub fn primary_upstreams(&self) -> Vec<String> {
@@ -586,6 +598,17 @@ impl Resolver {
         self.flush();
         self.has_ipv6
             .store(self.system.has_ipv6(), Ordering::Relaxed);
+        self.reread_system_servers();
+        self.host_upstreams.lock().expect("host upstreams").clear();
+    }
+
+    /// Reads the system's DNS servers again and rebuilds what is made of them
+    /// (the system set, the bootstrap, a primary set that is the system's),
+    /// keeping the cache: the enhanced mode took the system's DNS or gave it
+    /// back. The upstream sets of the lookups through a `Via` are made of the
+    /// system's servers too, so they go as well, with their answers: the next
+    /// lookup through the interface builds them from the new servers.
+    pub fn reread_system_servers(&self) {
         let system_specs: Vec<UpstreamSpec> = self
             .system
             .servers()
@@ -593,7 +616,8 @@ impl Resolver {
             .map(UpstreamSpec::Udp)
             .collect();
         self.apply_system_servers(&system_specs);
-        self.host_upstreams.lock().expect("host upstreams").clear();
+        // Their upstreams and caches hold the old servers' answers.
+        self.vias.lock().expect("vias").clear();
     }
 
     fn want_v6(&self, opts: &LookupOpts) -> bool {
@@ -771,7 +795,22 @@ impl Resolver {
                         started,
                     ));
                 }
-                HostAction::System(_) => {
+                HostAction::System(mode) => {
+                    // In the enhanced mode the system's DNS servers are the
+                    // physical network's (design §6.2); the library, which the
+                    // system's own DNS points at rurge, may answer with a fake
+                    // address, so only `force-syslib` asks it.
+                    if mode != SystemMode::ForceSyslib && self.system.enhanced_mode() {
+                        return self
+                            .system_lookup(
+                                &current,
+                                want_v6,
+                                Source::Host(HostKind::System),
+                                started,
+                                &opts,
+                            )
+                            .await;
+                    }
                     return self
                         .library_lookup(&current, want_v6, Source::Host(HostKind::System), started)
                         .await;
@@ -1043,7 +1082,9 @@ impl Resolver {
 
     /// The system's DNS servers when any is known, the system resolver
     /// library when none is: a single label given its search domain, and any
-    /// name of a resolver that has no server to ask.
+    /// name of a resolver that has no server to ask. In the enhanced mode
+    /// there is no library to fall back on — it may answer with a fake
+    /// address — and a name with no server to ask fails instead.
     async fn system_lookup(
         &self,
         name: &str,
@@ -1058,14 +1099,20 @@ impl Resolver {
             let answers = answers?;
             return Ok(from_answers(&answers, source, started));
         }
+        if self.system.enhanced_mode() {
+            return Err(no_server_outside());
+        }
         self.library_lookup(name, want_v6, source, started).await
     }
 
     /// `name` asked of the system resolver library — what `getaddrinfo`
     /// answers from — for the names only the system knows: the names ending
-    /// in `.local` and the `[Host]` values `server:system`, `server:syslib`
-    /// and `server:force-syslib` (all three are the library in the normal
-    /// mode), and any name when no server is left to ask.
+    /// in `.local` and `[Host]`'s `server:force-syslib`, in either mode, and
+    /// `server:system` / `server:syslib` in the normal mode, which are the
+    /// physical network's servers in the enhanced mode; and any name when no
+    /// server is left to ask and the enhanced mode is off (with it on, the
+    /// library's answer may be a fake address and there is nothing to ask
+    /// instead).
     ///
     /// The library gives no TTL and its answers are not cached here: the
     /// system keeps its own cache. Identical lookups in flight are not
@@ -1207,21 +1254,37 @@ fn traditional_specs(
 
 /// Bootstrap runs on the traditional (plain UDP) upstreams: the ones the
 /// profile configured, or the system's when it configured none. Applied both at
-/// construction and on every network change, so the two never disagree.
-fn bootstrap_set(traditional: &[UpstreamSpec], system: &[UpstreamSpec]) -> Vec<UpstreamRef> {
+/// construction and whenever the servers are read again, so the two never
+/// disagree.
+fn bootstrap_set(
+    traditional: &[UpstreamSpec],
+    system: &[UpstreamSpec],
+    direct: &Arc<dyn Connector>,
+) -> Vec<UpstreamRef> {
     let specs = if traditional.is_empty() {
         system
     } else {
         traditional
     };
-    specs.iter().map(build_plain_udp).collect()
+    specs.iter().map(|s| build_plain_udp(s, direct)).collect()
 }
 
-fn build_plain_udp(spec: &UpstreamSpec) -> UpstreamRef {
+fn build_plain_udp(spec: &UpstreamSpec, direct: &Arc<dyn Connector>) -> UpstreamRef {
     match spec {
-        UpstreamSpec::Udp(addr) => Arc::new(UdpUpstream::new(*addr)),
+        UpstreamSpec::Udp(addr) => Arc::new(UdpUpstream::new(*addr, direct.clone())),
         other => unreachable!("build_plain_udp called with {other:?}"),
     }
+}
+
+/// Nothing outside the enhanced mode to ask: the system's list of servers
+/// (the physical network's) is empty, and the library — which may answer with
+/// a fake address once the system's DNS points at rurge — is not asked
+/// instead.
+fn no_server_outside() -> DnsError {
+    DnsError::AllFailed(vec![(
+        "system DNS servers".to_string(),
+        "no DNS server outside the enhanced mode".to_string(),
+    )])
 }
 
 /// Notes a lookup on the trail of the session that is dialling when it ends,
@@ -1345,7 +1408,7 @@ mod tests {
     use super::*;
     use crate::message::{Qtype, Rcode, opt_size, parse_response, wire_id, wire_rcode};
     use crate::system::StaticSystemDns;
-    use crate::testing::{MockDns, query_wire, txt_answers};
+    use crate::testing::{MockDns, direct, query_wire, txt_answers};
     use rurge_config::HostName;
     use rurge_config::config::{LoadOptions, from_text};
     use rurge_net::connector::{
@@ -1441,6 +1504,7 @@ mod tests {
                 connectors: DnsConnectors::all(Arc::new(DirectConnector::new(Arc::new(
                     SystemResolve,
                 )))),
+                direct: direct(),
                 sets: e.sets.clone(),
                 system,
                 resources: e.resources.clone(),
@@ -1470,20 +1534,28 @@ mod tests {
         r
     }
 
-    /// A `SystemDns` whose server list changes, standing in for a network change.
+    /// A `SystemDns` whose server list changes, standing in for a network
+    /// change — and whose enhanced mode flips, for the enhanced mode taking
+    /// the system's DNS or giving it back.
     struct SwapSystemDns {
         servers: Mutex<Vec<SocketAddr>>,
+        enhanced: AtomicBool,
     }
 
     impl SwapSystemDns {
         fn new(addr: SocketAddr) -> SwapSystemDns {
             SwapSystemDns {
                 servers: Mutex::new(vec![addr]),
+                enhanced: AtomicBool::new(false),
             }
         }
 
         fn set(&self, addr: SocketAddr) {
             *self.servers.lock().expect("servers") = vec![addr];
+        }
+
+        fn set_enhanced(&self, on: bool) {
+            self.enhanced.store(on, Ordering::Relaxed);
         }
     }
 
@@ -1499,6 +1571,9 @@ mod tests {
         }
         fn has_ipv6(&self) -> bool {
             false
+        }
+        fn enhanced_mode(&self) -> bool {
+            self.enhanced.load(Ordering::Relaxed)
         }
         fn library_lookup<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, io::Result<Vec<IpAddr>>> {
             Box::pin(std::future::ready(Err(io::Error::new(
@@ -1884,6 +1959,259 @@ mod tests {
             assert_eq!(system.query_count(name, Qtype::A), 0, "{name}");
         }
         assert_eq!(*asked.lock().unwrap(), ["a.test", "b.test", "c.test"]);
+    }
+
+    /// The enhanced mode (design §6.2): `server:system` and `server:syslib`
+    /// are the servers of the physical network, not the resolver library —
+    /// the library may answer with a fake address, the system's DNS pointing
+    /// at rurge. The fake addresses the library would have given are not
+    /// taken.
+    #[tokio::test]
+    async fn in_the_enhanced_mode_system_and_syslib_ask_the_physical_servers() {
+        let physical = MockDns::spawn().await;
+        let known = [("a.test", "10.20.0.1"), ("b.test", "10.20.0.2")];
+        for (name, address) in known {
+            physical.set(name, &[address], &[], 60);
+        }
+        let e = env(&profile(
+            "",
+            "a.test = server:system\nb.test = server:syslib\n",
+        ));
+        let sys = StaticSystemDns {
+            servers: vec![physical.addr()],
+            enhanced: Arc::new(AtomicBool::new(true)),
+            library: vec![
+                ("a.test".into(), vec![ip("198.18.0.1")]),
+                ("b.test".into(), vec![ip("198.18.0.2")]),
+            ],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        for (name, address) in known {
+            let found = r.lookup(name, LookupOpts::default()).await.unwrap();
+            assert_eq!(
+                (found.v4, found.source),
+                (vec![v4(address)], Source::Host(HostKind::System)),
+                "{name}"
+            );
+            assert_eq!(physical.query_count(name, Qtype::A), 1, "{name}");
+        }
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "the library was asked: {:?}",
+            asked.lock().unwrap()
+        );
+    }
+
+    /// With no server of the physical network to ask, a `server:system` name
+    /// fails in the enhanced mode: it does not fall back to the library,
+    /// whose answer would be a fake address.
+    #[tokio::test]
+    async fn in_the_enhanced_mode_system_without_servers_fails_and_never_asks_the_library() {
+        let e = env(&profile("", "a.test = server:system\n"));
+        let sys = StaticSystemDns {
+            enhanced: Arc::new(AtomicBool::new(true)),
+            library: vec![("a.test".into(), vec![ip("198.18.0.1")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        let err = r.lookup("a.test", LookupOpts::default()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no DNS server outside the enhanced mode"),
+            "{err}"
+        );
+        assert!(matches!(err, DnsError::AllFailed(_)), "{err:?}");
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "the library was asked: {:?}",
+            asked.lock().unwrap()
+        );
+    }
+
+    /// `force-syslib` is the library in the enhanced mode too: the user asked
+    /// for it.
+    #[tokio::test]
+    async fn force_syslib_asks_the_library_in_the_enhanced_mode_too() {
+        let physical = MockDns::spawn().await;
+        physical.set("a.test", &["10.20.0.1"], &[], 60);
+        let e = env(&profile("", "a.test = server:force-syslib\n"));
+        let sys = StaticSystemDns {
+            servers: vec![physical.addr()],
+            enhanced: Arc::new(AtomicBool::new(true)),
+            library: vec![("a.test".into(), vec![ip("10.30.0.1")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        let found = r.lookup("a.test", LookupOpts::default()).await.unwrap();
+        assert_eq!(
+            (found.v4, found.source),
+            (vec![v4("10.30.0.1")], Source::Host(HostKind::System))
+        );
+        assert_eq!(*asked.lock().unwrap(), ["a.test"]);
+        assert_eq!(physical.query_count("a.test", Qtype::A), 0);
+    }
+
+    /// `.local` names stay the library's in the enhanced mode: mDNS and
+    /// Bonjour answer them, and no DNS server does.
+    #[tokio::test]
+    async fn local_names_ask_the_library_in_the_enhanced_mode_too() {
+        let physical = MockDns::spawn().await;
+        physical.set("printer.local", &["10.20.0.1"], &[], 60);
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            servers: vec![physical.addr()],
+            enhanced: Arc::new(AtomicBool::new(true)),
+            library: vec![("printer.local".into(), vec![ip("10.30.0.1")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        let found = r
+            .lookup("printer.local", LookupOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            (found.v4, found.source),
+            (vec![v4("10.30.0.1")], Source::System)
+        );
+        assert_eq!(*asked.lock().unwrap(), ["printer.local"]);
+        assert_eq!(physical.query_count("printer.local", Qtype::A), 0);
+    }
+
+    /// A single label is the system's in both modes; in the enhanced mode
+    /// only the servers of the physical network are asked for it.
+    #[tokio::test]
+    async fn a_single_label_asks_only_the_servers_in_the_enhanced_mode() {
+        let physical = MockDns::spawn().await;
+        physical.set("nas.home.lan", &["10.20.0.2"], &[], 60);
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            servers: vec![physical.addr()],
+            search_domains: vec!["home.lan".into()],
+            enhanced: Arc::new(AtomicBool::new(true)),
+            library: vec![("nas.home.lan".into(), vec![ip("198.18.0.5")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        let found = r.lookup("nas", LookupOpts::default()).await.unwrap();
+        assert_eq!(
+            (found.v4, found.source),
+            (vec![v4("10.20.0.2")], Source::System)
+        );
+        assert_eq!(physical.query_count("nas.home.lan", Qtype::A), 1);
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "the library was asked: {:?}",
+            asked.lock().unwrap()
+        );
+    }
+
+    /// And without a server of the physical network a single label fails in
+    /// the enhanced mode, the library's fake answer not taken.
+    #[tokio::test]
+    async fn a_single_label_asks_only_the_servers_in_the_enhanced_mode_and_fails_without_them() {
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            search_domains: vec!["home.lan".into()],
+            enhanced: Arc::new(AtomicBool::new(true)),
+            library: vec![("nas.home.lan".into(), vec![ip("198.18.0.5")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        let err = r.lookup("nas", LookupOpts::default()).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no DNS server outside the enhanced mode"),
+            "{err}"
+        );
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "the library was asked: {:?}",
+            asked.lock().unwrap()
+        );
+    }
+
+    /// A resolver with no server at all fails an ordinary name in the
+    /// enhanced mode instead of asking the library, the last place it turns
+    /// to in the normal mode.
+    #[tokio::test]
+    async fn a_resolver_without_servers_does_not_turn_to_the_library_in_the_enhanced_mode() {
+        let e = env(&profile("", ""));
+        let sys = StaticSystemDns {
+            enhanced: Arc::new(AtomicBool::new(true)),
+            library: vec![("www.example.test".into(), vec![ip("198.18.0.5")])],
+            ..StaticSystemDns::default()
+        };
+        let asked = sys.library_asked.clone();
+        let (r, _) = resolver_once(&e, sys);
+        assert!(r.primary_upstreams().is_empty());
+        let err = r
+            .lookup("www.example.test", LookupOpts::default())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no DNS server outside the enhanced mode"),
+            "{err}"
+        );
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "the library was asked: {:?}",
+            asked.lock().unwrap()
+        );
+    }
+
+    /// Re-reading the system's servers takes the new ones for everything
+    /// made of them — here `server:system` — and keeps the cache: the
+    /// enhanced mode took the system's DNS or gave it back.
+    #[tokio::test]
+    async fn reread_system_servers_takes_the_new_servers_and_keeps_the_cache() {
+        let primary = MockDns::spawn().await;
+        primary.set("a.test", &["10.0.0.1"], &[], 60);
+        let first = MockDns::spawn().await;
+        first.set("sys.test", &["10.20.0.1"], &[], 60);
+        let second = MockDns::spawn().await;
+        second.set("sys.test", &["10.20.0.2"], &[], 60);
+        let e = env(&profile(
+            &format!("dns-server = {}", primary.addr()),
+            "sys.test = server:system\n",
+        ));
+        let system = Arc::new(SwapSystemDns::new(first.addr()));
+        system.set_enhanced(true);
+        let (r, _) = resolver_with(&e, system.clone());
+        let a = r.lookup("a.test", LookupOpts::default()).await.unwrap();
+        assert_eq!(a.v4, vec![v4("10.0.0.1")]);
+        let s = r.lookup("sys.test", LookupOpts::default()).await.unwrap();
+        assert_eq!(s.v4, vec![v4("10.20.0.1")]);
+        assert_eq!(first.query_count("sys.test", Qtype::A), 1);
+
+        system.set(second.addr());
+        r.reread_system_servers();
+        let a = r.lookup("a.test", LookupOpts::default()).await.unwrap();
+        assert_eq!(
+            (a.v4, a.source),
+            (vec![v4("10.0.0.1")], Source::Cache { stale: false }),
+            "the cache is kept"
+        );
+        assert_eq!(primary.query_count("a.test", Qtype::A), 1, "asked once");
+        let bypass = LookupOpts {
+            bypass_cache: true,
+            ..LookupOpts::default()
+        };
+        let s = r.lookup("sys.test", bypass).await.unwrap();
+        assert_eq!(s.v4, vec![v4("10.20.0.2")], "the new servers");
+        assert_eq!(second.query_count("sys.test", Qtype::A), 1);
+        assert_eq!(
+            first.query_count("sys.test", Qtype::A),
+            1,
+            "the old server is not asked again"
+        );
     }
 
     /// A single label gets the first search domain and goes to the system's
@@ -3525,6 +3853,7 @@ https://dns.example/dns-query"
                 cfg,
                 ResolverDeps {
                     connectors: refusing_connectors(&asked),
+                    direct: direct(),
                     sets: e.sets.clone(),
                     system: Arc::new(StaticSystemDns::default()),
                     resources: e.resources.clone(),
@@ -3571,6 +3900,7 @@ https://dns.example/dns-query"
                 cfg,
                 ResolverDeps {
                     connectors: refusing_connectors(&asked),
+                    direct: direct(),
                     sets: e.sets.clone(),
                     system: Arc::new(StaticSystemDns::default()),
                     resources: e.resources.clone(),
