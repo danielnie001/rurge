@@ -85,6 +85,32 @@ impl ProcessTree {
         }
     }
 
+    /// Whether process `pid` is the program or one it started that is still
+    /// in its tree (M4 design 11). `false` when the platform cannot tell, and
+    /// for a process that is not running.
+    pub fn contains(&self, pid: u32) -> bool {
+        // the two that are never a program rurge started, and a group of 0
+        // would be rurge's own (see `contain`)
+        if pid <= 1 {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            let Ok(pid) = i32::try_from(pid) else {
+                return false;
+            };
+            // the program leads the group of everything it started, which
+            // inherit it; a process that is gone is not in it (`ESRCH`)
+            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid))) == Ok(self.group)
+        }
+        #[cfg(windows)]
+        {
+            // M4d takes the program's children in with `IsProcessInJob`;
+            // until then the platform cannot tell.
+            false
+        }
+    }
+
     /// A group that has already ended is not an error.
     #[cfg(unix)]
     fn signal(&self, signal: nix::sys::signal::Signal) -> io::Result<()> {
@@ -219,6 +245,54 @@ mod tests {
         let mut child = long_runner().spawn().unwrap();
         let mut tree = ProcessTree::contain(child.id()).unwrap();
         tree.kill().unwrap();
+        let ended = ended_within(&mut child, Duration::from_secs(10));
+        if !ended {
+            let _ = child.kill();
+        }
+        assert!(ended, "the program is still running");
+    }
+
+    /// The tree is the program and what it started while they last, and
+    /// nobody else (M4 design 11): a session of either is DIRECT. The shell
+    /// leads a group of its own, and the sleep it puts in the background is
+    /// what it started. Only CI's Linux and macOS run this.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_tree_contains_its_leader_and_what_it_started_and_nothing_else() {
+        use std::io::{BufRead, BufReader};
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        prepare(&mut command);
+        let mut child = command.spawn().unwrap();
+        let leader = child.id();
+        let printed = BufReader::new(child.stdout.take().unwrap())
+            .lines()
+            .next()
+            .expect("the child's id is printed")
+            .unwrap();
+        let started: u32 = printed.trim().parse().unwrap();
+        let mut tree = ProcessTree::contain(leader).unwrap();
+        assert!(tree.contains(leader), "the program itself");
+        assert!(tree.contains(started), "what the program started");
+        assert!(!tree.contains(std::process::id()), "our own process");
+        tree.kill().unwrap();
+        let _ = child.wait();
+    }
+
+    /// Windows cannot tell yet: the program's children are taken in with
+    /// `IsProcessInJob` in M4d; until then nothing is in the tree.
+    #[cfg(windows)]
+    #[test]
+    fn contains_is_false_until_m4d() {
+        let mut child = long_runner().spawn().unwrap();
+        let tree = ProcessTree::contain(child.id()).unwrap();
+        assert!(!tree.contains(child.id()));
+        assert!(!tree.contains(std::process::id()));
+        drop(tree);
         let ended = ended_within(&mut child, Duration::from_secs(10));
         if !ended {
             let _ = child.kill();

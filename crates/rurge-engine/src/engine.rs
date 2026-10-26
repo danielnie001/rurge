@@ -5,7 +5,7 @@ use crate::auto::{EVALUATION_FAILED, resolve_ready};
 use crate::control::Mode;
 use crate::fake_address::Turned;
 use crate::observe::{RequestLog, TrafficStats};
-use crate::owner::{LOOKUPS, NOT_IN_TIME, SLOW, SlotProcess, query_for};
+use crate::owner::{EXTERNAL, LOOKUPS, NOT_IN_TIME, SLOW, SlotProcess, query_for};
 use crate::runtime::Runtime;
 use crate::shared::EngineShared;
 use crate::state::StateStore;
@@ -29,7 +29,7 @@ use rurge_policy::auto::SelectCtx;
 use rurge_policy::{Note, PolicyRegistry, Resolution, TerminalKind};
 use rurge_proto::{OutboundError, OutboundRef, UdpSupport};
 use rurge_rules::matcher::SubRuleHit;
-use rurge_rules::{OutboundMode, Outcome};
+use rurge_rules::{LazyProcess, OutboundMode, Outcome};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
@@ -791,6 +791,21 @@ impl Engine {
         registry: &PolicyRegistry,
         handle: &SessionHandle,
     ) -> Chosen {
+        // the process of the session, waited for only while an `external`
+        // program runs (M4 design 11, M4b plan P16): the same `SlotProcess`
+        // the rules go on with, so neither waits twice
+        let process = SlotProcess::new(handle.process());
+        // a session of an external program or of what it started is DIRECT,
+        // whatever the rules and the outbound mode say (M4-D21)
+        if self.shared.externals.any_running()
+            && let Some(info) = process.process().await
+            && let Some(pid) = info.pid
+            && self.shared.externals.runs(pid)
+        {
+            handle.add_note(EXTERNAL);
+            tracing::debug!(session = handle.id(), pid, "{EXTERNAL}");
+            return Chosen::Policy(PolicyRef::Builtin(Builtin::Direct));
+        }
         match self.mode() {
             Mode::Direct => return Chosen::Policy(PolicyRef::Builtin(Builtin::Direct)),
             Mode::Proxy => match self.global_policy() {
@@ -808,7 +823,6 @@ impl Engine {
             },
             Mode::Rule => {}
         }
-        let process = SlotProcess::new(handle.process());
         let decision = rt
             .rules
             .evaluate_with_process(

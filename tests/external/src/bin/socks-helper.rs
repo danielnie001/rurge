@@ -3,7 +3,7 @@
 //! 127.0.0.1 only and connects nowhere but where its client asks.
 //!
 //! socks-helper --port <p> [--record <file>] [--delay-ms <n>] [--serve <n>]
-//!              [--child <file>] [--served <file>]
+//!              [--child <file>] [--child-pid <file>] [--served <file>]
 //! socks-helper --hold <file>
 //!
 //! `--record` appends its process id, its arguments and the proxy variables
@@ -12,7 +12,8 @@
 //! connection given up before its request does not count); `--child` starts
 //! a copy of itself in
 //! `--hold` mode, which listens on a port of its own, writes the port to
-//! `<file>` and runs until ended; `--served` appends its process id to
+//! `<file>` and runs until ended; `--child-pid` writes that copy's process
+//! id to `<file>`; `--served` appends its process id to
 //! `<file>` for every relayed session. When its port is taken it keeps
 //! running without listening, as `ssh -D` does without
 //! `ExitOnForwardFailure`.
@@ -83,7 +84,7 @@ fn main() {
     // (a child started in the first instants of a program would escape a
     // Windows Job Object)
     if let Some(file) = value(&args, "--child") {
-        start_child(&file);
+        start_child(&file, value(&args, "--child-pid").as_deref());
     }
     if let Some(limit) = serve {
         let mut relayed = 0;
@@ -122,15 +123,23 @@ fn note(file: Option<&str>) {
 }
 
 /// A copy of this program in `--hold` mode, left running: only the end of
-/// the whole tree ends it, which is what the tests check.
+/// the whole tree ends it, which is what the tests check. Its process id
+/// goes to `pid_file` when there is one: a test asks for it to give a
+/// session the process of what the program started.
 #[allow(clippy::zombie_processes)]
-fn start_child(file: &str) {
+fn start_child(file: &str, pid_file: Option<&str>) {
     let exe = std::env::current_exe().unwrap();
-    Command::new(exe)
+    let child = Command::new(exe)
         .args(["--hold", file])
         .stdin(Stdio::null())
         .spawn()
         .unwrap();
+    if let Some(pid_file) = pid_file {
+        // written whole at once, so a reader never sees half a number
+        let tmp = format!("{pid_file}.tmp");
+        std::fs::write(&tmp, child.id().to_string()).unwrap();
+        std::fs::rename(&tmp, pid_file).unwrap();
+    }
 }
 
 /// `true` once a session has been relayed to its end.

@@ -57,6 +57,9 @@ impl ProcessGroup for Tree {
     fn kill(&mut self) -> std::io::Result<()> {
         self.0.kill()
     }
+    fn contains(&self, pid: u32) -> bool {
+        self.0.contains(pid)
+    }
 }
 
 impl ProcessHook for Platform {

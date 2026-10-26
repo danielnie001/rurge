@@ -79,6 +79,13 @@ pub trait ProcessGroup: Send {
     fn terminate(&mut self) -> io::Result<()>;
     /// Ends every process now.
     fn kill(&mut self) -> io::Result<()>;
+    /// Whether process `pid` is one of them: the program or one it started
+    /// that is still in its group (M4 design 11). `false` when the platform
+    /// cannot tell.
+    fn contains(&self, pid: u32) -> bool {
+        let _ = pid;
+        false
+    }
 }
 
 /// No process groups: stopping a program kills the program alone.
@@ -196,11 +203,25 @@ struct Slot {
 /// belongs to the newer configuration.
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// The program while it runs, as the engine asks of it (M4 design 11): its
+/// own process id, and the group it leads.
+struct Live {
+    pid: u32,
+    /// Shared with the watching task, which ends the group when the program
+    /// goes.
+    tree: Arc<std::sync::Mutex<Tree>>,
+}
+
 /// One outbound's program, as `LocalPorts` sees it.
 struct Program {
     seq: u64,
     port: u16,
     slot: Mutex<Slot>,
+    /// The program, while it runs. A std lock, shared with the watching
+    /// task: whoever asks about a session's process is on the path of every
+    /// dial and never waits here, and the watching task must not keep the
+    /// outbound alive (a program is stopped when its last outbound goes).
+    live: Arc<std::sync::Mutex<Option<Live>>>,
     /// A newer outbound on the same port has taken it: this one never
     /// starts a program again.
     retired: AtomicBool,
@@ -300,6 +321,7 @@ impl ExternalOutbound {
                 seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
                 port: spec.local_port,
                 slot: Mutex::new(Slot::default()),
+                live: Arc::new(std::sync::Mutex::new(None)),
                 retired: AtomicBool::new(false),
             }),
             ports: Arc::new(LocalPorts::default()),
@@ -317,6 +339,34 @@ impl ExternalOutbound {
     /// Where the program's output goes.
     pub fn log_path(&self) -> &Path {
         &self.log
+    }
+
+    /// Whether the program runs now.
+    pub fn running(&self) -> bool {
+        self.program
+            .live
+            .lock()
+            .expect("external program")
+            .is_some()
+    }
+
+    /// Whether process `pid` is the running program or one it started that
+    /// is still in its group (M4 design 11): its sessions are DIRECT. The
+    /// program's own id counts whether or not the platform can tell: while
+    /// it runs unreaped, no other process has it. `false` while no program
+    /// runs.
+    pub fn runs(&self, pid: u32) -> bool {
+        let live = self.program.live.lock().expect("external program");
+        let Some(live) = live.as_ref() else {
+            return false;
+        };
+        if live.pid == pid {
+            return true;
+        }
+        live.tree
+            .lock()
+            .expect("external program tree")
+            .contains(pid)
     }
 
     /// Stops the program and whatever it started, when it runs; returns
@@ -389,8 +439,20 @@ impl ExternalOutbound {
         // an error drops `child`, which kills it
         let group = self.hook.contain(pid)?;
         tracing::info!(policy = %self.name, pid, "external: the program started");
+        let tree = Arc::new(std::sync::Mutex::new(Tree(group)));
+        *self.program.live.lock().expect("external program") = Some(Live {
+            pid,
+            tree: tree.clone(),
+        });
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(watch(self.name.clone(), pid, child, group, stopped));
+        let task = tokio::spawn(watch(
+            self.name.clone(),
+            pid,
+            child,
+            self.program.live.clone(),
+            tree,
+            stopped,
+        ));
         Ok(Running { stop, task })
     }
 
@@ -451,13 +513,21 @@ impl ExternalOutbound {
 }
 
 /// Ends the group once, however the watching task ends: when it is dropped
-/// unfinished (the runtime shutting down) too.
+/// unfinished (the runtime shutting down) too. It lives in an `Arc` that the
+/// outbound keeps while the program runs, so the watching task ends it
+/// itself rather than leaving that to the drop.
 struct Tree(Option<Box<dyn ProcessGroup>>);
 
 impl Tree {
-    fn terminate(&mut self) {
-        if let Some(group) = self.0.as_mut() {
-            let _ = group.terminate();
+    /// Asks the group to end; `false` when there is none — only the program
+    /// itself runs, and nothing is left for it to take along.
+    fn terminate(&mut self) -> bool {
+        match self.0.as_mut() {
+            Some(group) => {
+                let _ = group.terminate();
+                true
+            }
+            None => false,
         }
     }
 
@@ -465,6 +535,10 @@ impl Tree {
         if let Some(mut group) = self.0.take() {
             let _ = group.kill();
         }
+    }
+
+    fn contains(&self, pid: u32) -> bool {
+        self.0.as_ref().is_some_and(|group| group.contains(pid))
     }
 }
 
@@ -476,33 +550,34 @@ impl Drop for Tree {
 
 /// Owns the program until it exits or is told to stop. A program that
 /// exits takes what it started with it: whatever is left of the group
-/// would only hold the port the next start needs.
+/// would only hold the port the next start needs. Nothing asks about the
+/// tree after it is over (`Program::live`).
 async fn watch(
     policy: String,
     pid: u32,
     mut child: tokio::process::Child,
-    group: Option<Box<dyn ProcessGroup>>,
+    live: Arc<std::sync::Mutex<Option<Live>>>,
+    tree: Arc<std::sync::Mutex<Tree>>,
     stop: oneshot::Receiver<()>,
 ) {
-    let mut tree = Tree(group);
     tokio::select! {
         status = child.wait() => {
-            tree.end();
+            tree.lock().expect("external program tree").end();
             let code = status.ok().and_then(|s| s.code());
             tracing::info!(policy = %policy, pid, code, "external: the program exited");
         }
         _ = stop => {
-            if tree.0.is_some() {
-                tree.terminate();
-                if tokio::time::timeout(STOP_GRACE, child.wait()).await.is_err() {
-                    tree.end();
-                }
+            let asked = tree.lock().expect("external program tree").terminate();
+            if asked && tokio::time::timeout(STOP_GRACE, child.wait()).await.is_err() {
+                tree.lock().expect("external program tree").end();
             }
-            tree.end();
+            tree.lock().expect("external program tree").end();
             let _ = child.kill().await;
             tracing::info!(policy = %policy, pid, "external: the program stopped");
         }
     }
+    // the program is gone: no session is this one's any more
+    *live.lock().expect("external program") = None;
 }
 
 impl Outbound for ExternalOutbound {
@@ -663,6 +738,121 @@ mod tests {
             udp_relay: false,
         };
         ExternalOutbound::new("P", &spec, dir, Arc::new(NoProcessGroups))
+    }
+
+    /// A process group that says which processes are in it (none of them
+    /// really are), and listens to no signal: stopping is the watching
+    /// task's `kill` on the program itself.
+    struct Group(Arc<std::sync::Mutex<Vec<u32>>>);
+
+    impl ProcessGroup for Group {
+        fn terminate(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn contains(&self, pid: u32) -> bool {
+            self.0.lock().expect("group").contains(&pid)
+        }
+    }
+
+    /// A hook whose program is in a group of `claimed` processes, whatever
+    /// the platform answers; the last program it took in is its leader.
+    struct FakeHook {
+        claimed: Arc<std::sync::Mutex<Vec<u32>>>,
+        leader: std::sync::Mutex<Option<u32>>,
+    }
+
+    impl FakeHook {
+        fn new(claimed: &[u32]) -> Arc<FakeHook> {
+            Arc::new(FakeHook {
+                claimed: Arc::new(std::sync::Mutex::new(claimed.to_vec())),
+                leader: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn leader(&self) -> u32 {
+            self.leader
+                .lock()
+                .expect("leader")
+                .expect("a program started")
+        }
+    }
+
+    impl ProcessHook for FakeHook {
+        fn prepare(&self, _command: &mut Command) {}
+
+        fn contain(&self, pid: u32) -> io::Result<Option<Box<dyn ProcessGroup>>> {
+            *self.leader.lock().expect("leader") = Some(pid);
+            Ok(Some(Box::new(Group(self.claimed.clone()))))
+        }
+    }
+
+    /// A program of the system's own, run directly so that killing it kills
+    /// the program itself, that runs for half a minute unless stopped.
+    fn long_runner() -> (String, Vec<String>) {
+        #[cfg(windows)]
+        let (exec, args) = (
+            "ping",
+            vec!["-n".to_string(), "30".to_string(), "127.0.0.1".to_string()],
+        );
+        #[cfg(unix)]
+        let (exec, args) = ("sleep", vec!["30".to_string()]);
+        (exec.to_string(), args)
+    }
+
+    fn running_outbound(hook: Arc<dyn ProcessHook>, port: u16, dir: &Path) -> ExternalOutbound {
+        let (exec, args) = long_runner();
+        let spec = ExternalSpec {
+            exec,
+            args: rurge_config::spec::Secret::new(args),
+            local_port: port,
+            addresses: Vec::new(),
+            udp_relay: false,
+        };
+        ExternalOutbound::new("P", &spec, dir, hook)
+    }
+
+    /// While the program runs, `runs` answers for its own process id and for
+    /// what the platform says is in its group (M4 design 11); a process in
+    /// neither is not its own.
+    #[tokio::test]
+    async fn a_running_program_answers_runs_for_its_own_pid() {
+        // above every port number, and no process of this machine
+        const STARTED: u32 = 4_000_321;
+        let dir = tempfile::tempdir().unwrap();
+        let hook = FakeHook::new(&[STARTED]);
+        let o = running_outbound(hook.clone(), 9, dir.path());
+        assert!(!o.running(), "nothing runs before the program starts");
+        o.ensure_started().await.unwrap();
+        assert!(o.running());
+        let leader = hook.leader();
+        assert_ne!(leader, STARTED);
+        assert!(o.runs(leader), "the program itself");
+        assert!(o.runs(STARTED), "what the program started");
+        assert!(!o.runs(STARTED + 1), "neither");
+        o.stop().await;
+    }
+
+    /// A stopped program runs nothing any more, and neither does what it
+    /// started.
+    #[tokio::test]
+    async fn a_stopped_program_runs_nothing() {
+        const STARTED: u32 = 4_000_322;
+        let dir = tempfile::tempdir().unwrap();
+        let hook = FakeHook::new(&[STARTED]);
+        let o = running_outbound(hook.clone(), 9, dir.path());
+        o.ensure_started().await.unwrap();
+        let leader = hook.leader();
+        assert!(o.running());
+        assert!(o.runs(leader) && o.runs(STARTED));
+        o.stop().await;
+        assert!(!o.running());
+        assert!(!o.runs(leader), "the program itself");
+        assert!(!o.runs(STARTED), "what the program started");
     }
 
     /// A program that cannot be started fails the request at once, and

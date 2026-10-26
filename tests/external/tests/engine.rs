@@ -5,10 +5,16 @@
 mod common;
 use common::*;
 use rurge_config::config::{LoadOptions, from_text};
+use rurge_config::rule::PolicyRef;
+use rurge_config::session::ProcessInfo;
 use rurge_dns::system::StaticSystemDns;
+use rurge_engine::owner::{EXTERNAL, NOT_IN_TIME};
 use rurge_engine::stack::StackOptions;
-use rurge_engine::{Engine, EngineShared, Runtime, RuntimeOptions};
+use rurge_engine::{
+    Engine, EngineShared, OwnerLookup, OwnerQuery, RequestRecord, Runtime, RuntimeOptions,
+};
 use rurge_rules::{GeoUrls, OutboundMode};
+use std::sync::Mutex;
 
 /// `[General]` for every test: loopback listeners, nothing tested online.
 const GENERAL: &str = "[General]\nhttp-listen = 127.0.0.1:0\nipv6 = false\n\
@@ -32,6 +38,11 @@ fn shared() -> EngineShared {
 }
 
 async fn runtime(dir: &Path, text: &str, shared: EngineShared) -> Runtime {
+    runtime_in(dir, text, shared, OutboundMode::Rule).await
+}
+
+/// `runtime`, in the outbound mode the engine starts in.
+async fn runtime_in(dir: &Path, text: &str, shared: EngineShared, mode: OutboundMode) -> Runtime {
     let path = dir.join("t.conf");
     std::fs::write(&path, text).unwrap();
     let loaded = from_text(text, &path, &LoadOptions::for_tests());
@@ -59,7 +70,7 @@ async fn runtime(dir: &Path, text: &str, shared: EngineShared) -> Runtime {
                 dns_override: Default::default(),
                 resource_resolve: None,
             },
-            outbound_mode: OutboundMode::Rule,
+            outbound_mode: mode,
             idle_timeout: Duration::from_secs(600),
             shared,
             request_log_size: 100,
@@ -77,8 +88,12 @@ struct Harness {
 }
 
 async fn harness(text: &str) -> Harness {
+    harness_in(text, shared(), OutboundMode::Rule).await
+}
+
+async fn harness_in(text: &str, shared: EngineShared, mode: OutboundMode) -> Harness {
     let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::new(runtime(dir.path(), text, shared()).await);
+    let engine = Engine::new(runtime_in(dir.path(), text, shared, mode).await);
     let listeners = engine.bind_listeners().await.unwrap();
     let http = listeners[0].1.local_addr;
     Harness {
@@ -273,4 +288,248 @@ async fn a_reload_that_keeps_the_port_hands_it_to_the_new_program() {
     drop(old);
     h.engine.stop_external_programs().await;
     wait_closed(port).await;
+}
+
+/// The platform's lookup as far as the engine can tell: it answers the
+/// process it is told to, at once, or after a delay as a slow system does.
+struct Owners {
+    process: Mutex<Option<ProcessInfo>>,
+    delay: Duration,
+}
+
+impl Owners {
+    fn new() -> Arc<Owners> {
+        Arc::new(Owners {
+            process: Mutex::new(None),
+            delay: Duration::ZERO,
+        })
+    }
+
+    /// A lookup that takes longer than the rules wait for it.
+    fn slow() -> Arc<Owners> {
+        Arc::new(Owners {
+            process: Mutex::new(None),
+            delay: Duration::from_millis(600),
+        })
+    }
+
+    /// From now on the process behind a session is `pid`, at once.
+    fn finds(&self, pid: u32) {
+        *self.process.lock().unwrap() = Some(ProcessInfo {
+            pid: Some(pid),
+            name: "socks-helper".to_string(),
+            path: None,
+        });
+    }
+}
+
+impl OwnerLookup for Owners {
+    fn is_local(&self, _ip: std::net::IpAddr) -> Option<bool> {
+        None
+    }
+
+    fn owner(&self, _query: &OwnerQuery) -> Option<ProcessInfo> {
+        std::thread::sleep(self.delay);
+        self.process.lock().unwrap().clone()
+    }
+}
+
+fn shared_with(owners: Arc<Owners>) -> EngineShared {
+    EngineShared {
+        processes: Arc::new(Platform),
+        owners: Some(owners),
+        ..EngineShared::default()
+    }
+}
+
+/// The process id `--record` wrote first.
+fn pid_of(record: &str) -> u32 {
+    record
+        .lines()
+        .next()
+        .expect("a recorded start")
+        .split(' ')
+        .next()
+        .expect("pid=")
+        .trim_start_matches("pid=")
+        .parse()
+        .expect("a process id")
+}
+
+/// The id of the newest written record, or 0 when none is written yet.
+fn newest(h: &Harness) -> u64 {
+    h.engine.request_log().recent(1).pop().map_or(0, |r| r.id)
+}
+
+/// The record of the session that began after the one whose id is `after`:
+/// waits for it at most 10 seconds, as a session is recorded once it ends.
+async fn record_after(h: &Harness, after: u64) -> RequestRecord {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(record) = h.engine.request_log().recent(1).pop()
+            && record.id > after
+        {
+            return record;
+        }
+        assert!(Instant::now() < deadline, "no record after {after}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A profile with the helper as `Ext` on `port`, `extra` arguments, and the
+/// rule `FINAL,DIRECT`: `Ext` is there but nothing sends a session to it.
+fn unused_program(port: u16, extra: &str) -> String {
+    format!(
+        "{GENERAL}[Proxy]\nExt = external, exec = \"{}\", args = --port, args = {port}{extra}, local-port = {port}\n\
+[Rule]\nFINAL,DIRECT\n",
+        helper().replace('\\', "\\\\")
+    )
+}
+
+/// A session of an `external` program's process is DIRECT whatever the rules
+/// say, and the record says why; a session of any other process follows them
+/// (M4 design 11, M4-D21).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sessions_of_an_external_program_go_direct_whatever_the_rules() {
+    let port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let record_file = dir.path().join("record");
+    let extra = format!(
+        ", args = --record, args = \"{}\"",
+        record_file.to_string_lossy().replace('\\', "\\\\")
+    );
+    let owners = Owners::new();
+    let h = harness_in(
+        &profile(port, &extra),
+        shared_with(owners.clone()),
+        OutboundMode::Rule,
+    )
+    .await;
+    let echo = echo_server().await;
+
+    // the program starts because of a session that `FINAL` sends to it
+    echo_via(h.http, echo).await;
+    let pid = pid_of(&wait_for_file(&record_file).await);
+    // the first session's record, so the next one is told apart from it
+    let before = record_after(&h, 0).await.id;
+
+    // its own sessions are DIRECT, and the record says why
+    owners.finds(pid);
+    echo_via(h.http, echo).await;
+    let record = record_after(&h, before).await;
+    assert_eq!(record.policy, ["DIRECT"], "{record:?}");
+    assert!(record.notes.contains(&EXTERNAL.to_string()), "{record:?}");
+
+    // another process's follow the rules, which send them to `Ext`
+    owners.finds(std::process::id());
+    let before = newest(&h);
+    echo_via(h.http, echo).await;
+    let record = record_after(&h, before).await;
+    assert_eq!(record.policy, ["Ext"], "{record:?}");
+    assert!(!record.notes.contains(&EXTERNAL.to_string()), "{record:?}");
+
+    h.engine.stop_external_programs().await;
+    wait_closed(port).await;
+}
+
+/// The global mode sends every session to the `external` policy; a session of
+/// the program's process is still DIRECT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_the_global_mode_too() {
+    let port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let record_file = dir.path().join("record");
+    let extra = format!(
+        ", args = --record, args = \"{}\"",
+        record_file.to_string_lossy().replace('\\', "\\\\")
+    );
+    let owners = Owners::new();
+    let h = harness_in(
+        &profile(port, &extra),
+        shared_with(owners.clone()),
+        OutboundMode::Proxy(PolicyRef::parse("Ext")),
+    )
+    .await;
+    let echo = echo_server().await;
+
+    echo_via(h.http, echo).await;
+    let pid = pid_of(&wait_for_file(&record_file).await);
+    // the first session's record, so the next one is told apart from it
+    let before = record_after(&h, 0).await.id;
+    owners.finds(pid);
+    echo_via(h.http, echo).await;
+    let record = record_after(&h, before).await;
+    assert_eq!(record.policy, ["DIRECT"], "{record:?}");
+    assert!(record.notes.contains(&EXTERNAL.to_string()), "{record:?}");
+
+    h.engine.stop_external_programs().await;
+    wait_closed(port).await;
+}
+
+/// What the program started is its own too: the session of a child process is
+/// DIRECT (M4 design 11). Unix only: Windows cannot tell the children until
+/// M4d, so only CI's Linux and macOS run this.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_the_program_started_goes_direct_too() {
+    let port = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| {
+        dir.path()
+            .join(name)
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+    };
+    let extra = format!(
+        ", args = --child, args = \"{}\", args = --child-pid, args = \"{}\"",
+        path("child-port"),
+        path("child-pid")
+    );
+    let owners = Owners::new();
+    let h = harness_in(
+        &profile(port, &extra),
+        shared_with(owners.clone()),
+        OutboundMode::Rule,
+    )
+    .await;
+    let echo = echo_server().await;
+
+    echo_via(h.http, echo).await;
+    let child: u32 = wait_for_file(&dir.path().join("child-pid"))
+        .await
+        .trim()
+        .parse()
+        .unwrap();
+    // the first session's record, so the next one is told apart from it
+    let before = record_after(&h, 0).await.id;
+    owners.finds(child);
+    echo_via(h.http, echo).await;
+    let record = record_after(&h, before).await;
+    assert_eq!(record.policy, ["DIRECT"], "{record:?}");
+    assert!(record.notes.contains(&EXTERNAL.to_string()), "{record:?}");
+
+    h.engine.stop_external_programs().await;
+    wait_closed(port).await;
+}
+
+/// A program that is configured but not running is not waited for: the
+/// session's process never arrives in time, no rule asks for it, and the
+/// record is not marked down for a wait nobody needed (M4b plan P16).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_wait_without_a_running_program() {
+    let port = free_port();
+    let h = harness_in(
+        &unused_program(port, ""),
+        shared_with(Owners::slow()),
+        OutboundMode::Rule,
+    )
+    .await;
+
+    echo_via(h.http, echo_server().await).await;
+    let record = record_after(&h, 0).await;
+    assert_eq!(record.policy, ["DIRECT"], "{record:?}");
+    assert!(
+        !record.notes.contains(&NOT_IN_TIME.to_string()),
+        "the session waited for a process nobody asked for: {record:?}"
+    );
 }

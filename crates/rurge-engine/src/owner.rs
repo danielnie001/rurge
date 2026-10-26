@@ -19,6 +19,9 @@ pub const PROCESS_WAIT: Duration = Duration::from_millis(200);
 pub const LOOKUPS: usize = 2;
 /// The note on a session whose rules gave up waiting for its process.
 pub const NOT_IN_TIME: &str = "Process not known within 200 ms: PROCESS-NAME did not match";
+/// The note on a session of an external program or of what it started: it is
+/// DIRECT whatever the rules say (M4 design 11).
+pub const EXTERNAL: &str = "Requested by an external program: always DIRECT";
 /// What is warned about, once, when the rules first give up waiting.
 pub const SLOW: &str =
     "process lookup took longer than 200 ms; PROCESS-NAME rules decided without the process";

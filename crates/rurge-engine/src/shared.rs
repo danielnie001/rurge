@@ -123,16 +123,32 @@ impl ExternalPrograms {
         list.push(Arc::downgrade(outbound));
     }
 
-    /// Stops every program still running, all at once; returns when they
-    /// are gone.
-    pub async fn stop_all(&self) {
-        let live: Vec<Arc<ExternalOutbound>> = self
-            .list
+    /// The outbounds of every generation that still exist.
+    fn live(&self) -> Vec<Arc<ExternalOutbound>> {
+        self.list
             .lock()
             .expect("external program list")
             .iter()
             .filter_map(Weak::upgrade)
-            .collect();
+            .collect()
+    }
+
+    /// Whether a program of any of them runs now: only then is a session's
+    /// process waited for (M4 design 11, M4b plan P16).
+    pub fn any_running(&self) -> bool {
+        self.live().iter().any(|o| o.running())
+    }
+
+    /// Whether process `pid` is a running program or one it started that is
+    /// still in its group: its sessions are DIRECT (M4 design 11).
+    pub fn runs(&self, pid: u32) -> bool {
+        self.live().iter().any(|o| o.runs(pid))
+    }
+
+    /// Stops every program still running, all at once; returns when they
+    /// are gone.
+    pub async fn stop_all(&self) {
+        let live = self.live();
         let stops: Vec<_> = live
             .iter()
             .map(|o| {
