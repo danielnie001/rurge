@@ -512,6 +512,102 @@ async fn stopping_the_tun_ends_a_relay_stuck_on_its_upstream() {
     assert!(record.up > 0, "something went to the upstream: {record:?}");
 }
 
+// ---- starting a TUN
+
+/// Options that `TunOptions::check` refuses are refused before anything is
+/// opened: no pool's file, no TUN. Options it accepts still start one.
+#[tokio::test]
+async fn start_tun_refuses_options_that_check_refuses_and_opens_nothing() {
+    let h = harness(profile(&guarded(""))).await;
+    let refused = TunOptions {
+        shards: 0,
+        ..Default::default()
+    };
+    let expected = refused.check().expect_err("the options are refused");
+    let (device, _end) = MemoryDevice::pair(1500, 16);
+    let Err(error) = h
+        .engine
+        .start_tun(Arc::new(device), FakePinger::new(), refused)
+        .await
+    else {
+        panic!("the TUN does not start");
+    };
+    assert_eq!(error, expected, "the reason is the one of the check");
+    assert!(
+        pool_file(h.dir.path()).is_none(),
+        "nothing opened the pool's file"
+    );
+
+    let (device, _end) = MemoryDevice::pair(1500, 16);
+    let tun = h
+        .engine
+        .start_tun(Arc::new(device), FakePinger::new(), TunOptions::default())
+        .await
+        .expect("the options it accepts start a TUN");
+    assert!(pool_file(h.dir.path()).is_some(), "the pool is open now");
+    tun.stop();
+    assert_eq!(ends(&tun).await, Ending::Stopped);
+}
+
+/// A device whose MTU is below 1280 is refused before anything is opened:
+/// smoltcp cannot work with less, and the MTU is rurge's own choice.
+#[tokio::test]
+async fn start_tun_refuses_a_device_below_1280() {
+    let h = harness(profile(&guarded(""))).await;
+    let (device, _end) = MemoryDevice::pair(1279, 16);
+    let Err(error) = h
+        .engine
+        .start_tun(Arc::new(device), FakePinger::new(), TunOptions::default())
+        .await
+    else {
+        panic!("the TUN does not start");
+    };
+    assert_eq!(error, "the device's MTU is below 1280");
+    assert!(
+        pool_file(h.dir.path()).is_none(),
+        "nothing opened the pool's file"
+    );
+}
+
+/// One engine runs one TUN: a second one is refused while the first runs, and
+/// starts once the first has ended and its pool's last save is written
+/// (`tun_ended`).
+#[tokio::test]
+async fn a_second_tun_on_one_engine_is_refused_until_the_first_has_ended() {
+    let h = harness(profile(&guarded(""))).await;
+    let (device, _end) = MemoryDevice::pair(1500, 16);
+    let first = h
+        .engine
+        .start_tun(Arc::new(device), FakePinger::new(), TunOptions::default())
+        .await
+        .expect("the TUN starts");
+
+    let (device, _end) = MemoryDevice::pair(1500, 16);
+    let Err(error) = h
+        .engine
+        .start_tun(Arc::new(device), FakePinger::new(), TunOptions::default())
+        .await
+    else {
+        panic!("a second TUN is refused");
+    };
+    assert!(error.contains("already running"), "{error}");
+
+    first.stop();
+    assert_eq!(ends(&first).await, Ending::Stopped);
+    tokio::time::timeout(WITHIN, h.engine.tun_ended())
+        .await
+        .expect("the first TUN has ended and its pool's last save is written");
+
+    let (device, _end) = MemoryDevice::pair(1500, 16);
+    let second = h
+        .engine
+        .start_tun(Arc::new(device), FakePinger::new(), TunOptions::default())
+        .await
+        .expect("the second TUN starts once the first has ended");
+    second.stop();
+    assert_eq!(ends(&second).await, Ending::Stopped);
+}
+
 // ---- the pool
 
 /// The pool is kept in the data directory: a name that was given an address is
@@ -558,7 +654,8 @@ async fn the_engine_reopens_the_pool() {
     let (device, _app_end) = MemoryDevice::pair(1500, 16);
     let tun = second
         .start_tun(Arc::new(device), FakePinger::new(), TunOptions::default())
-        .await;
+        .await
+        .expect("the TUN starts");
     let pool = tun.pool().expect("a pool");
     assert_eq!(pool.address_of("kept.test", false), Some(v4));
     assert_eq!(pool.address_of("kept.test", true), Some(v6));
@@ -747,10 +844,14 @@ async fn an_association_returns_when_closed_and_lets_go_of_its_client() {
         .await
         .expect("the association returns once it is closed")
         .unwrap();
-    // the engine's tasks that hold the client end with the association
-    wait_until("the engine to let go of the client", || {
-        Arc::strong_count(&client) == 1
-    })
+    // the engine's tasks that hold the client end with the association, and
+    // they end within `STOP_GRACE` — the second a stopping TUN gives the
+    // sessions that still hold a client — of the association's end
+    wait_until_within(
+        "the engine to let go of the client",
+        Duration::from_secs(1),
+        || Arc::strong_count(&client) == 1,
+    )
     .await;
 }
 

@@ -212,6 +212,11 @@ pub struct Engine {
     /// The places for the lookups of processes that use a blocking thread
     /// (`LOOKUPS`).
     owner_permits: Arc<tokio::sync::Semaphore>,
+    /// The engine's one TUN: one permit, taken by `start_tun` and held by the
+    /// task that keeps the pool of fake addresses saved, until the TUN has
+    /// ended and its last save is written (phase 3 M4 design 3.4, P7).
+    /// `Engine::tun_ended` waits for it.
+    pub(crate) tun_permits: Arc<tokio::sync::Semaphore>,
     /// The rules waited for a process and gave up, and the engine said so
     /// (`SLOW`) — once.
     process_wait_warned: AtomicBool,
@@ -257,6 +262,7 @@ impl Engine {
             udp_associations: std::sync::atomic::AtomicUsize::new(0),
             udp_warned: std::sync::Mutex::new(None),
             owner_permits: Arc::new(tokio::sync::Semaphore::new(LOOKUPS)),
+            tun_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             process_wait_warned: AtomicBool::new(false),
         });
         let rt = engine.runtime();

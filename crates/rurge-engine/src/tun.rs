@@ -14,6 +14,10 @@ use rurge_tun::{Hooks, Pinger, Tun, TunHandle, TunOptions, TunSettings};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The MTU a device of the TUN needs at the least: smoltcp 0.12 cannot work
+/// with less, and the MTU is rurge's own choice (as [`Tun::start`] asserts).
+const MIN_MTU: usize = 1280;
+
 /// How often the pool's file is written at most while mappings change.
 const POOL_SAVE_EVERY: Duration = Duration::from_secs(10);
 
@@ -51,18 +55,32 @@ impl Engine {
     /// data directory only once the first has ended and its last save is written
     /// (`clean 1` on the file's second line; the engine's tracker waits for it).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// As [`Tun::start`] does: for options that [`TunOptions::check`] refuses,
-    /// and for a device whose MTU is below 1280. The pool's file has been opened
-    /// by then, and says that the run has not ended, and the engine holds the
-    /// pool for its listeners: whoever starts a TUN checks the options first.
+    /// Options that [`TunOptions::check`] refuses, a device whose MTU is below
+    /// 1280, and a TUN that still runs on this engine (or whose pool's last save
+    /// is still being written: see [`Engine::tun_ended`]). Nothing is opened or
+    /// started then.
     pub async fn start_tun(
         self: &Arc<Self>,
         device: Arc<dyn Device>,
         pinger: Arc<dyn Pinger>,
         options: TunOptions,
-    ) -> TunHandle {
+    ) -> Result<TunHandle, String> {
+        options.check()?;
+        if device.mtu() < MIN_MTU {
+            return Err("the device's MTU is below 1280".to_string());
+        }
+        // One TUN to an engine: the permit is taken before anything is opened,
+        // so that a second TUN neither runs beside this one nor writes its
+        // pool's file. It ends with the task that writes the last save and
+        // lets go of the pool; any way out of this function before then drops
+        // it.
+        let permitted = self
+            .tun_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "a TUN is already running on this engine".to_string())?;
         let path = self.data_dir().join(FILE_NAME);
         let (pool, loaded) = tokio::task::spawn_blocking({
             let (path, now) = (path.clone(), Instant::now());
@@ -105,6 +123,9 @@ impl Engine {
             if let Some(engine) = engine.upgrade() {
                 let_go(&engine.fake_pool, &kept);
             }
+            // The last save is written and the pool is let go: the engine has
+            // no TUN now (`Engine::tun_ended`).
+            drop(permitted);
         });
         // The TUN stops with the engine's accepting, as the listeners do; and
         // this task ends with the TUN when that comes first.
@@ -116,7 +137,21 @@ impl Engine {
                 _ = stopping.join() => {}
             }
         });
-        tun
+        Ok(tun)
+    }
+
+    /// Resolves once no TUN runs on this engine: the last one has ended and its
+    /// pool's last save is written.
+    pub async fn tun_ended(&self) {
+        // The semaphore has one permit and is never closed, so this waits for
+        // the task that keeps the pool saved (`start_tun`) and takes the permit
+        // back at once.
+        let permitted = self
+            .tun_permits
+            .acquire()
+            .await
+            .expect("the semaphore of the TUN's place is never closed");
+        drop(permitted);
     }
 }
 

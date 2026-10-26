@@ -396,8 +396,14 @@ pub async fn get(stream: &mut TcpStream, host: &str, path: &str) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-pub async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+pub async fn wait_until(what: &str, check: impl FnMut() -> bool) {
+    wait_until_within(what, Duration::from_secs(5), check).await
+}
+
+/// `wait_until`, bounded by `limit` instead of five seconds: for something
+/// that has to happen well within a bound of its own.
+pub async fn wait_until_within(what: &str, limit: Duration, mut check: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + limit;
     while !check() {
         assert!(
             tokio::time::Instant::now() < deadline,

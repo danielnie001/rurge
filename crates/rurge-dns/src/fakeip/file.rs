@@ -131,6 +131,8 @@ fn number(word: &str) -> Option<u32> {
 /// Writes `text` to the file: to a temporary file beside it first and then
 /// renamed over it, so that a reader finds the old text or the new, and
 /// without waiting for the disk. The directory is made if it is not there.
+/// On Unix the file belongs to its owner alone: it lists the names
+/// applications have asked for.
 pub(super) fn write(path: &Path, text: &str) -> io::Result<()> {
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
@@ -140,8 +142,37 @@ pub(super) fn write(path: &Path, text: &str) -> io::Result<()> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, text)?;
+    write_temporary(&temporary, text)?;
     std::fs::rename(&temporary, path)
+}
+
+/// Writes `text` to `temporary`, which the rename then puts in place: on Unix
+/// as its owner's alone, since it lists the names applications have asked
+/// for.
+#[cfg(unix)]
+fn write_temporary(temporary: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // `mode` reaches only a file this call makes: one that a run which ended
+    // between the write and the rename left there keeps its own permissions,
+    // and the rename would carry them over.
+    if temporary.exists() {
+        std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(temporary)?;
+    file.write_all(text.as_bytes())
+}
+
+/// `write_temporary` on a platform without mode bits: the permissions of the
+/// data directory are the file's (Windows).
+#[cfg(not(unix))]
+fn write_temporary(temporary: &Path, text: &str) -> io::Result<()> {
+    std::fs::write(temporary, text)
 }
 
 #[cfg(test)]
@@ -235,5 +266,34 @@ mod tests {
             };
             assert!(!reason.contains("secret"), "{reason}");
         }
+    }
+
+    /// The names in the file are the ones applications have asked for: on
+    /// Unix only its owner may read it, also when a temporary file that a run
+    /// ended between the write and the rename left there is written again.
+    #[cfg(unix)]
+    #[test]
+    fn the_pool_file_is_its_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-ip.txt");
+        write(&path, "rurge-fake-ip 1\n").unwrap();
+        assert_eq!(mode_of(&path), 0o600, "the file is its owner's alone");
+
+        // What a run that ended between the write and the rename left: the
+        // write's own mode does not reach a file that is there already, and
+        // the rename would carry 0644 over.
+        let temporary = dir.path().join("fake-ip.txt.tmp");
+        std::fs::write(&temporary, "old").unwrap();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&temporary), 0o644, "the file left there");
+        write(&path, "rurge-fake-ip 1\ncursor 0 wrapped 0 clean 1\n").unwrap();
+        assert_eq!(mode_of(&path), 0o600, "the rename carried 0644 over");
+        assert!(!temporary.exists(), "the temporary file is renamed");
     }
 }

@@ -60,7 +60,8 @@ impl Rig {
         let tun = h
             .engine
             .start_tun(Arc::new(device), pinger.clone(), TunOptions::default())
-            .await;
+            .await
+            .expect("the TUN starts");
         Rig {
             h,
             tun,
