@@ -30,6 +30,11 @@ pub fn decide(table: Option<&EgressTable>, dst: IpAddr) -> Result<Option<&str>, 
     let Some(table) = table else {
         return Ok(None);
     };
+    // An IPv4 address written as the IPv6 address it maps to (`::ffff:a.b.c.d`)
+    // is an IPv4 address: a dual-stack IPv6 socket that dials it sends IPv4
+    // packets, so rules 2 to 4 have to see it as one (the phase 3 / M4b plan's
+    // execution record row 71).
+    let dst = dst.to_canonical();
     if never_bound(dst) {
         return Ok(None);
     }
@@ -195,6 +200,27 @@ mod tests {
         assert_eq!(decide(Some(&t), dst("192.168.1.5")), Ok(Some("eth0")));
         // in the routes but not directly connected: the primary interface
         assert_eq!(decide(Some(&t), dst("192.168.2.5")), Ok(Some("Wi-Fi")));
+    }
+
+    /// An IPv4 address written as the IPv6 address it maps to is decided as
+    /// the IPv4 address it is: a dual-stack IPv6 socket that dials it sends
+    /// IPv4 packets, so rules 3 and 4 must see IPv4 (the phase 3 / M4b plan's
+    /// execution record row 71).
+    #[test]
+    fn an_ipv4_address_in_its_mapped_form_is_decided_as_an_ipv4_address() {
+        let t = table(
+            subnets(&[("192.168.1.0/24", "eth0")]),
+            routes(&["0.0.0.0/0"], &["::/0"]),
+            Some("Wi-Fi"),
+        );
+        assert_eq!(
+            decide(Some(&t), dst("::ffff:192.168.1.5")),
+            Ok(Some("eth0"))
+        );
+        assert_eq!(decide(Some(&t), dst("::ffff:8.8.8.8")), Ok(Some("Wi-Fi")));
+        // and what is never bound in IPv4 is never bound in that form either
+        assert_eq!(decide(Some(&t), dst("::ffff:127.0.0.1")), Ok(None));
+        assert_eq!(decide(Some(&t), dst("::ffff:169.254.1.1")), Ok(None));
     }
 
     #[test]
