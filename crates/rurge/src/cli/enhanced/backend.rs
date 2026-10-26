@@ -38,10 +38,12 @@ pub trait Backend: Send + Sync {
     fn open(&self) -> Result<Opened, String>;
     /// The adapter's address, MTU, link and own settings, and with `ipv6` its
     /// IPv6 address. `Ok(false)`: IPv6 was asked for and could not be had (the
-    /// backend has warned): this open goes on without it.
+    /// manager logs the WARN, so the backend need not): this open goes on
+    /// without it.
     fn configure(&self, dev: &Opened, ipv6: bool) -> Result<bool, String>;
     /// The IPv6 half alone, on an adapter that is up (a reload or a change of
-    /// network turned IPv6 on). `Ok(false)` as for `configure`.
+    /// network turned IPv6 on). `Ok(false)` as for `configure`, with the WARN
+    /// from the manager as well.
     #[allow(dead_code)] // wired up by M4a task 9
     fn configure_ipv6(&self, dev: &Opened) -> Result<bool, String>;
     #[allow(dead_code)] // wired up by M4a task 9

@@ -34,7 +34,8 @@ impl Starter for EngineStarter {
 
 /// The engine's TUN as the manager holds it. `ended` is the one a close waits
 /// for, and it includes the engine's last save of its fake-address pool; the
-/// task that watches for a failed device waits for `ending` alone (R20).
+/// task that watches for a failed device waits for `ending` alone (the phase 3 /
+/// M4a plan's execution record row 62).
 struct EngineTun {
     handle: TunHandle,
     engine: Arc<Engine>,

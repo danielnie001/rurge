@@ -74,9 +74,9 @@ pub trait RunningTun: Send + Sync {
     fn ended(&self) -> BoxFuture<'_, Ending>;
     /// Ends when the TUN itself has ended (`TunHandle::join`), without the
     /// engine's last save: what the task that watches for a device that fails
-    /// waits for (R20: waiting for `Engine::tun_ended` here would hold the
-    /// engine's one TUN's place, and an open right after a close would be
-    /// refused).
+    /// waits for (the phase 3 / M4a plan's execution record row 62: waiting on
+    /// `Engine::tun_ended` here would hold the engine's one TUN's place, and an
+    /// open right after a close would be refused).
     fn ending(&self) -> BoxFuture<'_, Ending>;
     fn counters(&self) -> rurge_engine::TunCounters;
 }
@@ -134,9 +134,10 @@ impl Shared {
     }
 }
 
-/// Told the number of an open whose TUN failed (P24): the `rurge run` main
-/// loop turns the enhanced mode off when the number is the one that is on. Not
-/// the main loop's `Command`: this module knows nothing of it (R21).
+/// Told the number of an open whose TUN failed (P24; the phase 3 / M4a plan's
+/// execution record row 63): the `rurge run` main loop turns the enhanced mode
+/// off when the number is the one that is on. Not the main loop's `Command`:
+/// this module knows nothing of it.
 pub type TunEnded = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// Owned by the `rurge run` main loop, which calls it one request at a time.
@@ -148,7 +149,8 @@ pub struct EnhancedMode {
     shared: Arc<Shared>,
     /// Where a TUN that failed is told (P24).
     ended: TunEnded,
-    /// How many opens have succeeded: each is numbered from one (R21).
+    /// How many opens have succeeded: each is numbered from one (the phase 3 /
+    /// M4a plan's execution record row 63).
     opens: u64,
     /// What is on, and what a close has to undo.
     on: Option<On>,
@@ -159,7 +161,7 @@ pub struct EnhancedMode {
 #[derive(Default)]
 struct On {
     /// The number of this open: a TUN's failure is only news if it is this
-    /// open's (R21).
+    /// open's (the phase 3 / M4a plan's execution record row 63).
     sequence: u64,
     dev: Option<Opened>,
     tun: Option<Arc<dyn RunningTun>>,
@@ -313,7 +315,8 @@ impl EnhancedMode {
 
     /// Whether `sequence` is the number of the open that is on now. A failed
     /// TUN of an earlier open (or of one a close has happened since) has
-    /// nothing left to turn off (R21).
+    /// nothing left to turn off (the phase 3 / M4a plan's execution record row
+    /// 63).
     pub fn is_current_open(&self, sequence: u64) -> bool {
         self.on.as_ref().is_some_and(|on| on.sequence == sequence)
     }
@@ -352,9 +355,9 @@ impl EnhancedMode {
 
     /// Watches the TUN of an open that has just succeeded: a device that fails
     /// ends the enhanced mode, and says so (P24). The wait is for `ending`
-    /// alone (R20): whatever waits on `ended` is a close, which owns the TUN's
-    /// place in the engine. Stops the manager itself makes end as `Stopped`,
-    /// which is no news.
+    /// alone (the phase 3 / M4a plan's execution record row 62): whatever waits
+    /// on `ended` is a close, which owns the TUN's place in the engine. Stops
+    /// the manager itself makes end as `Stopped`, which is no news.
     fn watch(&self, tun: Arc<dyn RunningTun>, sequence: u64) {
         let ended = self.ended.clone();
         tokio::spawn(async move {
@@ -840,6 +843,9 @@ mod tests {
     struct MockTun {
         calls: Calls,
         stopped: Arc<AtomicBool>,
+        /// `stop()` wakes `ending()`, which a TUN that does not fail does not
+        /// answer before.
+        stopped_notify: Arc<tokio::sync::Notify>,
         /// Whether `ended()` answers at once.
         ends: bool,
         /// Whether `ending()` answers `DeviceFailed` at once (P24).
@@ -849,6 +855,7 @@ mod tests {
     impl RunningTun for MockTun {
         fn stop(&self) {
             self.stopped.store(true, Ordering::SeqCst);
+            self.stopped_notify.notify_one();
             self.calls.push("stop");
         }
 
@@ -866,10 +873,10 @@ mod tests {
             Box::pin(async move {
                 if self.failing {
                     Ending::DeviceFailed("the device failed (test)".to_string())
-                } else if self.ends {
-                    Ending::Stopped
                 } else {
-                    std::future::pending().await
+                    // a TUN that is not stopped yet has not ended either
+                    self.stopped_notify.notified().await;
+                    Ending::Stopped
                 }
             })
         }
@@ -904,6 +911,7 @@ mod tests {
                 Ok(Arc::new(MockTun {
                     calls: self.calls.clone(),
                     stopped: self.stopped.clone(),
+                    stopped_notify: Arc::new(tokio::sync::Notify::new()),
                     ends: self.ends,
                     failing: self.failing,
                 }) as Arc<dyn RunningTun>)
@@ -1005,7 +1013,8 @@ mod tests {
     }
 
     /// A device that fails ends the enhanced mode: the manager tells the loop
-    /// which open it belonged to (P24, R21).
+    /// which open it belonged to (P24; the phase 3 / M4a plan's execution
+    /// record row 63).
     #[tokio::test]
     async fn a_device_that_fails_tells_the_loop_which_open_it_belongs_to() {
         let mut f = fixture_with(true, true).await;
@@ -1018,6 +1027,26 @@ mod tests {
         assert!(f.mode.is_current_open(1));
         f.mode.disable().await.unwrap();
         assert!(!f.mode.is_current_open(1), "a close ends that open");
+        assert!(f.told.try_recv().is_err(), "the one failure was told once");
+    }
+
+    /// A TUN a close stopped is no news: the watch waits for the TUN to end,
+    /// the stop ends it as `Stopped`, and the manager tells the loop nothing
+    /// (P24).
+    #[tokio::test]
+    async fn a_tun_a_close_stopped_tells_the_loop_nothing() {
+        let mut f = fixture(true).await;
+        f.mode.enable(wanted()).await.unwrap();
+        f.mode.disable().await.unwrap();
+        assert!(
+            f.starter.stopped.load(Ordering::SeqCst),
+            "the close stopped the TUN"
+        );
+        // waiting for what must not happen: the watch task has had time to run
+        // after the stop, and it has nothing to wait on once `ending()` has
+        // answered `Stopped` (200 ms against a task that only needs to be
+        // scheduled once)
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             f.told.try_recv().is_err(),
             "a TUN a close stopped is no news"

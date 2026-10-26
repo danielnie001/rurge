@@ -308,10 +308,12 @@ fn the_enhanced_mode_opens_at_start_and_closes_at_stop() {
     let mut cmd = run_with_the_file_backend(&conf, &data, &file);
     cmd.args(["--enhanced-mode", "--system-proxy"]);
     let mut daemon = spawn_command(cmd);
+    // The line comes once `enable` has returned, and so after `state.json`'s
+    // flag is written (the file's last action, `adjust`, is written before it).
+    // `wait_for_line` takes the lines it reads, and the API's line comes first.
+    let api = api_port(&daemon);
+    wait_for_line(&daemon, "enhanced mode on");
     let expected = routes_of(false);
-    wait_until("the enhanced mode to be on", || {
-        actions(&file).last().map(String::as_str) == Some("adjust")
-    });
     assert_eq!(
         actions(&file),
         [
@@ -334,7 +336,6 @@ fn the_enhanced_mode_opens_at_start_and_closes_at_stop() {
         "the two changes that outlive the device are in the backup: {state}"
     );
 
-    let api = api_port(&daemon);
     assert_eq!(api_call(api, "POST", "/v1/stop", "k", Some("{}")).0, 200);
     assert_eq!(wait_for_exit(&mut daemon, 20), Some(0));
     assert_eq!(
@@ -510,9 +511,7 @@ fn a_killed_run_with_the_enhanced_mode_on_is_undone_by_the_next_start() {
     let mut cmd = run_with_the_file_backend(&conf, &data, &file);
     cmd.arg("--enhanced-mode");
     let daemon = spawn_command(cmd);
-    wait_until("the enhanced mode to be on", || {
-        actions(&file).last().map(String::as_str) == Some("adjust")
-    });
+    wait_for_line(&daemon, "enhanced mode on");
     // the way a run dies: nothing is given back
     drop(daemon);
     assert_eq!(read_json(&file)["dns"], true, "the DNS is still taken over");
@@ -550,9 +549,7 @@ fn ipv6_vif_always_opens_with_ipv6() {
     let mut cmd = run_with_the_file_backend(&conf, &data, &file);
     cmd.arg("--enhanced-mode");
     let daemon = spawn_command(cmd);
-    wait_until("the enhanced mode to be on", || {
-        actions(&file).last().map(String::as_str) == Some("adjust")
-    });
+    wait_for_line(&daemon, "enhanced mode on");
     let on = actions(&file);
     assert!(on.contains(&"configure".to_string()), "{on:?}");
     let system = read_json(&file);
@@ -581,9 +578,7 @@ fn ipv6_that_fails_goes_on_without_it() {
         .arg("--log-file")
         .arg(logs.join("rurge.log"));
     let daemon = spawn_command(cmd);
-    wait_until("the enhanced mode to be on", || {
-        actions(&file).last().map(String::as_str) == Some("adjust")
-    });
+    wait_for_line(&daemon, "enhanced mode on");
     let system = read_json(&file);
     assert_eq!(system["ipv6"], false, "{system}");
     let expected = routes_of(false);
@@ -620,9 +615,17 @@ fn a_device_that_fails_turns_the_enhanced_mode_off() {
     let daemon = spawn_command(cmd);
     let api = api_port(&daemon);
     let expected = routes_of(false);
+    // A close writes `undo adjust` first, then rewrites the backup, and only
+    // then says the mode is off; so the sequence and `state.json` are read once
+    // that last action is in the file and `GET` says off. `GET` alone is not
+    // enough: it is false before the open has finished as well.
     wait_until(
         "the enhanced mode to be off after the device failed",
-        || actions(&file).last().map(String::as_str) == Some("undo adjust"),
+        || {
+            actions(&file).last().map(String::as_str) == Some("undo adjust")
+                && parsed(&api_call(api, "GET", "/v1/features/enhanced_mode", "k", None).1)["enabled"]
+                    == false
+        },
     );
     assert_eq!(
         actions(&file)[5..],
