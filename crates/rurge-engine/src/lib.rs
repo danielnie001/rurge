@@ -26,7 +26,7 @@ mod tun;
 mod udp;
 pub mod views;
 
-pub use control::{Control, LogLevel, Mode, ReloadReport};
+pub use control::{Control, EnhancedStatus, LogLevel, Mode, ReloadReport};
 pub use engine::{
     Engine, FAKE_ADDRESS_NOT_KNOWN, ListenerSpec, PoliciesView, REFUSED_STRICT, RuleView,
     UnknownPolicy,

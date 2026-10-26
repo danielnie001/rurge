@@ -16,7 +16,7 @@ use rurge_config::general::LogLevel;
 use rurge_config::general::{Listener, parse_http_listen, parse_socks5_listen};
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::ListenerKind;
-use rurge_engine::control::{Control, LogLevel as ApiLogLevel, Mode, ReloadReport};
+use rurge_engine::control::{Control, EnhancedStatus, LogLevel as ApiLogLevel, Mode, ReloadReport};
 use rurge_engine::profile::{Boot, BootLimits, ProfileSources, boot_need, disk_remote};
 use rurge_engine::stack::DnsOverride;
 use rurge_engine::state::{STATE_FILE, State, StateStore, profile_key};
@@ -81,6 +81,10 @@ pub struct RunArgs {
     /// Point the operating system's proxy settings at rurge while it runs
     #[arg(long, env = "RURGE_SYSTEM_PROXY", value_parser = switch())]
     pub system_proxy: bool,
+    /// Take the machine's traffic through a virtual adapter while rurge runs
+    /// (the enhanced mode). Needs root or Administrator.
+    #[arg(long, env = "RURGE_ENHANCED_MODE", value_parser = switch())]
+    pub enhanced_mode: bool,
     /// A policy group without members rejects instead of going DIRECT
     #[arg(long, env = "RURGE_EMPTY_GROUP_REJECT", value_parser = switch())]
     pub empty_group_reject: bool,
@@ -282,6 +286,10 @@ enum Command {
     Reload(oneshot::Sender<ReloadReport>),
     Stop,
     SystemProxy(bool, oneshot::Sender<Result<(), String>>),
+    EnhancedMode(bool, oneshot::Sender<Result<(), String>>),
+    /// The TUN of the open numbered so failed (`EnhancedMode::is_current_open`
+    /// says whether that open is the one that is on).
+    TunEnded(u64),
     /// The machine is on another network (`network::spawn` tells).
     NetworkChanged(NetworkFacts),
 }
@@ -291,6 +299,8 @@ struct LoopControl {
     log_level: LevelHandle,
     /// Mirrors `SystemProxyManager::enabled`.
     system_proxy: Arc<AtomicBool>,
+    /// What the enhanced mode is, and what its TUN has counted.
+    enhanced: Arc<super::enhanced::Shared>,
 }
 
 fn failed_report() -> ReloadReport {
@@ -349,6 +359,22 @@ impl Control for LoopControl {
 
     fn system_proxy_enabled(&self) -> bool {
         self.system_proxy.load(Ordering::SeqCst)
+    }
+
+    fn set_enhanced_mode(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let (reply, rx) = oneshot::channel();
+            self.tx
+                .send(Command::EnhancedMode(enabled, reply))
+                .await
+                .map_err(|_| "rurge is shutting down".to_string())?;
+            rx.await
+                .unwrap_or_else(|_| Err("rurge is shutting down".to_string()))
+        })
+    }
+
+    fn enhanced_mode(&self) -> EnhancedStatus {
+        self.enhanced.status()
     }
 }
 
@@ -587,6 +613,28 @@ fn takeover_paused_here(engine: &Engine) -> bool {
         .config
         .effective_ssid_setting(&engine.network())
         .is_some_and(|line| line.suspend)
+}
+
+/// What the enhanced mode should be for the generation in use and the network
+/// (M4 design 4.6, 4.7). The start and the API's `POST` both ask it, and task
+/// 9's reload and change of network will too.
+fn wanted_now(engine: &Engine) -> super::enhanced::wanted::Wanted {
+    let runtime = engine.runtime();
+    let general = &runtime.config.general;
+    let external = runtime.config.external_addresses();
+    let primary = engine
+        .network()
+        .primary
+        .as_ref()
+        .map(|primary| primary.interface.clone());
+    // M4a task 9: from the network (P18)
+    super::enhanced::wanted::wanted(
+        general,
+        &external,
+        false,
+        primary,
+        cfg!(target_os = "macos"),
+    )
 }
 
 /// The system proxy as the user wants it, and as the network lets it be
@@ -1530,10 +1578,31 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         // Command channel from the API (M4 design §6). `cmd_tx` stays alive
         // here for the same reason as `reload_tx` below.
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(4);
+        // The enhanced mode's manager has to be here before the API: the API
+        // reads its state. It is not opened until the listeners and the API
+        // are up (P25, below).
+        let mut enhanced = super::enhanced::EnhancedMode::new(
+            enhanced_backend,
+            store.clone(),
+            super::enhanced::starter(engine.clone()),
+            super::enhanced::egress_slot(),
+            {
+                let tx = cmd_tx.clone();
+                Arc::new(move |sequence| {
+                    // a failure must not be lost to a full queue: the send is
+                    // its own task, and an already-finished loop drops it
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(Command::TunEnded(sequence)).await;
+                    });
+                })
+            },
+        );
         let control: Arc<dyn Control> = Arc::new(LoopControl {
             tx: cmd_tx.clone(),
             log_level: level_handle,
             system_proxy: sysproxy.flag(),
+            enhanced: enhanced.shared(),
         });
         // The API comes up right after the listeners and before the summary
         // line, so `api on` is the third startup line (the CLI tests and
@@ -1576,12 +1645,35 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         // everything fallible is behind us: nothing below returns early while
         // the operating system points at rurge, except the failure to enable.
         //
-        // On a network that says to leave the system alone nothing is enabled:
-        // `--system-proxy` is only noted, and done when the pause ends.
+        // The enhanced mode goes first (P25): the system proxy points at the
+        // listeners that are already up, and a start whose system proxy fails
+        // gives the enhanced mode back before it exits. Task 9 adds the pause
+        // of `[SSID Setting]`; until then `--enhanced-mode` is what decides.
+        if args.enhanced_mode {
+            match enhanced.enable(wanted_now(&engine)).await {
+                Ok(()) => println!("enhanced mode on"),
+                Err(e) => {
+                    eprintln!("error: cannot turn the enhanced mode on: {e}");
+                    return Ok(ExitCode::from(1));
+                }
+            }
+        }
+        // The system proxy comes next. On a network that says to leave the
+        // system alone nothing is enabled: `--system-proxy` is only noted, and
+        // done when the pause ends.
         let mut takeover = Takeover::new(args.system_proxy);
         if !takeover.begin(&engine) && args.system_proxy {
             if let Err(e) = switch_system_proxy(&mut sysproxy, &engine, &listeners, true).await {
                 eprintln!("error: cannot enable the system proxy: {e}");
+                // P25: what this start did goes back before it ends
+                if enhanced.enabled() {
+                    match enhanced.disable().await {
+                        Ok(()) => println!("enhanced mode off"),
+                        Err(e) => eprintln!(
+                            "error: cannot turn the enhanced mode off: {e}; what outlives rurge stays in state.json and is undone on the next start"
+                        ),
+                    }
+                }
                 return Ok(ExitCode::from(1));
             }
             let applied = sysproxy.applied().map(describe).unwrap_or_default();
@@ -1694,6 +1786,32 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                         }
                         let _ = reply.send(result);
                     }
+                    Some(Command::EnhancedMode(enabled, reply)) => {
+                        // task 9 turns this into `Takeover`'s, which notes the
+                        // request on a paused network
+                        let result = if enabled {
+                            enhanced.enable(wanted_now(&engine)).await
+                        } else {
+                            enhanced.disable().await
+                        };
+                        if let Err(e) = &result {
+                            tracing::error!(error = %e, enabled, "cannot switch the enhanced mode");
+                        }
+                        let _ = reply.send(result);
+                    }
+                    Some(Command::TunEnded(sequence)) => {
+                        // a failure of an open that has been closed, or of one
+                        // an open has replaced since, is not this one's
+                        if enhanced.is_current_open(sequence) {
+                            tracing::error!("the virtual adapter failed; the enhanced mode is off");
+                            if let Err(e) = enhanced.disable().await {
+                                tracing::error!(
+                                    error = %e,
+                                    "cannot turn the enhanced mode off after the adapter failed"
+                                );
+                            }
+                        }
+                    }
                     Some(Command::NetworkChanged(facts)) => {
                         network_changed(&daemon, facts, &listeners, &mut sysproxy, &mut takeover)
                             .await;
@@ -1709,7 +1827,17 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         println!("shutting down (Ctrl-C or SIGTERM again to exit now)");
         #[cfg(not(unix))]
         println!("shutting down (Ctrl-C again to exit now)");
-        // The system proxy first: rurge is about to stop serving, and the
+        // The enhanced mode first (M4-D16): what it leaves behind is the
+        // machine's DNS, and the sessions on the adapter ended with its TUN.
+        if enhanced.enabled() {
+            match enhanced.disable().await {
+                Ok(()) => println!("enhanced mode off"),
+                Err(e) => eprintln!(
+                    "error: cannot turn the enhanced mode off: {e}; what outlives rurge stays in state.json and is undone on the next start"
+                ),
+            }
+        }
+        // The system proxy next: rurge is about to stop serving, and the
         // forced exit below must not leave the OS pointing at a dead port.
         if sysproxy.enabled() {
             match sysproxy.disable().await {
@@ -1862,6 +1990,7 @@ mod tests {
             tx,
             log_level: handle.clone(),
             system_proxy: Arc::new(AtomicBool::new(false)),
+            enhanced: Arc::new(crate::cli::enhanced::Shared::new()),
         };
         for (name, filter) in [
             ("verbose", LevelFilter::TRACE),

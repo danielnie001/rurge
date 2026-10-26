@@ -12,11 +12,13 @@ use rurge_config::session::ListenerKind;
 use rurge_config::{RemoteRef, RemoteRole, SourceInfo};
 use rurge_dns::system::StaticSystemDns;
 use rurge_dns::testing::MockDns;
-use rurge_engine::control::{Control, LogLevel, ReloadReport};
+use rurge_engine::control::{Control, EnhancedStatus, LogLevel, ReloadReport};
 use rurge_engine::profile::{ProfileSources, SourcesOptions};
 use rurge_engine::stack::{StackOptions, resource_client};
 use rurge_engine::state::{STATE_FILE, State, StateStore};
-use rurge_engine::{Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions};
+use rurge_engine::{
+    Engine, EngineShared, ListenerSpec, Running, Runtime, RuntimeOptions, TunCounters,
+};
 use rurge_net::BoxFuture;
 use rurge_net::resource::{ResourceOptions, ResourceSource, cache_file, resource_key};
 use rurge_net::testing::{TestServer, seed_cache};
@@ -41,6 +43,8 @@ struct FakeControl {
     levels: Mutex<Vec<LogLevel>>,
     system_proxy: AtomicBool,
     fail_system_proxy: AtomicBool,
+    enhanced: Mutex<EnhancedStatus>,
+    fail_enhanced: AtomicBool,
 }
 
 impl Control for FakeControl {
@@ -75,6 +79,18 @@ impl Control for FakeControl {
     }
     fn system_proxy_enabled(&self) -> bool {
         self.system_proxy.load(Ordering::SeqCst)
+    }
+    fn set_enhanced_mode(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            if self.fail_enhanced.load(Ordering::SeqCst) {
+                return Err("no virtual adapter could be made (test)".to_string());
+            }
+            self.enhanced.lock().unwrap().enabled = enabled;
+            Ok(())
+        })
+    }
+    fn enhanced_mode(&self) -> EnhancedStatus {
+        *self.enhanced.lock().unwrap()
     }
 }
 
@@ -548,7 +564,7 @@ async fn features_collections_stop_and_unknown_paths() {
     assert_eq!(
         get(&api, "/v1/features/mitm").await,
         (200, json!({ "enabled": false })),
-        "only system_proxy is live"
+        "only system_proxy and enhanced_mode are live"
     );
     assert_eq!(
         post(
@@ -604,6 +620,112 @@ async fn features_collections_stop_and_unknown_paths() {
     assert_eq!((status, body), (401, json!({ "error": "unauthorized" })));
     assert_eq!(post(&api, "/v1/stop", json!({})).await, (200, json!({})));
     wait_until(async || api.control.stops.load(Ordering::SeqCst) == 1).await;
+}
+
+/// `GET /v1/features/enhanced_mode`: the two switches it has, the ten reasons a
+/// packet is dropped, and the panics of the TCP stacks (M3-D22, P12's names).
+/// A mode that is off says zero for all of them.
+#[tokio::test]
+async fn enhanced_mode_get_has_the_counters_and_the_shape() {
+    let api = api().await;
+    let off = json!({
+        "enabled": false,
+        "dropped": {
+            "malformed": 0,
+            "fragment": 0,
+            "martian": 0,
+            "unsupported": 0,
+            "queueFull": 0,
+            "unknownFake": 0,
+            "busy": 0,
+            "beyondWindow": 0,
+            "rstLimited": 0,
+            "icmpLimited": 0,
+        },
+        "stackPanics": 0,
+    });
+    assert_eq!(get(&api, "/v1/features/enhanced_mode").await, (200, off));
+    {
+        let mut status = api.control.enhanced.lock().unwrap();
+        status.enabled = true;
+        status.counters = TunCounters {
+            malformed: 1,
+            fragment: 2,
+            martian: 3,
+            unsupported: 4,
+            queue_full: 5,
+            unknown_fake: 6,
+            busy: 7,
+            beyond_window: 8,
+            rst_limited: 9,
+            icmp_limited: 10,
+            stack_panics: 11,
+        };
+    }
+    assert_eq!(
+        get(&api, "/v1/features/enhanced_mode").await,
+        (
+            200,
+            json!({
+                "enabled": true,
+                "dropped": {
+                    "malformed": 1,
+                    "fragment": 2,
+                    "martian": 3,
+                    "unsupported": 4,
+                    "queueFull": 5,
+                    "unknownFake": 6,
+                    "busy": 7,
+                    "beyondWindow": 8,
+                    "rstLimited": 9,
+                    "icmpLimited": 10,
+                },
+                "stackPanics": 11,
+            })
+        )
+    );
+}
+
+/// `POST /v1/features/enhanced_mode` goes to the control, whose refusal is a
+/// 500 with its reason; what the switch did not change is what `GET` gives.
+#[tokio::test]
+async fn enhanced_mode_post_goes_to_the_control_and_its_error_is_a_500() {
+    let api = api().await;
+    assert_eq!(
+        post(
+            &api,
+            "/v1/features/enhanced_mode",
+            json!({ "enabled": true })
+        )
+        .await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/features/enhanced_mode").await.1["enabled"],
+        true
+    );
+    api.control.fail_enhanced.store(true, Ordering::SeqCst);
+    let (status, body) = post(
+        &api,
+        "/v1/features/enhanced_mode",
+        json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["error"], "no virtual adapter could be made (test)");
+    assert_eq!(
+        get(&api, "/v1/features/enhanced_mode").await.1["enabled"],
+        true,
+        "the refusal left it as it was"
+    );
+    // the body is read as the other features' are
+    let (status, _) = post(
+        &api,
+        "/v1/features/enhanced_mode",
+        json!({ "enabled": "yes" }),
+    )
+    .await;
+    assert_eq!(status, 400);
 }
 
 #[tokio::test]

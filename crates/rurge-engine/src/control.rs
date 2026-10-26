@@ -1,6 +1,7 @@
 //! Runtime control surface (M4 design §4, §6): the outbound mode as the API
 //! and CLI see it, and (Task 3) the `Control` trait the daemon implements.
 
+use crate::TunCounters;
 use rurge_net::BoxFuture;
 use rurge_rules::OutboundMode;
 
@@ -86,6 +87,13 @@ impl LogLevel {
     }
 }
 
+/// What the enhanced mode is now (`GET /v1/features/enhanced_mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnhancedStatus {
+    pub enabled: bool,
+    pub counters: TunCounters,
+}
+
 /// What the daemon lets the API drive (M4 design §6). Implemented by the
 /// `rurge run` main loop; tests use a fake.
 pub trait Control: Send + Sync {
@@ -96,6 +104,10 @@ pub trait Control: Send + Sync {
     /// back. The error text is shown to the API caller.
     fn set_system_proxy(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>>;
     fn system_proxy_enabled(&self) -> bool;
+    /// Turns the enhanced mode on or off. The error text is shown to the API caller.
+    fn set_enhanced_mode(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>>;
+    /// Whether the enhanced mode is on, and what its TUN has counted (zeros when off).
+    fn enhanced_mode(&self) -> EnhancedStatus;
 }
 
 #[cfg(test)]

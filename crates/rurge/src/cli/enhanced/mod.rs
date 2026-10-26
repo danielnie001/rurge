@@ -9,12 +9,14 @@
 //! owned by the `rurge run` main loop, which calls it one request at a time.
 
 mod backend;
+mod engine;
 mod file;
 mod undo;
 pub(crate) mod wanted;
 
 pub use backend::backend;
 use backend::{Backend, Opened};
+pub use engine::starter;
 use rurge_engine::state::StateStore;
 use rurge_net::BoxFuture;
 use rurge_platform::route::RouteSet;
@@ -41,7 +43,6 @@ pub type EgressSlot = Arc<std::sync::RwLock<Option<Arc<EgressTable>>>>;
 
 /// An empty egress slot: what a run that has not turned the enhanced mode on
 /// yet has.
-#[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
 pub fn egress_slot() -> EgressSlot {
     Arc::new(std::sync::RwLock::new(None))
 }
@@ -60,25 +61,28 @@ fn filled(slot: &EgressSlot) -> bool {
 
 /// Starts the TUN the manager runs: the engine's, or a test's (P6: the engine
 /// cannot make a TUN that never ends, and a close's limit needs one).
-#[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
 pub trait Starter: Send + Sync {
     fn start(&self, device: Arc<dyn Device>) -> BoxFuture<'_, Result<Arc<dyn RunningTun>, String>>;
 }
 
 /// A TUN the manager runs.
-#[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
 pub trait RunningTun: Send + Sync {
     fn stop(&self);
     /// Ends when the TUN and all it holds of the engine have ended
     /// (`TunHandle::join`, then `Engine::tun_ended`), and says how: a device
     /// that failed ends the enhanced mode (P24, task 8).
     fn ended(&self) -> BoxFuture<'_, Ending>;
+    /// Ends when the TUN itself has ended (`TunHandle::join`), without the
+    /// engine's last save: what the task that watches for a device that fails
+    /// waits for (R20: waiting for `Engine::tun_ended` here would hold the
+    /// engine's one TUN's place, and an open right after a close would be
+    /// refused).
+    fn ending(&self) -> BoxFuture<'_, Ending>;
     fn counters(&self) -> rurge_engine::TunCounters;
 }
 
 /// Echo requests while the enhanced mode runs: in this version none go out
 /// (P15; M4 design §10 puts a real one here in M4b).
-#[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
 pub struct NoPinger;
 
 impl Pinger for NoPinger {
@@ -93,36 +97,24 @@ impl Pinger for NoPinger {
 }
 
 /// For the API: whether the enhanced mode is on, and its TUN's counters.
-#[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
 pub struct Shared {
     enabled: AtomicBool,
     /// The TUN the counters come from while it runs.
     tun: Mutex<Option<Arc<dyn RunningTun>>>,
 }
 
-/// What the API says of the enhanced mode, all zero while it is off. M4a task 8
-/// moves this to `rurge_engine::EnhancedStatus`; until then it is the
-/// manager's own.
-#[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Status {
-    pub enabled: bool,
-    pub counters: rurge_engine::TunCounters,
-}
-
 impl Shared {
-    fn new() -> Shared {
+    pub fn new() -> Shared {
         Shared {
             enabled: AtomicBool::new(false),
             tun: Mutex::new(None),
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
-    pub fn status(&self) -> Status {
+    pub fn status(&self) -> rurge_engine::EnhancedStatus {
         let tun = self.tun.lock().unwrap_or_else(|e| e.into_inner());
         let enabled = self.enabled.load(Ordering::SeqCst);
-        Status {
+        rurge_engine::EnhancedStatus {
             enabled,
             counters: match (enabled, tun.as_ref()) {
                 (true, Some(tun)) => tun.counters(),
@@ -142,6 +134,11 @@ impl Shared {
     }
 }
 
+/// Told the number of an open whose TUN failed (P24): the `rurge run` main
+/// loop turns the enhanced mode off when the number is the one that is on. Not
+/// the main loop's `Command`: this module knows nothing of it (R21).
+pub type TunEnded = Arc<dyn Fn(u64) + Send + Sync>;
+
 /// Owned by the `rurge run` main loop, which calls it one request at a time.
 pub struct EnhancedMode {
     backend: Arc<dyn Backend>,
@@ -149,6 +146,10 @@ pub struct EnhancedMode {
     starter: Arc<dyn Starter>,
     egress: EgressSlot,
     shared: Arc<Shared>,
+    /// Where a TUN that failed is told (P24).
+    ended: TunEnded,
+    /// How many opens have succeeded: each is numbered from one (R21).
+    opens: u64,
     /// What is on, and what a close has to undo.
     on: Option<On>,
 }
@@ -157,6 +158,9 @@ pub struct EnhancedMode {
 /// part of that it has got to.
 #[derive(Default)]
 struct On {
+    /// The number of this open: a TUN's failure is only news if it is this
+    /// open's (R21).
+    sequence: u64,
     dev: Option<Opened>,
     tun: Option<Arc<dyn RunningTun>>,
     /// The routes installed into the adapter.
@@ -280,12 +284,12 @@ impl EnhancedMode {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
     pub fn new(
         backend: Arc<dyn Backend>,
         store: Arc<StateStore>,
         starter: Arc<dyn Starter>,
         egress: EgressSlot,
+        ended: TunEnded,
     ) -> EnhancedMode {
         EnhancedMode {
             backend,
@@ -293,22 +297,28 @@ impl EnhancedMode {
             starter,
             egress,
             shared: Arc::new(Shared::new()),
+            ended,
+            opens: 0,
             on: None,
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
     pub fn enabled(&self) -> bool {
         self.on.is_some()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
     pub fn shared(&self) -> Arc<Shared> {
         self.shared.clone()
     }
 
+    /// Whether `sequence` is the number of the open that is on now. A failed
+    /// TUN of an earlier open (or of one a close has happened since) has
+    /// nothing left to turn off (R21).
+    pub fn is_current_open(&self, sequence: u64) -> bool {
+        self.on.as_ref().is_some_and(|on| on.sequence == sequence)
+    }
+
     /// Already on: `Ok` at once.
-    #[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
     pub async fn enable(&mut self, wanted: Wanted) -> Result<(), String> {
         if self.on.is_some() {
             return Ok(());
@@ -318,7 +328,10 @@ impl EnhancedMode {
         match self.open(&mut on, &wanted, &saved).await {
             Ok(()) => {
                 let tun = on.tun.clone().expect("an open that succeeded has a TUN");
-                self.shared.set_on(tun);
+                self.shared.set_on(tun.clone());
+                self.opens += 1;
+                on.sequence = self.opens;
+                self.watch(tun, on.sequence);
                 self.on = Some(on);
                 Ok(())
             }
@@ -337,8 +350,23 @@ impl EnhancedMode {
         }
     }
 
+    /// Watches the TUN of an open that has just succeeded: a device that fails
+    /// ends the enhanced mode, and says so (P24). The wait is for `ending`
+    /// alone (R20): whatever waits on `ended` is a close, which owns the TUN's
+    /// place in the engine. Stops the manager itself makes end as `Stopped`,
+    /// which is no news.
+    fn watch(&self, tun: Arc<dyn RunningTun>, sequence: u64) {
+        let ended = self.ended.clone();
+        tokio::spawn(async move {
+            if let Ending::DeviceFailed(reason) = tun.ending().await {
+                // the reason alone: the line the main loop says is the ERROR
+                tracing::debug!(error = %reason, "the virtual adapter failed");
+                ended(sequence);
+            }
+        });
+    }
+
     /// Never stops halfway; the first error is what comes back.
-    #[cfg_attr(not(test), allow(dead_code))] // wired up by M4a task 8
     pub async fn disable(&mut self) -> Result<(), String> {
         let Some(on) = self.on.take() else {
             return Ok(());
@@ -406,6 +434,11 @@ impl EnhancedMode {
         let with = dev.clone();
         let configured = call(move || backend.configure(&with, asked)).await?;
         let ipv6 = asked && configured;
+        if asked && !configured {
+            // design 4.6 / M4-D17: IPv6 that cannot be had is no failure of
+            // the open, but the user should know their network is IPv4 only
+            tracing::warn!("IPv6 could not be configured; the enhanced mode goes on without it");
+        }
 
         // 3. the TUN, so that packets are taken before traffic comes to it
         let tun = self.starter.start(dev.device.clone()).await?;
@@ -809,6 +842,8 @@ mod tests {
         stopped: Arc<AtomicBool>,
         /// Whether `ended()` answers at once.
         ends: bool,
+        /// Whether `ending()` answers `DeviceFailed` at once (P24).
+        failing: bool,
     }
 
     impl RunningTun for MockTun {
@@ -827,17 +862,31 @@ mod tests {
             })
         }
 
+        fn ending(&self) -> BoxFuture<'_, Ending> {
+            Box::pin(async move {
+                if self.failing {
+                    Ending::DeviceFailed("the device failed (test)".to_string())
+                } else if self.ends {
+                    Ending::Stopped
+                } else {
+                    std::future::pending().await
+                }
+            })
+        }
+
         fn counters(&self) -> rurge_engine::TunCounters {
             rurge_engine::TunCounters::default()
         }
     }
 
-    /// A starter whose TUN ends at once, or never.
+    /// A starter whose TUN ends at once, or never, and whose device fails when
+    /// it is asked to.
     #[derive(Default)]
     struct MockStarter {
         calls: Calls,
         fail: Arc<Mutex<Option<String>>>,
         ends: bool,
+        failing: bool,
         stopped: Arc<AtomicBool>,
     }
 
@@ -856,6 +905,7 @@ mod tests {
                     calls: self.calls.clone(),
                     stopped: self.stopped.clone(),
                     ends: self.ends,
+                    failing: self.failing,
                 }) as Arc<dyn RunningTun>)
             })
         }
@@ -868,12 +918,19 @@ mod tests {
         backend: Arc<Mock>,
         starter: Arc<MockStarter>,
         egress: EgressSlot,
+        /// The open numbers the manager told the loop about (P24).
+        told: tokio::sync::mpsc::UnboundedReceiver<u64>,
         mode: EnhancedMode,
     }
 
     /// A manager over a mock backend and a mock starter, `state.json` in a
     /// temporary directory. `ends` says whether the TUN's `ended()` answers.
     async fn fixture(ends: bool) -> Fixture {
+        fixture_with(ends, false).await
+    }
+
+    /// `fixture`, and whether the TUN's device fails at once (P24).
+    async fn fixture_with(ends: bool, failing: bool) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.json");
         let (store, _) = StateStore::open(state.clone()).await;
@@ -888,13 +945,18 @@ mod tests {
         let starter = Arc::new(MockStarter {
             calls,
             ends,
+            failing,
             ..MockStarter::default()
         });
+        let (tell, told) = tokio::sync::mpsc::unbounded_channel();
         let mode = EnhancedMode::new(
             backend.clone(),
             store.clone(),
             starter.clone(),
             egress.clone(),
+            Arc::new(move |sequence| {
+                let _ = tell.send(sequence);
+            }),
         );
         Fixture {
             _dir: dir,
@@ -903,6 +965,7 @@ mod tests {
             backend,
             starter,
             egress,
+            told,
             mode,
         }
     }
@@ -939,6 +1002,26 @@ mod tests {
 
     fn lines(what: &[&str]) -> Vec<String> {
         what.iter().map(|line| line.to_string()).collect()
+    }
+
+    /// A device that fails ends the enhanced mode: the manager tells the loop
+    /// which open it belonged to (P24, R21).
+    #[tokio::test]
+    async fn a_device_that_fails_tells_the_loop_which_open_it_belongs_to() {
+        let mut f = fixture_with(true, true).await;
+        f.mode.enable(wanted()).await.unwrap();
+        let sequence = tokio::time::timeout(Duration::from_secs(1), f.told.recv())
+            .await
+            .expect("the failure is told")
+            .expect("the channel is still open");
+        assert_eq!(sequence, 1, "the first open is number one");
+        assert!(f.mode.is_current_open(1));
+        f.mode.disable().await.unwrap();
+        assert!(!f.mode.is_current_open(1), "a close ends that open");
+        assert!(
+            f.told.try_recv().is_err(),
+            "a TUN a close stopped is no news"
+        );
     }
 
     /// This version sends no echo requests: every one of them says so at once
