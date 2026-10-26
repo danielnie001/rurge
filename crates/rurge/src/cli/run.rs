@@ -1657,11 +1657,14 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         )?;
         opts.remote = Some(sources.remote());
         sources.track(&cfg.source);
+        // The interfaces the network is read without: the virtual adapter
+        // while the enhanced mode is on. The manager sets it (M4b task 6).
+        let exclude = network::Exclude::default();
         // The network before the first generation, which is built on it: its
         // `subnet` groups and `SUBNET` rules look at it from the first
         // session on, and the DNS `[SSID Setting]` sets for it is the DNS of
         // its resolver.
-        let started = network::start(&network_backend).await;
+        let started = network::start(&network_backend, &exclude).await;
         shared
             .network
             .store(network::facts_of(&started.snapshot));
@@ -1856,6 +1859,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let following_the_network = network::spawn(
             network_backend,
             started,
+            exclude,
             cmd_tx.clone(),
             Command::NetworkChanged,
         );

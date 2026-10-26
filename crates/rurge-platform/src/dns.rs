@@ -5,15 +5,41 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
+use crate::route::{SPACE_V4, SPACE_V6};
+
 pub fn servers() -> Vec<SocketAddr> {
     let mut out: Vec<SocketAddr> = Vec::new();
-    for ip in platform::servers() {
+    for ip in without_rurge_space(platform::servers()) {
         let sa = SocketAddr::new(ip, 53);
         if !out.contains(&sa) {
             out.push(sa);
         }
     }
     out
+}
+
+/// `servers` without the ones in rurge's own address space (design 4.5). No
+/// DNS server of the system's is there: the responder is, while the enhanced
+/// mode is on, and the system DNS may still point at it for a while after a
+/// crash (design 6.3, P11). The network the machine is on is read through this
+/// too, so that a snapshot does not say the responder is a server either.
+///
+/// Order and duplicates are the caller's business: what is not in the space is
+/// handed on as it came.
+pub(crate) fn without_rurge_space(servers: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
+    servers
+        .into_iter()
+        .filter(|ip| !in_rurge_space(ip))
+        .collect()
+}
+
+/// Whether `ip` is in rurge's own address space: the adapter, the responder
+/// and the fake addresses.
+fn in_rurge_space(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => SPACE_V4.contains(v4),
+        IpAddr::V6(v6) => SPACE_V6.contains(v6),
+    }
 }
 
 pub fn search_domains() -> Vec<String> {
@@ -179,6 +205,37 @@ mod tests {
         assert!(!g("fd00::1"));
         assert!(!g("ff02::1"));
         assert!(!g("::"));
+    }
+
+    /// rurge's own address space holds no DNS server of the system's (design
+    /// 6.3, P11): the responder is there while the enhanced mode is on, and
+    /// the system DNS may still point at it for a while after a crash.
+    #[test]
+    fn servers_in_rurges_space_are_left_out() {
+        let asked = [
+            "198.18.0.2",
+            "198.17.255.255",
+            "198.19.255.255",
+            "198.20.0.1",
+            "8.8.8.8",
+            "fd00:6152::2",
+            "fd00:6153::1",
+        ]
+        .map(|text| text.parse::<IpAddr>().unwrap());
+        assert_eq!(
+            without_rurge_space(asked),
+            ["198.17.255.255", "198.20.0.1", "8.8.8.8", "fd00:6153::1"]
+                .map(|text| text.parse::<IpAddr>().unwrap())
+        );
+        // nothing at all is nothing left
+        assert_eq!(without_rurge_space([] as [IpAddr; 0]), Vec::<IpAddr>::new());
+        // and what is there keeps its order and its duplicates
+        let twice =
+            ["8.8.8.8", "198.18.0.2", "8.8.8.8"].map(|text| text.parse::<IpAddr>().unwrap());
+        assert_eq!(
+            without_rurge_space(twice),
+            ["8.8.8.8", "8.8.8.8"].map(|text| text.parse::<IpAddr>().unwrap())
+        );
     }
 
     #[test]

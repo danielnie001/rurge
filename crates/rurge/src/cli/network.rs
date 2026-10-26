@@ -96,12 +96,25 @@ fn is_global(address: &IpAddr) -> bool {
     }
 }
 
+/// The interfaces the network task leaves out of what it reads: the virtual
+/// adapter while the enhanced mode is on (the manager sets it).
+pub type Exclude = Arc<std::sync::RwLock<Vec<String>>>;
+
+/// What a read leaves out: the interfaces the list holds when the read begins,
+/// taken once for it. The manager sets the list long after the start.
+fn read_opts(exclude: &Exclude) -> ReadOpts {
+    ReadOpts {
+        exclude: exclude.read().unwrap_or_else(|e| e.into_inner()).clone(),
+    }
+}
+
 /// Reads the network on a thread of the blocking pool: it may run programs,
-/// each for two seconds at most. `None` is a read that did not happen (the
-/// reader of the platform panicked), which says nothing of the network: it is
-/// not a network that is not known.
-async fn look(backend: Backend) -> Option<Snapshot> {
-    match tokio::task::spawn_blocking(move || netenv::read(&backend, &ReadOpts::default())).await {
+/// each for two seconds at most. `exclude` names the interfaces to leave out.
+/// `None` is a read that did not happen (the reader of the platform panicked),
+/// which says nothing of the network: it is not a network that is not known.
+async fn look(backend: Backend, exclude: Exclude) -> Option<Snapshot> {
+    let opts = read_opts(&exclude);
+    match tokio::task::spawn_blocking(move || netenv::read(&backend, &opts)).await {
         Ok(snapshot) => Some(snapshot),
         Err(e) => {
             tracing::debug!(panicked = e.is_panic(), "cannot read the network");
@@ -111,9 +124,9 @@ async fn look(backend: Backend) -> Option<Snapshot> {
 }
 
 /// The network as the commands that run without a daemon look at it: read
-/// once, and as it is then.
+/// once, and as it is then. There is no virtual adapter to leave out.
 pub async fn read_once(backend: &Backend) -> NetworkFacts {
-    look(backend.clone())
+    look(backend.clone(), Exclude::default())
         .await
         .map(|snapshot| facts_of(&snapshot))
         .unwrap_or_default()
@@ -142,10 +155,12 @@ pub struct Started {
 }
 
 /// Begins to listen, then looks. In this order: what changes between the two
-/// is a hint, and not lost. Call it once per process.
-pub async fn start(backend: &Backend) -> Started {
+/// is a hint, and not lost. Call it once per process. `exclude` names the
+/// interfaces the look leaves out.
+pub async fn start(backend: &Backend, exclude: &Exclude) -> Started {
     let hints = forward_hints(netenv::hints(backend));
-    let (snapshot, late) = first_look(|| look(backend.clone()), FIRST_LOOK).await;
+    let exclude = exclude.clone();
+    let (snapshot, late) = first_look(|| look(backend.clone(), exclude.clone()), FIRST_LOOK).await;
     Started {
         hints,
         snapshot,
@@ -204,9 +219,11 @@ fn forward_hints(hints: std::sync::mpsc::Receiver<()>) -> Arc<Notify> {
 
 /// Follows the network until the daemon is gone: every change is told to
 /// `changes`, as `wrap` makes of it. The task is gone with the handle.
+/// `exclude` is the list of interfaces to leave out, read at every look.
 pub fn spawn<C: Send + 'static>(
     backend: Backend,
     started: Started,
+    exclude: Exclude,
     changes: mpsc::Sender<C>,
     wrap: fn(NetworkChange) -> C,
 ) -> AbortOnDropHandle<()> {
@@ -215,7 +232,7 @@ pub fn spawn<C: Send + 'static>(
         snapshot,
         late,
     } = started;
-    let again = move || look(backend.clone());
+    let again = move || look(backend.clone(), exclude.clone());
     AbortOnDropHandle::new(tokio::spawn(follow(
         hints, again, snapshot, late, changes, wrap,
     )))
@@ -1013,6 +1030,21 @@ mod tests {
         }
     }
 
+    /// A read leaves out the interfaces the list holds when it is made, and
+    /// not those it held when the task began: the manager sets the virtual
+    /// adapter when the enhanced mode comes on, long after the start, and
+    /// clears it when it goes.
+    #[test]
+    fn the_list_of_interfaces_to_leave_out_is_taken_before_each_read() {
+        let exclude = Exclude::default();
+        assert_eq!(read_opts(&exclude).exclude, Vec::<String>::new());
+        *exclude.write().unwrap_or_else(|e| e.into_inner()) = vec!["utun7".to_string()];
+        assert_eq!(read_opts(&exclude).exclude, ["utun7"]);
+        assert_eq!(read_opts(&exclude).exclude, ["utun7"], "one for every read");
+        exclude.write().unwrap_or_else(|e| e.into_inner()).clear();
+        assert_eq!(read_opts(&exclude).exclude, Vec::<String>::new());
+    }
+
     /// The first look is of the network the backend names, and a file that
     /// says nothing makes the engine know nothing.
     #[tokio::test]
@@ -1020,11 +1052,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("network.json");
         let backend = Backend::File(file.clone());
-        assert_eq!(start(&backend).await.snapshot, Snapshot::default());
+        assert_eq!(
+            start(&backend, &Exclude::default()).await.snapshot,
+            Snapshot::default()
+        );
         assert_eq!(read_once(&backend).await, NetworkFacts::default());
 
         std::fs::write(&file, serde_json::to_string(&on_wifi("Home")).unwrap()).unwrap();
         assert_eq!(read_once(&backend).await, told_of("Home").facts);
-        assert_eq!(start(&backend).await.snapshot, on_wifi("Home"));
+        assert_eq!(
+            start(&backend, &Exclude::default()).await.snapshot,
+            on_wifi("Home")
+        );
     }
 }

@@ -20,6 +20,7 @@ mod watch;
 mod windows;
 
 use crate::dirs::Os;
+use crate::dns::without_rurge_space;
 use host::{Host, RealHost};
 use macos::PortCache;
 use serde::{Deserialize, Serialize};
@@ -123,9 +124,9 @@ pub struct Quick {
 #[derive(Clone, Debug, Default)]
 pub struct ReadOpts {
     /// Interfaces that are neither the primary interface nor the Wi-Fi link,
-    /// whatever the system says of them. (The virtual adapter of the enhanced
-    /// mode is one; until there is one the list is empty.) The file backend
-    /// has no use for it: its file says what the network is.
+    /// whatever the system says of them (the virtual adapter while the enhanced
+    /// mode is on). The file backend has no use for it: its file says what the
+    /// network is.
     pub exclude: Vec<String>,
 }
 
@@ -182,11 +183,16 @@ pub fn read_quick(backend: &Backend, opts: &ReadOpts) -> Quick {
 }
 
 fn quick_on(os: Os, host: &dyn Host, opts: &ReadOpts, ports: &PortCache) -> Quick {
-    match os {
+    let mut quick = match os {
         Os::Windows => windows::quick(host, opts),
         Os::MacOs => macos::quick(host, opts, ports),
         Os::Unix => linux::quick(host, opts),
-    }
+    };
+    // The DNS servers rurge's own address space holds are no server to ask
+    // (design 6.3, P11). Both reads come through here, and so does `read`,
+    // which has its Wi-Fi link out of the same quick look.
+    quick.dns = without_rurge_space(quick.dns);
+    quick
 }
 
 fn read_on(os: Os, host: &dyn Host, opts: &ReadOpts, ports: &PortCache) -> Snapshot {
@@ -215,7 +221,7 @@ fn file_snapshot(path: &Path) -> Snapshot {
             return Snapshot::default();
         }
     };
-    serde_json::from_str(&text).unwrap_or_else(|e| {
+    let mut snapshot: Snapshot = serde_json::from_str(&text).unwrap_or_else(|e| {
         // where, not what: the text may be a name that is not to be logged
         tracing::debug!(
             category = ?e.classify(),
@@ -224,7 +230,11 @@ fn file_snapshot(path: &Path) -> Snapshot {
             "the network file is not a network"
         );
         Snapshot::default()
-    })
+    });
+    // as what the platform says is: the address space of rurge is no server
+    // of the system's (design 6.3, P11)
+    snapshot.dns = without_rurge_space(snapshot.dns);
+    snapshot
 }
 
 /// What says which network an interface is on, out of its addresses: the IPv4
@@ -347,6 +357,42 @@ mod tests {
                 ssid: None,
                 bssid: None
             })
+        );
+    }
+
+    /// The addresses of rurge's own space are no DNS server to ask, whichever
+    /// source said them (design 6.3, P11): the responder is there while the
+    /// enhanced mode is on, and the system DNS may still point at it for a
+    /// while after a crash.
+    #[test]
+    fn a_snapshot_leaves_out_dns_servers_in_rurges_space() {
+        // a file that names the responder beside a server of somebody else's
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("network.json");
+        let mut written = snapshot();
+        written.dns = vec![ip("198.18.0.2"), ip("192.0.2.53"), ip("fd00:6152::2")];
+        std::fs::write(&path, serde_json::to_string(&written).unwrap()).unwrap();
+        let backend = Backend::File(path);
+        let read = read(&backend, &ReadOpts::default());
+        assert_eq!(read.dns, vec![ip("192.0.2.53")]);
+        // the cheap look says the same of it
+        assert_eq!(read_quick(&backend, &ReadOpts::default()).dns, read.dns);
+
+        // and a machine that names it does too (the readers of the three
+        // platforms are followed by the one place that leaves it out)
+        use host::testing::FakeHost;
+        let host = FakeHost::default().with_file(
+            "/etc/resolv.conf",
+            "nameserver 198.18.0.2\nnameserver 192.0.2.53\n",
+        );
+        let ports = PortCache::new();
+        assert_eq!(
+            read_on(Os::Unix, &host, &ReadOpts::default(), &ports).dns,
+            vec![ip("192.0.2.53")]
+        );
+        assert_eq!(
+            quick_on(Os::Unix, &host, &ReadOpts::default(), &ports).dns,
+            vec![ip("192.0.2.53")]
         );
     }
 
