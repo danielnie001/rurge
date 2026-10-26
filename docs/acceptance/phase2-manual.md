@@ -133,7 +133,7 @@
 
 前置：本机能用 `ssh` 登录一台自己的服务器（密钥登录，不需要输入口令），服务器的主机密钥已在 `known_hosts` 里。外部程序不能交互式提问（Unix 上读终端会被挂起，rurge 仍当它在运行），所以 `ssh` 一律带 `-o BatchMode=yes -o ExitOnForwardFailure=yes`（后者让本机端口绑定失败时 `ssh` 直接退出）。配置里写 `[Proxy]` 一条 `Ext = external, exec = "<ssh 的完整路径>", args = "-N", args = "-o", args = "BatchMode=yes", args = "-o", args = "ExitOnForwardFailure=yes", args = "-D", args = "127.0.0.1:1080", args = "<用户>@<服务器>", local-port = 1080`，`[Rule]` 里 `FINAL,Ext`；`rurge check -c <配置>` 零错误（没有 `W0007`）。三个平台各验一遍。
 
-- [ ] 第一次用到时拉起：`rurge run -c <配置> --log-level info` 启动后没有 `ssh` 进程；`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 返回 200，此时有了 `ssh` 进程，日志里有 `external: the program started`（策略名与 pid，没有参数）。
+- [ ] 第一次用到时拉起：`rurge run -c <配置> --log-level info` 启动后没有 `ssh` 进程；`curl -x http://127.0.0.1:<http-listen 端口> https://example.com/ -I` 返回 200，此时有了 `ssh` 进程，日志里有 `external: the program started`（策略名，没有参数与 pid；pid 在 DEBUG 的 `external: the program's process id` 一行）。
 - [ ] 日志文件：`<数据目录>/external/Ext.log` 里有一行 `--- rurge: starting the program …`，`ssh` 自己的输出（如有）在它后面。
 - [ ] 再拉起：手动结束这个 `ssh` 进程，日志里有 `external: the program exited`；再发一个请求，2 秒左右后返回 200，出现了新的 `ssh` 进程。
 - [ ] 停止：`rurge stop`（或 Ctrl-C）之后没有 `ssh` 进程残留（Windows：任务管理器；Unix：`ps`）；日志里有 `external: the program stopped`。

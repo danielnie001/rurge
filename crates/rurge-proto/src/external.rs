@@ -438,7 +438,8 @@ impl ExternalOutbound {
             .ok_or_else(|| io::Error::other("the program exited at once"))?;
         // an error drops `child`, which kills it
         let group = self.hook.contain(pid)?;
-        tracing::info!(policy = %self.name, pid, "external: the program started");
+        tracing::info!(policy = %self.name, "external: the program started");
+        tracing::debug!(policy = %self.name, pid, "external: the program's process id");
         let tree = Arc::new(std::sync::Mutex::new(Tree(group)));
         *self.program.live.lock().expect("external program") = Some(Live {
             pid,
@@ -447,7 +448,6 @@ impl ExternalOutbound {
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(watch(
             self.name.clone(),
-            pid,
             child,
             self.program.live.clone(),
             tree,
@@ -554,7 +554,6 @@ impl Drop for Tree {
 /// tree after it is over (`Program::live`).
 async fn watch(
     policy: String,
-    pid: u32,
     mut child: tokio::process::Child,
     live: Arc<std::sync::Mutex<Option<Live>>>,
     tree: Arc<std::sync::Mutex<Tree>>,
@@ -564,7 +563,7 @@ async fn watch(
         status = child.wait() => {
             tree.lock().expect("external program tree").end();
             let code = status.ok().and_then(|s| s.code());
-            tracing::info!(policy = %policy, pid, code, "external: the program exited");
+            tracing::info!(policy = %policy, code, "external: the program exited");
         }
         _ = stop => {
             let asked = tree.lock().expect("external program tree").terminate();
@@ -573,7 +572,7 @@ async fn watch(
             }
             tree.lock().expect("external program tree").end();
             let _ = child.kill().await;
-            tracing::info!(policy = %policy, pid, "external: the program stopped");
+            tracing::info!(policy = %policy, "external: the program stopped");
         }
     }
     // the program is gone: no session is this one's any more
@@ -951,5 +950,95 @@ mod tests {
         );
         assert!(!elsewhere.program.retired.load(Ordering::Acquire));
         assert!(!new.program.retired.load(Ordering::Acquire));
+    }
+
+    /// The program's process id goes only to DEBUG: a process's name, path and
+    /// PID are DEBUG's (CLAUDE.md, "the levels of the log"). The INFO lines
+    /// of the program's life name the policy and nothing of the process; the
+    /// id is the DEBUG line that follows the start (the phase 3 / M4b plan's
+    /// execution record row 74).
+    #[tokio::test]
+    async fn the_programs_pid_is_only_logged_at_debug() {
+        let (log, _logging, _second) = Log::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let o = running_outbound(FakeHook::new(&[]), 9, dir.path());
+        o.ensure_started().await.unwrap();
+        o.stop().await;
+
+        let started = log.with("external: the program started");
+        assert_eq!(started.len(), 1, "{started:?}");
+        assert!(started[0].starts_with("INFO "), "{}", started[0]);
+        assert!(!started[0].contains("pid="), "{}", started[0]);
+
+        let id = log.with("external: the program's process id");
+        assert_eq!(id.len(), 1, "{id:?}");
+        assert!(id[0].starts_with("DEBUG "), "{}", id[0]);
+        assert!(id[0].contains("pid="), "{}", id[0]);
+
+        let stopped = log.with("external: the program stopped");
+        assert_eq!(stopped.len(), 1, "{stopped:?}");
+        assert!(!stopped[0].contains("pid="), "{}", stopped[0]);
+    }
+
+    /// What this thread logs, at every level, as `LEVEL fields…`: while the
+    /// guard and the second dispatcher live. While one dispatcher alone is
+    /// registered, tracing asks only the thread that first reaches a call site
+    /// whether it is wanted: a site another test reached first would stay shut
+    /// on this thread too.
+    #[derive(Clone, Default)]
+    struct Log(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Log {
+        fn capture() -> (Log, tracing::subscriber::DefaultGuard, tracing::Dispatch) {
+            let log = Log::default();
+            let logging = tracing::subscriber::set_default(log.clone());
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            (log, logging, second)
+        }
+
+        /// The lines that have `text` in them.
+        fn with(&self, text: &str) -> Vec<String> {
+            let lines = self.0.lock().unwrap();
+            lines
+                .iter()
+                .filter(|line| line.contains(text))
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl tracing::Subscriber for Log {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Fields(Vec::new());
+            event.record(&mut fields);
+            fields.0.sort();
+            let line = format!("{} {}", event.metadata().level(), fields.0.join(" "));
+            self.0.lock().unwrap().push(line);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// An event's fields, each as `name=value`.
+    struct Fields(Vec<String>);
+
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
     }
 }
