@@ -1,5 +1,6 @@
 //! `rurge run`: the foreground proxy daemon (M3 design §9.3).
 
+use super::enhanced::{EnhancedMode, wanted::Wanted};
 use super::network;
 use super::rule::{parse_mode, print_diagnostics};
 use super::runtime::{PlatformOwners, PlatformProcesses, RuntimeArgs, owners_backend};
@@ -9,7 +10,6 @@ use crate::capabilities;
 use anyhow::Context;
 use clap::Args;
 use rurge_api::ApiContext;
-use rurge_config::NetworkFacts;
 use rurge_config::config::{LoadError, LoadOptions, Loaded, Platform};
 use rurge_config::general::ControllerAccess;
 use rurge_config::general::LogLevel;
@@ -291,7 +291,7 @@ enum Command {
     /// says whether that open is the one that is on).
     TunEnded(u64),
     /// The machine is on another network (`network::spawn` tells).
-    NetworkChanged(NetworkFacts),
+    NetworkChanged(network::NetworkChange),
 }
 
 struct LoopControl {
@@ -616,9 +616,10 @@ fn takeover_paused_here(engine: &Engine) -> bool {
 }
 
 /// What the enhanced mode should be for the generation in use and the network
-/// (M4 design 4.6, 4.7). The start and the API's `POST` both ask it, and task
-/// 9's reload and change of network will too.
-fn wanted_now(engine: &Engine) -> super::enhanced::wanted::Wanted {
+/// (M4 design 4.6, 4.7): `ipv6_usable` is whether this network has IPv6 for
+/// `ipv6-vif = auto` (P18). The start, the API's `POST`, a reload and a change
+/// of network all ask it.
+fn wanted_now(engine: &Engine, ipv6_usable: bool) -> Wanted {
     let runtime = engine.runtime();
     let general = &runtime.config.general;
     let external = runtime.config.external_addresses();
@@ -627,21 +628,21 @@ fn wanted_now(engine: &Engine) -> super::enhanced::wanted::Wanted {
         .primary
         .as_ref()
         .map(|primary| primary.interface.clone());
-    // M4a task 9: from the network (P18)
     super::enhanced::wanted::wanted(
         general,
         &external,
-        false,
+        ipv6_usable,
         primary,
         cfg!(target_os = "macos"),
     )
 }
 
-/// The system proxy as the user wants it, and as the network lets it be
-/// (phase 3 M1 design 7.4). While the network says to leave the system alone
-/// the takeover is paused: the system proxy is given back as it was, and what
-/// is asked for meanwhile is only noted. It is in memory: `state.json` has the
-/// system proxy as it is, which is how a crash is recovered from.
+/// The system proxy and the enhanced mode as the user wants them, and as the
+/// network lets them be (phase 3 M1 design 7.4, M4 design 9.9). While the
+/// network says to leave the system alone the takeover is paused: both are
+/// given back as they were, and what is asked for meanwhile is only noted. It
+/// is in memory: `state.json` has them as they are, which is how a crash is
+/// recovered from.
 ///
 /// Not the engine's `suspend`, which refuses new sessions for a managed
 /// profile whose update failed.
@@ -649,20 +650,25 @@ struct Takeover {
     /// What the user asked for last: `--system-proxy`, then what each
     /// `POST /v1/features/system_proxy` that was answered with success said.
     wanted: bool,
+    /// The same for the enhanced mode: `--enhanced-mode`, then what each
+    /// `POST /v1/features/enhanced_mode` that was answered with success said.
+    enhanced_wanted: bool,
     /// The network says to leave the system alone.
     paused: bool,
 }
 
 impl Takeover {
-    fn new(wanted: bool) -> Takeover {
+    fn new(wanted: bool, enhanced_wanted: bool) -> Takeover {
         Takeover {
             wanted,
+            enhanced_wanted,
             paused: false,
         }
     }
 
     /// The start: whether the network the daemon begins on pauses the takeover.
-    /// If it does nothing is set, and `wanted` is what the pause ends with.
+    /// If it does nothing is set, and `wanted` and `enhanced_wanted` are what
+    /// the pause ends with.
     fn begin(&mut self, engine: &Engine) -> bool {
         self.paused = takeover_paused_here(engine);
         if self.paused {
@@ -673,17 +679,21 @@ impl Takeover {
 
     /// Whether the takeover is paused is the generation in use and the network
     /// together: look again after either has changed, and do what the
-    /// difference asks. Entering the pause gives the system proxy back (that
-    /// it was on is what the user wants, and is noted); leaving it makes the
-    /// system proxy what the user last asked for, in both directions: pointed
-    /// at rurge again if they want it so, and given back if they asked for
-    /// that meanwhile and it is still pointed at rurge (the pause could not
-    /// give it back). Each is tried once.
+    /// difference asks. Entering the pause gives both back (that they were on
+    /// is what the user wants, and is noted); leaving it makes both what the
+    /// user last asked for, in both directions: pointed at rurge again if they
+    /// want it so, and given back if they asked for that meanwhile and it is
+    /// still on (the pause could not give it back). Each is tried once.
+    ///
+    /// The enhanced mode goes first, in both directions, as it does at the exit
+    /// (M4-D16): what it leaves behind is the machine's DNS.
     async fn follow(
         &mut self,
         engine: &Engine,
         listeners: &[(ListenerSpec, Running)],
         sysproxy: &mut SystemProxyManager,
+        enhanced: &mut EnhancedMode,
+        ipv6_usable: bool,
     ) {
         let paused = takeover_paused_here(engine);
         if paused == self.paused {
@@ -691,6 +701,15 @@ impl Takeover {
         }
         self.paused = paused;
         if paused {
+            if enhanced.enabled() {
+                self.enhanced_wanted = true;
+                if let Err(e) = enhanced.disable().await {
+                    tracing::error!(
+                        error = %e,
+                        "cannot turn the enhanced mode off for the pause; it stays on"
+                    );
+                }
+            }
             if sysproxy.enabled() {
                 self.wanted = true;
                 if let Err(e) = sysproxy.disable().await {
@@ -702,6 +721,25 @@ impl Takeover {
             }
             tracing::info!("takeover paused on this network");
         } else {
+            match (self.enhanced_wanted, enhanced.enabled()) {
+                (true, false) => {
+                    if let Err(e) = enhanced.enable(wanted_now(engine, ipv6_usable)).await {
+                        tracing::error!(
+                            error = %e,
+                            "cannot turn the enhanced mode on when the pause ends; it stays off"
+                        );
+                    }
+                }
+                (false, true) => {
+                    if let Err(e) = enhanced.disable().await {
+                        tracing::error!(
+                            error = %e,
+                            "cannot turn the enhanced mode off when the pause ends; it stays on"
+                        );
+                    }
+                }
+                _ => {}
+            }
             match (self.wanted, sysproxy.enabled()) {
                 (true, false) => {
                     if let Err(e) = switch_system_proxy(sysproxy, engine, listeners, true).await {
@@ -743,6 +781,30 @@ impl Takeover {
         self.wanted = enabled;
         Ok(())
     }
+
+    /// `POST /v1/features/enhanced_mode`. While the takeover is paused nothing
+    /// is opened or closed: success is answered, and what was asked for is what
+    /// is done when the pause ends.
+    async fn switch_enhanced(
+        &mut self,
+        engine: &Engine,
+        enhanced: &mut EnhancedMode,
+        ipv6_usable: bool,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if self.paused {
+            tracing::info!(
+                enabled,
+                "the takeover is paused on this network; the enhanced mode is left as it is, and set as asked when the pause ends"
+            );
+        } else if enabled {
+            enhanced.enable(wanted_now(engine, ipv6_usable)).await?;
+        } else {
+            enhanced.disable().await?;
+        }
+        self.enhanced_wanted = enabled;
+        Ok(())
+    }
 }
 
 /// The machine is on another network (phase 3 M1 design 4): the engine is
@@ -752,11 +814,17 @@ impl Takeover {
 /// API, in the main loop.
 async fn network_changed(
     d: &Daemon<'_>,
-    facts: NetworkFacts,
+    change: network::NetworkChange,
     listeners: &[(ListenerSpec, Running)],
     sysproxy: &mut SystemProxyManager,
     takeover: &mut Takeover,
+    enhanced: &mut EnhancedMode,
+    ipv6_usable: &mut bool,
 ) {
+    let network::NetworkChange {
+        facts,
+        ipv6_usable: on_this_network,
+    } = change;
     // The interface and its kind are said at INFO. What says where the
     // machine is (the name of the network, the access point, the gateways) is
     // said at DEBUG only.
@@ -791,7 +859,21 @@ async fn network_changed(
         );
     }
     follow_the_dns_of_the_network(d).await;
-    takeover.follow(d.engine, listeners, sysproxy).await;
+    // Before `takeover.follow`, which opens the enhanced mode when the pause
+    // ends: what it opens with is this network's IPv6, not the last one's.
+    *ipv6_usable = on_this_network;
+    let was_on = enhanced.enabled();
+    takeover
+        .follow(d.engine, listeners, sysproxy, enhanced, *ipv6_usable)
+        .await;
+    // A mode `takeover.follow` has just opened is on this generation and this
+    // network already: following again would only take the DNS and the
+    // adjustments over once more.
+    if was_on && enhanced.enabled() {
+        enhanced
+            .follow(wanted_now(d.engine, *ipv6_usable), true)
+            .await;
+    }
 }
 
 /// A generation is built with the DNS that `[SSID Setting]` sets for the
@@ -843,6 +925,8 @@ async fn reload_and_refresh(
     listeners: &mut Vec<(ListenerSpec, Running)>,
     sysproxy: &mut SystemProxyManager,
     takeover: &mut Takeover,
+    enhanced: &mut EnhancedMode,
+    ipv6_usable: bool,
 ) -> ReloadReport {
     let report = reload(d, listeners).await;
     if report.ok {
@@ -851,8 +935,21 @@ async fn reload_and_refresh(
         // network's. It is the question asked after a change of network, asked
         // of whatever generation comes in.
         follow_the_dns_of_the_network(d).await;
+        // A mode that is on takes the new generation with what differs (M4
+        // design 9.7): the routes the profile's items and the external programs
+        // add up to, the IPv6 half as `ipv6-vif` says, and the egress table. A
+        // mode that is off stays off, and one `takeover.follow` has just opened
+        // is on the new generation already.
+        let was_on = enhanced.enabled();
         // before the refresh: it does nothing for a system proxy that is given back
-        takeover.follow(d.engine, listeners, sysproxy).await;
+        takeover
+            .follow(d.engine, listeners, sysproxy, enhanced, ipv6_usable)
+            .await;
+        if was_on && enhanced.enabled() {
+            enhanced
+                .follow(wanted_now(d.engine, ipv6_usable), false)
+                .await;
+        }
     }
     let settings = current_settings(d.engine, listeners);
     if report.ok
@@ -1535,6 +1632,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         shared
             .network
             .store(network::facts_of(&started.snapshot));
+        // Whether this network has IPv6 for `ipv6-vif = auto` (P18): the
+        // start asks once, and every change of network asks again.
+        let mut ipv6_usable = network::ipv6_usable(&started.snapshot);
         let engine_rt =
             build_engine_runtime(cfg, &rt, &run_opts, outbound_mode.clone(), &shared).await?;
         print_diagnostics(engine_rt.diagnostics());
@@ -1645,12 +1745,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         // everything fallible is behind us: nothing below returns early while
         // the operating system points at rurge, except the failure to enable.
         //
+        // On a network that says to leave the system alone neither is set:
+        // the options are only noted, and done when the pause ends (M4-D18).
+        let mut takeover = Takeover::new(args.system_proxy, args.enhanced_mode);
+        let paused = takeover.begin(&engine);
         // The enhanced mode goes first (P25): the system proxy points at the
         // listeners that are already up, and a start whose system proxy fails
-        // gives the enhanced mode back before it exits. Task 9 adds the pause
-        // of `[SSID Setting]`; until then `--enhanced-mode` is what decides.
-        if args.enhanced_mode {
-            match enhanced.enable(wanted_now(&engine)).await {
+        // gives the enhanced mode back before it exits.
+        if !paused && args.enhanced_mode {
+            match enhanced.enable(wanted_now(&engine, ipv6_usable)).await {
                 Ok(()) => println!("enhanced mode on"),
                 Err(e) => {
                     eprintln!("error: cannot turn the enhanced mode on: {e}");
@@ -1658,11 +1761,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 }
             }
         }
-        // The system proxy comes next. On a network that says to leave the
-        // system alone nothing is enabled: `--system-proxy` is only noted, and
-        // done when the pause ends.
-        let mut takeover = Takeover::new(args.system_proxy);
-        if !takeover.begin(&engine) && args.system_proxy {
+        // The system proxy comes next.
+        if !paused && args.system_proxy {
             if let Err(e) = switch_system_proxy(&mut sysproxy, &engine, &listeners, true).await {
                 eprintln!("error: cannot enable the system proxy: {e}");
                 // P25: what this start did goes back before it ends
@@ -1744,7 +1844,15 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             tokio::select! {
                 _ = signals.recv() => break,
                 _ = reload_signal => {
-                    reload_and_refresh(&daemon, &mut listeners, &mut sysproxy, &mut takeover).await;
+                    reload_and_refresh(
+                        &daemon,
+                        &mut listeners,
+                        &mut sysproxy,
+                        &mut takeover,
+                        &mut enhanced,
+                        ipv6_usable,
+                    )
+                    .await;
                 }
                 // A source has a new version: the same reload as any other
                 // trigger, and the only one made for a download. It comes a
@@ -1752,14 +1860,29 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 // next look, so for up to a second new sessions run on the
                 // generation that was due.
                 _ = sources.changed() => {
-                    reload_and_refresh(&daemon, &mut listeners, &mut sysproxy, &mut takeover).await;
+                    reload_and_refresh(
+                        &daemon,
+                        &mut listeners,
+                        &mut sysproxy,
+                        &mut takeover,
+                        &mut enhanced,
+                        ipv6_usable,
+                    )
+                    .await;
                 }
                 _ = look.tick() => {
                     follow_the_sources(&sources, &engine);
                     // the local file has been outlived by an update
                     if sources.outdated() {
-                        reload_and_refresh(&daemon, &mut listeners, &mut sysproxy, &mut takeover)
-                            .await;
+                        reload_and_refresh(
+                            &daemon,
+                            &mut listeners,
+                            &mut sysproxy,
+                            &mut takeover,
+                            &mut enhanced,
+                            ipv6_usable,
+                        )
+                        .await;
                     }
                 }
                 cmd = cmd_rx.recv() => match cmd {
@@ -1769,6 +1892,8 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                             &mut listeners,
                             &mut sysproxy,
                             &mut takeover,
+                            &mut enhanced,
+                            ipv6_usable,
                         )
                         .await;
                         let _ = reply.send(report);
@@ -1787,13 +1912,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                         let _ = reply.send(result);
                     }
                     Some(Command::EnhancedMode(enabled, reply)) => {
-                        // task 9 turns this into `Takeover`'s, which notes the
-                        // request on a paused network
-                        let result = if enabled {
-                            enhanced.enable(wanted_now(&engine)).await
-                        } else {
-                            enhanced.disable().await
-                        };
+                        // on a paused network this only notes the request (M4
+                        // design 9.9)
+                        let result = takeover
+                            .switch_enhanced(&engine, &mut enhanced, ipv6_usable, enabled)
+                            .await;
                         if let Err(e) = &result {
                             tracing::error!(error = %e, enabled, "cannot switch the enhanced mode");
                         }
@@ -1812,9 +1935,17 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                             }
                         }
                     }
-                    Some(Command::NetworkChanged(facts)) => {
-                        network_changed(&daemon, facts, &listeners, &mut sysproxy, &mut takeover)
-                            .await;
+                    Some(Command::NetworkChanged(change)) => {
+                        network_changed(
+                            &daemon,
+                            change,
+                            &listeners,
+                            &mut sysproxy,
+                            &mut takeover,
+                            &mut enhanced,
+                            &mut ipv6_usable,
+                        )
+                        .await;
                     }
                     None => {}
                 },

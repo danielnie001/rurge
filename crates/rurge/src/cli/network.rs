@@ -10,6 +10,7 @@
 use rurge_config::{NetKind, NetworkFacts, Primary, WifiLink};
 use rurge_platform::netenv::{self, Backend, ReadOpts, Snapshot};
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -58,6 +59,40 @@ pub fn facts_of(snapshot: &Snapshot) -> NetworkFacts {
             ssid: wifi.ssid.clone(),
             bssid: wifi.bssid.clone(),
         }),
+    }
+}
+
+/// What the main loop is told of a change of network: what the engine looks
+/// at, and whether the enhanced mode has IPv6 to use here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkChange {
+    pub facts: NetworkFacts,
+    pub ipv6_usable: bool,
+}
+
+/// Whether the network has IPv6 the enhanced mode can use (`ipv6-vif = auto`,
+/// P18): the primary interface has an IPv6 gateway and a global IPv6 address.
+///
+/// A gateway that is link-local is an IPv6 gateway all the same: a router
+/// advertises itself from the link-local address, and that is the address an
+/// IPv6 default route usually names. Whether the address in `addresses` is the
+/// machine's own or one it will get is no part of it either: the platform
+/// leaves the host bits out, so a global address is a global prefix.
+pub fn ipv6_usable(snapshot: &Snapshot) -> bool {
+    let Some(primary) = snapshot.primary.as_ref() else {
+        return false;
+    };
+    let gateway = primary.routers.iter().any(IpAddr::is_ipv6);
+    let global = snapshot.addresses.iter().any(is_global);
+    gateway && global
+}
+
+/// Whether `address` is in `2000::/3`, the global unicast range: the first
+/// three bits of its first group are `001`.
+fn is_global(address: &IpAddr) -> bool {
+    match address {
+        IpAddr::V6(address) => address.segments()[0] >> 13 == 0b001,
+        IpAddr::V4(_) => false,
     }
 }
 
@@ -173,7 +208,7 @@ pub fn spawn<C: Send + 'static>(
     backend: Backend,
     started: Started,
     changes: mpsc::Sender<C>,
-    wrap: fn(NetworkFacts) -> C,
+    wrap: fn(NetworkChange) -> C,
 ) -> AbortOnDropHandle<()> {
     let Started {
         hints,
@@ -213,7 +248,7 @@ async fn follow<C, A, F>(
     mut told: Snapshot,
     mut first: Option<Late>,
     changes: mpsc::Sender<C>,
-    wrap: impl Fn(NetworkFacts) -> C,
+    wrap: impl Fn(NetworkChange) -> C,
 ) where
     A: FnMut() -> F,
     F: Future<Output = Option<Snapshot>>,
@@ -287,7 +322,7 @@ async fn forget_the_stored_hint(hints: &Notify) {
 /// from here on. `false`: nobody listens any more.
 async fn tell<C>(
     changes: &mpsc::Sender<C>,
-    wrap: &impl Fn(NetworkFacts) -> C,
+    wrap: &impl Fn(NetworkChange) -> C,
     told: &mut Snapshot,
     now: Snapshot,
 ) -> bool {
@@ -299,8 +334,12 @@ async fn tell<C>(
         addresses = told.addresses != now.addresses,
         "the network is not what it was"
     );
+    let change = NetworkChange {
+        facts,
+        ipv6_usable: ipv6_usable(&now),
+    };
     *told = now;
-    changes.send(wrap(facts)).await.is_ok()
+    changes.send(wrap(change)).await.is_ok()
 }
 
 #[cfg(test)]
@@ -332,9 +371,17 @@ mod tests {
         }
     }
 
-    /// What the engine is told of `on_wifi(ssid)`.
-    fn told_of(ssid: &str) -> NetworkFacts {
-        facts_of(&on_wifi(ssid))
+    /// What the main loop is told of `on_wifi(ssid)`.
+    fn told_of(ssid: &str) -> NetworkChange {
+        told_of_snapshot(&on_wifi(ssid))
+    }
+
+    /// What the main loop is told of a network.
+    fn told_of_snapshot(snapshot: &Snapshot) -> NetworkChange {
+        NetworkChange {
+            facts: facts_of(snapshot),
+            ipv6_usable: ipv6_usable(snapshot),
+        }
     }
 
     /// Lets the tasks that can run, run.
@@ -355,7 +402,7 @@ mod tests {
     struct World {
         hints: Arc<Notify>,
         now: Arc<Mutex<Option<Snapshot>>>,
-        told: mpsc::Receiver<NetworkFacts>,
+        told: mpsc::Receiver<NetworkChange>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -397,7 +444,9 @@ mod tests {
                     }
                 }
             };
-            let task = tokio::spawn(follow(hints.clone(), again, first, late, tx, |facts| facts));
+            let task = tokio::spawn(follow(hints.clone(), again, first, late, tx, |change| {
+                change
+            }));
             settle().await;
             let world = World {
                 hints,
@@ -416,8 +465,8 @@ mod tests {
             settle().await;
         }
 
-        /// What the engine has been told since the last call.
-        fn told(&mut self) -> Vec<NetworkFacts> {
+        /// What the main loop has been told since the last call.
+        fn told(&mut self) -> Vec<NetworkChange> {
             let mut all = Vec::new();
             while let Ok(facts) = self.told.try_recv() {
                 all.push(facts);
@@ -661,13 +710,13 @@ mod tests {
         let mut joined = on_wifi("B");
         joined.primary = None;
         world.change(Some(joined.clone())).await;
-        assert_eq!(world.told(), [facts_of(&joined)]);
+        assert_eq!(world.told(), [told_of_snapshot(&joined)]);
 
         pass(Duration::from_secs(2)).await;
         let mut cable = on_wifi("B");
         cable.wifi = None;
         world.change(Some(cable.clone())).await;
-        assert_eq!(world.told(), [facts_of(&cable)]);
+        assert_eq!(world.told(), [told_of_snapshot(&cable)]);
     }
 
     /// A daemon that began without knowing the network is told the first one
@@ -892,6 +941,36 @@ mod tests {
         assert_eq!(facts_of(&hidden).wifi.unwrap().ssid, None);
     }
 
+    /// `ipv6-vif = auto` needs both an IPv6 gateway and a global IPv6 address
+    /// (P18); a gateway that is link-local is the usual one, and an address
+    /// that is not global is no address to use.
+    #[test]
+    fn ipv6_is_usable_with_a_gateway_and_a_global_address() {
+        let with = |routers: &[&str], addresses: &[&str]| Snapshot {
+            primary: Some(netenv::Primary {
+                interface: "wlan0".to_string(),
+                kind: netenv::NetKind::Wifi,
+                routers: routers.iter().map(|text| ip(text)).collect(),
+            }),
+            addresses: addresses.iter().map(|text| ip(text)).collect(),
+            ..on_wifi("Home")
+        };
+        // one of the two is not enough
+        assert!(!ipv6_usable(&with(&["fe80::1"], &["192.0.2.10"])));
+        assert!(!ipv6_usable(&with(&["192.0.2.1"], &["2001:db8::"])));
+        // both, and the link-local address a router advertises from will do
+        assert!(ipv6_usable(&with(&["fe80::1"], &["2001:db8::"])));
+        assert!(ipv6_usable(&with(
+            &["192.0.2.1", "2001:db8::1"],
+            &["2001:db8::"]
+        )));
+        // a private address is no global one, and neither is a link-local
+        assert!(!ipv6_usable(&with(&["fe80::1"], &["fd00::"])));
+        assert!(!ipv6_usable(&with(&["fe80::1"], &["fe80::"])));
+        // no network is no IPv6
+        assert!(!ipv6_usable(&Snapshot::default()));
+    }
+
     /// A hint of the platform reaches the task, and the thread that brings it
     /// ends once the task is gone.
     #[tokio::test]
@@ -945,7 +1024,7 @@ mod tests {
         assert_eq!(read_once(&backend).await, NetworkFacts::default());
 
         std::fs::write(&file, serde_json::to_string(&on_wifi("Home")).unwrap()).unwrap();
-        assert_eq!(read_once(&backend).await, told_of("Home"));
+        assert_eq!(read_once(&backend).await, told_of("Home").facts);
         assert_eq!(start(&backend).await.snapshot, on_wifi("Home"));
     }
 }

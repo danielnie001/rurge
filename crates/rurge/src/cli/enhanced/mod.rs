@@ -167,6 +167,9 @@ struct On {
     tun: Option<Arc<dyn RunningTun>>,
     /// The routes installed into the adapter.
     routes: Option<RouteSet>,
+    /// The adapter has its IPv6 half (M4 design 4.6): whether `ipv6-vif` and
+    /// the network made it, and `configure_ipv6` could give it.
+    ipv6: bool,
     /// The egress table is in the slot.
     egress: bool,
     /// The system's DNS is taken over, or its takeover was attempted (a
@@ -224,6 +227,33 @@ fn backup_value(undo: &[Undo]) -> Option<serde_json::Value> {
         })
         .expect("Backup serializes"),
     )
+}
+
+/// The egress table for these routes and the network's primary interface.
+fn table(routes: &RouteSet, wanted: &Wanted) -> EgressTable {
+    EgressTable {
+        routes: routes.clone(),
+        primary: wanted.primary.clone(),
+    }
+}
+
+/// The routes of `a` and `b` together, each once, sorted: what may be in the
+/// adapter while a change of routes is being made (R25).
+fn union(a: &RouteSet, b: &RouteSet) -> RouteSet {
+    let mut together = a.clone();
+    for net in &b.v4 {
+        if !together.v4.contains(net) {
+            together.v4.push(*net);
+        }
+    }
+    for net in &b.v6 {
+        if !together.v6.contains(net) {
+            together.v6.push(*net);
+        }
+    }
+    together.v4.sort();
+    together.v6.sort();
+    together
 }
 
 /// One backend call, off the runtime: every one of them blocks (programs,
@@ -391,6 +421,184 @@ impl EnhancedMode {
         result
     }
 
+    /// What a reload or a change of network asks of an enhanced mode that is
+    /// on (M4 design 9.7, 9.8): the IPv6 half on or off as the generation and
+    /// the network say, the routes only by what differs, and after a change of
+    /// network the DNS and the system's own adjustments once more.
+    ///
+    /// A step that fails is logged, and the rest still goes on: the enhanced
+    /// mode keeps what it has and stays on (M4 design 9.7). A set of routes
+    /// that did not go in is no reason to go back to one that is out of date,
+    /// and `GET` goes on saying `enabled: true`.
+    ///
+    /// The egress table is always the superset of what goes into the adapter
+    /// (R25): while the routes change it is the old set and the new one
+    /// together, so that a connection of rurge's to a route that is already in
+    /// the adapter does not come back into it (M4b's reader).
+    pub async fn follow(&mut self, wanted: Wanted, network_changed: bool) {
+        let Some(mut on) = self.on.take() else {
+            return;
+        };
+        let Some(dev) = on.dev.clone() else {
+            self.on = Some(on);
+            return;
+        };
+
+        // the IPv6 half: the adapter's address, then its routes, then the DNS
+        let mut ipv6 = wanted.ipv6;
+        if ipv6 != on.ipv6 {
+            if ipv6 {
+                let backend = self.backend.clone();
+                let with = dev.clone();
+                match call(move || backend.configure_ipv6(&with)).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // as at an open: this one goes on without it
+                        tracing::warn!(
+                            "IPv6 could not be configured; the enhanced mode goes on without it"
+                        );
+                        ipv6 = false;
+                    }
+                    Err(e) => {
+                        // what the adapter has of IPv6 is unknown: count it off
+                        self.failed("configure_ipv6", &e);
+                        ipv6 = false;
+                    }
+                }
+            } else {
+                let backend = self.backend.clone();
+                let with = dev.clone();
+                if let Err(e) = call(move || backend.unconfigure_ipv6(&with)).await {
+                    self.failed("unconfigure_ipv6", &e);
+                }
+            }
+        }
+
+        // the routes: only what differs
+        let mut next = wanted.routes.clone();
+        if !ipv6 {
+            next.v6.clear();
+        }
+        let old = on.routes.clone().unwrap_or_default();
+        let (add, remove) = RouteSet::diff(&old, &next);
+        if add.is_empty() && remove.is_empty() {
+            // nothing to add or remove, and the table takes the new primary
+            set_egress(&self.egress, Some(table(&next, &wanted)));
+            on.routes = Some(next);
+        } else {
+            set_egress(&self.egress, Some(table(&union(&old, &next), &wanted)));
+            let backend = self.backend.clone();
+            let with = dev.clone();
+            match call(move || backend.routes(&with, &add, &remove)).await {
+                Ok(added) => {
+                    if !added {
+                        // the IPv6 half could not be added, and the backend has warned
+                        next.v6.clear();
+                    }
+                    set_egress(&self.egress, Some(table(&next, &wanted)));
+                    on.routes = Some(next);
+                }
+                Err(e) => {
+                    // what went in is unknown: the set it keeps is the one it
+                    // had, and the table keeps the union until the next call
+                    self.failed("routes", &e);
+                }
+            }
+        }
+
+        // the DNS, once: a change of the IPv6 half or of the network both mean
+        // the system's DNS is read again (R24)
+        if ipv6 != on.ipv6 || network_changed {
+            self.take_the_dns_again(&dev, ipv6).await;
+        }
+        if network_changed {
+            self.adjust_again(wanted.primary.as_deref()).await;
+        }
+        on.ipv6 = ipv6;
+        self.on = Some(on);
+    }
+
+    /// One step of a follow that did not happen: the step and its reason are
+    /// the log's, and the enhanced mode goes on with what it has (M4 design
+    /// 9.7).
+    fn failed(&self, step: &str, error: &str) {
+        tracing::error!(
+            step,
+            error = %error,
+            "cannot follow the change; the enhanced mode goes on with what it has"
+        );
+    }
+
+    /// Takes the system's DNS over again, after a change of the IPv6 half or of
+    /// the network (design 9.7, 9.8): what taking it over will need goes into
+    /// the backup first (design 9.1), and the takeover follows it. A step that
+    /// fails stays in the log.
+    async fn take_the_dns_again(&self, dev: &Opened, ipv6: bool) {
+        let mut saved = match self.saved_undo().await {
+            Ok(saved) => saved,
+            Err(e) => {
+                self.failed("dns_undo", &e);
+                return;
+            }
+        };
+        let backend = self.backend.clone();
+        let with = dev.clone();
+        let have = saved.clone();
+        let save = match call(move || backend.dns_undo(&with, &have)).await {
+            Ok(save) => save,
+            Err(e) => {
+                self.failed("dns_undo", &e);
+                return;
+            }
+        };
+        if !save.is_empty() {
+            saved.extend_from_slice(&save);
+            if let Err(e) = self.save_undo(&saved).await {
+                // what the system would keep after a crash would be unknown
+                self.failed("dns_backup", &e);
+                return;
+            }
+        }
+        let backend = self.backend.clone();
+        let with = dev.clone();
+        if let Err(e) = call(move || backend.take_dns(&with, ipv6)).await {
+            self.failed("take_dns", &e);
+        }
+    }
+
+    /// The system's own adjustments once more, after a change of network (M4
+    /// design 9.8): the backup first, then the step.
+    async fn adjust_again(&self, primary: Option<&str>) {
+        let mut saved = match self.saved_undo().await {
+            Ok(saved) => saved,
+            Err(e) => {
+                self.failed("adjust_undo", &e);
+                return;
+            }
+        };
+        let backend = self.backend.clone();
+        let have = saved.clone();
+        let one = primary.map(str::to_string);
+        let save = match call(move || backend.adjust_undo(one.as_deref(), &have)).await {
+            Ok(save) => save,
+            Err(e) => {
+                self.failed("adjust_undo", &e);
+                return;
+            }
+        };
+        if let Some(undo) = save {
+            saved.push(undo);
+            if let Err(e) = self.save_undo(&saved).await {
+                self.failed("adjust_backup", &e);
+                return;
+            }
+        }
+        let backend = self.backend.clone();
+        if let Err(e) = call(move || backend.adjust()).await {
+            self.failed("adjust", &e);
+        }
+    }
+
     /// The undo actions `state.json` holds, in the order the changes were made.
     async fn saved_undo(&self) -> Result<Vec<Undo>, String> {
         match self.store.snapshot().await.enhanced_backup {
@@ -437,6 +645,7 @@ impl EnhancedMode {
         let with = dev.clone();
         let configured = call(move || backend.configure(&with, asked)).await?;
         let ipv6 = asked && configured;
+        on.ipv6 = ipv6;
         if asked && !configured {
             // design 4.6 / M4-D17: IPv6 that cannot be had is no failure of
             // the open, but the user should know their network is IPv4 only
@@ -1555,5 +1764,137 @@ mod tests {
             Some(Ok(()))
         );
         assert_eq!(f.store.snapshot().await.enhanced_backup, None);
+    }
+
+    /// A reload that changes nothing asks the system for nothing: no `routes
+    /// +0 -0`, no DNS takeover, no adjustment (R24). The egress table takes
+    /// the new primary all the same.
+    #[tokio::test]
+    async fn a_follow_that_changes_nothing_asks_for_no_routes() {
+        let mut f = fixture(true).await;
+        f.mode.enable(wanted()).await.unwrap();
+        let asked = f.backend.calls.list().len();
+        let mut moved = wanted();
+        moved.primary = Some("eth1".to_string());
+        f.mode.follow(moved.clone(), false).await;
+        assert_eq!(
+            f.backend.calls.list().len(),
+            asked,
+            "no step was asked for: {:?}",
+            f.backend.calls.list()
+        );
+        assert_eq!(f.backend.routes.lock().unwrap().len(), 1);
+        let table = f
+            .egress
+            .read()
+            .unwrap()
+            .clone()
+            .expect("the table is there");
+        assert_eq!(table.routes, moved.routes);
+        assert_eq!(table.primary.as_deref(), Some("eth1"));
+        assert!(f.mode.enabled());
+    }
+
+    /// What the egress table holds while the routes cannot be installed: the
+    /// old set and the new one together, so that a connection of rurge's to a
+    /// route that is already in the adapter does not come back into it (R25).
+    #[tokio::test]
+    async fn a_follow_that_cannot_install_keeps_the_table_a_superset() {
+        let mut f = fixture(true).await;
+        f.mode.enable(wanted()).await.unwrap();
+        let excluded = ["1.2.3.0/24".parse().unwrap()];
+        let mut next = wanted();
+        next.routes = RouteSet::compute(&RouteInputs {
+            ipv6: true,
+            excluded: &excluded,
+            included: &[],
+            external: &[],
+            explicit_space: false,
+        });
+        assert_ne!(next.routes, wanted().routes);
+        *f.backend.fail.lock().unwrap() = Some("routes".to_string());
+        f.mode.follow(next.clone(), false).await;
+        assert!(f.mode.enabled(), "the enhanced mode goes on");
+        let table = f
+            .egress
+            .read()
+            .unwrap()
+            .clone()
+            .expect("the table is there");
+        for net in wanted().routes.v4.iter().chain(next.routes.v4.iter()) {
+            assert!(table.routes.v4.contains(net), "{net} left the table");
+        }
+
+        // what it kept is the set that went in: the next attempt asks for the
+        // difference between that and the one that failed
+        *f.backend.fail.lock().unwrap() = None;
+        f.mode.follow(next.clone(), false).await;
+        let (add, remove) = f.backend.routes.lock().unwrap()[1].clone();
+        let (wanted_add, wanted_remove) = RouteSet::diff(&wanted().routes, &next.routes);
+        assert_eq!(add, wanted_add);
+        assert_eq!(remove, wanted_remove);
+        let table = f
+            .egress
+            .read()
+            .unwrap()
+            .clone()
+            .expect("the table is there");
+        assert_eq!(table.routes, next.routes, "the table is what went in");
+    }
+
+    /// A change of the IPv6 half and of the network together take the DNS over
+    /// once, with the IPv6 the change ended with (R24).
+    #[tokio::test]
+    async fn a_follow_takes_the_dns_over_once_for_ipv6_and_the_network() {
+        let mut f = fixture(true).await;
+        f.mode.enable(without_ipv6()).await.unwrap();
+        let after_open = f.backend.calls.list().len();
+        f.mode.follow(wanted(), true).await;
+        assert_eq!(
+            f.backend.calls.list()[after_open..],
+            lines(&[
+                "configure_ipv6",
+                "routes",
+                "dns_undo",
+                "take_dns",
+                "adjust_undo",
+                "adjust",
+            ])
+        );
+        assert_eq!(
+            *f.backend.dns.lock().unwrap(),
+            [false, true],
+            "one takeover, with the IPv6 the change ended with"
+        );
+        assert_eq!(f.backend.routes.lock().unwrap().len(), 2);
+        let (add, remove) = f.backend.routes.lock().unwrap()[1].clone();
+        assert!(!add.v6.is_empty(), "the IPv6 routes went in");
+        assert!(remove.is_empty());
+        assert!(f.mode.enabled());
+    }
+
+    /// A reload that turns IPv6 off gives the adapter's IPv6 half back, removes
+    /// its routes and takes the DNS over once more without it.
+    #[tokio::test]
+    async fn a_follow_that_turns_ipv6_off_gives_the_half_back() {
+        let mut f = fixture(true).await;
+        f.mode.enable(wanted()).await.unwrap();
+        let after_open = f.backend.calls.list().len();
+        f.mode.follow(without_ipv6(), false).await;
+        assert_eq!(
+            f.backend.calls.list()[after_open..],
+            // the mock says `routes off` for a call that only removes
+            lines(&["unconfigure_ipv6", "routes off", "dns_undo", "take_dns"])
+        );
+        assert_eq!(
+            f.backend.dns.lock().unwrap().last(),
+            Some(&false),
+            "the DNS is taken over without IPv6"
+        );
+        let (add, remove) = f.backend.routes.lock().unwrap()[1].clone();
+        assert!(add.is_empty(), "nothing is added");
+        assert!(remove.v4.is_empty());
+        assert!(!remove.v6.is_empty(), "only the IPv6 routes go");
+        assert!(f.mode.enabled());
     }
 }

@@ -44,9 +44,7 @@ pub trait Backend: Send + Sync {
     /// The IPv6 half alone, on an adapter that is up (a reload or a change of
     /// network turned IPv6 on). `Ok(false)` as for `configure`, with the WARN
     /// from the manager as well.
-    #[allow(dead_code)] // wired up by M4a task 9
     fn configure_ipv6(&self, dev: &Opened) -> Result<bool, String>;
-    #[allow(dead_code)] // wired up by M4a task 9
     fn unconfigure_ipv6(&self, dev: &Opened) -> Result<(), String>;
     /// Adds `add`, then removes `remove`; removing goes on past errors.
     /// `Ok(false)`: the IPv6 half of `add` could not be added (warned).

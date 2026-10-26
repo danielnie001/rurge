@@ -7236,8 +7236,10 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         const LISTENERS: &str =
             "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@127.0.0.1:0";
 
-        /// The machine on a Wi-Fi network it has joined.
-        fn wifi(ssid: &str) -> Value {
+        /// The machine on a Wi-Fi network it has joined. `run::enhanced_mode`
+        /// starts daemons on these networks as well, so the helpers there see
+        /// them (`pub(super)`).
+        pub(super) fn wifi(ssid: &str) -> Value {
             json!({
                 "primary": { "interface": "wlan0", "kind": "wifi", "routers": ["192.0.2.1"] },
                 "wifi": { "interface": "wlan0", "ssid": ssid },
@@ -7247,7 +7249,7 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
         }
 
         /// The machine on a cable.
-        fn cable() -> Value {
+        pub(super) fn cable() -> Value {
             json!({
                 "primary": { "interface": "eth0", "kind": "wired", "routers": ["198.51.100.1"] },
                 "dns": ["198.51.100.53"],
@@ -7257,12 +7259,12 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
 
         /// One test's world: a directory with the profile, the data directory
         /// and the file that says which network the machine is on.
-        struct World {
+        pub(super) struct World {
             dir: tempfile::TempDir,
         }
 
         impl World {
-            fn on(network: &Value) -> World {
+            pub(super) fn on(network: &Value) -> World {
                 let world = World {
                     dir: tempfile::tempdir().unwrap(),
                 };
@@ -7274,14 +7276,14 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
                 self.dir.path().join("network.json")
             }
 
-            fn data(&self) -> PathBuf {
+            pub(super) fn data(&self) -> PathBuf {
                 self.dir.path().join("data")
             }
 
             /// Writes the profile: `[General]` with `general` after the
             /// listeners and the API, then `rest`. The daemon says what it
             /// does (`notify`: INFO).
-            fn profile(&self, general: &str, rest: &str) -> PathBuf {
+            pub(super) fn profile(&self, general: &str, rest: &str) -> PathBuf {
                 self.profile_logging("notify", general, rest)
             }
 
@@ -7297,7 +7299,7 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             }
 
             /// `rurge run` on this world's network.
-            fn run(&self, conf: &Path, extra: &[&str]) -> Command {
+            pub(super) fn run(&self, conf: &Path, extra: &[&str]) -> Command {
                 let mut cmd = rurge_run(conf, &self.data());
                 cmd.args(extra).env(
                     "RURGE_NETWORK_BACKEND",
@@ -7307,14 +7309,14 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             }
 
             /// The machine is on `network` from now on.
-            fn move_to(&self, network: &Value) {
+            pub(super) fn move_to(&self, network: &Value) {
                 put_network(&self.network(), network);
             }
         }
 
         /// The lines of the daemon's log, up to the next one with `needle` in
         /// it; they are all returned, that one last.
-        fn wait_for_log(daemon: &Daemon, needle: &str) -> Vec<String> {
+        pub(super) fn wait_for_log(daemon: &Daemon, needle: &str) -> Vec<String> {
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             let mut seen = Vec::new();
             loop {
@@ -7519,7 +7521,8 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             }
         }
 
-        const OFFICE: &str = "[Rule]\nFINAL,DIRECT\n[SSID Setting]\nSSID:Office suspend=true\n";
+        pub(super) const OFFICE: &str =
+            "[Rule]\nFINAL,DIRECT\n[SSID Setting]\nSSID:Office suspend=true\n";
 
         /// A world whose "system proxy" holds `ORIGINAL_PROXY`.
         fn with_a_system_proxy(world: &World) -> PathBuf {

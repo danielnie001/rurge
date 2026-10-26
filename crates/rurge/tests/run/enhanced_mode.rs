@@ -4,6 +4,7 @@
 //! (`RURGE_ENHANCED_BACKEND=file:<path>`), so nothing here reads or changes the
 //! machine's routes or DNS, and no test reaches the platform backend.
 
+use super::the_network::{OFFICE, World, wait_for_log, wifi};
 use super::*;
 use rurge_platform::route::{RouteInputs, RouteSet};
 use serde_json::{Value, json};
@@ -250,18 +251,23 @@ fn an_unknown_enhanced_backend_ends_the_start_with_2() {
 /// through it, or stop the daemon that way. The key is `k`.
 const LISTENERS_AND_API: &str = "http-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\nhttp-api = k@127.0.0.1:0\nloglevel = info";
 
-/// The routes an enhanced mode of these tests' profile installs, as the file
-/// backend writes them: the profile has no `tun-*` items and no `external`
-/// policies, so the computation is the base prefixes alone, and the count is
-/// never written out here (M4a task 8).
-fn routes_of(ipv6: bool) -> Vec<String> {
-    let set = RouteSet::compute(&RouteInputs {
+/// What a profile with no `tun-*` items and no `external` policies installs,
+/// with `one_excluded` left out where it is given (a `tun-excluded-routes`
+/// item): the base prefixes alone, so the count is never written out here
+/// (M4a task 8).
+fn routes_set(ipv6: bool, one_excluded: Option<&str>) -> RouteSet {
+    let excluded = one_excluded.map(|text| text.parse().unwrap());
+    RouteSet::compute(&RouteInputs {
         ipv6,
-        excluded: &[],
+        excluded: excluded.as_slice(),
         included: &[],
         external: &[],
         explicit_space: cfg!(target_os = "macos"),
-    });
+    })
+}
+
+/// What the file backend writes for `set`: one string a prefix, sorted.
+fn strings(set: &RouteSet) -> Vec<String> {
     let mut all: Vec<String> = set
         .v4
         .iter()
@@ -270,6 +276,11 @@ fn routes_of(ipv6: bool) -> Vec<String> {
         .collect();
     all.sort();
     all
+}
+
+/// The routes an enhanced mode of these tests' profile installs.
+fn routes_of(ipv6: bool) -> Vec<String> {
+    strings(&routes_set(ipv6, None))
 }
 
 /// The routes the file backend says are installed.
@@ -646,5 +657,289 @@ fn a_device_that_fails_turns_the_enhanced_mode_off() {
     wait_until("the log to say the adapter failed", || {
         log_text(&logs).contains("the virtual adapter failed")
     });
+    drop(daemon);
+}
+
+/// The enhanced mode's "system" of a `World`: the data directory is made
+/// first, because the file backend writes into it.
+fn world_file(world: &World) -> PathBuf {
+    let data = world.data();
+    std::fs::create_dir_all(&data).unwrap();
+    enhanced_file(&data)
+}
+
+/// `world.run(conf, extra)` with the enhanced mode's backend pointed at
+/// `file`, beside the network file `World::run` gives the daemon.
+fn run_enhanced(world: &World, conf: &Path, file: &Path, extra: &[&str]) -> Command {
+    let mut cmd = world.run(conf, extra);
+    cmd.env("RURGE_ENHANCED_BACKEND", format!("file:{}", file.display()));
+    cmd
+}
+
+/// Whether `GET /v1/features/enhanced_mode` says the enhanced mode is on.
+fn enhanced_on(api: u16) -> bool {
+    let (status, body) = api_call(api, "GET", "/v1/features/enhanced_mode", "k", None);
+    assert_eq!(status, 200, "{body}");
+    parsed(&body)["enabled"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("no `enabled` in {body}"))
+}
+
+/// `POST /v1/features/enhanced_mode`, the status only: what is asked for
+/// during a pause is answered with success without being done.
+fn ask_for_the_enhanced_mode(api: u16, on: bool) -> u16 {
+    api_call(
+        api,
+        "POST",
+        "/v1/features/enhanced_mode",
+        "k",
+        Some(&json!({ "enabled": on }).to_string()),
+    )
+    .0
+}
+
+/// How often the backend did `step`.
+fn done(file: &Path, step: &str) -> usize {
+    actions(file).iter().filter(|done| *done == step).count()
+}
+
+/// A start on a network that says to suspend opens nothing: the enhanced mode
+/// is only noted, and the pause is what keeps it off. Leaving the pause opens
+/// it, going back closes it, and leaving again opens it once more.
+#[test]
+fn the_enhanced_mode_waits_on_a_suspend_network_and_opens_when_it_is_left() {
+    let world = World::on(&wifi("Office"));
+    let conf = world.profile("", OFFICE);
+    let file = world_file(&world);
+    let daemon = spawn_command(run_enhanced(&world, &conf, &file, &["--enhanced-mode"]));
+    let api = api_port(&daemon);
+    wait_for_log(&daemon, "takeover paused on this network");
+    assert_eq!(
+        backend_json(&file),
+        Value::Null,
+        "nothing was asked of the system"
+    );
+    assert!(!enhanced_on(api));
+
+    world.move_to(&wifi("Home"));
+    wait_until("the enhanced mode to open when the pause ends", || {
+        enhanced_on(api)
+    });
+    assert_eq!(actions(&file)[0], "open");
+    assert_eq!(installed(&file), routes_of(false));
+
+    world.move_to(&wifi("Office"));
+    wait_until("the enhanced mode to close for the pause", || {
+        !enhanced_on(api)
+    });
+    assert_eq!(done(&file, "close"), 1);
+    assert_eq!(done(&file, "open"), 1);
+
+    world.move_to(&wifi("Home"));
+    wait_until("the enhanced mode to open again", || enhanced_on(api));
+    assert_eq!(done(&file, "open"), 2, "{:?}", actions(&file));
+    drop(daemon);
+}
+
+/// What is asked for during a pause is answered with success and done when
+/// the pause ends; what is asked for while the pause holds it off is left
+/// off when the pause ends.
+#[test]
+fn a_post_during_the_pause_is_noted_and_done_when_it_ends() {
+    let world = World::on(&wifi("Office"));
+    let conf = world.profile("", OFFICE);
+    let file = world_file(&world);
+    let daemon = spawn_command(run_enhanced(&world, &conf, &file, &["--enhanced-mode"]));
+    let api = api_port(&daemon);
+    wait_for_log(&daemon, "takeover paused on this network");
+
+    // asked for while paused: answered, and nothing is opened
+    assert_eq!(ask_for_the_enhanced_mode(api, true), 200);
+    assert_eq!(
+        backend_json(&file),
+        Value::Null,
+        "nothing was asked of the system"
+    );
+    assert!(!enhanced_on(api));
+
+    // the pause ends: what was asked for is done
+    world.move_to(&wifi("Home"));
+    wait_until("the enhanced mode to open when the pause ends", || {
+        enhanced_on(api)
+    });
+    assert_eq!(done(&file, "open"), 1);
+
+    // on, and the machine goes back to the paused network: it closes
+    world.move_to(&wifi("Office"));
+    wait_until("the enhanced mode to close for the pause", || {
+        !enhanced_on(api)
+    });
+    assert_eq!(done(&file, "close"), 1);
+
+    // asked to stay off while the pause holds it off: it stays off
+    assert_eq!(ask_for_the_enhanced_mode(api, false), 200);
+    world.move_to(&wifi("Home"));
+    wait_for_log(&daemon, "takeover resumed");
+    assert!(
+        !enhanced_on(api),
+        "it is left off, as asked during the pause"
+    );
+    assert_eq!(done(&file, "open"), 1, "it was not opened a second time");
+    drop(daemon);
+}
+
+/// A reload leaves the routes alone except for what differs: one `routes`
+/// call with what `RouteSet::diff` says, and no open, close or DNS takeover.
+#[test]
+fn a_reload_changes_only_the_routes_that_changed() {
+    let world = World::on(&wifi("Home"));
+    let conf = world.profile("", "[Rule]\nFINAL,DIRECT\n");
+    let file = world_file(&world);
+    let daemon = spawn_command(run_enhanced(&world, &conf, &file, &["--enhanced-mode"]));
+    let api = api_port(&daemon);
+    wait_until("the enhanced mode to open", || enhanced_on(api));
+    let before = actions(&file);
+    assert_eq!(installed(&file), routes_of(false));
+
+    // the profile leaves one piece of the range out, and is reloaded
+    let excluded = "1.2.3.0/24";
+    let (add, remove) =
+        RouteSet::diff(&routes_set(false, None), &routes_set(false, Some(excluded)));
+    assert!(!add.is_empty() && !remove.is_empty(), "the piece is a hole");
+    world.profile(
+        &format!("tun-excluded-routes = {excluded}"),
+        "[Rule]\nFINAL,DIRECT\n",
+    );
+    let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"ok\":true"), "{body}");
+
+    let next = routes_set(false, Some(excluded));
+    wait_until("the routes of the reload to be installed", || {
+        installed(&file) == strings(&next)
+    });
+    assert_eq!(
+        actions(&file)[before.len()..],
+        [format!("routes +{} -{}", add.len(), remove.len())],
+        "one call with the difference, and nothing else"
+    );
+    drop(daemon);
+}
+
+/// A reload that turns IPv6 on gives the adapter its IPv6 half, adds the IPv6
+/// routes and takes the DNS over again; one that turns it off gives the half
+/// back, removes those routes and takes the DNS over without IPv6.
+#[test]
+fn a_reload_turns_ipv6_on_and_off() {
+    let world = World::on(&wifi("Home"));
+    let conf = world.profile("ipv6-vif = disabled", "[Rule]\nFINAL,DIRECT\n");
+    let file = world_file(&world);
+    let daemon = spawn_command(run_enhanced(&world, &conf, &file, &["--enhanced-mode"]));
+    let api = api_port(&daemon);
+    wait_until("the enhanced mode to open", || enhanced_on(api));
+    assert_eq!(installed(&file), routes_of(false));
+    let after_open = actions(&file).len();
+
+    world.profile("ipv6-vif = always", "[Rule]\nFINAL,DIRECT\n");
+    let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+    assert_eq!(status, 200, "{body}");
+    wait_until("IPv6 to be turned on", || {
+        installed(&file) == routes_of(true) && backend_json(&file)["ipv6"] == true
+    });
+    assert_eq!(
+        actions(&file)[after_open..],
+        [
+            "configure_ipv6".to_string(),
+            format!("routes +{} -0", routes_set(true, None).v6.len()),
+            "take_dns".to_string(),
+        ],
+        "the IPv6 half, its routes, and the DNS once more"
+    );
+    let after_ipv6 = actions(&file).len();
+
+    world.profile("ipv6-vif = disabled", "[Rule]\nFINAL,DIRECT\n");
+    let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+    assert_eq!(status, 200, "{body}");
+    wait_until("IPv6 to be turned off", || {
+        installed(&file) == routes_of(false) && backend_json(&file)["ipv6"] == false
+    });
+    assert_eq!(
+        actions(&file)[after_ipv6..],
+        [
+            "unconfigure_ipv6".to_string(),
+            format!("routes +0 -{}", routes_set(true, None).v6.len()),
+            "take_dns".to_string(),
+        ],
+        "the IPv6 half given back, its routes, and the DNS once more"
+    );
+    drop(daemon);
+}
+
+/// `ipv6-vif = auto` follows the network: the IPv6 half comes with a global
+/// address and an IPv6 gateway, and goes without them.
+#[test]
+fn ipv6_auto_follows_the_network() {
+    let world = World::on(&wifi("Home"));
+    let conf = world.profile("ipv6-vif = auto", "[Rule]\nFINAL,DIRECT\n");
+    let file = world_file(&world);
+    let daemon = spawn_command(run_enhanced(&world, &conf, &file, &["--enhanced-mode"]));
+    let api = api_port(&daemon);
+    wait_until("the enhanced mode to open", || enhanced_on(api));
+    assert_eq!(backend_json(&file)["ipv6"], false);
+    assert_eq!(installed(&file), routes_of(false));
+
+    // the network gains IPv6: a gateway (the link-local address a router
+    // advertises from) and a global /64
+    let mut with_ipv6 = wifi("Home");
+    with_ipv6["primary"]["routers"] = json!(["192.0.2.1", "fe80::1"]);
+    with_ipv6["addresses"] = json!(["192.0.2.10", "2001:db8:1::"]);
+    world.move_to(&with_ipv6);
+    wait_until("IPv6 to come on with the network", || {
+        installed(&file) == routes_of(true) && backend_json(&file)["ipv6"] == true
+    });
+    assert_eq!(done(&file, "configure_ipv6"), 1, "{:?}", actions(&file));
+
+    world.move_to(&wifi("Home"));
+    wait_until("IPv6 to go off with the network", || {
+        installed(&file) == routes_of(false) && backend_json(&file)["ipv6"] == false
+    });
+    assert_eq!(done(&file, "unconfigure_ipv6"), 1, "{:?}", actions(&file));
+    drop(daemon);
+}
+
+/// A change that cannot be followed is logged as an error and leaves the
+/// enhanced mode on, with what it has installed.
+#[test]
+fn a_follow_that_fails_keeps_the_enhanced_mode_on() {
+    let world = World::on(&wifi("Home"));
+    let conf = world.profile("", "[Rule]\nFINAL,DIRECT\n");
+    let file = world_file(&world);
+    let logs = world.data().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let log_file = logs.join("rurge.log");
+    let daemon = spawn_command(run_enhanced(
+        &world,
+        &conf,
+        &file,
+        &["--enhanced-mode", "--log-file", log_file.to_str().unwrap()],
+    ));
+    let api = api_port(&daemon);
+    wait_until("the enhanced mode to open", || enhanced_on(api));
+    let before = installed(&file);
+
+    // the system will not take the routes now, and the profile is reloaded
+    let mut system = backend_json(&file);
+    system["fail"] = json!("routes");
+    std::fs::write(&file, system.to_string()).unwrap();
+    world.profile("tun-excluded-routes = 1.2.3.0/24", "[Rule]\nFINAL,DIRECT\n");
+    let (status, body) = api_call(api, "POST", "/v1/profiles/reload", "k", Some("{}"));
+    assert_eq!(status, 200, "{body}");
+    wait_until("the log to say the change could not be followed", || {
+        log_text(&logs)
+            .lines()
+            .any(|line| line.contains("ERROR") && line.contains("routes"))
+    });
+    assert!(enhanced_on(api), "the enhanced mode goes on");
+    assert_eq!(installed(&file), before, "what went in before stays");
     drop(daemon);
 }
