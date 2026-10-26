@@ -687,10 +687,32 @@ async fn enhanced_mode_get_has_the_counters_and_the_shape() {
 }
 
 /// `POST /v1/features/enhanced_mode` goes to the control, whose refusal is a
-/// 500 with its reason; what the switch did not change is what `GET` gives.
+/// 500 with its reason; an open that is refused leaves the mode off, which is
+/// what `GET` goes on saying.
 #[tokio::test]
 async fn enhanced_mode_post_goes_to_the_control_and_its_error_is_a_500() {
     let api = api().await;
+    assert_eq!(
+        get(&api, "/v1/features/enhanced_mode").await.1["enabled"],
+        false,
+        "it begins off"
+    );
+    api.control.fail_enhanced.store(true, Ordering::SeqCst);
+    let (status, body) = post(
+        &api,
+        "/v1/features/enhanced_mode",
+        json!({ "enabled": true }),
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["error"], "no virtual adapter could be made (test)");
+    assert_eq!(
+        get(&api, "/v1/features/enhanced_mode").await.1["enabled"],
+        false,
+        "the refusal left it off"
+    );
+    // and once it is taken, the same switch turns it off again
+    api.control.fail_enhanced.store(false, Ordering::SeqCst);
     assert_eq!(
         post(
             &api,
@@ -703,20 +725,6 @@ async fn enhanced_mode_post_goes_to_the_control_and_its_error_is_a_500() {
     assert_eq!(
         get(&api, "/v1/features/enhanced_mode").await.1["enabled"],
         true
-    );
-    api.control.fail_enhanced.store(true, Ordering::SeqCst);
-    let (status, body) = post(
-        &api,
-        "/v1/features/enhanced_mode",
-        json!({ "enabled": false }),
-    )
-    .await;
-    assert_eq!(status, 500, "{body}");
-    assert_eq!(body["error"], "no virtual adapter could be made (test)");
-    assert_eq!(
-        get(&api, "/v1/features/enhanced_mode").await.1["enabled"],
-        true,
-        "the refusal left it as it was"
     );
     // the body is read as the other features' are
     let (status, _) = post(

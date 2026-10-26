@@ -55,7 +55,7 @@ impl RunningTun for EngineTun {
     }
 
     fn ending(&self) -> BoxFuture<'_, Ending> {
-        Box::pin(async move { self.handle.join().await })
+        Box::pin(async move { self.handle.ending().await })
     }
 
     fn counters(&self) -> TunCounters {

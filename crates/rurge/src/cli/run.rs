@@ -652,6 +652,8 @@ struct Takeover {
     wanted: bool,
     /// The same for the enhanced mode: `--enhanced-mode`, then what each
     /// `POST /v1/features/enhanced_mode` that was answered with success said.
+    /// A close that answers 500 has still taken the mode off, and is recorded
+    /// as off too (the phase 3 / M4a plan's execution record row 97).
     enhanced_wanted: bool,
     /// The network says to leave the system alone.
     paused: bool,
@@ -683,7 +685,9 @@ impl Takeover {
     /// is what the user wants, and is noted); leaving it makes both what the
     /// user last asked for, in both directions: pointed at rurge again if they
     /// want it so, and given back if they asked for that meanwhile and it is
-    /// still on (the pause could not give it back). Each is tried once.
+    /// still on. That last part is the system proxy's case alone: a close of the
+    /// enhanced mode never stops halfway, so the pause always gives it back and
+    /// there is nothing of it left to give. Each is tried once.
     ///
     /// The enhanced mode goes first, in both directions, as it does at the exit
     /// (M4-D16): what it leaves behind is the machine's DNS.
@@ -706,7 +710,7 @@ impl Takeover {
                 if let Err(e) = enhanced.disable().await {
                     tracing::error!(
                         error = %e,
-                        "cannot turn the enhanced mode off for the pause; it stays on"
+                        "the enhanced mode is off for the pause, but part of it could not be undone; what outlives rurge stays in state.json and is undone on the next start"
                     );
                 }
             }
@@ -721,24 +725,19 @@ impl Takeover {
             }
             tracing::info!("takeover paused on this network");
         } else {
-            match (self.enhanced_wanted, enhanced.enabled()) {
-                (true, false) => {
-                    if let Err(e) = enhanced.enable(wanted_now(engine, ipv6_usable)).await {
-                        tracing::error!(
-                            error = %e,
-                            "cannot turn the enhanced mode on when the pause ends; it stays off"
-                        );
-                    }
-                }
-                (false, true) => {
-                    if let Err(e) = enhanced.disable().await {
-                        tracing::error!(
-                            error = %e,
-                            "cannot turn the enhanced mode off when the pause ends; it stays on"
-                        );
-                    }
-                }
-                _ => {}
+            // Only the direction that opens: a mode given back for the pause is
+            // off whatever the user last asked for. `(false, true)` is the
+            // system proxy's case alone, whose close can fail and leave it
+            // pointed at rurge (the phase 3 / M4a plan's execution record row
+            // 97).
+            if self.enhanced_wanted
+                && !enhanced.enabled()
+                && let Err(e) = enhanced.enable(wanted_now(engine, ipv6_usable)).await
+            {
+                tracing::error!(
+                    error = %e,
+                    "cannot turn the enhanced mode on when the pause ends; it stays off"
+                );
             }
             match (self.wanted, sysproxy.enabled()) {
                 (true, false) => {
@@ -800,7 +799,13 @@ impl Takeover {
         } else if enabled {
             enhanced.enable(wanted_now(engine, ipv6_usable)).await?;
         } else {
-            enhanced.disable().await?;
+            // A close never stops halfway: it takes the mode off first, and an
+            // error is one of its undos that did not go. What the user asked
+            // for is off all the same, even though the error goes back to the
+            // API's 500 (the phase 3 / M4a plan's execution record row 97).
+            let result = enhanced.disable().await;
+            self.enhanced_wanted = false;
+            result?;
         }
         self.enhanced_wanted = enabled;
         Ok(())
@@ -1930,7 +1935,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                             if let Err(e) = enhanced.disable().await {
                                 tracing::error!(
                                     error = %e,
-                                    "cannot turn the enhanced mode off after the adapter failed"
+                                    "the enhanced mode is off after the adapter failed, but part of it could not be undone; what outlives rurge stays in state.json and is undone on the next start"
                                 );
                             }
                         }

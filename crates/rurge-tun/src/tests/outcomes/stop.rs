@@ -165,9 +165,9 @@ async fn stop_ends_a_relay_stuck_on_its_upstream() {
 
 /// A dialer whose dials wait for the test to let them through, and then do what
 /// the fake dialer does.
-struct Gated {
-    inner: Arc<FakeDialer>,
-    open: watch::Sender<bool>,
+pub(super) struct Gated {
+    pub(super) inner: Arc<FakeDialer>,
+    pub(super) open: watch::Sender<bool>,
 }
 
 impl Dialer for Gated {

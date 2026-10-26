@@ -39,8 +39,8 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 | POST | `/v1/profiles/reload` | | `{"ok":true,"errors":0,"warnings":1,"listenersRebound":false}`；解析失败或构建 `Runtime` 失败时 `ok:false`，运行中的配置不变；重绑监听器失败时也是 `ok:false`，但新配置这时已经生效，只是监听器归零，直到下一次重载成功为止（下一次重载会无条件重试绑定） |
 | POST | `/v1/profiles/check` | 可带 `{"name":"<Profile 名>"}` | `{"ok":…,"errors":N,"warnings":N,"diagnostics":[Diagnostic…],"error":null\|"<首个错误>"}`（校验磁盘上的当前配置，不影响运行；`Diagnostic` 与 `rurge check --json` 相同，每项另有 `hint`——字符串或 `null`：阶段 1 补遗（M5a）起多数诊断码有缺省建议，见兼容性清单 10.3 节 `--check` 一行）。阶段 1 补遗（M5b）起应答另有 `error`，请求可带 `name`：不是正在运行的那份 Profile 的名字 → 404 `{"error":"profile not found"}`；正文不是 JSON 对象、`name` 不是字符串或正文超过 2 MiB → 400；见下「Profile 的当前文本与检查」 |
 | POST | `/v1/log/level` | `{"level":"verbose"\|"debug"\|"info"\|"notify"\|"warning"\|"error"}` | `{}` |
-| GET | `/v1/features/{system_proxy\|enhanced_mode\|mitm\|capture\|rewrite\|scripting}` | | `system_proxy` 返回真实状态 `{"enabled":bool}`；其余恒 `{"enabled":false}` |
-| POST | `/v1/features/{name}` | `{"enabled":bool}` | `system_proxy`：成功 `{}`；失败 500 `{"error":"<原因>"}`（例如不支持的 Linux 桌面会带 `export http_proxy=…` 提示）；其余功能 501 |
+| GET | `/v1/features/{system_proxy\|enhanced_mode\|mitm\|capture\|rewrite\|scripting}` | | `system_proxy` 返回真实状态 `{"enabled":bool}`；阶段 3 / M4a 起 `enhanced_mode` 也是真实状态，另带 `dropped` 与 `stackPanics`（形状见 `docs/api/phase3.md` 的「M4」一节）；其余恒 `{"enabled":false}` |
+| POST | `/v1/features/{name}` | `{"enabled":bool}` | `system_proxy`：成功 `{}`；失败 500 `{"error":"<原因>"}`（例如不支持的 Linux 桌面会带 `export http_proxy=…` 提示）；阶段 3 / M4a 起 `enhanced_mode` 同 `system_proxy`（成功 `{}`，失败 500 带原因）；其余功能 501 |
 | GET | `/v1/modules` | | `{"enabled":[],"available":[]}` |
 | GET | `/v1/scripting` | | `{"scripts":[]}` |
 | GET | `/v1/events` | | `{"events":[]}` |

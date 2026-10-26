@@ -526,6 +526,18 @@ impl TunHandle {
         self.inner.life.ending()
     }
 
+    /// Ends as soon as the TUN has been told to end — a stop, or a device that
+    /// failed — with the first reason given, and does not wait for the TUN's
+    /// tasks. [`TunHandle::join`] waits for those too, and a dial that is under
+    /// way holds it; whoever watches for a device that failed cannot wait for a
+    /// dial that might never come back (M3b's delayed item 8, the phase 3 / M4a
+    /// plan's execution record row 100). What a close waits for is `join`, with
+    /// a limit of its own.
+    pub async fn ending(&self) -> Ending {
+        self.inner.life.stopped().await;
+        self.inner.life.ending()
+    }
+
     /// The packets dropped so far, for each reason.
     pub fn counters(&self) -> Counters {
         self.inner.stats.counters()

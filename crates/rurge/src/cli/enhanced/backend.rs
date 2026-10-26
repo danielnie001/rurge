@@ -47,7 +47,10 @@ pub trait Backend: Send + Sync {
     fn configure_ipv6(&self, dev: &Opened) -> Result<bool, String>;
     fn unconfigure_ipv6(&self, dev: &Opened) -> Result<(), String>;
     /// Adds `add`, then removes `remove`; removing goes on past errors.
-    /// `Ok(false)`: the IPv6 half of `add` could not be added (warned).
+    /// `Ok(false)`: the IPv6 half of `add` could not be added (warned). The
+    /// backend has taken that half back and removed `remove` all the same, so
+    /// what the adapter still has is the old set less `remove` (the phase 3 /
+    /// M4a plan's execution record row 95).
     fn routes(&self, dev: &Opened, add: &RouteSet, remove: &RouteSet) -> Result<bool, String>;
     /// The undo actions `take_dns` will need that are not among `saved` (the
     /// ones in the backup already), read before it is done (macOS: each

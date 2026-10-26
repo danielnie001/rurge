@@ -40,11 +40,23 @@ impl Undo {
     }
 
     /// The name this undo goes by in the log, in the file backend's actions and
-    /// in its `fail_undo`.
+    /// in its `fail_undo`. A macOS network service's name is here, so this is
+    /// for the file backend and the DEBUG log only (M4 design §13).
     pub(super) fn label(&self) -> String {
         match self {
             Undo::Test { step } => step.clone(),
             Undo::MacDns { service, .. } => format!("mac_dns {service}"),
+            Undo::RpFilter { value } => format!("rp_filter {value}"),
+        }
+    }
+
+    /// What an ERROR line may say of this undo: its kind and, for a loosened
+    /// `rp_filter`, the value put back. A network service's name is the user's
+    /// to choose and stays out of anything above DEBUG (M4 design §13).
+    pub(super) fn kind(&self) -> String {
+        match self {
+            Undo::Test { step } => step.clone(),
+            Undo::MacDns { .. } => "mac_dns".to_string(),
             Undo::RpFilter { value } => format!("rp_filter {value}"),
         }
     }
@@ -134,6 +146,29 @@ mod tests {
             }
             .label(),
             "mac_dns Wi-Fi"
+        );
+    }
+
+    /// What the ERROR line says of an undo never carries a network service's
+    /// name, which its user may have made anything (M4 design §13): the kind
+    /// alone, or the value put back.
+    #[test]
+    fn the_logs_name_of_an_undo_has_no_service_name_in_it() {
+        assert_eq!(
+            Undo::MacDns {
+                service: "Wi-Fi".to_string(),
+                servers: vec![]
+            }
+            .kind(),
+            "mac_dns"
+        );
+        assert_eq!(Undo::RpFilter { value: 1 }.kind(), "rp_filter 1");
+        assert_eq!(
+            Undo::Test {
+                step: "take_dns".to_string()
+            }
+            .kind(),
+            "take_dns"
         );
     }
 }

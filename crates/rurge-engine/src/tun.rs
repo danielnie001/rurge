@@ -141,7 +141,9 @@ impl Engine {
     }
 
     /// Resolves once no TUN runs on this engine: the last one has ended and its
-    /// pool's last save is written.
+    /// pool's last save is written. It takes the one TUN's permit on its way
+    /// through, so a `start_tun` that comes at the same moment is refused as
+    /// one on a running TUN: start the next TUN after this has returned.
     pub async fn tun_ended(&self) {
         // The semaphore has one permit and is never closed, so this waits for
         // the task that keeps the pool saved (`start_tun`) and takes the permit

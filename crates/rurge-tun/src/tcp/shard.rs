@@ -129,7 +129,7 @@ impl Shard {
         let warn = self
             .rebuild_warns
             .lock()
-            .expect("the limit on a shard's rebuilds said")
+            .expect("the shard's rebuild warnings")
             .allow(Instant::now());
         if warn {
             tracing::warn!(shard = self.index, "{}", REBUILT);

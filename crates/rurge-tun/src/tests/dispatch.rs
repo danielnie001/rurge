@@ -121,7 +121,7 @@ async fn queued_bytes_are_given_back_when_the_shard_takes_the_packets() {
 /// The shard a connection goes to is chosen by a key of the TUN's own: one key
 /// chooses the same shard for the same connection every time, and two TUNs'
 /// keys do not choose the same shards for a run of connections (for 64 of them,
-/// the chance that they all agree is 256^-63).
+/// the chance that they all agree is 256^-64).
 #[test]
 fn shards_are_chosen_with_a_key_of_each_tun() {
     const SHARDS: usize = 256;

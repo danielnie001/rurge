@@ -116,24 +116,47 @@ pub fn remove_routes(t: &WindowsTools, index: u32, set: &RouteSet) -> Vec<Step> 
 /// Point the adapter's DNS at the responder, then drop what the resolver
 /// cached (design 5.4). The setting lives in the adapter's own configuration,
 /// so the adapter going away takes it with it, and it is no undo step.
+///
+/// Windows keeps the IPv4 and IPv6 server lists apart: `set dnsservers`
+/// changes only its own family's. With IPv6 off, the IPv6 list is cleared in a
+/// step of its own, so that an address the adapter no longer has is not left
+/// being asked (the phase 3 / M4a plan's execution record row 96). That step
+/// ignores a failure: there is nothing to clear the first time, and an adapter
+/// that has no IPv6 binding may not take the line, with no IPv6 list to leave
+/// behind either.
 pub fn take_dns(t: &WindowsTools, index: u32, ipv6: bool) -> Vec<Step> {
-    let mut lines = vec![format!(
+    let ipv4 = format!(
         "interface ipv4 set dnsservers name={index} source=static address={RESPONDER_V4} register=none validate=no"
-    )];
+    );
+    let mut steps = Vec::with_capacity(3);
     if ipv6 {
-        lines.push(format!(
-            "interface ipv6 set dnsservers name={index} source=static address={RESPONDER_V6} register=none validate=no"
+        steps.push(netsh_step(
+            t,
+            &[
+                ipv4,
+                format!(
+                    "interface ipv6 set dnsservers name={index} source=static address={RESPONDER_V6} register=none validate=no"
+                ),
+            ],
+            OnFailure::Fail,
+        ));
+    } else {
+        steps.push(netsh_step(t, &[ipv4], OnFailure::Fail));
+        steps.push(netsh_step(
+            t,
+            &[format!(
+                "interface ipv6 set dnsservers name={index} source=static address=none register=none validate=no"
+            )],
+            OnFailure::Ignore,
         ));
     }
-    vec![
-        netsh_step(t, &lines, OnFailure::Fail),
-        Step {
-            program: t.ipconfig.clone(),
-            args: vec!["/flushdns".to_owned()],
-            script: None,
-            on_failure: OnFailure::Ignore,
-        },
-    ]
+    steps.push(Step {
+        program: t.ipconfig.clone(),
+        args: vec!["/flushdns".to_owned()],
+        script: None,
+        on_failure: OnFailure::Ignore,
+    });
+    steps
 }
 
 /// `set interface` for one family.
@@ -345,13 +368,47 @@ mod tests {
                 ipconfig(),
             ]
         );
-        // IPv6 off: the one IPv4 server.
+        // IPv6 off: the one IPv4 server, then the IPv6 list cleared in a step
+        // of its own, then the flush.
         assert_eq!(
-            take_dns(&tools(), 12, false)[0],
-            netsh(
-                "interface ipv4 set dnsservers name=12 source=static address=198.18.0.2 register=none validate=no\n",
-                OnFailure::Fail,
+            take_dns(&tools(), 12, false),
+            [
+                netsh(
+                    "interface ipv4 set dnsservers name=12 source=static address=198.18.0.2 register=none validate=no\n",
+                    OnFailure::Fail,
+                ),
+                netsh(
+                    "interface ipv6 set dnsservers name=12 source=static address=none register=none validate=no\n",
+                    OnFailure::Ignore,
+                ),
+                ipconfig(),
+            ]
+        );
+    }
+
+    /// Turning IPv6 off clears the IPv6 DNS list, which Windows keeps apart
+    /// from the IPv4 one, after the IPv4 list is set and before the caches are
+    /// flushed (the phase 3 / M4a plan's execution record row 96).
+    #[test]
+    fn turning_ipv6_off_clears_the_ipv6_dns_list() {
+        let steps = take_dns(&tools(), 12, false);
+        assert_eq!(steps.len(), 3, "{steps:?}");
+        assert_eq!(steps[0].on_failure, OnFailure::Fail);
+        assert_eq!(steps[1].on_failure, OnFailure::Ignore);
+        assert_eq!(
+            steps[1].script.as_deref(),
+            Some(
+                "interface ipv6 set dnsservers name=12 source=static address=none register=none validate=no\n"
             )
+        );
+        assert_eq!(steps[2].args, ["/flushdns".to_owned()]);
+        assert!(
+            !steps[0]
+                .script
+                .as_deref()
+                .unwrap_or_default()
+                .contains("interface ipv6"),
+            "the IPv4 list alone is set in the first step"
         );
     }
 

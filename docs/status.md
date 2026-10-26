@@ -280,11 +280,11 @@ M4（平台接入）的细化设计与四份实施计划写好了，**代码一�
 
 ### M4a（平台无关的骨架）
 
-M4a 做完了（2026-10-26；计划 `docs/superpowers/plans/2026-10-26-phase3-m4a-skeleton-plan.md`，下面写"M4a 记录第 N 行""M4a 延后第 N 行"指它末尾的「执行期修正记录」与「延后事项」两张表，写"P N"指它的「计划期决定」）。**上一节「M4 的设计与计划」里"代码一行也没有写"那句以这一段为准**（那是当时的事实，规矩是历史的段落不逐处改、由后写的段落订正）：M4 的代码从 M4a 起开始写，M4a 这一份写完了，M4b ～ M4d 一行也还没有。
+M4a 做完了（2026-10-26；计划 `docs/superpowers/plans/2026-10-26-phase3-m4a-skeleton-plan.md`，下面写"M4a 记录第 N 行""M4a 延后第 N 行"指它末尾的「执行期修正记录」与「延后事项」两张表，写"P N"指它的「计划期决定」）。**上一节「M4 的设计与计划」里"代码一行也没有写"那句以这一段为准**（那是当时的事实，规矩是历史的段落不逐处改、由后写的段落订正）：M4 的代码从 M4a 起开始写，M4a 这一份写完了，M4b ～ M4d 一行也还没有。M4a 由协调的会话逐个任务调 Pi 做、逐个任务评审，做完之后经整分支终审与一轮修正（2026-10-27），接着做 M4b，不停下等所有者评审（M4a 记录第 104 行）。
 
 做了什么：一句话说，增强模式的生命周期在不碰系统的前提下整个做出来了——路由集的计算与三个平台的步骤（都是数据）、`state.json` 的备份与崩溃之后的恢复、可执行文件里的管理器与三个后端、`--enhanced-mode` 与 `GET` / `POST /v1/features/enhanced_mode`、退出的次序、接管暂停的增强模式一半、重载与网络变化的增量、`rurge check` 的四个新诊断、`external` 的 `addresses` 进路由的排除。**使用者仍然开不了增强模式**：平台后端对每个动作都答 `the enhanced mode is not available on this platform in this version`（见下面"没做的"）。细节在 `docs/api/phase3.md` 的「M4」一节；代码在 `crates/rurge-platform/src/route/`（`RouteSet` 与 `linux` / `macos` / `windows` 三个翻译）、`crates/rurge/src/cli/enhanced/`（`EnhancedMode`、`Backend`、`FileBackend`、`Undo`、`Wanted`、生产的 `Starter`）与 `crates/rurge/src/cli/run.rs` 的接线。
 设计第 15 节归 M4a 的 M3 延后事项，各做在：**M3a 延后第 17 行的第二、三、四条 → 任务 1**（进片的队列按字节计，`TunOptions::queue_bytes` 缺省 32 MiB、超出按 `queue_full` 丢；`shard_of` 用每个 TUN 一个 `RandomState`，`DefaultHasher` 去掉了；片重建的 WARN 每片每分钟至多一行，其余 DEBUG）；**M3b 延后第 8 行与第 14 行的一条 → 任务 7 与任务 2**（可执行文件关闭时等 `join` 至多 3 秒，`JOIN_LIMIT`，用例 `closing_waits_for_the_tun_three_seconds_at_most`；"引擎放开客户端"的证据从 5 秒收到 `STOP_GRACE` 加余量，`an_association_returns_when_closed_and_lets_go_of_its_client`）；**M3b 延后第 23 ～ 25 行 → 任务 2**（`fake-ip.txt` 在 Unix 上以 `0600` 建出；`Engine::start_tun` 返回 `Result`、先 `TunOptions::check` 再查 MTU 下限 1280，不再 panic 着把池的文件留在 `clean 0`；一个引擎一个 TUN，`Engine::tun_ended()`）。
-门禁：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过，`cargo test -j 8 --workspace --no-fail-fast` **81 个结果行、4422 通过、0 失败、13 忽略**（没有二进制异常退出，没有重跑；M4a 记录第 94 行）——一台 Windows 11 x86-64 的开发机上的一次运行，不是 CI。
+门禁：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过，`cargo test -j 8 --workspace --no-fail-fast` **81 个结果行、4430 通过、0 失败、13 忽略**（`rurge-proto-wireguard` 的 lib 二进制以 `STATUS_HEAP_CORRUPTION` 退出，单独重跑通过、数字算进去了；M4a 记录第 105 行）——一台 Windows 11 x86-64 的开发机上的一次运行，不是 CI。
 
 没做的，与不要当成已经有的：
 
@@ -293,19 +293,19 @@ M4a 做完了（2026-10-26；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 - **出口表没有读的人**：M4a 写出口表（`cli/enhanced` 的 `EgressSlot`），判定的那一半（`PlatformSockets` 的 `egress`）是 M4b。所以这一版没有防环。
 - **ICMP 回显不转发**：TUN 的 `Pinger` 是 `NoPinger`（每个回显请求都立刻失败），M4b 换成真的套接字。
 - **Linux 与 macOS 上 `0600` 的用例只在 CI 上编译运行**：`crates/rurge-dns/src/fakeip/file.rs` 的 `the_pool_file_is_its_owners_alone` 是 `#[cfg(unix)]` 的，这台 Windows 开发机上没有编译过（M4a 记录第 22 行说的同一件事）。
-- 手工验收一项也没有做（`docs/acceptance/phase3-manual.md` 的 M4 一节要等 M4c / M4d 之后才能做）；兼容性清单的 `ipv6-vif`、`tun-excluded-routes`、`tun-included-routes` 与 `external` 的 `addresses` 四行写的是"目前（阶段 3 / M4a）"，其余行随 M4d。
+- 手工验收一项也没有做（`docs/acceptance/phase3-manual.md` 里还没有 M4 一节，只有 M1、M2、M3；M4d 写它，要验的东西列在设计第 16 节）；兼容性清单的 `ipv6-vif`、`tun-excluded-routes`、`tun-included-routes` 与 `external` 的 `addresses` 四行写的是"目前（阶段 3 / M4a）"，其余行随 M4d。
 - **M4a 的提交 CI 都没有见过**（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986，此后没有推送）。
 
 以后的会话必须知道的事：
 
-- **`EnhancedMode::follow` 的次序与失败策略**（`crates/rurge/src/cli/enhanced/mod.rs`）：IPv6 从关到开是"网卡的地址 → 路由 → 系统 DNS → 系统自己的调整（只在换网络时）"，从开到关是"DNS → 路由 → 地址"（协调者的裁定，M4a 记录第 79 行）。一次 `follow` 至多接管一次系统 DNS（IPv6 变了与换网络合并成一次）。每一步失败只记一行 ERROR（`cannot follow the change; the enhanced mode goes on with what it has`，带 `step` 与 `error`），后面的照做，增强模式照开、已做的保留，`GET` 照实是 `true`。备份写不进去时紧接着的那一步不做。
+- **`EnhancedMode::follow` 的次序与失败策略**（`crates/rurge/src/cli/enhanced/mod.rs`）：IPv6 从关到开是"网卡的地址 → 路由 → 系统 DNS → 系统自己的调整（只在换网络时）"，从开到关是"DNS → 路由 → 地址"（协调者的裁定，M4a 记录第 79 行）。一次 `follow` 至多接管一次系统 DNS（IPv6 变了与换网络合并成一次）。每一步失败只记一行 ERROR（`cannot follow the change; the enhanced mode goes on with what it has`，带 `step` 与 `error`），后面的照做，增强模式照开、已做的保留，`GET` 照实是 `true`。备份写不进去时紧接着的那一步不做。路由的 IPv6 一半失败（`routes` 回 `Ok(false)`）时别当空集：后端只撤它新加的那一半、照常减掉要减的，所以记下的是旧集减去要减的（与新的交集）；这一次之前 IPv6 没开着的这一次按没开往下做（DNS 以没有 IPv6 接管，与打开同一条规矩，M4a 记录第 95 行），本来就开着的照开着。
 - **出口表始终是装进网卡的路由的超集**（协调者的裁定 R25，M4a 记录第 75 行）：路由那一步之前先写"旧的与新的并起来"的集合，成功之后写新的，失败就留着并集。M4b 的读者靠这一条不把 rurge 自己的连接引回虚拟网卡，改这一段之前先读它。
-- **`Takeover` 的两半**（`run.rs`）：系统代理与增强模式各有一个"想要的"，启动参数与每一次得到成功应答的 `POST` 都能改它；进入暂停时两样都给出、记下想要，离开暂停时照想要的办，两个方向都对，且**增强模式先于系统代理**。启动时就在暂停的网络上两样都不开。设备自己坏了（`Ending::DeviceFailed`）时管理器把增强模式整个关掉、不重试，但 `Takeover` 记的"想要的"不变（P24）——设备坏一次不该改变使用者的意图。
+- **`Takeover` 的两半**（`run.rs`）：系统代理与增强模式各有一个"想要的"，启动参数与每一次得到成功应答的 `POST` 都能改它；进入暂停时两样都给出、记下想要，离开暂停时照想要的办，且**增强模式先于系统代理**。增强模式的关从不半途停下，所以关闭回 500 时它已经关了：`POST false` 不论成败都把"想要的"记成关（协调者的裁定 R35，M4a 记录第 97 行），离开暂停时只有"想要开着而关着"这一支要开，没有"想要关着而仍开着"那一支（那只是系统代理的）。启动时就在暂停的网络上两样都不开。设备自己坏了（`Ending::DeviceFailed`）时管理器把增强模式整个关掉、不重试，但 `Takeover` 记的"想要的"不变（P24）——设备坏一次不该改变使用者的意图。
 - `StateStore::try_update` 与 `update` 各用在哪里：**备份的"加"用 `try_update`**（写不进就不做那一步，打开整个回退），**备份的"去掉"与 `features.enhanced_mode` 用 `update`**（写不进只记 ERROR，下次启动再撤销一遍，撤销对已经撤销过的东西无害）。备份只记会在崩溃之后留在系统里的动作（macOS 的 DNS、Linux 的 `rp_filter` 与文件后端的 `test`），设备、地址、路由不进；`features.enhanced_mode` 没有读者，它只是记录。
-- `Starter` / `RunningTun` 是起 TUN 的接缝（P6）：生产里那个包 `Engine::start_tun`（`cli/enhanced/engine.rs`），用例里是假的。`RunningTun` 有两句话——`ended()`（关闭等它，含引擎最后保存池）与 `ending()`（等设备坏了的那个任务只看 TUN 自己结束，不占引擎那一个 TUN 的位置，M4a 记录第 62 行）。
+- `Starter` / `RunningTun` 是起 TUN 的接缝（P6）：生产里那个包 `Engine::start_tun`（`cli/enhanced/engine.rs`），用例里是假的。`RunningTun` 有两句话——`ended()`（关闭等它，含引擎最后保存池，关闭给这一步 3 秒的时限）与 `ending()`（等设备坏了的那个任务只看 TUN 被告诉结束，不占引擎那一个 TUN 的位置，也不等正在进行的拨号——`TunHandle::ending()` 在停止令牌被取消时回，M4a 记录第 62、100 行）。
 - `Command::TunEnded(序号)`：序号归管理器（每次打开成功加一），主循环用 `is_current_open` 判断"是不是正开着的那一次"，早先那一次或关闭之后的失败不再处理。队列满时用一个任务把消息送进去，不丢。
 - 起 `rurge` 二进制的辅助函数（`rurge_command()`、`rurge_process()`）缺省设 `RURGE_ENHANCED_BACKEND=off`：没有一条起 `rurge` 二进制的缺省用例能走到平台后端。要用文件后端的用例在构造函数之后自己设 `file:<路径>`；那个文件的写不是原子的，等的办法见 `docs/testing.md` 的「阶段 3 / M4a 起」。
-- 崩溃之后的恢复（`EnhancedMode::recover`）在拿到实例锁之后、任何新改动之前，与系统代理的恢复同一个位置；配置读不了、有错误、日志文件打不开的那三个出口也做（标准错误四句之一，不改变退出码）。读不懂的备份三处都原样留着。
+- 崩溃之后的恢复（`EnhancedMode::recover`）在拿到实例锁之后、任何新改动之前，与系统代理的恢复同一个位置；配置读不了、有错误、日志文件打不开的那三个出口也做（标准错误四句之一，不改变退出码）。读不懂的备份三处都原样留着。备份为空而 `features.enhanced_mode` 为真时（Windows，或 Linux 不用改 `rp_filter`），恢复也把它写回 `false`（M4a 记录第 99 行）。撤销失败的 ERROR 行的 `step` 只写种类（`mac_dns` 不带服务名），完整的名字在紧跟的 DEBUG 行（M4a 记录第 98 行）。
 
 去向写着项目所有者的（后来的会话不要自己定）：设计第 20 节的 Q2（设备、路由、网络环境改用现成的包，或开 `nix` 的 `socket` / `net` 特性）、Q3（发行包随附官方签名的 `wintun.dll`）、Q4（L2 特权用例在 CI 上启用、macOS 与 Windows 的冒烟）、Q5（Windows 防 DNS 泄漏的严格模式，WFP）；**推送**（M4a 的提交都在本地 `phase3-m4a` 分支上，`origin/main` 仍是 `ac0a98a`）；**手工验收**（M3、M4 两节都要真机，M4 一节要等 M4c / M4d）；P24 对设计第 9.4 节的订正（设备自己坏了的情形）**M4d 收尾时**写进设计的订正，M4a 不改设计正文。
 

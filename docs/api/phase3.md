@@ -8,7 +8,7 @@
 
 阶段 3 / M3c（DNS 应答器、预匹配与经监听器来的 fake 地址，设计 `docs/superpowers/specs/2026-10-18-phase3-m3-tun-core-design.md` 第 11 ～ 13 节，计划 `docs/superpowers/plans/2026-10-23-phase3-m3c-dns-responder-prematch-plan.md`）**没有新增端点**，也没有改任何响应的形状：经虚拟网卡来的会话在请求记录里多了预匹配的两种 `notes` 和没有端口的 `dst`，经监听器来的 fake 地址有了一条失败原因 `fake address not known`，应答器与预匹配有了几行日志，计数的 `queue_full` 多了几处来源。**`rurge run` 要到 M4 才起虚拟网卡，使用者今天看不到这些**（连经监听器来的那一半也要有 TUN 的池）；见最后一节「M3c　虚拟网卡的 DNS 应答器、预匹配与经监听器来的 fake 地址」。
 
-阶段 3 / M4a（增强模式的生命周期与平台接入的骨架，设计 `docs/superpowers/specs/2026-10-26-phase3-m4-platform-design.md`，计划 `docs/superpowers/plans/2026-10-26-phase3-m4a-skeleton-plan.md`）**没有新增端点**：`GET` / `POST /v1/features/enhanced_mode` 从恒假、不可切换变成活的（`GET` 的形状阶段 1 就写着，现在有真值），`rurge run` 多了 `--enhanced-mode` / `RURGE_ENHANCED_MODE`，`rurge check` 多了 `W0035` ～ `W0038`。**这一版的平台后端对每个动作都答 "not available"**，所以使用者仍然开不了增强模式；下面说的其余行为今天只有经只供测试的文件后端才看得到。见最后一节「M4　增强模式（平台接入）」。
+阶段 3 / M4a（增强模式的生命周期与平台接入的骨架，设计 `docs/superpowers/specs/2026-10-26-phase3-m4-platform-design.md`，计划 `docs/superpowers/plans/2026-10-26-phase3-m4a-skeleton-plan.md`）**没有新增端点**：`GET` / `POST /v1/features/enhanced_mode` 从恒假、不可切换变成活的（形状是 M3 设计定的——M3-D22，它的第 14 节——M4 设计第 3 节照用；阶段 1 到 M3 这个端点 `GET` 恒为 `{"enabled":false}`、`POST` 回 501，M4a 起才有真值），`rurge run` 多了 `--enhanced-mode` / `RURGE_ENHANCED_MODE`，`rurge check` 多了 `W0035` ～ `W0038`。**这一版的平台后端对每个动作都答 "not available"**，所以使用者仍然开不了增强模式；下面说的其余行为今天只有经只供测试的文件后端才看得到。见最后一节「M4　增强模式（平台接入）」。
 
 ## 端点
 
@@ -441,12 +441,12 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 {"enabled":true,"dropped":{"malformed":0,"fragment":0,"martian":0,"unsupported":0,"queueFull":0,"unknownFake":0,"busy":0,"beyondWindow":0,"rstLimited":0,"icmpLimited":0},"stackPanics":0}
 ```
 
-`dropped` 的十个键是 camelCase（同 API 别处），`stackPanics` 在顶层；它们的含义是 `rurge-tun` 的 `Counters`（丢弃按原因各一个数，加 TCP 栈的 panic 次数），本页「M3c」一节「计数」一表说的是各原因还数什么。这个形状从阶段 1 起就写着（那时恒为 `{"enabled":false}`），M4a 起才有真值。
+`dropped` 的十个键是 camelCase（同 API 别处），`stackPanics` 在顶层；它们的含义是 `rurge-tun` 的 `Counters`（丢弃按原因各一个数，加 TCP 栈的 panic 次数），本页「M3c」一节「计数」一表说的是各原因还数什么。这个形状是 M3 设计定的（M3-D22，它的第 14 节），M4 设计第 3 节照用；阶段 1 到 M3 这个端点 `GET` 恒为 `{"enabled":false}`、`POST` 回 501，M4a 起才有真值。
 
 `POST` 的体是 `{"enabled": <bool>}`（与其余功能端点同一个读法：不是布尔值、不是 JSON 对象都是 400）。
 
 - 成功回 `{}`。打开成功时日志先有一行 INFO `enhanced mode on`（管理器写的），然后一行 INFO `enhanced mode switched via http-api`（端点写的，字段 `enabled`）；关闭成功时是 INFO `enhanced mode off` 再这一行。
-- 失败回 500，体是 `{"error":"<原因>"}`，原因就是后端（或者它上面的 `state.json`）给的那句话；主循环另记一行 ERROR `cannot switch the enhanced mode`（字段 `error`、`enabled`）。打开失败已经自己撤销了做过的事，`GET` 照实说 `enabled: false`。
+- 失败回 500，体是 `{"error":"<原因>"}`，原因就是后端（或者它上面的 `state.json`）给的那句话；主循环另记一行 ERROR `cannot switch the enhanced mode`（字段 `error`、`enabled`）。打开失败已经自己撤销了做过的事，`GET` 照实说 `enabled: false`（想要的不因一次没做成的打开而改）。关闭失败时回 500，但模式已经关了——关从不半途停下，`GET` 为假，想要的也记成关（协调者的裁定 R35；M4a 计划「执行期修正记录」第 97 行）。
 - **已经是要的状态时直接回成功**：开着的再 `POST true`、关着的再 `POST false` 都回 `{}`，一个后端动作都没有（日志里只有端点那一行）。
 - 接管暂停期间（见下）回成功 `{}`，但什么也不开、什么也不关，只记下想要的。
 - 打开与关闭都在主循环里一次一个，与重载、网络变化、`POST /v1/stop` 排在同一个队列里。
@@ -463,18 +463,19 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 | INFO | `enhanced mode switched via http-api` | `enabled` | 每一次得到成功应答的 `POST`（暂停期间也一样） |
 | WARN | `IPv6 could not be configured; the enhanced mode goes on without it` | | 要 IPv6 而没有配上：打开时 `configure` 答"没有"，或重载 / 网络变化时 `configure_ipv6` 答"没有"。这一行由管理器写，后端不另写 |
 | WARN | `the TUN did not end within 3 seconds; going on` | | 关闭等 TUN 结束超过 3 秒（停止不取消正在进行的拨号，M3b 延后第 8 行），照常往下 |
-| ERROR | `cannot undo part of the enhanced mode; going on with the rest` | `step`、`error` | 关闭（含打开失败的回退）里一条撤销失败。`step` 是那条撤销动作的名字：`take_dns`、`adjust`、`rp_filter <值>`、`mac_dns <服务>` |
+| ERROR | `cannot undo part of the enhanced mode; going on with the rest` | `step`、`error` | 关闭（含打开失败的回退）里一条撤销失败。`step` 是那条撤销动作的种类：`take_dns`、`adjust`、`rp_filter <值>`、`mac_dns`（macOS 的网络服务名不在这一行，在紧跟的 DEBUG 行里） |
+| DEBUG | `the undo action that could not be undone` | `step`（完整的名字，含 macOS 的服务名） | 紧跟上一行 |
 | ERROR | `state.json's enhanced backup cannot be read; it is left as it is and nothing is undone` | `error` | 启动的恢复读到读不懂的备份：什么也不撤销，备份原样留着 |
 | ERROR | `state.json's enhanced backup cannot be read; what outlives the device is left as it is` | `error` | 关闭时读到读不懂的备份：其余各步照做，备份原样留着 |
 | ERROR | `cannot follow the change; the enhanced mode goes on with what it has` | `step`、`error` | 重载或网络变化时某一步失败；`step` 是 `configure_ipv6`、`routes`、`dns_undo`、`dns_backup`、`take_dns`、`adjust_undo`、`adjust_backup`、`adjust`、`unconfigure_ipv6` 之一 |
 | DEBUG | `the virtual adapter failed` | `error`（设备的原话） | 设备自己坏了。原因只在这里，下面那一行 ERROR 由主循环说 |
 | ERROR | `the virtual adapter failed; the enhanced mode is off` | | 主循环收到"正开着的这一次的 TUN 坏了"（P24），关掉增强模式之前 |
-| ERROR | `cannot turn the enhanced mode off after the adapter failed` | `error` | 上面那次关闭失败（不重试） |
+| ERROR | `the enhanced mode is off after the adapter failed, but part of it could not be undone; what outlives rurge stays in state.json and is undone on the next start` | `error` | 上面那次关闭失败（不重试） |
 | INFO | `restored what the enhanced mode left last time` | | 启动的恢复把备份里的撤销动作都做成了 |
 | ERROR | `cannot undo what the enhanced mode left; it stays in state.json and is tried on the next start` | `error` | 启动的恢复里有撤销失败；失败的那几条留在备份里 |
 | ERROR | `cannot switch the enhanced mode` | `error`、`enabled` | `POST` 的开关失败（API 这时回 500） |
 
-接管暂停的那几行（`takeover paused on this network`、`takeover resumed`、`the takeover is paused on this network; the enhanced mode is left as it is, and set as asked when the pause ends`，以及三条 `cannot turn the enhanced mode …`）在下面「接管暂停：增强模式的那一半」，与系统代理那几行在同一张表里（本页「网络任务的日志行」）。
+接管暂停的那几行（`takeover paused on this network`、`takeover resumed`、`the takeover is paused on this network; the enhanced mode is left as it is, and set as asked when the pause ends`，以及两条 `cannot turn the enhanced mode …`）在下面「接管暂停：增强模式的那一半」，与系统代理那几行在同一张表里（本页「网络任务的日志行」）。
 
 上面「启动参数与环境变量」与下面「`state.json`」里那些标准输出与标准错误不是日志行：它们照旧不受 `--log-level` 与 `--log-file` 影响，上表只讲 tracing 的行。
 
@@ -489,7 +490,7 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 - 形状是 `{"undo":[…]}`，次序即做成的次序；每一项是 `{"kind": …}` 加自己的字段：`mac_dns`（`service`、`servers`，原来的服务器，没有手设过就是空表）、`rp_filter`（`value`，原来的值）、`test`（`step`，只供测试的文件后端用的那一种）。读不懂的一项让整份备份读不懂：`serde` 拒绝一个不认识的 `kind`。
 - **什么时候写**：打开的第 6 步（接管系统 DNS）与第 8 步（系统自己的调整）之前各写一次，写的是"打开前备份里已有的 + 这一步新要的"，用 `try_update`（写进磁盘才换内存里的状态）；写不进时那一步不做，已经做过的倒着撤销，打开失败，错误是 `cannot write state.json: <系统的原因>`。重载与网络变化再做这两步时同样先写。
 - **什么时候清**：关闭（含打开失败的回退）与启动的恢复里，做成一条就从备份里去掉一条，最后把剩下的写回；一条也不剩时 `enhanced_backup` 是 `null`，同时 `features.enhanced_mode` 写 `false`。这一步用 `update`：写不进只记一行 ERROR，下一次启动会把同样的几条再撤销一遍（撤销已经撤销过的东西是无害的）。
-- `features.enhanced_mode`：打开的最后一步写 `true`，备份清空时写 `false`。启动时不读它——开关只看参数与 `POST`（M4-D15）——所以它只是给人和以后的会话看的记录。
+- `features.enhanced_mode`：打开的最后一步写 `true`，备份清空时写 `false`。启动时不读它——开关只看参数与 `POST`（M4-D15）——所以它只是给人和以后的会话看的记录。崩溃之后没有备份而它为真（Windows 的备份总是空的，Linux 不用改 `rp_filter` 时也是），启动的恢复也把它写回 `false`：那一次启动把上次留下的都算清了（协调者的裁定 R37；M4a 计划「执行期修正记录」第 99 行）。
 - **启动时的恢复**：拿到数据目录的实例锁之后、任何新改动之前，与系统代理的恢复同一个位置（配置读不了、有错误、日志文件打不开的那三个出口也做，见 `docs/api/phase1.md` 的「配置加载不了时也恢复」一条）。备份里有撤销动作就**倒着**做（最后做的先撤），成功的从备份里去掉。有一句成功时是 INFO `restored what the enhanced mode left last time`，有失败时是 ERROR `cannot undo what the enhanced mode left; it stays in state.json and is tried on the next start`。
 - 那三个没有日志的出口（配置读不了、配置有错误、`--log-file` 打不开）把结果写到标准错误，四句之一：`warning: a previous run left changes of the enhanced mode; they were undone`、`… ; they were undone, but state.json could not be updated: the next start undoes them again`、`warning: cannot undo what the enhanced mode left: <原因>; it stays in state.json and is tried on the next start`，以及取不到后端时的 `warning: <后端的报错>; the enhanced mode's changes were not undone`（`RURGE_ENHANCED_BACKEND` 的取值不对时）。都不改变退出码。
 - **读不懂的备份照原样留着**：启动的恢复、关闭、打开三处都只记一行（前两处各一句 ERROR、打开是回一个以 `state.json's enhanced backup cannot be read` 开头的错误并且一个后端动作也不做），谁都不改写它。理由与系统代理一样：那可能是以后版本写下的形状，猜着撤销比不动更坏。
@@ -498,12 +499,12 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 
 生效的 `[SSID Setting]` 行写了 `suspend=true` 的网络上，接管暂停（本页「接管暂停时的系统代理端点」一节说的是系统代理那一半），增强模式照同一种语义（设计第 9.9 节、M4-D18）：
 
-- **进入暂停**：开着的增强模式按关闭的次序关掉（系统 DNS 先交还），并记下"想要开着"——即便这一关失败了，也照样记下（它仍开着，离开暂停时不会再开一次）。失败是 ERROR `cannot turn the enhanced mode off for the pause; it stays on`。
-- **离开暂停**：照记下的"想要"办，两个方向都对：想要开着而关着的就打开（用的是这一刻这一代的配置与这个网络的 IPv6，失败记 ERROR `cannot turn the enhanced mode on when the pause ends; it stays off`，不重试）；想要关着而开着的（进入暂停时没关掉）就关掉（失败记 ERROR `cannot turn the enhanced mode off when the pause ends; it stays on`）。
+- **进入暂停**：开着的增强模式按关闭的次序关掉（系统 DNS 先交还），并记下"想要开着"。关从不半途停下：这一关之后它是关着的，失败只是某一条撤销没成——那一句 ERROR `the enhanced mode is off for the pause, but part of it could not be undone; what outlives rurge stays in state.json and is undone on the next start` 说的是没撤销成的那部分，它留在 `state.json` 里等下一次启动。离开暂停时想要开着就再开（不是在原来那一次上继续）。
+- **离开暂停**：照记下的"想要"办：想要开着而关着的就打开（用的是这一刻这一代的配置与这个网络的 IPv6，失败记 ERROR `cannot turn the enhanced mode on when the pause ends; it stays off`，不重试）。"想要关着而仍开着就关掉"只对系统代理成立：它的恢复可以失败而仍指向 rurge；增强模式的关从不半途停下，所以没有这一支。
 - **先增强模式、后系统代理**，两个方向都是（与退出的次序一致，M4-D16）：增强模式留下的是整台机器的 DNS，越早还越好。
 - **启动时就在这样的网络上**：两样都不开，`--enhanced-mode` 与 `--system-proxy` 只记下想要的；`GET` 照实说 `false`，标准输出里没有 `enhanced mode on` 那一行。离开这个网络时才开。
 - 暂停期间的 `POST /v1/features/enhanced_mode` 回成功 `{}`、只记下想要的，日志里一行 INFO `the takeover is paused on this network; the enhanced mode is left as it is, and set as asked when the pause ends`（字段 `enabled`）。
-- 暂停只在内存里，不进 `state.json`。进入暂停时增强模式已经关掉、备份已经清空（关失败时它仍开着、备份也还在，那一次崩溃之后的下一次启动照常撤销），所以暂停期间 rurge 崩溃，通常没有它的东西要恢复。
+- 暂停只在内存里，不进 `state.json`。进入暂停时增强模式已经关掉、备份通常已经清空；关失败时模式仍是关的，只是没撤销成的那几条还在备份里，那一次崩溃之后的下一次启动照常撤销。所以暂停期间 rurge 崩溃，通常没有它的东西要恢复。
 - "想要的状态"由三处决定，最后一次生效：`--enhanced-mode`、进入暂停时它是不是开着、暂停期间每一次得到成功应答的 `POST`。
 - **设备自己坏了之后，"想要"不变**（P24）：管理器把增强模式整个关掉（交还 DNS、撤销会留下的），记 ERROR 一行，不重试；`Takeover` 记的"想要"仍是原来那个，所以离开 / 再进暂停时不会因为一次设备故障改变使用者的意图。`GET` 从此说 `enabled: false`。
 
@@ -516,6 +517,7 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 - **`ipv6-vif = auto` 的判据**（P18）：主网卡有 IPv6 网关（网络快照的 `routers` 里有 IPv6 地址，链路本地的也算——IPv6 的默认路由本来通常写的就是链路本地地址），且本机地址列表里有落在 `2000::/3` 的 IPv6 地址（平台给出的是主机位清零的 /64 网络地址，所以看的是前缀）。两个都成立才算这个网络有 IPv6，判一次、随网络变化再判。
 - **网络变化时 DNS 与系统自己的调整再做一次**：新网络上可能多了（macOS）或换了一批网络服务、`rp_filter` 可能被网络管理程序改回去了。做法与打开时一样：先 `dns_undo` 读一次要撤销什么、写进备份（`try_update`），再 `take_dns`；先 `adjust_undo`，再 `adjust`。哪一步失败都只记一行 ERROR、后面的照做；备份写不进去时紧接着的那一步不做（崩溃之后系统是什么样就不知道了），与打开的规矩一致。
 - **失败的步骤记 ERROR，增强模式照开**：已做的保留，不回滚到旧集合（旧集合本身也可能已经不对），`GET` 照实说 `enabled: true`。路由那一步失败时出口表留着"旧的与新的合起来"那一份（M4a 计划「执行期修正记录」第 75 行）：出口表始终是装进网卡的路由的**超集**，否则 rurge 自己的一条连接会回到虚拟网卡里（M4b 的读者按它判定，见设计第 7.1 节）。
+- **路由的 IPv6 一半失败（`routes` 回 `Ok(false)`）**：后端只撤掉它新加的那一半、照常减掉要减的，所以网卡里剩下的 IPv6 路由是"旧的减掉要减的"（旧集与新的交集），管理器就记下这一份，出口表也换成它——仍是网卡里路由的超集。这一次调用之前 IPv6 没开着的（打开，或重载 / 网络变化把 IPv6 从关变到开），这一次按 IPv6 没开往下做（设计 M4-D17）：`on.ipv6` 为假，系统 DNS 以没有 IPv6 接管，打开时 INFO `enhanced mode on` 的 `ipv6` 字段也为假；IPv6 本来就开着的，照开着，不多接管一次 DNS。网卡上已有的 IPv6 地址留着（随设备走）。这一条是协调者的裁定 R33（M4a 计划「执行期修正记录」第 95 行），它覆盖了第 75 行里"`Ok(false)` 时只去掉 `next.v6`"那半句。
 - 出口表在每次 `follow` 里都换成新的主网卡；路由不变时也一样（换网络可能只换了主网卡）。
 
 ### `rurge check` 的四个新码与 `external` 的 `addresses`
@@ -544,5 +546,5 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 - **ICMP 回显不转发**：这一版 TUN 的 `Pinger` 是 `NoPinger`，每个回显请求都立刻失败（`ICMP forwarding is not available in this version`），`ping` 经虚拟网卡不通。M4b 换成真的套接字。
 - **Linux 与 macOS 的 `0600` 用例只在 CI 上编译运行**：池的文件 `fake-ip.txt` 在 Unix 上以 `0600` 建出（M4a 的任务 2），那条 `#[cfg(unix)]` 的用例在这台 Windows 开发机上没有编译过。
 - **三个平台的步骤没有在机器上跑过**：`netsh` 与 `ip` 的写法是按文档与手册页核对出来的（M4a 计划 P2 ～ P5），没有一条在真机上执行过；`rurge check` 的四个码只对着 Profile 的解析测过。
-- **手工验收没有做**：增强模式在真机上的开与关、路由表的样子、系统 DNS 的接管与交还、`kill -9` 之后的恢复、防环、睡眠唤醒与换网络、`ping`、接管暂停，都要等 M4c / M4d 之后；`docs/acceptance/phase3-manual.md` 的 M4 一节在设计第 16 节里列了要验的东西，今天一项也没有做过。
+- **手工验收没有做**：增强模式在真机上的开与关、路由表的样子、系统 DNS 的接管与交还、`kill -9` 之后的恢复、防环、睡眠唤醒与换网络、`ping`、接管暂停，都要等 M4c / M4d 之后；`docs/acceptance/phase3-manual.md` 里还没有 M4 一节（只有 M1、M2、M3），M4d 写它，要验的东西列在设计第 16 节，今天一项也没有做过。
 - 全部用例只在一台 Windows 11 x86-64 的开发机上跑过，`rurge run --enhanced-mode` 的每一种行为都只经文件后端端到端测过；CI 没有见过 M4a 的提交。

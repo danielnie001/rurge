@@ -236,6 +236,11 @@ impl RouteSet {
 
         RouteSet {
             v4,
+            // `Ipv6Net::aggregate` has the same edge at `u128::MAX` as the IPv4
+            // one: only a `tun-included-routes` prefix that stops at
+            // `ffff:…:fffe` meets it, which is the multicast range (the base
+            // prefixes always leave `ff00::/8` out), and it is not handled (the
+            // phase 3 / M4a plan's deferred row 1).
             v6: Ipv6Net::aggregate(&v6),
         }
     }

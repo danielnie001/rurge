@@ -2,16 +2,22 @@
 //! the ending and one warning; and what `join` answers, and which ending stays.
 
 use super::assert_nothing_left;
+use super::stop::Gated;
 use crate::device::{Device, MemoryDevice};
-use crate::testing::{Script, Upstream};
+use crate::testing::{AppStack, FakeDialer, Script, Upstream};
 use crate::tests::log_capture::LogCapture;
-use crate::tests::support::{addr, hello, in_five_seconds, rig, rig_with, within};
+use crate::tests::support::{
+    Extras, WITHIN, addr, eventually, hello, in_five_seconds, rig, rig_with, tun_dialing, within,
+};
 use crate::{Counters, Ending, Life, TunOptions};
 use rurge_net::BoxFuture;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
+use tokio::time::timeout;
 
 /// The warnings among the lines the capture has, whole.
 fn warnings(log: &LogCapture) -> Vec<String> {
@@ -115,6 +121,57 @@ async fn a_device_that_fails_ends_the_tun() {
     );
     assert_nothing_left(&rig.tun);
     assert_eq!(rig.tun.counters(), Counters::default());
+}
+
+/// `ending` answers as soon as the TUN is told to end, without waiting for a
+/// dial that is under way: what watches for a device that failed must not wait
+/// for a dial that never comes back, while a close, which does wait for the
+/// TUN's tasks, gives its wait for `join` a limit of its own (the phase 3 / M4a
+/// plan's execution record row 100).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ending_answers_before_a_dial_under_way_comes_back() {
+    let (device, end) = MemoryDevice::pair(1500, 4096);
+    let fake = FakeDialer::new();
+    let echo = Upstream::echo().await;
+    let dst = addr("192.0.2.1:80");
+    fake.script(dst, Script::Upstream(echo.addr()));
+    let (open, _) = watch::channel(false);
+    let gated = Arc::new(Gated {
+        inner: fake.clone(),
+        open,
+    });
+    let tun = tun_dialing(
+        Arc::new(device),
+        gated.clone(),
+        &Extras::default(),
+        TunOptions::default(),
+    );
+    let app = AppStack::start(end);
+    let _tcp = within("the connection to be made", app.connect(dst))
+        .await
+        .expect("connect");
+    eventually("the dial to be under way", WITHIN, || {
+        gated.open.receiver_count() == 1
+    })
+    .await;
+
+    // the device fails under the TUN while the dial is still held
+    app.close();
+    let ending = in_five_seconds("the TUN to say why it ended", tun.ending()).await;
+    assert!(matches!(ending, Ending::DeviceFailed(_)), "{ending:?}");
+    // the one fixed wait of this test, for what must not happen: `join` coming
+    // back with the dial still held. It ends in milliseconds once the dial is
+    // let through; 300 ms is generous for that and short for the test.
+    assert!(
+        timeout(Duration::from_millis(300), tun.join())
+            .await
+            .is_err(),
+        "join came back with a dial under way"
+    );
+    gated.open.send_replace(true);
+    let joined = in_five_seconds("the TUN to end", tun.join()).await;
+    assert!(matches!(joined, Ending::DeviceFailed(_)), "{joined:?}");
+    assert_nothing_left(&tun);
 }
 
 /// A device that fails after the stop changes nothing: the TUN was ending

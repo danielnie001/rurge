@@ -976,3 +976,36 @@ fn a_follow_that_fails_keeps_the_enhanced_mode_on() {
     assert_eq!(installed(&file), before, "what went in before stays");
     drop(daemon);
 }
+
+/// A close that fails has still done what the user asked: the mode is off (the
+/// 500 speaks of what could not be undone), and a pause that ends does not open
+/// it again (the phase 3 / M4a plan's execution record row 97).
+#[test]
+fn a_close_that_fails_is_still_what_the_user_asked_for() {
+    let world = World::on(&wifi("Home"));
+    let conf = world.profile("", OFFICE);
+    let file = world_file(&world);
+    let daemon = spawn_command(run_enhanced(&world, &conf, &file, &["--enhanced-mode"]));
+    let api = api_port(&daemon);
+    wait_until("the enhanced mode to open", || enhanced_on(api));
+    assert_eq!(done(&file, "open"), 1);
+
+    // the system will not take the DNS back, so the close cannot undo it all
+    let mut system = backend_json(&file);
+    system["fail_undo"] = json!("take_dns");
+    std::fs::write(&file, system.to_string()).unwrap();
+    assert_eq!(ask_for_the_enhanced_mode(api, false), 500);
+    assert!(!enhanced_on(api), "the mode is off, whatever the 500 says");
+
+    // into a paused network and out again: what the user closed stays closed
+    world.move_to(&wifi("Office"));
+    wait_for_log(&daemon, "takeover paused on this network");
+    world.move_to(&wifi("Home"));
+    wait_for_log(&daemon, "takeover resumed");
+    assert_eq!(done(&file, "open"), 1, "it was not opened a second time");
+    assert!(
+        !enhanced_on(api),
+        "the pause does not open what the user closed"
+    );
+    drop(daemon);
+}

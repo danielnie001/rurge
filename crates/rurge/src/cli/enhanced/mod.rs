@@ -72,11 +72,13 @@ pub trait RunningTun: Send + Sync {
     /// (`TunHandle::join`, then `Engine::tun_ended`), and says how: a device
     /// that failed ends the enhanced mode (P24, task 8).
     fn ended(&self) -> BoxFuture<'_, Ending>;
-    /// Ends when the TUN itself has ended (`TunHandle::join`), without the
+    /// Ends when the TUN itself has been told to end (a stop, or a device that
+    /// failed), with its first reason, without waiting for its tasks or for the
     /// engine's last save: what the task that watches for a device that fails
-    /// waits for (the phase 3 / M4a plan's execution record row 62: waiting on
-    /// `Engine::tun_ended` here would hold the engine's one TUN's place, and an
-    /// open right after a close would be refused).
+    /// waits for (the phase 3 / M4a plan's execution record rows 62 and 100:
+    /// waiting on `Engine::tun_ended` here would hold the engine's one TUN's
+    /// place, and an open right after a close would be refused; waiting for all
+    /// of the TUN's tasks would hold it for a dial that might never come back).
     fn ending(&self) -> BoxFuture<'_, Ending>;
     fn counters(&self) -> rurge_engine::TunCounters;
 }
@@ -276,7 +278,17 @@ impl EnhancedMode {
         backend: &Arc<dyn Backend>,
         store: &StateStore,
     ) -> Option<Result<(), String>> {
-        let value = store.snapshot().await.enhanced_backup?;
+        let state = store.snapshot().await;
+        let Some(value) = state.enhanced_backup else {
+            // Nothing to undo. A run that died with the flag on and no undo
+            // action (Windows, or Linux without `rp_filter` to loosen) left it
+            // saying what is no longer true: this start has undone it all (the
+            // phase 3 / M4a plan's execution record row 99).
+            if state.features.enhanced_mode {
+                store.update(|s| s.features.enhanced_mode = false).await;
+            }
+            return None;
+        };
         let backup = match serde_json::from_value::<Backup>(value) {
             Ok(backup) => backup,
             Err(e) => {
@@ -296,7 +308,13 @@ impl EnhancedMode {
             let (backend, one) = (backend.clone(), undo.clone());
             match call(move || backend.undo(&one)).await {
                 Ok(()) => closing.undone.push(index),
-                Err(e) => closing.keep(&undo.label(), e),
+                Err(e) => {
+                    tracing::debug!(
+                        step = %undo.label(),
+                        "the undo action that could not be undone"
+                    );
+                    closing.keep(&undo.kind(), e);
+                }
             }
         }
         let remaining = closing.remaining(&backup.undo);
@@ -386,9 +404,11 @@ impl EnhancedMode {
 
     /// Watches the TUN of an open that has just succeeded: a device that fails
     /// ends the enhanced mode, and says so (P24). The wait is for `ending`
-    /// alone (the phase 3 / M4a plan's execution record row 62): whatever waits
-    /// on `ended` is a close, which owns the TUN's place in the engine. Stops
-    /// the manager itself makes end as `Stopped`, which is no news.
+    /// alone — the TUN being told to end, not all of its tasks — (the phase 3 /
+    /// M4a plan's execution record rows 62 and 100): whatever waits on `ended`
+    /// is a close, which owns the TUN's place in the engine, and a dial that is
+    /// under way holds the TUN's tasks without holding this. Stops the manager
+    /// itself makes end as `Stopped`, which is no news.
     fn watch(&self, tun: Arc<dyn RunningTun>, sequence: u64) {
         let ended = self.ended.clone();
         tokio::spawn(async move {
@@ -430,9 +450,11 @@ impl EnhancedMode {
     /// The order is the one an open and a close go in (design 9.3, 9.4): IPv6
     /// that comes on is the adapter's address, then its routes, then the DNS;
     /// IPv6 that goes is the reverse, the DNS handed back while the address it
-    /// points at is still there, then the routes, then the address. A system's
-    /// DNS that names an address the adapter no longer has waits out its
-    /// lookups until it does, and a program is one of those per lookup.
+    /// points at is still there, then the routes, then the address. The other
+    /// order would be a long wait for every lookup: until the DNS is given back,
+    /// each query the system sends to the address it no longer has waits out its
+    /// timeout, and on a real system every step in between is a program that
+    /// takes its time.
     ///
     /// A step that fails is logged, and the rest still goes on: the enhanced
     /// mode keeps what it has and stays on (M4 design 9.7). A set of routes
@@ -444,6 +466,12 @@ impl EnhancedMode {
     /// change it is the old set and the new one together, so that a connection
     /// of rurge's to a route that is already in the adapter does not come back
     /// into it (M4b's reader).
+    ///
+    /// A set of routes whose IPv6 half cannot go in is recorded as what the
+    /// adapter still has of it, the old IPv6 routes less the ones removed (the
+    /// backend takes back only the half it added); and an IPv6 that was off
+    /// before this call goes on as if it were off, M4-D17's rule for a follow
+    /// as for an open (the phase 3 / M4a plan's execution record row 95).
     pub async fn follow(&mut self, wanted: Wanted, network_changed: bool) {
         let Some(mut on) = self.on.take() else {
             return;
@@ -499,13 +527,32 @@ impl EnhancedMode {
             on.routes = Some(next);
         } else {
             set_egress(&self.egress, Some(table(&union(&old, &next), &wanted)));
+            // What the adapter still has of the old IPv6 routes if the new
+            // half cannot go in: the backend takes back only the half it
+            // added, and removes what it was asked to, so what is left is the
+            // old set less `remove` (the old and the new together). Taken
+            // before `remove` goes to the backend (the phase 3 / M4a plan's
+            // execution record row 95).
+            let kept_v6: Vec<_> = old
+                .v6
+                .iter()
+                .filter(|net| !remove.v6.contains(net))
+                .copied()
+                .collect();
             let backend = self.backend.clone();
             let with = dev.clone();
             match call(move || backend.routes(&with, &add, &remove)).await {
                 Ok(added) => {
                     if !added {
-                        // the IPv6 half could not be added, and the backend has warned
-                        next.v6.clear();
+                        // The IPv6 half could not be added, and the backend
+                        // has warned. What is in the adapter is `kept_v6`,
+                        // and an IPv6 that was off before this call goes on
+                        // as if it were off (M4-D17; the phase 3 / M4a plan's
+                        // execution record row 95).
+                        next.v6 = kept_v6;
+                        if !was_ipv6 {
+                            ipv6 = false;
+                        }
                     }
                     set_egress(&self.egress, Some(table(&next, &wanted)));
                     on.routes = Some(next);
@@ -666,7 +713,7 @@ impl EnhancedMode {
         let asked = wanted.ipv6;
         let with = dev.clone();
         let configured = call(move || backend.configure(&with, asked)).await?;
-        let ipv6 = asked && configured;
+        let mut ipv6 = asked && configured;
         on.ipv6 = ipv6;
         if asked && !configured {
             // design 4.6 / M4-D17: IPv6 that cannot be had is no failure of
@@ -689,7 +736,10 @@ impl EnhancedMode {
         );
         on.egress = true;
 
-        // 5. the routes
+        // 5. the routes. A set that loses its IPv6 half takes the open on as
+        // if IPv6 were off (M4-D17; the phase 3 / M4a plan's execution record
+        // row 95): `ipv6` and `on.ipv6` go false before the DNS is taken over.
+        // There is no old set here, so nothing is left in the adapter to record.
         let mut routes = wanted.routes.clone();
         if !ipv6 {
             routes.v6.clear();
@@ -699,8 +749,14 @@ impl EnhancedMode {
         let add = routes.clone();
         let added = call(move || backend.routes(&with, &add, &RouteSet::default())).await?;
         if !added {
-            // the IPv6 half could not be added, and the backend has warned
+            // The IPv6 half could not be added, and the backend has warned.
+            // No IPv6 was on before this open, so the open goes on as if it
+            // were off (M4-D17): its routes, the DNS it takes over and what
+            // `GET` and the log say of it (the phase 3 / M4a plan's execution
+            // record row 95).
             routes.v6.clear();
+            ipv6 = false;
+            on.ipv6 = false;
         }
         on.routes = Some(routes.clone());
 
@@ -832,7 +888,11 @@ impl EnhancedMode {
         let backend = self.backend.clone();
         let one = undo.clone();
         if let Err(e) = call(move || backend.undo(&one)).await {
-            closing.keep(&undo.label(), e);
+            tracing::debug!(
+                step = %undo.label(),
+                "the undo action that could not be undone"
+            );
+            closing.keep(&undo.kind(), e);
         } else {
             closing.undone.push(index);
         }
@@ -879,6 +939,9 @@ mod tests {
         backups_seen: BackupsSeen,
         egress: EgressSlot,
         egress_reported: Arc<Mutex<bool>>,
+        /// Whether `routes` answers `Ok(false)` when it is given an IPv6 half:
+        /// as a real backend, only then, and what went in has no IPv6 half.
+        no_ipv6_half: Arc<Mutex<bool>>,
         /// The routes of each `routes` call, as (add, remove).
         routes: Arc<Mutex<Vec<(RouteSet, RouteSet)>>>,
         /// What `configure` was asked for, and what `take_dns` was given.
@@ -984,6 +1047,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((add.clone(), remove.clone()));
+            if *self.no_ipv6_half.lock().unwrap() && !add.v6.is_empty() {
+                // the IPv6 half is not in: the backend took it back and
+                // removed `remove` all the same
+                return Ok(false);
+            }
             Ok(true)
         }
 
@@ -1923,5 +1991,128 @@ mod tests {
         assert!(remove.v4.is_empty());
         assert!(!remove.v6.is_empty(), "only the IPv6 routes go");
         assert!(f.mode.enabled());
+    }
+
+    /// The routes' IPv6 half that cannot be added is taken back by the backend,
+    /// which still removes what it was asked to: what the manager records is
+    /// the old IPv6 routes less the removed ones, the table holds them, IPv6
+    /// stays on, and the DNS is not taken over again (the phase 3 / M4a plan's
+    /// execution record row 95).
+    #[tokio::test]
+    async fn an_ipv6_half_that_cannot_be_added_leaves_the_old_routes_recorded() {
+        let mut f = fixture(true).await;
+        f.mode.enable(wanted()).await.unwrap();
+        let old = wanted().routes;
+        let mut moved = old.clone();
+        let gone = moved.v6.remove(0);
+        moved.v6.push("2001:db8::/32".parse().unwrap());
+        moved.v6.sort();
+        let mut next = wanted();
+        next.routes = moved;
+        *f.backend.no_ipv6_half.lock().unwrap() = true;
+        let dns_before = f.backend.dns.lock().unwrap().len();
+
+        f.mode.follow(next, false).await;
+
+        let on = f.mode.on.as_ref().expect("the enhanced mode stays on");
+        let kept: Vec<_> = old.v6.iter().filter(|net| **net != gone).copied().collect();
+        assert_eq!(
+            on.routes.as_ref().unwrap().v6,
+            kept,
+            "what the adapter still has, not the empty set"
+        );
+        assert!(on.ipv6, "IPv6 was on before and stays on");
+        let table = f
+            .egress
+            .read()
+            .unwrap()
+            .clone()
+            .expect("the table is there");
+        for net in &kept {
+            assert!(table.routes.v6.contains(net), "{net} left the table");
+        }
+        assert_eq!(
+            f.backend.dns.lock().unwrap().len(),
+            dns_before,
+            "no second DNS takeover"
+        );
+    }
+
+    /// IPv6 that comes on and whose routes cannot go in goes on as if IPv6 were
+    /// off (M4-D17): the DNS is taken over without IPv6, and only a change of
+    /// network takes it over again (the phase 3 / M4a plan's execution record
+    /// row 95).
+    #[tokio::test]
+    async fn a_follow_that_turns_ipv6_on_without_its_half_goes_on_as_if_it_were_off() {
+        let mut f = fixture(true).await;
+        f.mode.enable(without_ipv6()).await.unwrap();
+        *f.backend.no_ipv6_half.lock().unwrap() = true;
+
+        f.mode.follow(wanted(), false).await;
+        let on = f.mode.on.as_ref().expect("the enhanced mode stays on");
+        assert!(!on.ipv6, "this follow goes on as if IPv6 were off");
+        assert_eq!(
+            *f.backend.dns.lock().unwrap(),
+            [false],
+            "no takeover: the IPv6 ended where it began"
+        );
+
+        // another network takes the DNS over once, without IPv6
+        f.mode.follow(wanted(), true).await;
+        assert_eq!(
+            *f.backend.dns.lock().unwrap(),
+            [false, false],
+            "one takeover for the network, without IPv6"
+        );
+        assert!(!f.mode.on.as_ref().expect("the enhanced mode stays on").ipv6);
+    }
+
+    /// An open whose routes lose their IPv6 half takes the DNS over without
+    /// IPv6 and says it is off (M4-D17; the phase 3 / M4a plan's execution
+    /// record row 95).
+    #[tokio::test]
+    async fn an_open_without_its_ipv6_half_takes_the_dns_over_without_it() {
+        let mut f = fixture(true).await;
+        *f.backend.no_ipv6_half.lock().unwrap() = true;
+        f.mode.enable(wanted()).await.unwrap();
+        assert_eq!(
+            *f.backend.dns.lock().unwrap(),
+            [false],
+            "the DNS is taken over without IPv6"
+        );
+        let on = f.mode.on.as_ref().expect("the open succeeded");
+        assert!(!on.ipv6);
+        assert!(
+            on.routes.as_ref().unwrap().v6.is_empty(),
+            "nothing of the IPv6 half is recorded"
+        );
+        assert!(f.mode.enabled());
+    }
+
+    /// A run that died with the flag on and left no undo action behind
+    /// (Windows, whose backup is always empty, or Linux without an `rp_filter`
+    /// to loosen): the next start has nothing to undo, and `state.json` stops
+    /// saying it is on (the phase 3 / M4a plan's execution record row 99).
+    #[tokio::test]
+    async fn a_crash_that_left_no_undo_action_puts_the_flag_back() {
+        let f = fixture(true).await;
+        f.store
+            .update(|s| {
+                s.features.enhanced_mode = true;
+            })
+            .await;
+        assert_eq!(
+            EnhancedMode::recover(&(f.backend.clone() as Arc<dyn Backend>), &f.store).await,
+            None,
+            "there is nothing to undo"
+        );
+        let state = f.store.snapshot().await;
+        assert!(!state.features.enhanced_mode, "the flag is put back");
+        assert_eq!(state.enhanced_backup, None);
+        assert!(
+            f.backend.calls.list().is_empty(),
+            "nothing is asked of the system: {:?}",
+            f.backend.calls.list()
+        );
     }
 }
