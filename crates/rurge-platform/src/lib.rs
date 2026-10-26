@@ -3,6 +3,7 @@
 pub mod command;
 pub mod dirs;
 pub mod dns;
+pub mod icmp;
 pub mod netenv;
 pub mod process;
 pub mod procinfo;

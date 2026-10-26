@@ -572,6 +572,10 @@ pub fn subnets(exclude: &[String]) -> io::Result<Vec<(IpNet, String)>>;
 | 39 | 6 | 派工第 6 条（协调者的裁定，R15）：守护进程的 `ProfileSources::production` 换成 `rt.sockets.clone()` / `rt.system_dns.clone()`；任务 4 放在 `EngineShared::new` 上面那段“下载走平台套接字与 rurge 的解析器”的注释挪到了调用旁边，“The hook and the platform DNS are made here for now…”那句删掉 | 本提交 |
 | 40 | 6 | 执行者的裁定（用例）：端到端用例没有用 `World`（`World::run` 走 `--no-network`，下载不可能发生），自己写 profile / 数据目录 / 网络文件，网络取值用 `the_network::wifi("Home")`，并用 `rurge_run_online` 把两个 GeoIP 地址指到回环。下载要让它在增强模式开着的时候发生：打开之后改写 profile 加一个从未下载过的 `RULE-SET`，再经 API reload（新资源没有缓存，下载必定发生在开着的期间） | 本提交 |
 | 41 | 6 | 执行者的裁定（用例）：`Platform::subnets` 没有用例走到它（它读本机的网卡与地址，全局约束明说这一份不测它）；`Off::subnets` 在现有 `the_off_backend_says_it_is_off` 里加了一条断言；文件后端的 `subnets` 另有 `the_subnets_come_from_the_file_and_are_not_an_action` | 本提交 |
+| 42 | 7 | 派工第 1 条（协调者的裁定）：出口是 `None` 的回显套接字建好之后显式 `bind` 到未指定地址（`0.0.0.0:0` / `[::]:0`），再起收包任务；出口是 `Some(网卡)` 的只调 `bind_interface`、不再 `bind`（Windows 的 `bind_interface` 本身就是一次 `bind`，再来一次会报错）。理由：Windows 上没 `bind` 过也没有发送过的套接字，`recvfrom` 报 `WSAEINVAL`。落在 `crates/rurge/src/cli/pinger.rs` 的 `PlatformPinger::make` | 本提交 |
+| 43 | 7 | 执行者的裁定（范围）：`NoPinger`（`crates/rurge/src/cli/enhanced/mod.rs`）与唯一用它的一条用例 `no_echo_request_goes_out_in_this_version` 一起删掉——那条用例钉的是"这一版不发回显"，现在反了；`pings_the_loopback` 接上它的位置。用例数 −1 | 本提交 |
+| 44 | 7 | 执行者的裁定（依赖）：`rurge` 的 `Cargo.toml` 加 `getrandom.workspace = true`——P14 要每个 `PlatformPinger` 一个随机的标识符，取法照 `rurge-tun` / `rurge-proto` 的 `getrandom::u32()`；`getrandom` 本来就在工作区里，`Cargo.lock` 的包数不变，只有 `rurge` 的依赖列表多一行 | 本提交 |
+| 45 | 7 | 执行者的观察（判据）：`pings_the_loopback` 在本机没有跳过——这台 Windows 上 `icmp::open` 的原始套接字开得起来，`127.0.0.1` 与 `::1` 的回显都真的来回了一次、载荷相等（5 秒时限，循环 20 次全过）。Linux 的 `DGRAM`、macOS 的 `DGRAM` 与"不是管理员所以跳过"这条路径仍没有任何平台跑过 | 本提交 |
 
 ## 延后事项
 

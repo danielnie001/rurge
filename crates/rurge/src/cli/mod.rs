@@ -4,6 +4,7 @@ pub mod control;
 pub mod dns;
 pub mod enhanced;
 pub mod network;
+pub mod pinger;
 pub mod rule;
 pub mod run;
 pub mod runtime;

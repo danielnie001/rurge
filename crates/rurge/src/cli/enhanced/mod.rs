@@ -23,10 +23,8 @@ use rurge_engine::state::StateStore;
 use rurge_net::BoxFuture;
 use rurge_platform::route::RouteSet;
 use rurge_platform::socket::egress::EgressTable;
+use rurge_tun::Ending;
 use rurge_tun::device::Device;
-use rurge_tun::{Ending, Pinger};
-use std::io;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -97,21 +95,6 @@ pub trait RunningTun: Send + Sync {
     /// of the TUN's tasks would hold it for a dial that might never come back).
     fn ending(&self) -> BoxFuture<'_, Ending>;
     fn counters(&self) -> rurge_engine::TunCounters;
-}
-
-/// Echo requests while the enhanced mode runs: in this version none go out
-/// (P15; M4 design §10 puts a real one here in M4b).
-pub struct NoPinger;
-
-impl Pinger for NoPinger {
-    fn echo<'a>(&'a self, _dst: IpAddr, _payload: &'a [u8]) -> BoxFuture<'a, io::Result<Vec<u8>>> {
-        Box::pin(async {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "ICMP forwarding is not available in this version",
-            ))
-        })
-    }
 }
 
 /// For the API: whether the enhanced mode is on, and its TUN's counters.
@@ -978,6 +961,7 @@ mod tests {
     use super::*;
     use rurge_platform::route::RouteInputs;
     use serde_json::{Value, json};
+    use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
 
@@ -1475,21 +1459,6 @@ mod tests {
         assert!(
             f.told.try_recv().is_err(),
             "a TUN a close stopped is no news"
-        );
-    }
-
-    /// This version sends no echo requests: every one of them says so at once
-    /// (P15; M4b brings a real pinger).
-    #[tokio::test]
-    async fn no_echo_request_goes_out_in_this_version() {
-        let error = NoPinger
-            .echo("127.0.0.1".parse().unwrap(), b"ping")
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(
-            error.to_string(),
-            "ICMP forwarding is not available in this version"
         );
     }
 

@@ -1721,7 +1721,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         let mut enhanced = super::enhanced::EnhancedMode::new(
             enhanced_backend,
             store.clone(),
-            super::enhanced::starter(engine.clone()),
+            super::enhanced::starter(engine.clone(), rt.sockets.clone()),
             super::enhanced::Links {
                 egress: rt.egress.clone(),
                 enhanced: rt.system_dns.enhanced(),
