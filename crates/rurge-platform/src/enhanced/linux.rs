@@ -386,7 +386,9 @@ mod tests {
 
     /// Runs nothing: it records every command, and fails the steps whose
     /// program (by its file name) is `program` and whose script or whose
-    /// command line holds `text`.
+    /// command line holds `text`. It reads one file and no other: the script
+    /// [`exec::run`] writes under the test's `scratch`, whose name carries
+    /// `rurge-steps-` — every other argument is a word, not a path to look at.
     #[derive(Default)]
     struct Fake {
         calls: Mutex<Vec<Call>>,
@@ -424,10 +426,13 @@ mod tests {
     impl CommandRunner for Fake {
         fn run(&self, cmd: &[String]) -> io::Result<String> {
             // what the program would read: the run put the script's path in
-            // the arguments, and the file is there until the program ends
+            // the arguments, and the file is there until the program ends.
+            // Only that one argument is a path (the others are `dns`, `rurge`,
+            // `~.`): nothing outside the test's scratch is opened.
             let script = cmd
                 .iter()
                 .skip(1)
+                .filter(|arg| arg.contains("rurge-steps-"))
                 .find_map(|arg| fs::read_to_string(arg).ok())
                 .unwrap_or_default();
             let call = Call {
@@ -728,9 +733,12 @@ mod tests {
             );
         }
 
-        // a file that is not there is an error too, and the path stays out of it
+        // a file that is not there is an error too, and neither the path nor
+        // the interface's name is in it (design 13); the name is checked
+        // rather than `/proc`, which on Windows would be no check at all
         let error = system.adjust_saved(Some("eth0"), &[]).unwrap_err();
         assert!(error.starts_with("cannot read rp_filter: "), "{error}");
+        assert!(!error.contains("eth0"), "{error}");
         assert!(!error.contains("/proc"), "{error}");
     }
 
