@@ -428,13 +428,15 @@ M4d 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 - **L1 的核对**（任务 7）：`docs/acceptance/phase3-m4-l1-checklist.md`——280 条（本机跑过 276、只在非 Windows 运行 1、L2 3、缺 0），`CLAUDE.md` 与本节引用它，数照它写。
 - **文档**（任务 9，这一轮）：兼容性清单 9.1、6.3、10.3、10.4 节与两行新登记；`docs/api/phase3.md` 的「M4d」一节；`docs/acceptance/phase3-manual.md` 的 M4 一节（W19 ～ W41、M17 ～ M30、L18 ～ L32、P29 ～ P31）；`docs/testing.md` 的「阶段 3 / M4d 起」与 `RURGE_ENHANCED_BACKEND` 一段；两份 README；需求文档第 7 节阶段 3 的状态行；`CLAUDE.md` 的「现在在哪里」；设计末尾的「执行期的订正」。
 
-门禁：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过，`cargo test -j 8 --workspace --no-fail-fast` **86 个结果行、4637 通过、0 失败、13 忽略**（一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；工作区的 `gate-task-9.log`；与任务 7 的基线相同——这一轮只改文档与 `filled` 的标记）。
+门禁：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过，`cargo test -j 8 --workspace --no-fail-fast` **86 个结果行、4641 通过、0 失败、13 忽略**（一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；工作区的 `gate-task-9-fix-1.log`，`rurge-engine` 的 `udp_tls_family` 以 `STATUS_HEAP_CORRUPTION` 退出、单独重跑 7 条通过，重跑在 `gate-task-9-fix-1-rerun.log`；任务 9 的第一次门禁是 4637，这一轮加了 4 条用例）。
 
-**依赖与特性**：不加新的工作区依赖边，也不加外部包（`Cargo.lock` 的包数与 M4c 做完时相同）；`rurge-platform` 的 `windows-sys` 0.61.2 多开七个特性：`Win32_Networking_WinSock`（任务 1）、`Win32_NetworkManagement_Ndis`、`Win32_Security_Cryptography`、`Win32_Security_Cryptography_Catalog`、`Win32_Security_Cryptography_Sip`、`Win32_Security_WinTrust`、`Win32_System_LibraryLoader`（任务 3）。`tests/unsafe_functions.rs` 的 `LISTED` 现在 23 个函数（新加 `unicast_if`、`in_job` 与 `tun/windows/wintun.rs` 的十个）。
+**终审之后的两处代码修正**（2026-10-27，记录第 87、88 行）：一、Windows 的路由集另减 `240.0.0.0/4`（Windows 缺省挡这一段，`netsh` 加不加得进没有人核实过；`RouteInputs` 加 `class_e`，可执行文件给 `!cfg!(windows)`），缺省的 Profile 下 Windows 上 IPv4 是 27 条、Linux 与 macOS 仍是 55 条；二、发送失败的 ICMP 载体退休而不是立刻停掉（`PlatformPinger::forget`，再读一个回显时限、至多 4 个退休着）。两处都先看到红再变绿。
+
+**依赖与特性**：不加新的工作区依赖边，也不加外部包（`Cargo.lock` 的包数与 M4c 做完时相同）；`rurge-platform` 的 `windows-sys` 0.61.2 多开七个特性：`Win32_Networking_WinSock`（任务 1）、`Win32_NetworkManagement_Ndis`、`Win32_Security_Cryptography`、`Win32_Security_Cryptography_Catalog`、`Win32_Security_Cryptography_Sip`、`Win32_Security_WinTrust`、`Win32_System_LibraryLoader`（任务 3）。`tests/unsafe_functions.rs` 的 `LISTED` 现在 23 个函数（新加 `unicast_if`、`in_job` 与 `tun/windows/wintun.rs` 的十二个，其中 `verify_signer` 与 `load` 是任务 3 的）。
 
 没做的，与不要当成已经有的：
 
-- **三个平台的设备与系统改动都没有在真机上跑过**：Windows 的设备与那十二个放开的函数在这台开发机上编译、`clippy` 过，**没有在任何地方运行过**（没有一条缺省的用例开设备，`RURGE_TEST_WINTUN_DLL` 不设，P19，M4d 记录第 70 行）；Linux 与 macOS 专有的代码 CI 还没有见过。
+- **三个平台的设备与系统改动都没有在真机上跑过**：Windows 的设备与它的十个放开的函数在这台开发机上编译、`clippy` 过，**没有在任何地方运行过**（没有一条缺省的用例开设备，`RURGE_TEST_WINTUN_DLL` 不设，P19，M4d 记录第 70 行）；`verify_signer` 与 `load`（任务 3）在本机的单元用例里跑过、真的 `wintun.dll` 上没有（手工清单 W36）；Linux 与 macOS 专有的代码 CI 还没有见过。
 - **`a_real_wintun_dll_passes` 在本机没有真正跑过**（没有 `wintun.dll`）；真的 `wintun.dll` 的签名者是 `WireGuard LLC`、只读共享开着文件时 `LoadLibraryExW` 照样能载入，都要手工清单核（W36）。
 - **`the_wintun_dll_option_is_a_usage_error_elsewhere` 在本机只编译、不运行**，第一次运行是 Linux / macOS 的 CI（M4d 记录第 75、76 行）。
 - **L2 的用例没有运行过**：`tests/privileged` 写好、在这台机器上只编译到 `#![cfg(target_os = "linux")]` 之后是一个空文件；手工清单的 L32 是在一次性虚拟机上跑它。
@@ -443,6 +445,7 @@ M4d 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 - **`TunDevice::dropped()` 今天没有读者**：设备写不进的丢包只记在设备自己的计数与那一行 WARN、之后的 DEBUG 里，不进 `GET /v1/features/enhanced_mode` 的 `dropped`（那是 `rurge-tun` 的原因表）；要不要把它发给 API 归项目所有者。
 - **启动时的第一次下载在增强模式打开之前**（M4b 延后第 10 行；M4d 记录第 22 行）：`rurge run` 在拿到实例锁之后先做一次崩溃恢复（M4c 的 R10 把它挪到了 `wait_for_the_sources` 里、下载之前），等完 Profile 的远程来源才建引擎、才可能开增强模式，所以“增强模式开着的时候启动一次下载”这条路没有用例走到；那一次下载用 `resource_client()`（不带钩子）、问系统解析库——那时出口表是空的，带了钩子也只会答“不绑”，而崩溃留下的 macOS DNS 已经先恢复了。要改的是次序（先开增强模式还是先等下载），归项目所有者。
 - **`filled` 不再带 `#[cfg_attr(not(test), allow(dead_code))]`**（M4d 记录第 79 行）：核过它仍只有用例读（`git grep -n "filled(" crates/rurge/src`），所以换成 `#[cfg(test)]`、说明照实写；它说明里原来那句“wired up by …”已经不在。
+- **网卡名固定当作 `rurge`**（R25）：Wintun 把新的网卡叫 `rurge 1`、`rurge 2`…… 时（`rurge` 被一块它改不了名的网卡占着），网络任务的排除名单与出口表认不出它；本轮的延后事项第 10 行（修法与去向）。
 - **M4b 那一节里“Windows 的 `ProcessTree::contains` 恒假”与 `docs/api/phase3.md` 里同一件事的两处旧说法以本节为准**：Windows 上它经 `in_job` 回答，`crates/rurge-platform/src/process.rs` 的三条用例与端到端用例 `what_the_program_started_goes_direct_too`（三个平台都编译、在这台开发机上跑过）是证据。
 
 以后的会话必须知道的事：
@@ -457,10 +460,12 @@ M4d 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 - **发出去的包不超过 `wintun.h` 的 `WINTUN_MAX_IP_PACKET_SIZE`**（`MAX_PACKET`，0xFFFF，M4d 记录第 73 行）：超长的包会让驱动把整个发送环当成坏的，之后每次都是“环满”；`packet_size` 在放开的函数之前就拒它。
 - **要 Wintun 0.14 或更新**：0.13 的 `wintun.dll` 没有 `WintunCloseAdapter`（那时是 `WintunFreeAdapter` / `WintunDeleteAdapter`），`load` 因缺入口拒绝它，文字是 `wintun.dll has no WintunCloseAdapter: is it wintun.dll?`。它所在的目录应当只有管理员能写（P7）。
 - **`process` 的 Windows 一支用 `in_job`**：`contains` 的 `job` 是 `None` 回 `false`，`Err` 回 `false` 并只写一行 DEBUG；持着 Job Object 的那个进程退出时整棵进程树一起结束。
+- **Windows 的路由集不进 `240.0.0.0/4`**（记录第 87 行）：Windows 所有版本缺省挡这一段（草案 draft-schoen-intarea-unicast-240 的 Windows 一段、`mstcpip.h` 的 `NlatInvalid`），`netsh` 加不加得进没有人核实过；`class_e` 为假时 `RouteSet::compute` 在最后把它挖掉（包含项也带不回来），缺省的 Profile 下是 27 条。Linux 与 macOS 把它当普通单播（55 条），一行也不变。改路由集或读回时记着它。
+- **ICMP 载体退休，而不是立刻停**（记录第 88 行）：`forget` 把它移出表，接收任务再读一个回显时限（TUN 的 `echo_timeout`）才停，至多 4 个退休着；Linux 的数据报套接字只收得到自己那些请求的回复，所以已经发出的回显要靠它收。
 
-去向写着项目所有者的（后来的会话不要自己定）：设计第 20 节的 Q2（设备、路由、网络环境改用现成的包，或开 `nix` 的 `socket` / `net` 特性）、Q3（发行包随附官方签名的 `wintun.dll`）、Q4（L2 特权用例在 CI 上启用、macOS 与 Windows 的冒烟）、Q5（Windows 防 DNS 泄漏的严格模式，WFP）；**推送与读回 CI**（M4a ～ M4d 的提交都在本地，`origin/main` 仍是 `ac0a98a`；推送之后 M4c 的任务 10 与 M4d 的任务 8 一起做）；**三份手工验收清单**（阶段 1、2、3）一项也没有做；M4a 延后第 9 行（`queue_bytes` 要不要把每个包的 16 字节也算进预算）与第 13 行（`state.json` 的写不 `fsync`，掉电时备份可能没了）；M3a 计划延后第 1 行（`rurge-proto-wireguard` 的 `stack.rs` 里 `TCP_BUFFER` 那个读源码得出、没有观察过的 panic 风险，修法归所有者选）；M4b 延后第 1 行（`the_copy_takes_over_from_a_local_file_once_a_check_has_succeeded` 偶发 `ConnectionRefused`，原因不明，再见到时查）；M4c 延后第 1 行（L2 在 CI 上跑，总设计 Q4）与第 10 行（错误文本里 rurge 自己的网卡名、地址与前缀：要不要照 P7 改成固定的一句）；仓库里 26 份旧文件写着这台开发机带 Windows 账户名的本机路径（`git grep -l` 数得出，新写的内容里没有那个名字与那些路径），改不改归所有者。任务 7 的 L1 核对与这一轮的文档没有新的去向写着项目所有者的事。
+去向写着项目所有者的（后来的会话不要自己定）：设计第 20 节的 Q2（设备、路由、网络环境改用现成的包，或开 `nix` 的 `socket` / `net` 特性）、Q3（发行包随附官方签名的 `wintun.dll`）、Q4（L2 特权用例在 CI 上启用、macOS 与 Windows 的冒烟）、Q5（Windows 防 DNS 泄漏的严格模式，WFP）；**推送与读回 CI**（M4a ～ M4d 的提交都在本地，`origin/main` 仍是 `ac0a98a`；推送之后 M4c 的任务 10 与 M4d 的任务 8 一起做）；**三份手工验收清单**（阶段 1、2、3）一项也没有做；M4a 延后第 9 行（`queue_bytes` 要不要把每个包的 16 字节也算进预算）与第 13 行（`state.json` 的写不 `fsync`，掉电时备份可能没了）；M3a 计划延后第 1 行（`rurge-proto-wireguard` 的 `stack.rs` 里 `TCP_BUFFER` 那个读源码得出、没有观察过的 panic 风险，修法归所有者选）；M4b 延后第 1 行（`the_copy_takes_over_from_a_local_file_once_a_check_has_succeeded` 偶发 `ConnectionRefused`，原因不明，再见到时查）；M4c 延后第 1 行（L2 在 CI 上跑，总设计 Q4）与第 10 行（错误文本里 rurge 自己的网卡名、地址与前缀：要不要照 P7 改成固定的一句）；仓库里 26 份旧文件写着这台开发机带 Windows 账户名的本机路径（`git grep -l` 数得出，新写的内容里没有那个名字与那些路径），改不改归所有者；`TunDevice::dropped()` 要不要发给 API（本轮延后第 5 行）；启动时第一次下载与增强模式打开的次序（M4b 延后第 10 行、本轮延后第 6 行）。
 
-协调者在 M4d 代项目所有者作的裁定（所有者可以改，记在 M4d 记录的行里）：R16（`Wintun::module` 的生产读者是 `loaded` 的那一行 DEBUG，记录第 69 行）、R17（任务 4 漏的那条用例只断言 WARN 行，记录第 66 行）、R18（崩溃之后网卡随进程消失、探名字不会误报，待手工清单 W22，记录第 68 行）、R19（任务 5 修正第 1 轮的两条顾虑接受，记录第 73 行）、R20（第 75 行的理由由第 76 行订正）、R21（`--help` 显示 `RURGE_WINTUN_DLL` 的值，记录第 74 行）、R22（`holds_a_backup`——代码里是 `left_to_undo` / `Left::any`——不补单元用例，行为有端到端用例覆盖）。
+协调者在 M4d 代项目所有者作的裁定（所有者可以改，记在 M4d 记录的行里）：R16（`Wintun::module` 的生产读者是 `loaded` 的那一行 DEBUG，记录第 69 行）、R17（任务 4 漏的那条用例只断言 WARN 行，记录第 66 行）、R18（崩溃之后网卡随进程消失、探名字不会误报，待手工清单 W22，记录第 68 行）、R19（任务 5 修正第 1 轮的两条顾虑接受，记录第 73 行）、R20（第 75 行的理由由第 76 行订正）、R21（`--help` 显示 `RURGE_WINTUN_DLL` 的值，记录第 74 行）、R22（`holds_a_backup`——代码里是 `left_to_undo` / `Left::any`——不补单元用例，行为有端到端用例覆盖）、R23（Windows 的路由集不进 `240.0.0.0/4`，记录第 87 行、延后第 1～9 行之外）、R24（发送失败的 ICMP 载体退休，记录第 88 行）、R25（网卡名可能是 `rurge 1`，这一轮不修，延后第 10 行）。
 
 ## 附：依赖方向一条的原文（原在 `CLAUDE.md`「计划中的架构」）
 

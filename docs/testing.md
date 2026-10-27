@@ -282,11 +282,11 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 
 阶段 3 / M4d 起另有几条：
 
-一、**有真的 `wintun.dll` 的用例由 `RURGE_TEST_WINTUN_DLL` 放开**，缺省不设：设了它的那一条（`crates/rurge-platform/src/tun/windows/wintun.rs` 的 `a_real_wintun_dll_passes`）校验签名者（必须是 `WireGuard LLC`）并把模块加载起来，只读、只在用例自己的进程里；没设时它打印原因并返回，不失败。Pi 不设它、也不下载 `wintun.dll`（M4d 计划的「全局约束」）。**本机一次也没有真的跑过它**，真的 `wintun.dll` 的签名者由手工清单核对（`docs/acceptance/phase3-manual.md` 的 W36）。
+一、**有真的 `wintun.dll` 的用例由 `RURGE_TEST_WINTUN_DLL` 放开**，缺省不设：设了它的那一条（`crates/rurge-platform/src/tun/windows/wintun.rs` 的 `a_real_wintun_dll_passes`）校验签名者（必须是 `WireGuard LLC`）并把模块加载起来，只读、只在用例自己的进程里；没设时它打印原因并返回，不失败。缺省的 `cargo test` 与 CI 都不设它；执行计划的自动化会话也不设它、不下载 `wintun.dll`（M4d 计划的「全局约束」）。**本机一次也没有真的跑过它**，真的 `wintun.dll` 的签名者由手工清单核对（`docs/acceptance/phase3-manual.md` 的 W36）。
 
 二、**Windows 的读回夹具是手写的**（M4d 计划 P17）：`crates/rurge-platform/src/route/windows.rs` 的 `ROUTES_EN` / `ROUTES_ZH` / `ADDRESSES_EN` / `ADDRESSES_ZH` / `DNS_EN` / `DNS_ZH` / `MTU_EN` / `MTU_ZH` 与 `crates/rurge-platform/src/enhanced/windows.rs` 的 `ADDRESSES_V4` 一族，每份旁边写着 “not taken from a machine”。解析只认前缀、序号、地址与数字，不认文字，所以夹具里的字写错了也不影响结论；中文系统上真的 `netsh` 输出由手工清单的 W32 核对（英文与中文各一台）。
 
-三、**`WindowsSystem` 的用例只用假的执行器与临时目录**：程序经 `CommandRunner`（`crate::command::testing::FakeRunner`），脚本写进用例自己的 `tempfile::TempDir`，一条命令也不真的执行（M4d 计划的「全局约束」）。缺省的 `cargo test` 里允许的只读系统调用只有四样：校验测试二进制自己的签名（`WinVerifyTrust`，不联网）、从 System32 载入 `kernel32.dll` 看缺入口时的错误、回环套接字上的 `IP_UNICAST_IF`、测试自己起的子进程上的 `IsProcessInJob`。
+三、**`WindowsSystem` 的用例只用假的执行器与临时目录**：程序经 `CommandRunner`（`crate::command::testing::FakeRunner`），脚本写进用例自己的 `tempfile::TempDir`，一条命令也不真的执行（M4d 计划的「全局约束」）。缺省的 `cargo test` 里不改系统设置、只碰用例自己的东西的系统调用只有四样：校验测试二进制自己的签名（`WinVerifyTrust`，不联网）、从 System32 载入 `kernel32.dll` 看缺入口时的错误、回环套接字上的 `IP_UNICAST_IF`（设选项，不是只读）、测试自己起的子进程上的 `IsProcessInJob`。
 
 四、**没有一条缺省的用例开 Windows 的设备**（同 M4c 那一条，M4d 计划 P19）：`TunDevice::open` 与真实平台的 `System::open` 不被任何缺省用例调用；Windows 的 CI 机器以管理员运行，谁调了 `TunDevice::open`，就真的装了驱动、建了网卡。要测打开之后的事，用文件后端或 `Unsupported`。
 

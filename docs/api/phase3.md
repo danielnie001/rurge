@@ -762,13 +762,14 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
 
 阶段 3 / M4d（计划 `docs/superpowers/plans/2026-10-26-phase3-m4d-windows-wrapup-plan.md`，下面写“M4d 记录第 N 行”指它末尾的「执行期修正记录」）做的是 Windows 那一半：Wintun 的设备、`wintun.dll` 的查找与签名校验、`netsh` 的步骤与读回、`--wintun-dll`，以及 M4 的文档收尾。**本节订正上面几句**（规矩是历史的段落不逐处改、由后写的段落订正）：
 
-- M4 一节开头的“这一版开不了增强模式”在**三个平台**上都不成立了：Windows 的平台后端不再答 `Unsupported`，它答 `WindowsSystem` 与 Wintun 的设备——照代码会建名叫 `rurge` 的适配器、配地址与 MTU、装路由、把系统 DNS 指向应答器，关闭或崩溃之后的下一次启动把它们还回去。**Windows 的代码与不带 `cfg` 的部分在这台 Windows 11 x86-64 的开发机上编译、单元用例通过（一台机器上的一次运行，不是 CI）；Wintun 的设备与那十二个放开的函数没有在任何地方运行过**（没有一条缺省的用例开设备，`RURGE_TEST_WINTUN_DLL` 也不设，M4d 记录第 70 行），真机上也没有跑过。
+- M4 一节开头的“这一版开不了增强模式”在**三个平台**上都不成立了：Windows 的平台后端不再答 `Unsupported`，它答 `WindowsSystem` 与 Wintun 的设备——照代码会建名叫 `rurge` 的适配器、配地址与 MTU、装路由、把系统 DNS 指向应答器，关闭或崩溃之后的下一次启动把它们还回去。**Windows 的代码与不带 `cfg` 的部分在这台 Windows 11 x86-64 的开发机上编译、单元用例通过（一台机器上的一次运行，不是 CI）；Wintun 的设备与它的十个放开的函数（任务 5）没有在任何地方运行过**（没有一条缺省的用例开设备，`RURGE_TEST_WINTUN_DLL` 也不设，M4d 记录第 70 行），真机上也没有跑过；任务 3 的 `verify_signer` 与 `load` 在本机的单元用例里跑过（校验测试二进制自己的签名、载入 System32 的 `kernel32.dll`、一个不是 DLL 的文件），真的 `wintun.dll` 上没有（手工清单的 W36）。
 - 「外部程序一律 DIRECT」一节里“Windows 上 M4d 之前只认程序本身”与本节末尾「没有覆盖的」里“Windows 的 `ProcessTree::contains` 恒假”都不成立了：Windows 上它经 `in_job`（`IsProcessInJob`，M4d 任务 1）回答，程序拉起的子进程算在里面；端到端用例 `what_the_program_started_goes_direct_too` 三个平台都编译、在这台开发机上跑过（`crates/rurge-platform/src/process.rs` 的三条用例 `a_child_in_the_job_is_contained_and_this_process_is_not`、`an_exited_child_whose_handle_is_still_open_is_not_contained`、`a_process_that_is_gone_is_not_contained`）。
 - 「没有覆盖的」里“本机没有编译过的 Unix 代码”中列着的 `what_the_program_started_goes_direct_too` 与 `ProcessTree::contains` 的 `#[cfg(unix)]` 一段照旧，只是那一条端到端用例不再是 Unix 专属。
+- M4c 一节末尾「没有覆盖的」与本页末尾「没有覆盖的」里“`docs/acceptance/phase3-manual.md` 还没有 M4 一节…… M4d 写它”不成立了：M4 一节写好了（W19 ～ W41、M17 ～ M30、L18 ～ L32、P29 ～ P31，55 项），一项也没有做过。
 
 #### 打开 Windows 的增强模式要什么
 
-- 一个 **WireGuard LLC 签名的 `wintun.dll` 0.14 或更新**：0.13 没有 `WintunCloseAdapter`（那时是 `WintunFreeAdapter` / `WintunDeleteAdapter`），加载时因缺入口被拒，文字是 `wintun.dll has no WintunCloseAdapter: is it wintun.dll?`。往下取：<https://www.wintun.net/>。
+- 一个 **WireGuard LLC 签名的 `wintun.dll` 0.14 或更新**：0.13 没有 `WintunCloseAdapter`（那时是 `WintunFreeAdapter` / `WintunDeleteAdapter`），加载时因缺入口被拒，文字是 `wintun.dll has no WintunCloseAdapter: is it wintun.dll?`。往下取：<https://www.wintun.net/>。**要取与 `rurge.exe` 同一架构的那一份**：压缩包里每种架构一份（`bin/amd64`、`bin/x86`、`bin/arm64`、`bin/arm`），x86-64 的 Windows 用 `bin/amd64`；架构不对的那一份签名也对，但 `LoadLibraryExW` 不收（`cannot load wintun.dll: …`）。
 - 它放在 `rurge.exe` 旁边，或用 `--wintun-dll <PATH>`（环境变量 `RURGE_WINTUN_DLL`）指出。**别的平台给出这个选项是用法错误**：`--wintun-dll is only for Windows`，退出码 2，在 `Overrides::parse` 与读配置之前（`crates/rurge/src/cli/run.rs` 的 `wintun_dll_applies`，`:220`；`--help` 里这个选项照抄 `RunArgs` 的说明“Windows: where wintun.dll is (default: next to rurge.exe)”，与别的路径选项一样连 `RURGE_WINTUN_DLL` 的值一起显示，M4d 记录第 74、75、76 行）。
 - 它以**管理员**运行：不是管理员的错误是 `the enhanced mode needs to run as Administrator`（`crates/rurge-platform/src/tun/frame.rs` 的 `explained`，在 `rurge run` 的标准错误里是 `error: cannot turn the enhanced mode on: <这一句>`，在 API 里是 500 的 `{"error":"<这一句>"}`）。
 - **`wintun.dll` 所在的目录应当只有管理员能写**：rurge 校验的是那个文件、加载的也是它，但一个能被普通用户换掉的目录里，换文件与换签名是一回事（M4d 计划 P7）。
@@ -788,15 +789,15 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
 | 没有签名 | `wintun.dll is not signed` |
 | 签名者不是 `WireGuard LLC` | `wintun.dll is not signed by WireGuard LLC (it is signed by <签名者的名字>)`（签名者的简单显示名可以带，它不是个人信息） |
 | 签名不可信 | `wintun.dll's signature cannot be trusted (0x<状态码>)` 或 `… (no signer)` |
-| 不是能加载的 PE 文件 | `cannot load wintun.dll: <系统的错误>`（这台开发机上量到的是一行 `cannot load wintun.dll: …`，用例 `a_file_that_is_not_a_dll_cannot_be_loaded`） |
+| 一个文件，签名对但加载不了（最常见的是架构不对的 `wintun.dll`） | `cannot load wintun.dll: <系统的错误>`（这台开发机上量到的是 `cannot load wintun.dll: …`，用例 `a_file_that_is_not_a_dll_cannot_be_loaded`；x86-64 的 Windows 上拿错架构的那一份通常是 `%1 is not a valid Win32 application` 一类） |
 | 缺少一个入口（含 0.13 的 `WintunCloseAdapter`） | `wintun.dll has no <入口>: is it wintun.dll?` |
 | 路径里有 NUL | `the path of wintun.dll has a NUL in it` |
 
-这些错误不经 `frame::explained`（那里 `PermissionDenied` 一律被说成“要管理员”，签名不对会被说成缺管理员权限，M4d 记录第 59 行）。`--wintun-dll` 在 Windows 上给了而文件不在时，打开以 `cannot find wintun.dll …` 失败，增强模式不开，其余照旧运行。
+这些错误不经 `frame::explained`（那里 `PermissionDenied` 一律被说成“要管理员”，签名不对会被说成缺管理员权限，M4d 记录第 59 行）。`--wintun-dll` 在 Windows 上给了而文件不在时，两条路不同：带 `--enhanced-mode` **启动**时 `enable` 失败那一支印 `error: cannot turn the enhanced mode on: cannot find wintun.dll (…)` 并**以 1 退出**（增强模式不开）；经 `POST /v1/features/enhanced_mode` 打开时是 500 `{"error":"cannot find wintun.dll …"}`，其余的照旧运行。
 
 #### 网卡、序号与“正在被使用”
 
-设备在 `crates/rurge-platform/src/tun/windows/mod.rs`：**先探后建，不复用**（M4d 计划 P8）——先 `WintunOpenAdapter("rurge")` 探名字，探到就答 `the virtual adapter is in use: is another rurge running with the enhanced mode on?`（种类 `ResourceBusy`）；探不到才 `WintunCreateAdapter` 建一个名字 `rurge`、类型 `rurge`、**固定 GUID** 的适配器，环 8 MiB。建好之后每 100 毫秒问一次接口序号，至多 5 秒（`INDEX_WITHIN`），仍没有是 `the virtual adapter has no interface index 5 seconds after it was made: <系统的话>`。适配器随建它的进程消失（Wintun 用 `SwDeviceCreate`，寿命跟着句柄，这是读源码与邮件列表得出的，**真机没有核对**，手工清单的一项），所以 `taskkill /F` 之后的下一次启动不会撞上“正在被使用”。
+设备在 `crates/rurge-platform/src/tun/windows/mod.rs`：**先探后建，不复用**（M4d 计划 P8）——先 `WintunOpenAdapter("rurge")` 探名字，探到就答 `the virtual adapter is in use: is another rurge running with the enhanced mode on?`（种类 `ResourceBusy`）；探不到才 `WintunCreateAdapter` 建一个名字 `rurge`、类型 `rurge`、**固定 GUID** 的适配器，环 8 MiB。建好之后每 100 毫秒问一次接口序号，至多 5 秒（`INDEX_WITHIN`），仍没有是 `cannot open the virtual adapter: the virtual adapter has no interface index 5 seconds after it was made: <系统的话>`（`frame::explained` 的缺省一支加上了那个前缀）。适配器随建它的进程消失（Wintun 用 `SwDeviceCreate`，寿命跟着句柄，这是读源码与邮件列表得出的，**真机没有核对**，手工清单的一项），所以 `taskkill /F` 之后的下一次启动不会撞上“正在被使用”。网卡名可能不是 `rurge`：`rurge` 被一块它改不了名的网卡占着时 Wintun 会把新的叫 `rurge 1`、`rurge 2`……，而 rurge 认定名字是常数 `rurge`，于是网络任务的排除名单与出口表认不出它（罕见；本轮的延后事项第 10 行）。
 
 设备的关闭在最后一个 `Arc` 放掉时（`Drop`），次序是：置停止标志 → 关读线程那个通道的接收端（卡在满通道上的 `blocking_send` 因此醒来）→ 等读线程 → `WintunEndSession` → `WintunCloseAdapter`（它把 `WintunCreateAdapter` 建的适配器从系统里移除）。正常的关闭经 `call`（`spawn_blocking`）交出管理器那一份，这几步不在 tokio 的工作线程上；TUN 3 秒内没结束的那一种，最后一份在 TUN 的任务里放掉，那时 `Drop` 会占住一个工作线程（M4d 记录第 29 行；这个次序与“两枚停止标志”的缺陷见 `docs/status.md` 的 M4d 一节）。
 
@@ -813,18 +814,23 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
 | 系统 DNS | `interface ipv4 set dnsservers name=<序号> source=static address=198.18.0.2 register=none validate=no`（IPv6 是 `fd00:6152::2`；IPv6 没开时另跑一行 `address=none` 清掉 IPv6 的名单） | `show dnsservers` 里有应答器的地址；IPv4 没有是 `the system's DNS could not be pointed at the enhanced mode`，IPv6 没有只一行 WARN `the system's IPv6 DNS could not be pointed at the enhanced mode; it is left as it is`（M4d 记录第 62 行） |
 | 清缓存 | `ipconfig /flushdns`（失败不算错） | —— |
 
+**Windows 上不进 `240.0.0.0/4`**：Windows 所有版本缺省都挡这一段的流量（IETF 草案 draft-schoen-intarea-unicast-240 的 Windows 一段：“blocked by default in all versions of the Microsoft Windows operating system”；Windows SDK 的 `mstcpip.h` 里 `Ipv4AddressType` 把 `240.0.0.0/4`（除 `255.255.255.255`）判成 `NlatInvalid`），`netsh` 加不加得进这一段没有人核实过；加不进的话上面那张表的读回会让每一次打开都以「28 of the routes are missing」失败。所以 `RouteInputs.class_e` 为假（Windows）时，`RouteSet::compute` 在最后把 `240.0.0.0/4` 从 IPv4 的每一条里挖掉，包含项写了 `0.0.0.0/0` 或 `240.0.0.0/4` 也带不回来：缺省的 Profile 下 IPv4 是 27 条，Linux 与 macOS 是 55 条（多的 28 条就在这一段；M4d 记录第 87 行）。
+
 **网卡的度量与转发设置**：接口度量 `1`（比系统给物理网卡的低，也不写含义没有文档的 `0`），单独一行——现行的 `netsh interface` 页里 `set interface` 没有 `metric`，一行里有一个系统不认的参数可能整行失败，拆开之后失败的代价只是度量（M4d 计划 P9）；虚拟网卡自己的**转发、weak host send 与 weak host receive 都关掉**，这是防环的 Windows 一半（另一部分是 `IP_UNICAST_IF` / `IPV6_UNICAST_IF` 绑网卡），不动别的网卡（设计第 7.4 节、M4-D11）。
 
 读回只认前缀、序号、地址与数字，不认任何文字，所以系统的语言不影响结论；输出按 `from_utf8_lossy` 读，中文系统上汉字会坏、数字与地址不坏（夹具 `ROUTES_ZH`、`ADDRESSES_ZH`、`DNS_ZH`、`MTU_ZH` 是手写的，注明了不是从机器上取的，M4d 计划 P17）。每一步的 DEBUG 行是 `running a step of the enhanced mode`（带程序、参数与脚本全文）与 `reading back a setting of the enhanced mode`、`what the readback printed`；脚本写在数据目录的 `enhanced/` 下、`rurge-steps-<pid>-<n>.txt`、`create_new`、跑完删掉、崩溃留下的下一次 `open` 删，错误里脚本的路径换成 `…`。
 
+**发送失败的 ICMP 载体退休，而不是立刻停掉**（M4d 记录第 88 行）：`PlatformPinger::forget` 按 `Arc` 指针把载体移出表（下一次回显新建一个），但它的接收任务再读一个回显时限（TUN 的 `echo_timeout`）才停——Linux 的 ICMP 数据报套接字只收得到自己那些请求的回复，同一个载体上已经发出、正在等回复的回显要靠它收；同时退休着的至多 4 个，第 5 个退休时最早的立刻停。原始套接字与 macOS 的数据报套接字收得到本机全部 ICMP，重复的那一份由等待表丢掉。
+
 #### 测试后端与没有覆盖的
 
-`RURGE_ENHANCED_BACKEND` 的三个取值不变（上面「只供测试的后端」一节与 `docs/testing.md`）；**不设时 Windows 上也是平台后端**——`WindowsSystem` 与 Wintun 的设备（`crates/rurge-platform/src/enhanced/mod.rs` 的 `system()` 第三支）。这一节的说法订正了 `docs/testing.md` 的 `RURGE_ENHANCED_BACKEND` 一段里“Windows 上对每个动作都答不可用”那一句。
+`RURGE_ENHANCED_BACKEND` 的三个取值不变（上面「只供测试的后端」一节与 `docs/testing.md`）；**不设时 Windows 上也是平台后端**——`WindowsSystem` 与 Wintun 的设备（`crates/rurge-platform/src/enhanced/mod.rs` 的 `system()` 第三支）。`docs/testing.md` 的 `RURGE_ENHANCED_BACKEND` 一段在任务 9 跟着改了（同一段就说三个平台都是平台后端的代码）。
 
-- **Windows 的设备与系统改动没有在任何地方运行过**：`tun/windows/mod.rs`、`tun/windows/wintun.rs` 与 `enhanced/windows.rs` 在这台开发机上编译、`clippy -D warnings` 过，单元用例用的是假的执行器与临时目录；没有一条用例调 `TunDevice::open` 或 `wintun::` 的函数（`RURGE_TEST_WINTUN_DLL` 不设），真机上也没有跑过（M4d 记录第 70 行）。
+- **Windows 的设备与系统改动没有在任何地方运行过**：`tun/windows/mod.rs`、`tun/windows/wintun.rs` 与 `enhanced/windows.rs` 在这台开发机上编译、`clippy -D warnings` 过，单元用例用的是假的执行器与临时目录；没有一条用例调 `TunDevice::open` 或设备的那十个放开的函数（`loaded`、`load`、`verify_signer` 有单元用例）（`RURGE_TEST_WINTUN_DLL` 不设），真机上也没有跑过（M4d 记录第 70 行）。
 - **`a_real_wintun_dll_passes` 在本机没有真正跑过**（没有 `wintun.dll`，它打印原因就返回）：真的 `wintun.dll` 的签名者读成 `WireGuard LLC`、只读共享开着文件时 `LoadLibraryExW` 照样能载入，都由 `RURGE_TEST_WINTUN_DLL` 与手工清单核对（M4d 计划 P5、P7）。
 - **`the_wintun_dll_option_is_a_usage_error_elsewhere` 在这台开发机上只编译、不运行**（Windows 上这个选项是寻常的那个，那一句用法错误只出现在别的平台），第一次运行是 Linux / macOS 的 CI（M4d 记录第 75、76 行）。
 - **`TunDevice::dropped()` 今天没有读者**：设备写不进的丢包只记在设备自己的计数与那一行 WARN 里，不进 `GET /v1/features/enhanced_mode` 的 `dropped`（那是 `rurge-tun` 的原因表，设计第 3、13 节）。
+- **网卡名固定当作 `rurge`**：Wintun 把新的网卡叫 `rurge 1`、`rurge 2`…… 时（`rurge` 被一块它改不了名的网卡占着），网络任务的排除名单与 `physical_subnets`、出口表都认不出它。罕见；修法是建好之后按固定 GUID 经已有的 `ipconfig` 包读回真的别名（不加放开的函数），去向是本轮延后事项第 10 行。
 - 全部用例只在一台 Windows 11 x86-64 的开发机上跑过；M4 的提交 CI 一个也没有见过（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986）。
 
 ### 没有覆盖的
