@@ -9,10 +9,8 @@
 //! (`tun`) and the `system` below.
 //!
 //! `system` gives a platform that has one in this version its own system —
-//! Linux's is [`linux::LinuxSystem`], macOS's [`macos::MacSystem`] — and
-//! [`Unsupported`] to the rest. Windows's is [`windows::WindowsSystem`], which
-//! `system` is not asked for yet: its device comes in the M4d plan's task 5
-//! (the phase 3 / M4d plan's execution record row 12).
+//! Linux's is [`linux::LinuxSystem`], macOS's [`macos::MacSystem`], Windows's
+//! [`windows::WindowsSystem`] — and [`Unsupported`] to the rest.
 
 pub mod linux;
 pub mod macos;
@@ -100,9 +98,11 @@ pub trait System: Send + Sync {
 /// [`Unsupported`] elsewhere. Linux's is [`linux::LinuxSystem`], over the
 /// programs the system's own runner runs and the files under `/`; macOS's is
 /// [`macos::MacSystem`], over the same runner and `/etc/resolv.conf`. Scripts go
-/// to `scratch` (the data directory's `enhanced`).
+/// to `scratch` (the data directory's `enhanced`). `wintun_dll` is where
+/// `wintun.dll` is on Windows, and Linux has no use for it (the option is a
+/// usage error on the platforms without the device, M4 design 9.6).
 #[cfg(target_os = "linux")]
-pub fn system(scratch: PathBuf) -> Box<dyn System> {
+pub fn system(scratch: PathBuf, _wintun_dll: Option<PathBuf>) -> Box<dyn System> {
     Box::new(linux::LinuxSystem::new(
         std::sync::Arc::new(crate::command::TimedRunner(STEP_TIMEOUT)),
         "/".into(),
@@ -113,9 +113,11 @@ pub fn system(scratch: PathBuf) -> Box<dyn System> {
 /// The system of this platform: its own where it has one in this version, and
 /// [`Unsupported`] elsewhere. macOS's is [`macos::MacSystem`], over the programs
 /// the system's own runner runs and `/etc/resolv.conf`. Scripts go to `scratch`
-/// (the data directory's `enhanced`).
+/// (the data directory's `enhanced`). `wintun_dll` is where `wintun.dll` is on
+/// Windows, and macOS has no use for it (the option is a usage error on the
+/// platforms without the device, M4 design 9.6).
 #[cfg(target_os = "macos")]
-pub fn system(scratch: PathBuf) -> Box<dyn System> {
+pub fn system(scratch: PathBuf, _wintun_dll: Option<PathBuf>) -> Box<dyn System> {
     Box::new(macos::MacSystem::new(
         std::sync::Arc::new(crate::command::TimedRunner(STEP_TIMEOUT)),
         "/etc/resolv.conf".into(),
@@ -123,11 +125,27 @@ pub fn system(scratch: PathBuf) -> Box<dyn System> {
     ))
 }
 
+/// The system of this platform: Windows's is [`windows::WindowsSystem`], over
+/// `netsh` and `ipconfig` under the system root (`%SystemRoot%`, or
+/// `C:\Windows`), and with `wintun.dll` from `wintun_dll` or next to
+/// `rurge.exe`. Scripts go to `scratch` (the data directory's `enhanced`).
+#[cfg(windows)]
+pub fn system(scratch: PathBuf, wintun_dll: Option<PathBuf>) -> Box<dyn System> {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    Box::new(windows::WindowsSystem::new(
+        std::sync::Arc::new(crate::command::TimedRunner(STEP_TIMEOUT)),
+        crate::route::windows::WindowsTools::under(std::path::Path::new(&root)),
+        scratch,
+        crate::tun::dll::wintun_dll(wintun_dll.as_deref(), std::env::current_exe()),
+    ))
+}
+
 /// The system of a platform that has none in this version: [`Unsupported`],
 /// which says so to every action. `scratch` (the data directory's `enhanced`)
-/// has nothing to hold here.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn system(_scratch: PathBuf) -> Box<dyn System> {
+/// and `wintun_dll` (where Windows's `wintun.dll` would be) have nothing to
+/// hold here.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn system(_scratch: PathBuf, _wintun_dll: Option<PathBuf>) -> Box<dyn System> {
     Box::new(Unsupported)
 }
 

@@ -102,7 +102,9 @@ pub trait Backend: Send + Sync {
 pub fn backend(data_dir: &Path) -> anyhow::Result<Arc<dyn Backend>> {
     match std::env::var_os(BACKEND_ENV) {
         None => Ok(Arc::new(PlatformBackend {
-            system: rurge_platform::enhanced::system(data_dir.join("enhanced")),
+            // `wintun.dll` is looked for next to rurge.exe; `--wintun-dll`
+            // gives its place instead (the M4d plan's task 6)
+            system: rurge_platform::enhanced::system(data_dir.join("enhanced"), None),
         })),
         Some(value) => backend_from(&value.to_string_lossy()),
     }

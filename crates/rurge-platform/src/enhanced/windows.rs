@@ -15,8 +15,9 @@
 //! adapter's index, a DNS server. What a step failed with, what the readback
 //! printed and what was not found are DEBUG only (design 13).
 //!
-//! `system` does not give this system out yet: the device comes in the M4d
-//! plan's task 5 (the phase 3 / M4d plan's execution record row 12).
+//! `system` gives this system out on Windows: the steps name the adapter by
+//! the interface index the device opened, and `wintun.dll` comes from
+//! `--wintun-dll` or sits next to `rurge.exe`.
 
 use std::io;
 use std::net::IpAddr;
@@ -235,7 +236,7 @@ impl System for WindowsSystem {
     /// `wintun.dll` is weighed before anything is touched: without it there is
     /// no device to open, and what a run that died left under the scratch
     /// directory is no news to a reader who cannot have the enhanced mode. The
-    /// device itself is the M4d plan's task 5.
+    /// device and its interface index come from [`TunDevice::open`].
     fn open(&self) -> io::Result<TunDevice> {
         let dll = match &self.dll {
             Ok(dll) => dll,
