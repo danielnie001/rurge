@@ -562,6 +562,10 @@ mod tests {
             assert_eq!(
                 runner.lines(),
                 [
+                    "/usr/sbin/resolvectl llmnr rurge no",
+                    "/usr/sbin/resolvectl mdns rurge no",
+                    "/usr/sbin/resolvectl dnssec rurge no",
+                    "/usr/sbin/resolvectl dnsovertls rurge no",
                     dns,
                     "/usr/sbin/resolvectl domain rurge ~.",
                     "/usr/sbin/resolvectl default-route rurge yes",

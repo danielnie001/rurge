@@ -115,6 +115,21 @@ pub fn remove_routes(t: &LinuxTools, dev: &str, set: &RouteSet) -> Vec<Step> {
 
 /// Point the system resolver at the responder, for this link only (design
 /// 5.2): nothing else is written, and the settings go with the device.
+///
+/// The resolver's own settings are the machine's and hold for this link too
+/// unless it says otherwise (the phase 3 / M4c plan's execution record row 45):
+/// `DNSOverTLS=yes` would send every query to the responder over TLS on port
+/// 853, which it does not answer; `DNSSEC=yes` would not validate the fake
+/// answers; and with LLMNR or mDNS on, single-label names and `.local` would
+/// go to this link's multicast. So the four go off first, each best effort —
+/// an older resolved, or one built without a feature, is no reason to leave the
+/// system's DNS alone — and the servers go in after them, so that no moment
+/// has the servers set while the machine's own DoT still holds. `revert`
+/// ([`give_dns_back`]) takes all of it back with the device.
+///
+/// The cache flush at the end is best effort too: what it leaves behind is the
+/// names already in the cache, answering with their real addresses until they
+/// expire.
 pub fn take_dns(t: &LinuxTools, dev: &str, ipv6: bool) -> Vec<Step> {
     let Some(resolvectl) = &t.resolvectl else {
         return Vec::new();
@@ -123,7 +138,18 @@ pub fn take_dns(t: &LinuxTools, dev: &str, ipv6: bool) -> Vec<Step> {
     if ipv6 {
         servers.push(RESPONDER_V6.to_string());
     }
+    let off = |what: &str| {
+        resolvectl_step(
+            resolvectl,
+            vec![what.to_owned(), dev.to_owned(), "no".to_owned()],
+            OnFailure::Ignore,
+        )
+    };
     vec![
+        off("llmnr"),
+        off("mdns"),
+        off("dnssec"),
+        off("dnsovertls"),
         resolvectl_step(resolvectl, servers, OnFailure::Fail),
         resolvectl_step(
             resolvectl,
@@ -138,7 +164,11 @@ pub fn take_dns(t: &LinuxTools, dev: &str, ipv6: bool) -> Vec<Step> {
             vec!["default-route".to_owned(), dev.to_owned(), "yes".to_owned()],
             OnFailure::Ignore,
         ),
-        resolvectl_step(resolvectl, vec!["flush-caches".to_owned()], OnFailure::Fail),
+        resolvectl_step(
+            resolvectl,
+            vec!["flush-caches".to_owned()],
+            OnFailure::Ignore,
+        ),
     ]
 }
 
@@ -380,11 +410,36 @@ mod tests {
         );
     }
 
+    /// The resolver's own settings hold for this link unless it says otherwise,
+    /// so they go off first, best effort; then the servers, which are what has
+    /// to work; then `~.` and the default route; and the cache flush last,
+    /// whose failing only means a name already in the cache stays true until it
+    /// expires (the phase 3 / M4c plan's execution record row 45).
     #[test]
-    fn the_system_dns_is_taken_over_in_four_steps() {
+    fn the_system_dns_is_taken_over_after_the_resolvers_own_settings_go_off() {
         assert_eq!(
             take_dns(&tools(), "rurge", true),
             [
+                plain(
+                    "/usr/sbin/resolvectl",
+                    &["llmnr", "rurge", "no"],
+                    OnFailure::Ignore,
+                ),
+                plain(
+                    "/usr/sbin/resolvectl",
+                    &["mdns", "rurge", "no"],
+                    OnFailure::Ignore,
+                ),
+                plain(
+                    "/usr/sbin/resolvectl",
+                    &["dnssec", "rurge", "no"],
+                    OnFailure::Ignore,
+                ),
+                plain(
+                    "/usr/sbin/resolvectl",
+                    &["dnsovertls", "rurge", "no"],
+                    OnFailure::Ignore,
+                ),
                 plain(
                     "/usr/sbin/resolvectl",
                     &["dns", "rurge", "198.18.0.2", "fd00:6152::2"],
@@ -400,20 +455,20 @@ mod tests {
                     &["default-route", "rurge", "yes"],
                     OnFailure::Ignore,
                 ),
-                plain("/usr/sbin/resolvectl", &["flush-caches"], OnFailure::Fail),
+                plain("/usr/sbin/resolvectl", &["flush-caches"], OnFailure::Ignore,),
             ]
         );
-        // IPv6 off: the one IPv4 server, and the three steps after it.
+        // IPv6 off: the one IPv4 server, and the steps around it
         let steps = take_dns(&tools(), "rurge", false);
         assert_eq!(
-            steps[0],
+            steps[4],
             plain(
                 "/usr/sbin/resolvectl",
                 &["dns", "rurge", "198.18.0.2"],
                 OnFailure::Fail,
             )
         );
-        assert_eq!(steps.len(), 4);
+        assert_eq!(steps.len(), 8, "{steps:?}");
     }
 
     #[test]
