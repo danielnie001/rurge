@@ -738,9 +738,13 @@ impl EnhancedMode {
     /// them where the system's DNS reads them while it is on (design 6.3; M4c
     /// plan P10): macOS reads its own backup or what DHCP gave, Linux resolved's
     /// upstream list. The read runs programs on macOS after a change of
-    /// network, so it is a blocking call like the others. What it cannot read
-    /// leaves `None`, which is a failed lookup rather than the system's own
-    /// list — that one is the responder's while the DNS is taken over.
+    /// network, so it is a blocking call like the others. `None` — the system's
+    /// own list — is the backend's to answer, and only where that is the right
+    /// list (no takeover on Linux, the file backend without the key, `off`).
+    /// A read that does not come back is the empty list, as the two systems'
+    /// own answers are when they cannot read theirs: the lookup fails rather
+    /// than fall back to the machine's list, which is the responder's while the
+    /// DNS is taken over (coordinator's ruling R19).
     async fn read_physical(&self, primary: Option<&str>, saved: &[Undo], network_changed: bool) {
         let backend = self.backend.clone();
         let primary = primary.map(str::to_string);
@@ -753,9 +757,10 @@ impl EnhancedMode {
             Err(e) => {
                 tracing::debug!(
                     error = %e,
-                    "cannot read the DNS servers outside the enhanced mode; the lookup fails rather than ask the system's own"
+                    "cannot read the DNS servers outside the enhanced mode; the lookup gives up \
+                     rather than ask the system's own list"
                 );
-                self.set_physical(None);
+                self.set_physical(Some(Vec::new()));
             }
         }
     }
@@ -1115,6 +1120,9 @@ mod tests {
         /// stay as they were).
         physical: Arc<Mutex<Option<Vec<SocketAddr>>>>,
         physical_asked: Arc<Mutex<Vec<bool>>>,
+        /// Whether `physical_dns` panics: a read that does not come back, as a
+        /// backend whose task dies would leave it.
+        physical_panics: Arc<AtomicBool>,
     }
 
     impl Mock {
@@ -1290,6 +1298,9 @@ mod tests {
             _saved: &[Undo],
             network_changed: bool,
         ) -> Option<Vec<SocketAddr>> {
+            if self.physical_panics.load(Ordering::SeqCst) {
+                panic!("physical_dns panicked (test)");
+            }
             self.physical_asked.lock().unwrap().push(network_changed);
             self.physical.lock().unwrap().clone()
         }
@@ -1859,6 +1870,27 @@ mod tests {
             f.physical.read().unwrap().clone(),
             Some(written),
             "the slot is left as it was"
+        );
+    }
+
+    /// A read that does not come back is no servers, not the machine's own list
+    /// (coordinator's ruling R19; M4 design 6.3): `None` in the slot means "the
+    /// system's own", and during a takeover that list is the responder's —
+    /// Linux's resolved stub would send `server:system`'s queries back to the
+    /// responder. The backend's read panics here, `spawn_blocking` catches it
+    /// and `call` turns it into an error; the panic's message on standard error
+    /// is what this test expects, and the test itself does not panic.
+    #[tokio::test]
+    async fn a_read_that_does_not_come_back_is_no_servers() {
+        let mut f = fixture(true).await;
+        f.backend.physical_panics.store(true, Ordering::SeqCst);
+
+        f.mode.enable(wanted()).await.unwrap();
+
+        assert_eq!(
+            f.physical.read().unwrap().clone(),
+            Some(Vec::new()),
+            "the lookup fails rather than ask the system's own list"
         );
     }
 
