@@ -180,7 +180,7 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 
 `RURGE_PROCESS_BACKEND=off` 让 `rurge run` 不去查会话来自的进程（`shared.owners` 留空，请求记录里没有进程，`PROCESS-NAME` 一律按不知道判），是仅供自动化测试使用的开关（没设时查本机，恰好 `off` 才关，`OFF` 不行；别的取值会报错、以 2 退出——先恢复上一次崩溃留下的系统代理，在绑定任何端口之前——，从不退回真实的查找），不要在正常使用中设置它，它也不是给使用者的"关掉查找"的开关（M2-D3）。它不是命令行选项，所以不在 `--help` 里，也没有对应的隐藏选项；`rurge check`、`rule match`、`dns lookup` 不读它（它们不查进程）；`external` 策略拉起的程序拿不到它（那里没有任何以 `RURGE_` 开头的变量），嵌套的 `rurge run` 照常查本机，查找只读系统的表，不影响用例。
 
-`RURGE_ENHANCED_BACKEND` 把增强模式要动的那套系统换掉（`crates/rurge/src/cli/enhanced/backend.rs`），是仅供自动化测试使用的后端，不要在正常使用中设置它。不设时是平台后端；这一版（阶段 3 / M4a）它对每个动作都答 `the enhanced mode is not available on this platform in this version`，所以 `rurge run --enhanced-mode` 在每个平台上都以 1 退出、`POST /v1/features/enhanced_mode` 回 500（真实的执行随 M4c / M4d）。三个取值：
+`RURGE_ENHANCED_BACKEND` 把增强模式要动的那套系统换掉（`crates/rurge/src/cli/enhanced/backend.rs`），是仅供自动化测试使用的后端，不要在正常使用中设置它。不设时是平台后端：**Linux 与 macOS 上是真的系统一侧**（`rurge_platform::enhanced::system`：真的网卡、`ip` / `resolvectl` / `ifconfig` / `route` / `networksetup`、`rp_filter`），**Windows 上对每个动作都答 `the enhanced mode is not available on this platform in this version`**，所以 `rurge run --enhanced-mode` 在 Windows 上以 1 退出、`POST /v1/features/enhanced_mode` 回 500（M4d）。三个取值：
 
 - `RURGE_ENHANCED_BACKEND=file:<路径>`：把系统当成一个 JSON 文件（`crates/rurge/src/cli/enhanced/file.rs`）。文件里当前开着的各项是 `open`（设备开着没有）、`ipv6`（网卡有 IPv6 的一半没有）、`routes`（装着的前缀，字符串数组，排序并去重）、`dns`（系统 DNS 被接管没有）、`adjusted`（系统自己的调整做着没有），做过的动作按次序在 `actions` 里，每条一个字符串：`open`、`configure`、`configure_ipv6`、`unconfigure_ipv6`、`routes +<加了几条> -<减了几条>`、`take_dns`、`give_dns_back`、`adjust`、`close`、`undo <撤销动作的名字>`（`undo take_dns`、`undo adjust`、`undo rp_filter <值>`、`undo mac_dns <服务>`）。文件里不认识的键原样留着，所以用例可以在里面写下面三个。**失败的动作不记**，它对应的字段也不改：`actions` 里只有真的做成了的。
   - `"fail": "<动作名>"`：让那一个动作失败（错误 `<动作名> failed (test)`），只对着一个名字。`fail: routes` 只让"加"的那一半失败（`add` 非空时），关闭时减的那一半照做；`fail: configure_ipv6` 不算失败：`configure` 与 `configure_ipv6` 答"没有 IPv6"（打开与重载照常往下、管理器记一行 WARN），`configure` 那一步照样记一条 `configure`，`configure_ipv6` 什么也不记。
@@ -256,3 +256,24 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 四、`crates/rurge/src/cli/pinger.rs` 的 `pings_the_loopback` 对 `127.0.0.1` 与 `::1` 各发一次回显（5 秒时限），建不出套接字时打印原因并返回（Windows 不是管理员、Linux 的 `ping_group_range` 不允许）。**这台开发机上它没有跳过**：原始套接字开得起来，两个地址族都真的来回了一次、载荷相等（循环 20 次全过，M4b 记录第 45 行）；Linux / Android 的数据报套接字与它退到原始套接字的那一路、macOS 的数据报套接字、“开不了套接字所以跳过”这条路至今没有任何平台跑过，第一次 CI 的 Linux 与 macOS 是第一次。macOS 的数据报套接字按标识符与序号对号那一条也没有在 macOS 上观察过（同一行与第 46 行）。
 
 五、本轮新增用例的过滤词（`cargo test -j 8 --workspace --lib -- <过滤词>`，可执行文件的用`--bins`，集成用例用 `--test <文件名>`）：`rereading_the_system_servers_rebuilds_the_host_upstreams`（`rurge-dns`）；`only_a_route_built_from_an_egress_table_says_it_is_one` 与 `a_direct_connector_routes_to_the_egress_table_its_hook_names`（`rurge-net`）；`platform_sockets_say_which_egress_table_they_answer_from`、`a_follow_that_writes_the_same_table_keeps_the_one_in_the_slot` 与 `a_follow_that_writes_another_table_rebuilds_the_resolvers_upstreams`（可执行文件，`--bins`）；`a_connection_dialled_under_another_egress_table_takes_no_new_requests`（`rurge-proto-quic`）；`an_egress_table_change_underneath_dials_every_peer_anew`（`rurge-proto-wireguard`；它等的是250 毫秒一次的 `TICK`，提交前循环 20 次）；`an_ipv4_address_in_its_mapped_form_is_decided_as_an_ipv4_address`（`rurge-platform`）；`profile_sources_ask_the_hook`（`--test egress`）；`the_programs_pid_is_only_logged_at_debug`（`rurge-proto`）；扫描用例的两条纯函数用例是 `an_item_after_the_tests_is_reported` 与 `a_connector_without_a_hook_is_found_however_it_is_written`（`--test sockets`）。
+
+### 阶段 3 / M4c 起：平台的系统一侧与设备
+
+阶段 3 / M4c 起另有几条：
+
+一、**系统一侧的用例不碰系统**。`LinuxSystem`（`crates/rurge-platform/src/enhanced/linux.rs`）与 `MacSystem`（同目录的 `macos.rs`）都不带 `cfg`（M4c 计划 P2）：程序经 `CommandRunner` 给进来、文件经一个根目录（或 `resolv.conf` 的路径）给进来，所以那两个模块的全部用例在这台 Windows 开发机上也编译、也跑。假执行器是 `crate::command::testing` 的 `FakeRunner`（`reply` 写应答、`fail` 写失败、`calls` 回执行过的命令，键都是 `cmd.join(" ")`，没列的命令回空输出）；根目录是用例自己的 `tempfile::TempDir`，用例把 `etc/resolv.conf`、`proc/sys/net/ipv4/conf/*/rp_filter`、`run/systemd/resolve/resolv.conf` 放进去。命令与程序名一律按绝对路径断言（`/usr/sbin/ip`、`/usr/sbin/resolvectl`、`/usr/sbin/networksetup`、`/sbin/route` 一类），因为生产代码不查 `PATH`。抓日志的用例用 `LogCapture`（`crates/rurge-platform/src/log_capture.rs`，照 `rurge-tun` 的同一份写），都是普通的 `#[test]`：那两个函数是同步的，没有运行时。
+
+二、**没有一条缺省的用例开设备**（M4c 计划 P19）：`TunDevice::open` 与真实平台的 `System::open` 不被任何缺省用例调用，在这台开发机上它们也是带 `cfg` 的、编不到。在 Linux / macOS 的 CI 上它们是真的：以普通用户跑会得到 `EPERM`，但谁以 root 跑测试，就真的建了网卡。以后加用例的人照这一条：要测打开之后的事，用文件后端或不经 `system()` 的 `Unsupported`，不调这两个。
+
+三、**夹具是手写的**（M4c 计划 P20）：`enhanced/macos.rs` 的 `tests` 里有五份工具输出（`-listallnetworkservices`、`-getdnsservers`、`-listnetworkserviceorder`、`ipconfig getpacket`、DHCP 的一整包），每份开头一行注明它不是从 Mac 上取的、出自哪里。`-listnetworkserviceorder` 的格式凭记忆写，没有可引用的样本（P20），留给 M4d 的手工清单核对。
+
+四、**L2 特权用例**（计划的任务 9）：新的工作区成员 `tests/privileged`（包名 `rurge-privileged-tests`，`publish = false`，不是任何 crate 的依赖），要跑的东西、要求与它们改宿主上的什么见 `tests/privileged/README.md`。门控是 `RURGE_TEST_PRIVILEGED=1`，只在一次性的 Linux 虚拟机里、以 root 跑；没有它就每条用例打印一行 `skipped: …` 并返回，什么也不建。**这些用例写好之后没有在任何地方运行过。**
+
+- 地址与夹具（协调者的裁定 R17）：两个用例自建的命名空间 `rl2-a-<pid>-<n>`（“本机”）与 `rl2-b-<pid>-<n>`（“互联网”），veth 的 `10.231.0.2/30` / `10.231.0.1/30`，a 的默认路由经它；服务端在 b 的回环上另加的 `10.231.1.1/32` 才是用例的目标——它在 rurge 装进网卡的基础前缀里、不在 a 的任何直连路由里，只经默认路由可达，所以应用发给它的流量必然进虚拟网卡，而 rurge 自己的连接绑在 veth 上就绕得开（发给 `10.231.0.1` 的会走内核为 veth 装的 `/30` 直连路由，永远不进网卡，什么也证明不了）。`Lab` 在 `/etc/netns/rl2-a-<pid>-<n>/` 下写一份 `resolv.conf`（`ip netns exec` 把它绑到 a 的 `/etc/resolv.conf` 上），用例结束时删掉那个目录；`/etc/netns/` 原来没有时由用例建出来、用完留着。
+- 一个 Lab 一组自己的名字、一次只有一个 Lab（协调者的裁定 R20）：`<n>` 来自进程内的计数器（三条用例跑在同一个进程的线程上，只用进程号会撞），`static ONE_AT_A_TIME: Mutex<()>` 让它们一个接一个（`ip netns add` 的第一次还要把 `/run/netns` 挂成挂载点）。
+- 起 `rurge` 时去掉环境里每一个以 `RURGE_` 开头的变量，并把 `XDG_DATA_HOME` / `XDG_CONFIG_HOME` 指到 Lab 的临时目录下的两个目录（协调者的裁定 R21）：用例以 root 跑，root 的家目录不是测试文件的地方；而从开发机漏进来的 `RURGE_ENHANCED_BACKEND=off` 一类会让它根本不开增强模式。
+- `l2-helper` 的 DNS 报文编解码在 `tests/privileged/src/dns.rs`，六条单元用例在三个平台上都跑；`tests/privileged/tests/linux_netns.rs` 是 `#![cfg(target_os = "linux")]`，别的平台上是 0 条用例。
+
+五、两份名单的数目：`crates/rurge/tests/sockets.rs` 的 `LISTED` 现在 25 行（M4c 加的是 macOS 的 utun 控制套接字那一行），`crates/rurge-platform/tests/unsafe_functions.rs` 的 `LISTED` 现在 9 个函数（`set_iff` 与 `utun_connect`）——加一处建套接字的地方、加一个放开的函数时就地改，那两条扫描用例会逐处报错。
+
+六、**CI 的 clippy 错误在注解里**（计划的任务 1）：`.github/workflows/ci.yml` 的 clippy 一步有名字、输出 `tee` 到 `$RUNNER_TEMP/clippy.log`，“Report the failed tests”按 `steps.clippy.outcome` 选读哪一份日志，报告脚本把 `error[E….]:` 与 `error: ` 两类行发成 `::error title=compile error::` 注解。M4c 的 Linux / macOS 代码只有 CI 编译，而任务日志要登录才能读；这一改让编译错误在公开可读的注解里就能看到（M4c 记录第 10 行）。

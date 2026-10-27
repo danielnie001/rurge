@@ -24,8 +24,9 @@ pub const SCRIPT: &str = "{script}";
 pub enum OnFailure {
     /// The open fails, and what was done is undone.
     Fail,
-    /// The IPv6 half: a warning, and this open goes on as if IPv6 were off
-    /// (M4-D17).
+    /// The IPv6 half: this open goes on as if IPv6 were off (M4-D17), and the
+    /// failure is a DEBUG line — whether it costs the user IPv6, and the one
+    /// warning about it, are the caller's to say (`crate::route::exec::run`).
     Ipv6Off,
     /// Undoing goes on: removing routes, giving back what went with the
     /// device.
