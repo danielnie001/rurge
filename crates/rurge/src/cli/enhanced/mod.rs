@@ -3,12 +3,15 @@
 //! undone, and the TUN behind it.
 //!
 //! Nothing here reaches the machine of its own accord: the backend does what
-//! the steps say, and in this version the only backend that does anything is
-//! the file one tests set (`RURGE_ENHANCED_BACKEND=file:<path>`). The backend's
-//! actions are all blocking and all called on a blocking thread; the manager is
-//! owned by the `rurge run` main loop, which calls it one request at a time.
+//! the steps say — on Linux and macOS the platform's own system, which changes
+//! it, elsewhere a system that answers that the enhanced mode is not available
+//! — and the file backend (`RURGE_ENHANCED_BACKEND=file:<path>`) is the one
+//! tests set. The backend's actions are all blocking and all called on a
+//! blocking thread; the manager is owned by the `rurge run` main loop, which
+//! calls it one request at a time.
 
 mod backend;
+mod device;
 mod engine;
 mod file;
 mod undo;
@@ -25,6 +28,7 @@ use rurge_platform::route::RouteSet;
 use rurge_platform::socket::egress::EgressTable;
 use rurge_tun::Ending;
 use rurge_tun::device::Device;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -87,6 +91,11 @@ pub struct Links {
     /// was, so they are built again on the new one (M4 design 7.2; the phase
     /// 3 / M4b plan's execution record row 69).
     pub system_dns_changed: Arc<dyn Fn() + Send + Sync>,
+    /// The DNS servers of the network outside the enhanced mode, while it is
+    /// on: `PlatformSystemDns::physical`, which the system's DNS reads for
+    /// `server:system` (M4 design 6.3). Written after every DNS takeover and
+    /// cleared as the DNS is given back; `None` is the system's own list.
+    pub physical: Arc<std::sync::RwLock<Option<Vec<SocketAddr>>>>,
 }
 
 /// Starts the TUN the manager runs: the engine's, or a test's (P6: the engine
@@ -503,12 +512,14 @@ impl EnhancedMode {
         let mut ipv6 = wanted.ipv6;
         let turning_off = was_ipv6 && !ipv6;
         let turning_on = !was_ipv6 && ipv6;
+        let primary = wanted.primary.as_deref();
 
         // IPv6 going: the DNS first, while the address it points at is still
         // there (design 9.4, 9.7). The address goes at the end, below.
         let dns_taken = turning_off;
         if dns_taken {
-            self.take_the_dns_again(&dev, false).await;
+            self.take_the_dns_again(&dev, false, primary, network_changed)
+                .await;
         }
 
         // IPv6 coming: the adapter's address first
@@ -596,7 +607,8 @@ impl EnhancedMode {
         // it over already, and one follow takes it over at most once.
         let taking_the_dns = !dns_taken && (ipv6 != was_ipv6 || network_changed);
         if taking_the_dns {
-            self.take_the_dns_again(&dev, ipv6).await;
+            self.take_the_dns_again(&dev, ipv6, primary, network_changed)
+                .await;
         } else if table_changed {
             // Another table went in and no takeover follows: the resolver's
             // upstreams are bound to the table there was, and a DNS server's
@@ -668,8 +680,18 @@ impl EnhancedMode {
     /// Takes the system's DNS over again, after a change of the IPv6 half or of
     /// the network (design 9.7, 9.8): what taking it over will need goes into
     /// the backup first (design 9.1), and the takeover follows it. A step that
-    /// fails stays in the log.
-    async fn take_the_dns_again(&self, dev: &Opened, ipv6: bool) {
+    /// fails stays in the log. A change of network reads the servers outside
+    /// the enhanced mode anew, once the takeover is done; a reload does not,
+    /// even though the DNS may have been taken over again for IPv6's sake. The
+    /// paths that return before `take_dns` read nothing either: the DNS has
+    /// not changed hands, so the slot keeps what it had.
+    async fn take_the_dns_again(
+        &self,
+        dev: &Opened,
+        ipv6: bool,
+        primary: Option<&str>,
+        network_changed: bool,
+    ) {
         let mut saved = match self.saved_undo().await {
             Ok(saved) => saved,
             Err(e) => {
@@ -698,11 +720,54 @@ impl EnhancedMode {
         let backend = self.backend.clone();
         let with = dev.clone();
         let taken = call(move || backend.take_dns(&with, ipv6)).await;
+        // the servers outside are the new network's after a change of network,
+        // and the same ones otherwise: read before the callback, so that it
+        // already sees them, and whether or not the takeover went well (it may
+        // have changed half of it) — the same reason the callback comes anyway
+        if network_changed {
+            self.read_physical(primary, &saved, true).await;
+        }
         // a takeover changes hands whether or not it failed half way
         (self.links.system_dns_changed)();
         if let Err(e) = taken {
             self.failed("take_dns", &e);
         }
+    }
+
+    /// Reads the DNS servers of the network outside the enhanced mode and puts
+    /// them where the system's DNS reads them while it is on (design 6.3; M4c
+    /// plan P10): macOS reads its own backup or what DHCP gave, Linux resolved's
+    /// upstream list. The read runs programs on macOS after a change of
+    /// network, so it is a blocking call like the others. What it cannot read
+    /// leaves `None`, which is a failed lookup rather than the system's own
+    /// list — that one is the responder's while the DNS is taken over.
+    async fn read_physical(&self, primary: Option<&str>, saved: &[Undo], network_changed: bool) {
+        let backend = self.backend.clone();
+        let primary = primary.map(str::to_string);
+        let saved = saved.to_vec();
+        let read =
+            call(move || Ok(backend.physical_dns(primary.as_deref(), &saved, network_changed)))
+                .await;
+        match read {
+            Ok(servers) => self.set_physical(servers),
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "cannot read the DNS servers outside the enhanced mode; the lookup fails rather than ask the system's own"
+                );
+                self.set_physical(None);
+            }
+        }
+    }
+
+    /// Puts the servers outside the enhanced mode in their slot; `None` is the
+    /// system's own list (M4 design 6.3).
+    fn set_physical(&self, servers: Option<Vec<SocketAddr>>) {
+        *self
+            .links
+            .physical
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = servers;
     }
 
     /// The system's own adjustments once more, after a change of network (M4
@@ -846,11 +911,14 @@ impl EnhancedMode {
 
         // 7. the takeover: a takeover that fails may have changed half of it,
         // so it is undone as if it had — and the callback comes whether it
-        // succeeded or not
+        // succeeded or not. The servers outside the enhanced mode are read for
+        // `server:system` before that callback, so that it sees them too.
         on.dns = true;
         let backend = self.backend.clone();
         let with = dev.clone();
         let taken = call(move || backend.take_dns(&with, ipv6)).await;
+        self.read_physical(wanted.primary.as_deref(), &undo, false)
+            .await;
         (self.links.system_dns_changed)();
         taken?;
 
@@ -898,7 +966,9 @@ impl EnhancedMode {
                 }
             }
             // The DNS is handed back, whether or not each step went back: from
-            // here on what the system answers may be its own again.
+            // here on what the system answers may be its own again — and the
+            // servers outside the enhanced mode are the system's own.
+            self.set_physical(None);
             (self.links.system_dns_changed)();
         }
         // the routes: the traffic goes back to the physical adapter first
@@ -1040,6 +1110,11 @@ mod tests {
         /// The `exclude` of each `subnets` call, in order: a read, so not among
         /// `calls`.
         subnets_asked: Arc<Mutex<Vec<Vec<String>>>>,
+        /// What `physical_dns` answers with, and the `network_changed` of each
+        /// call, in order: a read, so not among `calls` (the order tests above
+        /// stay as they were).
+        physical: Arc<Mutex<Option<Vec<SocketAddr>>>>,
+        physical_asked: Arc<Mutex<Vec<bool>>>,
     }
 
     impl Mock {
@@ -1209,6 +1284,16 @@ mod tests {
             Ok(())
         }
 
+        fn physical_dns(
+            &self,
+            _primary: Option<&str>,
+            _saved: &[Undo],
+            network_changed: bool,
+        ) -> Option<Vec<SocketAddr>> {
+            self.physical_asked.lock().unwrap().push(network_changed);
+            self.physical.lock().unwrap().clone()
+        }
+
         fn close(&self, _dev: Opened) {
             self.closes.fetch_add(1, Ordering::SeqCst);
             self.calls.push("close");
@@ -1330,6 +1415,8 @@ mod tests {
         enhanced: Arc<AtomicBool>,
         /// The interfaces the network task leaves out of what it reads.
         exclude: Exclude,
+        /// The servers outside the enhanced mode, as `PlatformSystemDns` reads them.
+        physical: Arc<std::sync::RwLock<Option<Vec<SocketAddr>>>>,
         /// The open numbers the manager told the loop about (P24).
         told: tokio::sync::mpsc::UnboundedReceiver<u64>,
         mode: EnhancedMode,
@@ -1338,22 +1425,41 @@ mod tests {
     /// A manager over a mock backend and a mock starter, `state.json` in a
     /// temporary directory. `ends` says whether the TUN's `ended()` answers.
     async fn fixture(ends: bool) -> Fixture {
-        fixture_with(ends, false).await
+        fixture_on(ends, false, Record::Nothing).await
     }
 
     /// `fixture`, and whether the TUN's device fails at once (P24).
     async fn fixture_with(ends: bool, failing: bool) -> Fixture {
-        fixture_on(ends, failing, false).await
+        fixture_on(ends, failing, Record::Nothing).await
     }
 
     /// `fixture`, with `system_dns_changed` recorded among the calls the
     /// backend's steps are, so a test can read the order of the two.
     async fn fixture_recording_system_dns(ends: bool) -> Fixture {
-        fixture_on(ends, false, true).await
+        fixture_on(ends, false, Record::Dns).await
     }
 
-    /// `fixture_with`, and whether `system_dns_changed` is recorded.
-    async fn fixture_on(ends: bool, failing: bool, record_dns: bool) -> Fixture {
+    /// `fixture_recording_system_dns`, and what the physical slot held when
+    /// the callback ran: a test can see that the servers are written before
+    /// the callback that announces the new DNS.
+    async fn fixture_recording_physical(ends: bool) -> Fixture {
+        fixture_on(ends, false, Record::DnsAndPhysical).await
+    }
+
+    /// What the fixture's `system_dns_changed` leaves in the calls.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Record {
+        /// Nothing: the callback only marks the DNS changing hands where the
+        /// test asks for it.
+        Nothing,
+        /// `system_dns_changed on` / `off`, as the enhanced flag stands.
+        Dns,
+        /// `Dns`, and the servers in the physical slot as they are then.
+        DnsAndPhysical,
+    }
+
+    /// `fixture_with`, and what `system_dns_changed` records.
+    async fn fixture_on(ends: bool, failing: bool, record: Record) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.json");
         let (store, _) = StateStore::open(state.clone()).await;
@@ -1361,6 +1467,8 @@ mod tests {
         let egress = egress_slot();
         let enhanced = Arc::new(AtomicBool::new(false));
         let exclude: Exclude = Exclude::default();
+        let physical: Arc<std::sync::RwLock<Option<Vec<SocketAddr>>>> =
+            Arc::new(std::sync::RwLock::new(None));
         let backend = Arc::new(Mock {
             calls: calls.clone(),
             egress: egress.clone(),
@@ -1374,19 +1482,29 @@ mod tests {
             ..MockStarter::default()
         });
         let (tell, told) = tokio::sync::mpsc::unbounded_channel();
-        let system_dns_changed: Arc<dyn Fn() + Send + Sync> = if record_dns {
-            let calls = calls.clone();
-            let enhanced = enhanced.clone();
-            Arc::new(move || {
-                let on = if enhanced.load(Ordering::SeqCst) {
-                    "on"
-                } else {
-                    "off"
-                };
-                calls.push(format!("system_dns_changed {on}"));
-            })
-        } else {
-            Arc::new(|| {})
+        let system_dns_changed: Arc<dyn Fn() + Send + Sync> = match record {
+            Record::Nothing => Arc::new(|| {}),
+            Record::Dns | Record::DnsAndPhysical => {
+                let calls = calls.clone();
+                let enhanced = enhanced.clone();
+                let physical = physical.clone();
+                Arc::new(move || {
+                    let on = if enhanced.load(Ordering::SeqCst) {
+                        "on"
+                    } else {
+                        "off"
+                    };
+                    let mut said = format!("system_dns_changed {on}");
+                    if record == Record::DnsAndPhysical {
+                        let held = physical.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        said += &match held {
+                            None => " physical=None".to_string(),
+                            Some(servers) => format!(" physical={servers:?}"),
+                        };
+                    }
+                    calls.push(said);
+                })
+            }
         };
         let mode = EnhancedMode::new(
             backend.clone(),
@@ -1397,6 +1515,7 @@ mod tests {
                 enhanced: enhanced.clone(),
                 exclude: exclude.clone(),
                 system_dns_changed,
+                physical: physical.clone(),
             },
             Arc::new(move |sequence| {
                 let _ = tell.send(sequence);
@@ -1411,6 +1530,7 @@ mod tests {
             egress,
             enhanced,
             exclude,
+            physical,
             told,
             mode,
         }
@@ -1632,6 +1752,113 @@ mod tests {
                 "close",
                 "undo adjust",
             ])
+        );
+    }
+
+    /// The servers outside the enhanced mode are in their slot once the DNS is
+    /// taken over, before the callback that announces the new DNS, and gone
+    /// once it is given back, again before the callback. The number of
+    /// callbacks is M4b's four: writing the servers adds none of its own (M4c
+    /// plan's execution record row 30).
+    #[tokio::test]
+    async fn the_physical_servers_are_set_after_the_takeover_and_cleared_on_close() {
+        let mut f = fixture_recording_physical(true).await;
+        let servers: Vec<SocketAddr> = vec!["192.0.2.53:53".parse().unwrap()];
+        *f.backend.physical.lock().unwrap() = Some(servers.clone());
+
+        f.mode.enable(wanted()).await.unwrap();
+        let calls = f.backend.calls.list();
+        let takeover = calls
+            .iter()
+            .position(|call| call == "take_dns")
+            .expect("the DNS is taken over");
+        assert_eq!(
+            calls[takeover + 1],
+            format!("system_dns_changed on physical={servers:?}"),
+            "the callback after the takeover already sees the servers: {calls:?}"
+        );
+        assert_eq!(
+            f.physical.read().unwrap().clone(),
+            Some(servers),
+            "the slot holds them while the enhanced mode is on"
+        );
+
+        f.mode.disable().await.unwrap();
+        let calls = f.backend.calls.list();
+        let given_back = calls
+            .iter()
+            .position(|call| call == "undo take_dns")
+            .expect("the takeover is undone");
+        assert_eq!(
+            calls[given_back + 1],
+            "system_dns_changed on physical=None",
+            "the callback after the DNS is given back sees none: {calls:?}"
+        );
+        assert_eq!(f.physical.read().unwrap().clone(), None);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("system_dns_changed"))
+                .count(),
+            4,
+            "the four callbacks M4b pinned, none added: {calls:?}"
+        );
+    }
+
+    /// A change of network reads the servers outside the enhanced mode again,
+    /// after the takeover it takes: the other network has others.
+    #[tokio::test]
+    async fn a_change_of_network_reads_the_physical_servers_again() {
+        let mut f = fixture(true).await;
+        let first: Vec<SocketAddr> = vec!["192.0.2.53:53".parse().unwrap()];
+        *f.backend.physical.lock().unwrap() = Some(first.clone());
+        f.mode.enable(wanted()).await.unwrap();
+        assert_eq!(f.physical.read().unwrap().clone(), Some(first));
+
+        let second: Vec<SocketAddr> = vec!["198.51.100.53:53".parse().unwrap()];
+        *f.backend.physical.lock().unwrap() = Some(second.clone());
+        f.mode.follow(wanted(), true).await;
+
+        assert_eq!(
+            f.physical.read().unwrap().clone(),
+            Some(second),
+            "the slot holds the new network's servers"
+        );
+        assert_eq!(
+            *f.backend.physical_asked.lock().unwrap(),
+            [false, true],
+            "the open read them, and the change of network read them anew"
+        );
+    }
+
+    /// A reload reads nothing, even when the DNS is taken over again for IPv6's
+    /// sake: the network has not changed, and its servers are the same ones.
+    #[tokio::test]
+    async fn a_reload_does_not_read_them() {
+        let mut f = fixture(true).await;
+        let written: Vec<SocketAddr> = vec!["192.0.2.53:53".parse().unwrap()];
+        *f.backend.physical.lock().unwrap() = Some(written.clone());
+        f.mode.enable(wanted()).await.unwrap();
+        // what the network would answer now, if it were asked
+        *f.backend.physical.lock().unwrap() = Some(vec!["198.51.100.53:53".parse().unwrap()]);
+
+        // IPv6 off: the DNS is taken over again, without a change of network
+        f.mode.follow(without_ipv6(), false).await;
+
+        assert_eq!(
+            *f.backend.dns.lock().unwrap(),
+            [true, false],
+            "the DNS was taken over again"
+        );
+        assert_eq!(
+            *f.backend.physical_asked.lock().unwrap(),
+            [false],
+            "only the open read them"
+        );
+        assert_eq!(
+            f.physical.read().unwrap().clone(),
+            Some(written),
+            "the slot is left as it was"
         );
     }
 

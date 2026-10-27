@@ -205,9 +205,10 @@ pub struct PlatformSystemDns {
     /// Up while the enhanced mode's egress table is written (the manager says).
     enhanced: Arc<AtomicBool>,
     /// The servers the system had before the takeover, once something has
-    /// written them: M4c's macOS backup of each service's servers and of what
-    /// DHCP gave. Nothing writes it in this version; Linux's resolved upstream
-    /// list goes here as well, and Windows needs none (M4 design 6.3).
+    /// written them: the manager writes them from the platform backend's
+    /// `physical_dns` while the enhanced mode is on (M4c plan P13): macOS's
+    /// backup of each service's servers or of what DHCP gave, Linux's resolved
+    /// upstream list. Windows needs none (M4 design 6.3).
     physical: Arc<RwLock<Option<Vec<SocketAddr>>>>,
 }
 
@@ -221,6 +222,12 @@ impl PlatformSystemDns {
     /// its slot, and clears when it takes the table away.
     pub fn enhanced(&self) -> Arc<AtomicBool> {
         self.enhanced.clone()
+    }
+
+    /// The servers of the network outside the enhanced mode, which the manager
+    /// writes as the DNS changes hands (M4 design 6.3).
+    pub fn physical(&self) -> Arc<RwLock<Option<Vec<SocketAddr>>>> {
+        self.physical.clone()
     }
 }
 
@@ -693,9 +700,9 @@ mod tests {
             "the machine's own while it is off"
         );
 
-        // what M4c's macOS backup will hold: the servers that were there
+        // what M4c's manager will write: the servers that were there
         let backup = vec!["192.0.2.53:53".parse::<SocketAddr>().unwrap()];
-        *dns.physical.write().unwrap() = Some(backup.clone());
+        *dns.physical().write().unwrap() = Some(backup.clone());
         assert_eq!(
             dns.servers(),
             machine(),
@@ -711,7 +718,7 @@ mod tests {
         assert_eq!(dns.servers(), machine());
 
         // with no backup, the machine's own even while the mode is on
-        *dns.physical.write().unwrap() = None;
+        *dns.physical().write().unwrap() = None;
         dns.enhanced().store(true, Ordering::SeqCst);
         assert_eq!(dns.servers(), machine());
     }

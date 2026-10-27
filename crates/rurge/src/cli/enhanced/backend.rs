@@ -1,23 +1,27 @@
 //! What the manager asks of the system (M4 design 5.1, 9.1): abstract actions
 //! only, each of them blocking, and the backends that answer them.
 //!
-//! Nothing here runs a program or changes anything: in this version the
-//! platform backend answers every action with the same "not yet", and only the
-//! file backend (`file:<path>`, tests) does anything at all.
+//! Nothing here runs a program or changes anything by itself. The platform
+//! backend hands every action to `rurge_platform::enhanced::System` — Linux's
+//! or macOS's, which change the machine; on a platform without the enhanced
+//! mode in this version that system is `Unsupported` and answers as it does.
+//! The file backend (`file:<path>`) is the one tests set.
 
+use super::device::PlatformDevice;
 use super::file::FileBackend;
 use super::undo::Undo;
 use ipnet::IpNet;
+use rurge_platform::enhanced::{Adapter, Saved, System};
 use rurge_platform::route::RouteSet;
 use rurge_tun::device::Device;
+use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 /// `RURGE_ENHANCED_BACKEND`: unset → the platform's; `off`; `file:<path>`.
 pub const BACKEND_ENV: &str = "RURGE_ENHANCED_BACKEND";
 
-/// What the platform backend answers while it exists and does nothing, and
-/// what `off` answers.
-const NOT_YET: &str = "the enhanced mode is not available on this platform in this version";
+/// What `off` answers.
 const OFF: &str = "the enhanced mode backend is off (RURGE_ENHANCED_BACKEND=off)";
 
 /// The device a backend opened: what the TUN reads and writes, and how the
@@ -28,7 +32,6 @@ pub struct Opened {
     /// The interface's name: for the debug log and the egress table.
     pub name: String,
     /// Windows: the interface index the steps name the adapter by.
-    #[allow(dead_code)] // wired up by M4d
     pub index: Option<u32>,
 }
 
@@ -77,15 +80,26 @@ pub trait Backend: Send + Sync {
     fn adjust(&self) -> Result<(), String>;
     /// Puts one saved thing back: on a close, and after a crash.
     fn undo(&self, undo: &Undo) -> Result<(), String>;
+    /// The DNS servers of the network outside the enhanced mode, for
+    /// `server:system` while it is on (design 6.3); `None`: the system's own list.
+    fn physical_dns(
+        &self,
+        primary: Option<&str>,
+        saved: &[Undo],
+        network_changed: bool,
+    ) -> Option<Vec<SocketAddr>>;
     fn close(&self, dev: Opened);
 }
 
 /// The enhanced mode's backend, unless `RURGE_ENHANCED_BACKEND` says otherwise.
 /// An unknown value is an error: silently falling back would let a typo in a
-/// test take over the machine's routes and DNS.
-pub fn backend() -> anyhow::Result<Arc<dyn Backend>> {
+/// test take over the machine's routes and DNS. `data_dir` is where the
+/// platform's scripts go (its `enhanced/` directory, M4c plan P12).
+pub fn backend(data_dir: &Path) -> anyhow::Result<Arc<dyn Backend>> {
     match std::env::var_os(BACKEND_ENV) {
-        None => Ok(Arc::new(Platform)),
+        None => Ok(Arc::new(PlatformBackend {
+            system: rurge_platform::enhanced::system(data_dir.join("enhanced")),
+        })),
         Some(value) => backend_from(&value.to_string_lossy()),
     }
 }
@@ -100,50 +114,129 @@ fn backend_from(value: &str) -> anyhow::Result<Arc<dyn Backend>> {
     }
 }
 
-/// The system's own backend: M4c and M4d add the steps and the device. Until
-/// then every action says so, and nothing here touches a machine.
-struct Platform;
+/// The platform's own name for what an undo puts back (M4 design 9.2): the two
+/// kinds both platforms save. `None` for the one this version's system never
+/// saves — `Undo::Test`, the file backend's own step.
+fn saved_of(undo: &Undo) -> Option<Saved> {
+    match undo {
+        Undo::MacDns { service, servers } => Some(Saved::MacDns {
+            service: service.clone(),
+            servers: servers.clone(),
+        }),
+        Undo::RpFilter { value } => Some(Saved::RpFilter { value: *value }),
+        Undo::Test { .. } => None,
+    }
+}
 
-impl Backend for Platform {
+/// The manager's name for a saved change: what `state.json`'s backup keeps.
+fn undo_of(saved: &Saved) -> Undo {
+    match saved {
+        Saved::MacDns { service, servers } => Undo::MacDns {
+            service: service.clone(),
+            servers: servers.clone(),
+        },
+        Saved::RpFilter { value } => Undo::RpFilter { value: *value },
+    }
+}
+
+/// The system's own backend: `rurge-platform`'s `System` of this platform,
+/// which changes the machine where it has one (M4c) and says it has none
+/// elsewhere (M4d gives Windows its own). No `cfg`: `system()` picks it.
+struct PlatformBackend {
+    system: Box<dyn System>,
+}
+
+impl PlatformBackend {
+    /// The adapter as the steps name it.
+    fn adapter(dev: &Opened) -> Adapter {
+        Adapter {
+            name: dev.name.clone(),
+            index: dev.index,
+        }
+    }
+}
+
+impl Backend for PlatformBackend {
     fn open(&self) -> Result<Opened, String> {
-        Err(NOT_YET.to_string())
+        let tun = self.system.open().map_err(|e| e.to_string())?;
+        let adapter = tun.adapter().clone();
+        Ok(Opened {
+            device: Arc::new(PlatformDevice::new(tun)),
+            name: adapter.name,
+            index: adapter.index,
+        })
     }
-    fn configure(&self, _dev: &Opened, _ipv6: bool) -> Result<bool, String> {
-        Err(NOT_YET.to_string())
+    fn configure(&self, dev: &Opened, ipv6: bool) -> Result<bool, String> {
+        self.system.configure(&Self::adapter(dev), ipv6)
     }
-    fn configure_ipv6(&self, _dev: &Opened) -> Result<bool, String> {
-        Err(NOT_YET.to_string())
+    fn configure_ipv6(&self, dev: &Opened) -> Result<bool, String> {
+        self.system.configure_ipv6(&Self::adapter(dev))
     }
-    fn unconfigure_ipv6(&self, _dev: &Opened) -> Result<(), String> {
-        Err(NOT_YET.to_string())
+    fn unconfigure_ipv6(&self, dev: &Opened) -> Result<(), String> {
+        self.system.unconfigure_ipv6(&Self::adapter(dev))
     }
-    fn routes(&self, _dev: &Opened, _add: &RouteSet, _remove: &RouteSet) -> Result<bool, String> {
-        Err(NOT_YET.to_string())
+    fn routes(&self, dev: &Opened, add: &RouteSet, remove: &RouteSet) -> Result<bool, String> {
+        self.system.routes(&Self::adapter(dev), add, remove)
     }
     fn subnets(&self, exclude: &[String]) -> Result<Vec<(IpNet, String)>, String> {
-        // the one action of this backend that reads the machine: a list of
-        // interfaces and addresses (M4c is where the rest does something)
+        // the one action that reads the machine without a device: a list of
+        // interfaces and addresses
         rurge_platform::socket::egress::subnets(exclude).map_err(|e| e.to_string())
     }
-    fn dns_undo(&self, _dev: &Opened, _saved: &[Undo]) -> Result<Vec<Undo>, String> {
-        Err(NOT_YET.to_string())
+    fn dns_undo(&self, dev: &Opened, saved: &[Undo]) -> Result<Vec<Undo>, String> {
+        let saved: Vec<Saved> = saved.iter().filter_map(saved_of).collect();
+        self.system
+            .dns_saved(&Self::adapter(dev), &saved)
+            .map(|saved| saved.iter().map(undo_of).collect())
     }
-    fn take_dns(&self, _dev: &Opened, _ipv6: bool) -> Result<bool, String> {
-        Err(NOT_YET.to_string())
+    fn take_dns(&self, dev: &Opened, ipv6: bool) -> Result<bool, String> {
+        self.system.take_dns(&Self::adapter(dev), ipv6)
     }
-    fn give_dns_back(&self, _dev: &Opened) -> Result<(), String> {
-        Err(NOT_YET.to_string())
+    fn give_dns_back(&self, dev: &Opened) -> Result<(), String> {
+        self.system.give_dns_back(&Self::adapter(dev))
     }
-    fn adjust_undo(&self, _primary: Option<&str>, _saved: &[Undo]) -> Result<Option<Undo>, String> {
-        Err(NOT_YET.to_string())
+    fn adjust_undo(&self, primary: Option<&str>, saved: &[Undo]) -> Result<Option<Undo>, String> {
+        let saved: Vec<Saved> = saved.iter().filter_map(saved_of).collect();
+        self.system
+            .adjust_saved(primary, &saved)
+            .map(|saved| saved.as_ref().map(undo_of))
     }
     fn adjust(&self) -> Result<(), String> {
-        Err(NOT_YET.to_string())
+        self.system.adjust()
     }
-    fn undo(&self, _undo: &Undo) -> Result<(), String> {
-        Err(NOT_YET.to_string())
+    fn undo(&self, undo: &Undo) -> Result<(), String> {
+        match saved_of(undo) {
+            Some(saved) => self.system.undo(&saved),
+            None => {
+                // A kind no platform saves (a data directory brought over from
+                // the file backend): keeping it would make every start fail on
+                // it (M4c plan P9).
+                tracing::warn!("an undo the platform backend does not know is dropped");
+                Ok(())
+            }
+        }
     }
-    fn close(&self, _dev: Opened) {}
+    fn physical_dns(
+        &self,
+        primary: Option<&str>,
+        saved: &[Undo],
+        network_changed: bool,
+    ) -> Option<Vec<SocketAddr>> {
+        let saved: Vec<Saved> = saved.iter().filter_map(saved_of).collect();
+        self.system
+            .physical_dns(primary, &saved, network_changed)
+            .map(|servers| {
+                servers
+                    .into_iter()
+                    .map(|ip| SocketAddr::new(ip, 53))
+                    .collect()
+            })
+    }
+    fn close(&self, dev: Opened) {
+        // `dev` is the last owner of the device here: dropping it closes the
+        // descriptor, and the adapter goes with it
+        drop(dev);
+    }
 }
 
 /// The enhanced mode with the backend taken away: `RURGE_ENHANCED_BACKEND=off`,
@@ -187,6 +280,14 @@ impl Backend for Off {
     fn undo(&self, _undo: &Undo) -> Result<(), String> {
         Err(OFF.to_string())
     }
+    fn physical_dns(
+        &self,
+        _primary: Option<&str>,
+        _saved: &[Undo],
+        _network_changed: bool,
+    ) -> Option<Vec<SocketAddr>> {
+        None
+    }
     fn close(&self, _dev: Opened) {}
 }
 
@@ -197,57 +298,47 @@ mod tests {
     use rurge_platform::route::{SPACE_V4, SPACE_V6};
     use std::net::IpAddr;
 
-    /// This version's platform backend does nothing but say so: not one of its
-    /// actions reaches a machine (M4a: the steps are data, the device is M4c's).
+    /// The two kinds both platforms save map to one another in both
+    /// directions, so that what `state.json` keeps survives a round trip and
+    /// what a platform hands back is what the manager puts in the backup. The
+    /// file backend's own step is not one of them.
     #[test]
-    fn the_platform_backend_is_not_available_in_this_version() {
-        let backend = Platform;
-        let Err(error) = backend.open() else {
-            panic!("the platform backend opened a device")
+    fn undo_and_saved_map_both_ways() {
+        for undo in [
+            Undo::MacDns {
+                service: "Wi-Fi".to_string(),
+                servers: vec!["9.9.9.9".parse().unwrap(), "192.0.2.53".parse().unwrap()],
+            },
+            Undo::RpFilter { value: 2 },
+        ] {
+            let saved = saved_of(&undo).expect("a platform's own undo");
+            assert_eq!(undo_of(&saved), undo, "{undo:?}");
+        }
+        let test = Undo::Test {
+            step: "take_dns".to_string(),
         };
-        assert_eq!(error, NOT_YET);
-        let dev = Opened {
-            device: Arc::new(Nothing),
-            name: "rurge-test".to_string(),
-            index: None,
-        };
-        let routes = RouteSet::default();
-        assert_eq!(backend.configure(&dev, true).unwrap_err(), NOT_YET);
-        assert_eq!(backend.configure_ipv6(&dev).unwrap_err(), NOT_YET);
-        assert_eq!(backend.unconfigure_ipv6(&dev).unwrap_err(), NOT_YET);
-        assert_eq!(backend.routes(&dev, &routes, &routes).unwrap_err(), NOT_YET);
-        assert_eq!(backend.dns_undo(&dev, &[]).unwrap_err(), NOT_YET);
-        assert_eq!(backend.take_dns(&dev, false).unwrap_err(), NOT_YET);
-        assert_eq!(backend.give_dns_back(&dev).unwrap_err(), NOT_YET);
-        assert_eq!(backend.adjust_undo(None, &[]).unwrap_err(), NOT_YET);
-        assert_eq!(backend.adjust().unwrap_err(), NOT_YET);
-        assert_eq!(
-            backend.undo(&Undo::RpFilter { value: 1 }).unwrap_err(),
-            NOT_YET
-        );
-        backend.close(dev);
+        assert_eq!(saved_of(&test), None, "the file backend's step is not ours");
     }
 
-    /// A device of no use to anyone: `Platform` never opens one.
-    struct Nothing;
+    /// An undo of the file backend's kind is dropped rather than handed to a
+    /// system that would fail it on every start (M4c plan P9): the platform
+    /// backend answers `Ok(())` without asking the system anything — were it
+    /// handed on, `Unsupported` would fail it — and says so once, at WARN.
+    #[test]
+    fn a_test_undo_on_the_platform_backend_is_dropped() {
+        use rurge_net::testing::Lines;
 
-    impl Device for Nothing {
-        fn recv<'a>(
-            &'a self,
-            _into: &'a mut Vec<Vec<u8>>,
-            _max: usize,
-        ) -> rurge_net::BoxFuture<'a, std::io::Result<()>> {
-            Box::pin(std::future::pending())
-        }
-        fn send<'a>(
-            &'a self,
-            _packets: &'a mut Vec<Vec<u8>>,
-        ) -> rurge_net::BoxFuture<'a, std::io::Result<()>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn mtu(&self) -> usize {
-            1500
-        }
+        let lines = Lines::default();
+        let _capturing = lines.capture();
+        let backend = PlatformBackend {
+            system: Box::new(rurge_platform::enhanced::Unsupported),
+        };
+        let undo = Undo::Test {
+            step: "take_dns".to_string(),
+        };
+        assert_eq!(backend.undo(&undo), Ok(()));
+        let said = lines.said("an undo the platform backend does not know is dropped");
+        assert_eq!(said.len(), 1, "one WARN: {said:?}");
     }
 
     #[test]

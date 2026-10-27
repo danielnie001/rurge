@@ -17,6 +17,7 @@ use rurge_platform::route::{MTU, RouteSet};
 use rurge_tun::device::Device;
 use serde_json::{Map, Value, json};
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -252,6 +253,27 @@ impl Backend for FileBackend {
         }
         self.record(&mut map, format!("undo {label}"));
         self.write(&map)
+    }
+
+    /// The servers outside the enhanced mode are the file's `physical_dns`,
+    /// `["127.0.0.1:5353", …]`, read afresh on every call: a network that
+    /// changes its answer between two calls is seen by the second. A file
+    /// without the key says the system's own list is right (`None`); an entry
+    /// that is not an address is skipped. It is a read, so it is not recorded
+    /// among `actions`.
+    fn physical_dns(
+        &self,
+        _primary: Option<&str>,
+        _saved: &[Undo],
+        _network_changed: bool,
+    ) -> Option<Vec<SocketAddr>> {
+        let map = self.read();
+        let list = map.get("physical_dns")?.as_array()?;
+        Some(
+            list.iter()
+                .filter_map(|entry| entry.as_str()?.parse::<SocketAddr>().ok())
+                .collect(),
+        )
     }
 
     fn close(&self, _dev: Opened) {
@@ -490,6 +512,49 @@ mod tests {
         // and a read the file refuses, as it refuses any action
         std::fs::write(&path, json!({"fail": "subnets"}).to_string()).unwrap();
         assert_eq!(backend.subnets(&[]).unwrap_err(), "subnets failed (test)");
+    }
+
+    /// The servers outside the enhanced mode come from the file's
+    /// `physical_dns`, read afresh on every call: a file that changes between
+    /// two calls is seen by the second. A file without the key says the
+    /// system's own list is right, an entry that is not an address is
+    /// skipped, and the read is not recorded among `actions`.
+    #[test]
+    fn the_file_backend_gives_its_physical_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enhanced.json");
+        std::fs::write(
+            &path,
+            json!({"physical_dns": ["127.0.0.1:5353", "not an address", "192.0.2.53:53"]})
+                .to_string(),
+        )
+        .unwrap();
+        let backend = FileBackend::new(path.clone());
+        assert_eq!(
+            backend.physical_dns(Some("eth0"), &[], false),
+            Some(vec![
+                "127.0.0.1:5353".parse::<SocketAddr>().unwrap(),
+                "192.0.2.53:53".parse::<SocketAddr>().unwrap(),
+            ])
+        );
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["actions"], Value::Null, "a read is not an action");
+
+        // read afresh: the second call sees the file as it is now
+        std::fs::write(
+            &path,
+            json!({"physical_dns": ["198.51.100.53:53"]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.physical_dns(Some("eth0"), &[], true),
+            Some(vec!["198.51.100.53:53".parse::<SocketAddr>().unwrap()])
+        );
+
+        // no key: the system's own list is the answer
+        std::fs::write(&path, json!({}).to_string()).unwrap();
+        assert_eq!(backend.physical_dns(None, &[], false), None);
     }
 
     /// A file that is not there, or is not JSON, is a system nothing has been

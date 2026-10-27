@@ -1254,26 +1254,29 @@ fn recover_without_a_log(args: &RuntimeArgs) {
     let Ok(Some(_lock)) = lock_data_dir(&dir) else {
         return;
     };
-    restore_what_a_crash_left(&path);
+    restore_what_a_crash_left(&dir);
 }
 
 /// What `recover_without_a_log` does once it holds the lock: for a start that
 /// holds it already, which cannot take it a second time. The enhanced mode
-/// goes first: what it leaves behind is the machine's DNS.
-fn restore_what_a_crash_left(path: &Path) {
-    if !left_to_undo(path).any() {
+/// goes first: what it leaves behind is the machine's DNS. `dir` is the data
+/// directory, where `state.json` and the platform's scripts are.
+fn restore_what_a_crash_left(dir: &Path) {
+    let path = dir.join(STATE_FILE);
+    if !left_to_undo(&path).any() {
         return;
     }
-    restore_the_enhanced_mode(path);
-    restore_the_system_proxy(path);
+    restore_the_enhanced_mode(dir);
+    restore_the_system_proxy(&path);
 }
 
 /// The enhanced mode's half of `restore_what_a_crash_left`.
-fn restore_the_enhanced_mode(path: &Path) {
-    if !left_to_undo(path).enhanced {
+fn restore_the_enhanced_mode(dir: &Path) {
+    let path = dir.join(STATE_FILE);
+    if !left_to_undo(&path).enhanced {
         return;
     }
-    let backend = match super::enhanced::backend() {
+    let backend = match super::enhanced::backend(dir) {
         Ok(backend) => backend,
         Err(e) => {
             eprintln!("warning: {e}; the enhanced mode's changes were not undone");
@@ -1291,7 +1294,7 @@ fn restore_the_enhanced_mode(path: &Path) {
         // Forgetting a backup is a rewrite of `state.json`, and one that fails
         // reaches nothing but the log. A backup still there is undone again by
         // the next start, which is harmless: undoing twice is as undoing once.
-        Some(Ok(())) if left_to_undo(path).enhanced => eprintln!(
+        Some(Ok(())) if left_to_undo(&path).enhanced => eprintln!(
             "warning: a previous run left changes of the enhanced mode; they were undone, but state.json could not be updated: the next start undoes them again"
         ),
         Some(Ok(())) => {
@@ -1357,7 +1360,7 @@ impl Lock {
     fn recover(&self, args: &RuntimeArgs) {
         match self {
             Lock::NotYet => recover_without_a_log(args),
-            Lock::Taken(Some(_)) => restore_what_a_crash_left(&args.data_dir().join(STATE_FILE)),
+            Lock::Taken(Some(_)) => restore_what_a_crash_left(&args.data_dir()),
             // nothing shows that no live instance has the backup
             Lock::Taken(None) => {}
         }
@@ -1499,8 +1502,11 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         };
     // What the enhanced mode may touch is a matter of a variable as well, and a
     // value that names nothing ends a start as an unknown network backend
-    // does: a typo must not let a start take over the machine's DNS.
-    let enhanced_backend = match super::enhanced::backend() {
+    // does: a typo must not let a start take over the machine's DNS. The
+    // platform's scripts go under the data directory (M4c plan P12), so that
+    // path is worked out first — it is a path, not a directory made here.
+    let data_dir = args.runtime.data_dir();
+    let enhanced_backend = match super::enhanced::backend(&data_dir) {
         Ok(backend) => backend,
         Err(e) => {
             eprintln!("error: {e}");
@@ -1509,7 +1515,6 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         }
     };
     let platform = args.platform.unwrap_or_else(Platform::current);
-    let data_dir = args.runtime.data_dir();
     let mut opts = LoadOptions {
         environment: super::environment(platform, capabilities::CORE_VERSION),
         platform,
@@ -1726,6 +1731,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 egress: rt.egress.clone(),
                 enhanced: rt.system_dns.enhanced(),
                 exclude: exclude.clone(),
+                physical: rt.system_dns.physical(),
                 system_dns_changed: {
                     let engine = engine.clone();
                     Arc::new(move || engine.system_dns_changed())
