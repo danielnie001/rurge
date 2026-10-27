@@ -67,9 +67,11 @@ fn set_egress(slot: &EgressSlot, table: Option<EgressTable>) -> bool {
     true
 }
 
-/// Whether the egress table is in the slot: the mock backend and the tests ask
-/// (the reader that decides, `PlatformSockets`, reads the slot itself).
-#[cfg_attr(not(test), allow(dead_code))]
+/// Whether the egress table is in the slot: only the tests ask (the mock
+/// backend's `routes` and the assertions in this file). The reader that decides,
+/// `PlatformSockets`, reads the slot itself, and nothing in a non-test build
+/// has any use for this (the phase 3 / M4d plan's execution record row 79).
+#[cfg(test)]
 fn filled(slot: &EgressSlot) -> bool {
     slot.read().unwrap_or_else(|e| e.into_inner()).is_some()
 }
