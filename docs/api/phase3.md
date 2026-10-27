@@ -762,7 +762,7 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
 
 阶段 3 / M4d（计划 `docs/superpowers/plans/2026-10-26-phase3-m4d-windows-wrapup-plan.md`，下面写“M4d 记录第 N 行”指它末尾的「执行期修正记录」）做的是 Windows 那一半：Wintun 的设备、`wintun.dll` 的查找与签名校验、`netsh` 的步骤与读回、`--wintun-dll`，以及 M4 的文档收尾。**本节订正上面几句**（规矩是历史的段落不逐处改、由后写的段落订正）：
 
-- M4 一节开头的“这一版开不了增强模式”在**三个平台**上都不成立了：Windows 的平台后端不再答 `Unsupported`，它答 `WindowsSystem` 与 Wintun 的设备——照代码会建名叫 `rurge` 的适配器、配地址与 MTU、装路由、把系统 DNS 指向应答器，关闭或崩溃之后的下一次启动把它们还回去。**Windows 的代码与不带 `cfg` 的部分在这台 Windows 11 x86-64 的开发机上编译、单元用例通过（一台机器上的一次运行，不是 CI）；Wintun 的设备与那十个放开的函数没有在任何地方运行过**（没有一条缺省的用例开设备，`RURGE_TEST_WINTUN_DLL` 也不设，M4d 记录第 70 行），真机上也没有跑过。
+- M4 一节开头的“这一版开不了增强模式”在**三个平台**上都不成立了：Windows 的平台后端不再答 `Unsupported`，它答 `WindowsSystem` 与 Wintun 的设备——照代码会建名叫 `rurge` 的适配器、配地址与 MTU、装路由、把系统 DNS 指向应答器，关闭或崩溃之后的下一次启动把它们还回去。**Windows 的代码与不带 `cfg` 的部分在这台 Windows 11 x86-64 的开发机上编译、单元用例通过（一台机器上的一次运行，不是 CI）；Wintun 的设备与那十二个放开的函数没有在任何地方运行过**（没有一条缺省的用例开设备，`RURGE_TEST_WINTUN_DLL` 也不设，M4d 记录第 70 行），真机上也没有跑过。
 - 「外部程序一律 DIRECT」一节里“Windows 上 M4d 之前只认程序本身”与本节末尾「没有覆盖的」里“Windows 的 `ProcessTree::contains` 恒假”都不成立了：Windows 上它经 `in_job`（`IsProcessInJob`，M4d 任务 1）回答，程序拉起的子进程算在里面；端到端用例 `what_the_program_started_goes_direct_too` 三个平台都编译、在这台开发机上跑过（`crates/rurge-platform/src/process.rs` 的三条用例 `a_child_in_the_job_is_contained_and_this_process_is_not`、`an_exited_child_whose_handle_is_still_open_is_not_contained`、`a_process_that_is_gone_is_not_contained`）。
 - 「没有覆盖的」里“本机没有编译过的 Unix 代码”中列着的 `what_the_program_started_goes_direct_too` 与 `ProcessTree::contains` 的 `#[cfg(unix)]` 一段照旧，只是那一条端到端用例不再是 Unix 专属。
 

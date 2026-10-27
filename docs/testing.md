@@ -292,4 +292,4 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 
 五、**`--wintun-dll` 的那一条只在非 Windows 上运行**：`crates/rurge/tests/cli.rs` 的 `the_wintun_dll_option_is_a_usage_error_elsewhere` 是 `#[cfg_attr(not(windows), test)]` 加 `#[cfg_attr(windows, allow(dead_code))]`，在这台开发机上只编译、不运行（Windows 上这个选项是寻常的那个，带着它起的 `rurge run` 会成功并一直跑下去）；第一次运行是 Linux / macOS 的 CI（M4d 记录第 75、76 行）。`wintun_dll_applies` 自己的单元用例（`crates/rurge/src/cli/run.rs` 的 `wintun_dll_is_only_for_windows`）三个平台都跑。
 
-六、两份名单的数目（阶段 3 / M4d 之后）：`crates/rurge/tests/sockets.rs` 的 `LISTED` 仍是 25 行（M4d 的生产代码不新建套接字，Wintun 不是套接字，`unicast_if` 设在已有的套接字上），`crates/rurge-platform/tests/unsafe_functions.rs` 的 `LISTED` 现在 23 个函数（M4d 加了 `unicast_if`、`in_job` 与 `tun/windows/wintun.rs` 的十个）——加一处建套接字的地方、加一个放开的函数时就地改，那两条扫描用例会逐处报错。
+六、两份名单的数目（阶段 3 / M4d 之后）：`crates/rurge/tests/sockets.rs` 的 `LISTED` 仍是 25 行（M4d 的生产代码不新建套接字，Wintun 不是套接字，`unicast_if` 设在已有的套接字上），`crates/rurge-platform/tests/unsafe_functions.rs` 的 `LISTED` 现在 23 个函数（M4d 加了 `unicast_if`、`in_job` 与 `tun/windows/wintun.rs` 的十二个）——加一处建套接字的地方、加一个放开的函数时就地改，那两条扫描用例会逐处报错。
