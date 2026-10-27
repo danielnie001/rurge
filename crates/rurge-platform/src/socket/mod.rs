@@ -7,6 +7,8 @@
 use socket2::Socket;
 use std::io;
 use std::net::IpAddr;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 #[cfg(any(target_os = "macos", windows, test))]
 use std::sync::{Arc, Mutex};
 #[cfg(any(target_os = "macos", windows, test))]
@@ -115,18 +117,79 @@ pub fn bind_interface(socket: &Socket, interface: &str, family: Family) -> io::R
 
 #[cfg(windows)]
 pub fn bind_interface(socket: &Socket, interface: &str, family: Family) -> io::Result<()> {
-    // `Interface::name` is the adapter's friendly name on Windows ("Wi-Fi")
-    let addrs: Vec<(String, IpAddr)> = interfaces()?
-        .iter()
-        .map(|i| (i.name.clone(), i.ip()))
-        .collect();
+    // `Interface::name` is the adapter's friendly name on Windows ("Wi-Fi").
+    // One table: the source address and the index of the interface it belongs
+    // to have to come from the same one, and the table is cached for seconds.
+    let table = interfaces()?;
+    let addrs: Vec<(String, IpAddr)> = table.iter().map(|i| (i.name.clone(), i.ip())).collect();
     let source = pick_source(&addrs, interface, family).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::AddrNotAvailable,
             format!("interface {interface} has no usable address of this family"),
         )
     })?;
-    socket.bind(&std::net::SocketAddr::new(source, 0).into())
+    socket.bind(&std::net::SocketAddr::new(source, 0).into())?;
+    // The index of that same address's interface: `IfIndex` for an IPv4 entry
+    // and `Ipv6IfIndex` for an IPv6 one (`if-addrs`), 0 being none.
+    let index = table
+        .iter()
+        .find(|i| i.name == interface && i.ip() == source)
+        .and_then(|i| i.index);
+    let Some(index) = index else {
+        tracing::debug!(
+            "{interface} has no interface index here; the source address alone \
+             pins it"
+        );
+        return Ok(());
+    };
+    // The source address is the first layer (the strong host model); this is
+    // the second. Without it the socket still leaves through the interface
+    // that owns the address, so a failure is not the connection's.
+    match unicast_if(socket.as_raw_socket(), family, index) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::debug!("{interface}: the unicast interface could not be set: {e}");
+            Ok(())
+        }
+    }
+}
+
+/// Sends this socket's traffic out of interface `index` (M4 design 7.4): one
+/// `setsockopt`, `IP_UNICAST_IF` with the index in network byte order for
+/// IPv4, `IPV6_UNICAST_IF` in host byte order for IPv6 (the Winsock
+/// documentation of the two options).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn unicast_if(
+    socket: std::os::windows::io::RawSocket,
+    family: Family,
+    index: u32,
+) -> io::Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{
+        IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET_ERROR, WSAGetLastError,
+        setsockopt,
+    };
+    let (level, name, value) = match family {
+        Family::V4 => (IPPROTO_IP, IP_UNICAST_IF, index.to_be()),
+        Family::V6 => (IPPROTO_IPV6, IPV6_UNICAST_IF, index),
+    };
+    // SAFETY: `socket` is a live socket of the caller's; both options are
+    // documented to take a DWORD, which `value` is, and it outlives the call.
+    let set = unsafe {
+        setsockopt(
+            socket as usize,
+            level,
+            name,
+            (&raw const value).cast(),
+            size_of::<u32>() as i32,
+        )
+    };
+    if set != SOCKET_ERROR {
+        return Ok(());
+    }
+    // SAFETY: plain call, documented to report a socket call's own error.
+    let error = unsafe { WSAGetLastError() };
+    Err(io::Error::from_raw_os_error(error))
 }
 
 #[cfg(not(any(
@@ -216,6 +279,67 @@ mod tests {
             socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
         set_tos(&socket, Family::V4, 0x28).unwrap();
         assert_eq!(socket.tos_v4().unwrap(), 0x28);
+    }
+
+    /// The index of the interface that owns `ip`, found the way
+    /// `bind_interface` finds it: by address, not by name (the loopback's
+    /// name follows the system language on Windows).
+    #[cfg(windows)]
+    fn index_of(ip: &str) -> u32 {
+        let ip: IpAddr = ip.parse().unwrap();
+        let table = interfaces().expect("the interface table");
+        let entry = table
+            .iter()
+            .find(|i| i.ip() == ip)
+            .unwrap_or_else(|| panic!("no interface has {ip}"));
+        entry
+            .index
+            .unwrap_or_else(|| panic!("the interface that has {ip} has no index"))
+    }
+
+    /// A datagram from a socket whose unicast interface is the loopback's own
+    /// index still arrives: the option does not break a socket that only
+    /// talks to the loopback. Both ends are this test's own; a wait for the
+    /// datagram is bounded by the receiver's read timeout.
+    #[cfg(windows)]
+    fn reaches_the_loopback(addr: &str, ip: &str, family: Family) {
+        use std::net::UdpSocket;
+        use std::os::windows::io::AsRawSocket;
+        // the receiver is this test's own, on the loopback
+        let receiver = match UdpSocket::bind(addr) {
+            Ok(socket) => socket,
+            Err(e) if family == Family::V6 => {
+                eprintln!("no ::1 on this machine, so this is not tested: {e}");
+                return;
+            }
+            Err(e) => panic!("could not bind {addr}: {e}"),
+        };
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let sender = UdpSocket::bind(addr).unwrap();
+        unicast_if(sender.as_raw_socket(), family, index_of(ip))
+            .expect("the unicast interface is set on a loopback socket");
+        sender
+            .send_to(b"rurge", receiver.local_addr().unwrap())
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let (len, _) = receiver
+            .recv_from(&mut buf)
+            .expect("the datagram comes back");
+        assert_eq!(&buf[..len], b"rurge");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unicast_if_on_a_loopback_socket_still_reaches_the_loopback() {
+        reaches_the_loopback("127.0.0.1:0", "127.0.0.1", Family::V4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unicast_if_on_a_loopback_socket_still_reaches_the_loopback_over_ipv6() {
+        reaches_the_loopback("[::1]:0", "::1", Family::V6);
     }
 
     #[test]
