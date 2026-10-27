@@ -1,6 +1,9 @@
 //! `rurge run`: the foreground proxy daemon (M3 design §9.3).
 
-use super::enhanced::{EnhancedMode, wanted::Wanted};
+use super::enhanced::{
+    EnhancedMode,
+    wanted::{PlatformRoutes, Wanted},
+};
 use super::network;
 use super::rule::{parse_mode, print_diagnostics};
 use super::runtime::{PlatformOwners, PlatformProcesses, RuntimeArgs, owners_backend};
@@ -649,7 +652,15 @@ fn wanted_now(engine: &Engine, ipv6_usable: bool) -> Wanted {
         &external,
         ipv6_usable,
         primary,
-        cfg!(target_os = "macos"),
+        PlatformRoutes {
+            // macOS: utun is point-to-point, its address brings no subnet
+            // route, so rurge's space is installed as one (P22).
+            explicit_space: cfg!(target_os = "macos"),
+            // Windows blocks `240.0.0.0/4` by default, so no route of it goes
+            // in there; Linux and macOS route it as ordinary unicast (the
+            // phase 3 / M4d plan's execution record row 87).
+            class_e: !cfg!(windows),
+        },
     )
 }
 

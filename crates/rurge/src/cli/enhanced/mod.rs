@@ -1592,6 +1592,7 @@ mod tests {
                 included: &[],
                 external: &[],
                 explicit_space: false,
+                class_e: true,
             }),
             ipv6: true,
             primary: Some("eth0".to_string()),
@@ -1607,6 +1608,7 @@ mod tests {
                 included: &[],
                 external: &[],
                 explicit_space: false,
+                class_e: true,
             }),
             ipv6: false,
             primary: Some("eth0".to_string()),
@@ -2612,6 +2614,7 @@ mod tests {
             included: &[],
             external: &[],
             explicit_space: false,
+            class_e: true,
         });
         assert_ne!(next.routes, wanted().routes);
         f.mode.follow(next, false).await;
@@ -2638,6 +2641,7 @@ mod tests {
             included: &[],
             external: &[],
             explicit_space: false,
+            class_e: true,
         });
         assert_ne!(next.routes, wanted().routes);
         *f.backend.fail.lock().unwrap() = Some("routes".to_string());

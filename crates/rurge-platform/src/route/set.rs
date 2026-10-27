@@ -4,7 +4,9 @@
 //!
 //! A pure function of its inputs, so every platform tests it with data: the
 //! shape of the base prefixes, what is always subtracted, the complement of the
-//! holes, included winning over excluded, and rurge's own space staying in.
+//! holes, included winning over excluded, rurge's own space staying in, and
+//! what the platform's own way of routing `240.0.0.0/4` takes out (Windows
+//! only).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -27,6 +29,14 @@ pub struct RouteInputs<'a> {
     /// utun is point-to-point and its address brings no subnet route).
     /// Elsewhere the adapter's address brings it.
     pub explicit_space: bool,
+    /// The platform routes `240.0.0.0/4` as ordinary unicast (Linux, macOS).
+    /// Windows blocks that range by default in every version (draft-schoen-
+    /// intarea-unicast-240: "blocked by default in all versions of the
+    /// Microsoft Windows operating system"; `mstcpip.h`'s `Ipv4AddressType`
+    /// calls it `NlatInvalid`), so no route of it goes into the adapter
+    /// there — `netsh` would take none of them and the readback would call
+    /// every open short. See the phase 3 / M4d plan's execution record row 87.
+    pub class_e: bool,
 }
 
 /// The routes into the adapter: each family sorted, merged, each once.
@@ -66,6 +76,11 @@ const BASE_V6: [Ipv6Net; 9] = [
 
 /// The last IPv4 address: the broadcast, which never goes in (design 4.3).
 const BROADCAST_V4: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 255);
+
+/// The class E range, `240.0.0.0/4`: Windows routes none of it, so none of it
+/// goes into the adapter there (the phase 3 / M4d plan's execution record row
+/// 87; [`RouteInputs::class_e`]).
+const CLASS_E: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(240, 0, 0, 0), 4);
 
 /// What never goes into the adapter, whatever the profile says (design 4.3):
 /// loopback, link-local, multicast and broadcast. Multicast and broadcast are
@@ -234,6 +249,18 @@ impl RouteSet {
             v4 = carved;
         }
 
+        // Windows takes no route of `240.0.0.0/4`, whatever the profile says:
+        // it is carved out last, after `tun-included-routes` and aggregation,
+        // so that an included `0.0.0.0/0` or `240.0.0.0/4` does not bring it
+        // back either (the phase 3 / M4d plan's execution record row 87).
+        if !inputs.class_e {
+            let mut kept = Vec::with_capacity(v4.len());
+            for net in v4 {
+                complement_v4(net, &[CLASS_E], &mut kept);
+            }
+            v4 = kept;
+        }
+
         RouteSet {
             v4,
             // `Ipv6Net::aggregate` has the same edge at `u128::MAX` as the IPv4
@@ -343,6 +370,9 @@ mod tests {
             included: &[],
             external: &[],
             explicit_space: false,
+            // the algorithm tests want today's routes: every platform that
+            // routes `240.0.0.0/4` like ordinary unicast
+            class_e: true,
         }
     }
 
@@ -435,6 +465,87 @@ mod tests {
         // IPv6 has no hole here: its base set is seven prefixes, eight out of
         // 8000::/1 and 64:ff9b::/96 once fe80::/10 and ff00::/8 are out.
         assert_eq!(set.v6.len(), 16);
+    }
+
+    /// Windows routes none of `240.0.0.0/4`, so none of it goes into the
+    /// adapter there: 27 prefixes instead of 55, and the 28 left out are
+    /// exactly the class E range less the broadcast address (the phase 3 / M4d
+    /// plan's execution record row 87).
+    #[test]
+    fn windows_leaves_class_e_out() {
+        let unicast = RouteSet::compute(&inputs(false));
+        assert_eq!(unicast.v4.len(), 55);
+        assert_eq!(
+            unicast
+                .v4
+                .iter()
+                .filter(|net| CLASS_E.contains(&**net))
+                .count(),
+            28
+        );
+        let windows = RouteSet::compute(&RouteInputs {
+            class_e: false,
+            ..inputs(false)
+        });
+        assert_eq!(
+            windows.v4,
+            [
+                net4("1.0.0.0/8"),
+                net4("2.0.0.0/7"),
+                net4("4.0.0.0/6"),
+                net4("8.0.0.0/5"),
+                net4("16.0.0.0/4"),
+                net4("32.0.0.0/3"),
+                net4("64.0.0.0/3"),
+                net4("96.0.0.0/4"),
+                net4("112.0.0.0/5"),
+                net4("120.0.0.0/6"),
+                net4("124.0.0.0/7"),
+                net4("126.0.0.0/8"),
+                net4("128.0.0.0/3"),
+                net4("160.0.0.0/5"),
+                net4("168.0.0.0/8"),
+                net4("169.0.0.0/9"),
+                net4("169.128.0.0/10"),
+                net4("169.192.0.0/11"),
+                net4("169.224.0.0/12"),
+                net4("169.240.0.0/13"),
+                net4("169.248.0.0/14"),
+                net4("169.252.0.0/15"),
+                net4("169.255.0.0/16"),
+                net4("170.0.0.0/7"),
+                net4("172.0.0.0/6"),
+                net4("176.0.0.0/4"),
+                net4("192.0.0.0/3"),
+            ]
+        );
+        assert!(windows.v4.iter().all(|net| !CLASS_E.contains(net)));
+        assert!(!windows.contains(ip("240.0.0.1")));
+        assert!(!windows.contains(ip("255.255.255.254")));
+        assert!(windows.contains(ip("223.255.255.255")));
+    }
+
+    /// `tun-included-routes` cannot bring class E back where the platform does
+    /// not route it, however wide the item (the phase 3 / M4d plan's execution
+    /// record row 87).
+    #[test]
+    fn an_included_class_e_route_stays_out_where_the_platform_blocks_it() {
+        for item in ["240.0.0.0/4", "0.0.0.0/0"] {
+            let included = [net(item)];
+            let unicast = RouteSet::compute(&RouteInputs {
+                included: &included,
+                ..inputs(false)
+            });
+            assert!(unicast.contains(ip("240.0.0.1")), "{item}");
+            let windows = RouteSet::compute(&RouteInputs {
+                included: &included,
+                class_e: false,
+                ..inputs(false)
+            });
+            assert!(!windows.contains(ip("240.0.0.1")), "{item}");
+            assert!(!windows.contains(ip("255.255.255.254")), "{item}");
+            assert!(windows.contains(ip("1.1.1.1")), "{item}");
+        }
     }
 
     #[test]
@@ -562,6 +673,7 @@ mod tests {
             included: &included,
             external: &external,
             explicit_space: false,
+            class_e: true,
         });
         assert!(set.v6.is_empty());
         // The IPv4 items still do what they do.

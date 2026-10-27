@@ -343,6 +343,9 @@ fn routes_set(ipv6: bool, one_excluded: Option<&str>) -> RouteSet {
         included: &[],
         external: &[],
         explicit_space: cfg!(target_os = "macos"),
+        // what the executable installs here: Windows takes no route of
+        // `240.0.0.0/4` (the phase 3 / M4d plan's execution record row 87)
+        class_e: !cfg!(windows),
     })
 }
 
