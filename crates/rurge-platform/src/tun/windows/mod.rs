@@ -294,8 +294,9 @@ fn index(wintun: &Wintun, adapter: usize) -> io::Result<u32> {
                 return Err(io::Error::new(
                     error.kind(),
                     format!(
-                        "the virtual adapter has no interface index 5 seconds after it was made: \
-                         {error}"
+                        "the virtual adapter has no interface index {} seconds after it was made: \
+                         {error}",
+                        INDEX_WITHIN.as_secs()
                     ),
                 ));
             }
@@ -306,8 +307,9 @@ fn index(wintun: &Wintun, adapter: usize) -> io::Result<u32> {
 
 /// `packet` in `buf`, its length. A packet longer than the buffer is refused
 /// rather than cut short: what the first `buf.len()` bytes of it would be is
-/// not that packet. Wintun's packets are at most `0xFFFF` bytes (`wintun.h`
-/// has the ring's limit), so the TUN's read buffer is never too small.
+/// not that packet. Wintun's packets are at most [`wintun::MAX_PACKET`] bytes
+/// (`wintun.h`'s `WINTUN_MAX_IP_PACKET_SIZE`, the ring's limit too), so the
+/// TUN's read buffer is never too small.
 fn copy(packet: &[u8], buf: &mut [u8]) -> io::Result<usize> {
     if packet.len() > buf.len() {
         return Err(io::Error::new(

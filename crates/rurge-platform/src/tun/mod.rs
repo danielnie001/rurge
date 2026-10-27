@@ -34,9 +34,11 @@
 //! packet that is there and then moving what else is waiting is [`drain`]'s.
 //!
 //! `TunDevice::open` is what the platform's `System::open` calls, and no test
-//! calls it (M4c plan P19). It needs a tokio runtime: the descriptor is
-//! registered with the reactor of whichever thread's runtime is current, and a
-//! `spawn_blocking` thread has one.
+//! calls it (M4c plan P19). Linux and macOS need a tokio runtime: they register
+//! the descriptor with the reactor of whichever thread's runtime is current,
+//! and a `spawn_blocking` thread has one. Windows registers nothing — it starts
+//! the adapter's reader thread — and needs no runtime; a `spawn_blocking`
+//! thread is a blocking one there too.
 
 use std::io;
 use std::sync::Mutex;
@@ -97,8 +99,10 @@ pub struct TunDevice {
 }
 
 impl TunDevice {
-    /// Opens the adapter. Inside a tokio runtime (a `spawn_blocking` thread is):
-    /// the descriptor is registered with its reactor. Only the platform's
+    /// Opens the adapter. Linux and macOS register the descriptor with the
+    /// reactor of the current thread's runtime, so they run inside one (a
+    /// `spawn_blocking` thread is); Windows registers nothing, starts the
+    /// adapter's reader thread, and needs no runtime. Only the platform's
     /// `System::open` calls it, and no test does (M4c plan P19).
     pub fn open(spec: &DeviceSpec) -> io::Result<TunDevice> {
         let (imp, adapter) = Imp::open(spec)?;

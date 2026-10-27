@@ -37,6 +37,14 @@ const SIGNER: &str = "WireGuard LLC";
 /// execution record row 3).
 const FILE_SHARE_READ: u32 = 0x1;
 
+/// `WINTUN_MAX_IP_PACKET_SIZE` (`wintun.h`, `0xFFFF`): the largest packet a
+/// session's ring carries, and what `WintunAllocateSendPacket` says its
+/// `PacketSize` "Must be less or equal to". The user-mode side does not check
+/// it — a longer packet makes the driver take the whole send ring for broken,
+/// and every send after it is "full" — so the check is here (the phase 3 / M4d
+/// plan's execution record row 73).
+pub(super) const MAX_PACKET: usize = 0xFFFF;
+
 /// What the error says when the file is not there: where to get it, where it
 /// goes, and which option says somewhere else (plan task 3).
 const NOT_FOUND: &str = "cannot find wintun.dll (next to rurge.exe, or where --wintun-dll \
@@ -67,9 +75,10 @@ type Entry = unsafe extern "system" fn() -> isize;
 /// The pointers are [`Send`] and [`Sync`] like any function pointer, which is
 /// why the module handle is an integer: a pointer is neither (P4). Nothing is
 /// unloaded, so they are valid for as long as this is reachable.
-// The eleven entry points and the module handle are read by the functions
-// below, one call each: nothing here is unused (the phase 3 / M4d plan's
-// execution record row 55).
+// The eleven entry points are each read by one of the functions below; the
+// module handle is read by `loaded`'s DEBUG line, which says which module the
+// entry points came from. Nothing here is unused (the phase 3 / M4d plan's
+// execution record rows 55 and 69).
 pub(super) struct Wintun {
     /// `LoadLibraryExW`'s handle as an integer (P4). Never freed.
     pub(super) module: usize,
@@ -547,15 +556,11 @@ pub(super) fn receive(wintun: &Wintun, session: usize) -> io::Result<Option<Vec<
 pub(super) fn send(wintun: &Wintun, session: usize, packet: &[u8]) -> io::Result<bool> {
     use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
 
-    let size = u32::try_from(packet.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a packet for the virtual adapter is longer than 4 GiB",
-        )
-    })?;
+    let size = packet_size(packet)?;
     // SAFETY: `session` is a live session handle, and `size` is the packet's
-    // length, which `wintun.h` takes as a `u32`; the answer is room for that
-    // many bytes in the ring, or null.
+    // length, which is no more than `WINTUN_MAX_IP_PACKET_SIZE` (that is what
+    // `packet_size` answers, and `wintun.h` requires it); the answer is room
+    // for that many bytes in the ring, or null.
     let room = unsafe { (wintun.allocate_send)(session as SessionHandle, size) };
     if room.is_null() {
         let error = io::Error::last_os_error();
@@ -571,6 +576,20 @@ pub(super) fn send(wintun: &Wintun, session: usize, packet: &[u8]) -> io::Result
     // it, sent once: nothing writes into it after this.
     unsafe { (wintun.send)(session as SessionHandle, room) };
     Ok(true)
+}
+
+/// The length `WintunAllocateSendPacket` takes for `packet`: at most
+/// [`MAX_PACKET`] bytes, which is what `wintun.h` requires of its `PacketSize`.
+/// A longer packet is refused here rather than by the ring: the user-mode side
+/// does not check it, and the driver would take the whole send ring for broken.
+fn packet_size(packet: &[u8]) -> io::Result<u32> {
+    if packet.len() > MAX_PACKET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a packet for the virtual adapter is longer than 65535 bytes",
+        ));
+    }
+    Ok(packet.len() as u32)
 }
 
 /// `text` as Windows takes a name: UTF-16 with a NUL at the end. The names are
@@ -733,5 +752,24 @@ mod tests {
 
         let wintun = loaded(Path::new(&path)).expect("a signed wintun.dll is loaded");
         assert_ne!(wintun.module, 0, "the module handle is the load's answer");
+    }
+
+    /// A packet of the largest size the ring takes is that length; one byte
+    /// more is refused before the ring sees it, and says the limit
+    /// (`wintun.h`: the user-mode side does not check it, and the driver would
+    /// take the whole send ring for broken). Nothing here calls Wintun.
+    #[test]
+    fn a_packet_longer_than_wintun_takes_is_refused() {
+        assert_eq!(
+            packet_size(&vec![0u8; MAX_PACKET]).expect("the largest packet is taken"),
+            0xFFFF
+        );
+
+        let error = packet_size(&vec![0u8; MAX_PACKET + 1]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "a packet for the virtual adapter is longer than 65535 bytes"
+        );
     }
 }
