@@ -9,7 +9,8 @@
 //! (`tun`) and the `system` below.
 //!
 //! `system` gives a platform that has one in this version its own system —
-//! Linux's is [`linux::LinuxSystem`] — and [`Unsupported`] to the rest.
+//! Linux's is [`linux::LinuxSystem`], macOS's [`macos::MacSystem`] — and
+//! [`Unsupported`] to the rest.
 
 pub mod linux;
 pub mod macos;
@@ -90,7 +91,8 @@ pub trait System: Send + Sync {
 
 /// The system of this platform: its own where it has one in this version, and
 /// [`Unsupported`] elsewhere. Linux's is [`linux::LinuxSystem`], over the
-/// programs the system's own runner runs and the files under `/`. Scripts go
+/// programs the system's own runner runs and the files under `/`; macOS's is
+/// [`macos::MacSystem`], over the same runner and `/etc/resolv.conf`. Scripts go
 /// to `scratch` (the data directory's `enhanced`).
 #[cfg(target_os = "linux")]
 pub fn system(scratch: PathBuf) -> Box<dyn System> {
@@ -101,10 +103,23 @@ pub fn system(scratch: PathBuf) -> Box<dyn System> {
     ))
 }
 
+/// The system of this platform: its own where it has one in this version, and
+/// [`Unsupported`] elsewhere. macOS's is [`macos::MacSystem`], over the programs
+/// the system's own runner runs and `/etc/resolv.conf`. Scripts go to `scratch`
+/// (the data directory's `enhanced`).
+#[cfg(target_os = "macos")]
+pub fn system(scratch: PathBuf) -> Box<dyn System> {
+    Box::new(macos::MacSystem::new(
+        std::sync::Arc::new(crate::command::TimedRunner(STEP_TIMEOUT)),
+        "/etc/resolv.conf".into(),
+        scratch,
+    ))
+}
+
 /// The system of a platform that has none in this version: [`Unsupported`],
 /// which says so to every action. `scratch` (the data directory's `enhanced`)
 /// has nothing to hold here.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn system(_scratch: PathBuf) -> Box<dyn System> {
     Box::new(Unsupported)
 }

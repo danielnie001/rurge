@@ -90,6 +90,19 @@ pub fn utun_packet(datagram: &[u8]) -> Option<&[u8]> {
     Some(packet)
 }
 
+/// The IP packet in what a utun socket gave, moved to the front of `buf`: its
+/// length. `None` for a datagram that is no IP packet ([`utun_packet`]), and
+/// then nothing is moved.
+///
+/// The device's contract is the packet in the first `length` bytes of the
+/// buffer; utun leaves its four bytes of family before it, where a
+/// `TunDevice::recv` would take them for the packet's own (M4c plan task 7).
+pub fn utun_to_front(buf: &mut [u8], read: usize) -> Option<usize> {
+    let len = utun_packet(&buf[..read])?.len();
+    buf.copy_within(read - len..read, 0);
+    Some(len)
+}
+
 /// The platform whose words a failed open is explained in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Os {
@@ -204,6 +217,40 @@ mod tests {
         assert_eq!(utun_packet(&[]), None);
         assert_eq!(utun_packet(&[0, 0, 0]), None);
         assert_eq!(utun_packet(&DARWIN_AF_INET.to_be_bytes()), None);
+    }
+
+    /// What a utun socket gave, moved to the front of the buffer: the
+    /// `TunDevice` contract is the packet in `buf[..length]`, and utun puts the
+    /// four bytes of family before it in what was read.
+    #[test]
+    fn utun_to_front_moves_the_packet_to_the_front() {
+        for (family, packet) in [
+            (DARWIN_AF_INET, &[0x45u8, 0, 0, 20][..]),
+            (DARWIN_AF_INET6, &[0x60u8, 0, 0, 0, 0][..]),
+        ] {
+            let mut datagram = family.to_be_bytes().to_vec();
+            datagram.extend_from_slice(packet);
+            let read = datagram.len();
+            let mut buf = [0xEEu8; 64];
+            buf[..read].copy_from_slice(&datagram);
+
+            assert_eq!(utun_to_front(&mut buf, read), Some(packet.len()));
+            assert_eq!(&buf[..packet.len()], packet);
+        }
+
+        // no IP packet in it: a family utun does not give, only the four
+        // bytes, or nothing at all. Nothing is moved in any of them.
+        for (datagram, read) in [
+            (&[0, 0, 0, 1, 0x45, 0, 0, 20][..], 8),
+            (&DARWIN_AF_INET.to_be_bytes()[..], 4),
+            (&[][..], 0),
+        ] {
+            let mut buf = [0xEEu8; 16];
+            buf[..read].copy_from_slice(datagram);
+            let before = buf;
+            assert_eq!(utun_to_front(&mut buf, read), None, "{datagram:?}");
+            assert_eq!(buf, before, "{datagram:?}");
+        }
     }
 
     /// A read of the adapter gave a packet of that length; a read that gave

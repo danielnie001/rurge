@@ -10,8 +10,9 @@
 //! Adding a place that makes a socket, asks the system resolver or builds a
 //! connector without a hook means adding a row to the list and saying why —
 //! which function it is in, so that the row of the second place in a file is
-//! not taken for the row of the first. M4c and M4d have to do the same for the
-//! sockets they add for a device (the utun control socket on macOS).
+//! not taken for the row of the first. The utun control socket on macOS, which
+//! a device is opened with, has its row; M4d does the same for the sockets it
+//! adds for a device.
 //!
 //! Test code is skipped. A file is read up to the line of its first inline
 //! test module, `#[cfg(test)]` followed by `mod name {`: the repository's
@@ -54,7 +55,7 @@ const PATTERNS: [&str; 15] = [
 /// function that makes a second socket of the same kind has a row of its own.
 ///
 /// Adding a row means changing this list; so does removing one.
-const LISTED: [(&str, &str, &str); 24] = [
+const LISTED: [(&str, &str, &str); 25] = [
     (
         "crates/rurge-api/src/lib.rs",
         "TcpListener::bind(",
@@ -124,6 +125,11 @@ const LISTED: [(&str, &str, &str); 24] = [
         "crates/rurge-platform/src/netenv/watch.rs",
         "Socket::new(",
         "the macOS routing socket (`AF_ROUTE`), which does not go out",
+    ),
+    (
+        "crates/rurge-platform/src/tun/macos.rs",
+        "Socket::new(",
+        "`Device::open`: utun's kernel control socket (`AF_SYSTEM`), which does not go out",
     ),
     (
         "crates/rurge-proto-wireguard/src/stack.rs",
