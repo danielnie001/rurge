@@ -74,6 +74,10 @@ pub trait System: Send + Sync {
     fn give_dns_back(&self, dev: &Adapter) -> Result<(), String>;
     fn adjust_saved(&self, primary: Option<&str>, saved: &[Saved])
     -> Result<Option<Saved>, String>;
+    /// Loosens what `adjust_saved` asked for, or what `saved` holds already —
+    /// written again then, so that another program applying the system's
+    /// settings over it is undone by the next change of network. Not called
+    /// when neither says so (the phase 3 / M4c plan's execution record row 40).
     fn adjust(&self) -> Result<(), String>;
     /// Puts one saved thing back: on a close, and after a crash. A kind this
     /// platform never saves is dropped with a warning (M4c plan P9).

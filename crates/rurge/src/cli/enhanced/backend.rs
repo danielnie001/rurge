@@ -77,6 +77,10 @@ pub trait Backend: Send + Sync {
     /// primary interface, with what to put back; `None` when it need not be,
     /// or when `saved` has it already.
     fn adjust_undo(&self, primary: Option<&str>, saved: &[Undo]) -> Result<Option<Undo>, String>;
+    /// Loosens what `adjust_undo` asked for, or what `saved` holds already —
+    /// written again then, so that another program applying the system's
+    /// settings over it is undone by the next change of network. Not called
+    /// when neither says so (the phase 3 / M4c plan's execution record row 40).
     fn adjust(&self) -> Result<(), String>;
     /// Puts one saved thing back: on a close, and after a crash.
     fn undo(&self, undo: &Undo) -> Result<(), String>;

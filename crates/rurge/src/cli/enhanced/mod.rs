@@ -802,6 +802,12 @@ impl EnhancedMode {
                 return;
             }
         }
+        // the open's rule (the phase 3 / M4c plan's execution record row 40):
+        // write it when this network asks for it or the backup has it already,
+        // and leave a machine that needs no loosening alone
+        if !saved.iter().any(|undo| undo.stage() == Stage::Adjust) {
+            return;
+        }
         let backend = self.backend.clone();
         if let Err(e) = call(move || backend.adjust()).await {
             self.failed("adjust", &e);
@@ -927,7 +933,12 @@ impl EnhancedMode {
         (self.links.system_dns_changed)();
         taken?;
 
-        // 8. the system's own adjustments, the same way
+        // 8. the system's own adjustments, the same way. `rp_filter` is
+        // loosened only where it has to be: `adjust_undo` says this network
+        // needs it, or the backup holds a loosening already — written then so
+        // that another program applying `sysctl.d` over it is undone by the
+        // next change of network (the phase 3 / M4c plan's execution record
+        // row 40).
         let backend = self.backend.clone();
         let have = undo.clone();
         let primary = wanted.primary.clone();
@@ -936,9 +947,13 @@ impl EnhancedMode {
             undo.push(one);
             self.save_undo(&undo).await?;
         }
+        // the stage was reached whether or not it wrote anything: a close
+        // undoes what the backup holds for it
         on.adjust = true;
-        let backend = self.backend.clone();
-        call(move || backend.adjust()).await?;
+        if undo.iter().any(|undo| undo.stage() == Stage::Adjust) {
+            let backend = self.backend.clone();
+            call(move || backend.adjust()).await?;
+        }
 
         // 9. say that it is on (P16: the flag follows all of it, not the TUN)
         self.store.update(|s| s.features.enhanced_mode = true).await;
@@ -1123,6 +1138,10 @@ mod tests {
         /// Whether `physical_dns` panics: a read that does not come back, as a
         /// backend whose task dies would leave it.
         physical_panics: Arc<AtomicBool>,
+        /// Whether `adjust_undo` answers `None`: as Linux does when the
+        /// interface's effective value is not 1, or when there is no interface
+        /// to read yet (the phase 3 / M4c plan's execution record row 40).
+        no_adjust: Arc<AtomicBool>,
     }
 
     impl Mock {
@@ -1268,6 +1287,9 @@ mod tests {
             saved: &[Undo],
         ) -> Result<Option<Undo>, String> {
             self.step("adjust_undo")?;
+            if self.no_adjust.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             let adjust = Undo::Test {
                 step: "adjust".to_string(),
             };
@@ -1969,6 +1991,79 @@ mod tests {
                 ("adjust".to_string(), lines(&["take_dns", "adjust"])),
             ],
             "each step finds its undo action in state.json already"
+        );
+    }
+
+    /// No loosening is asked for (the interface's effective value is not 1):
+    /// an open that finds a backup without one leaves `net.ipv4.conf.all`
+    /// alone, and keeps no undo action for it (the phase 3 / M4c plan's
+    /// execution record row 40).
+    #[tokio::test]
+    async fn a_machine_that_needs_no_loosening_is_left_alone() {
+        let mut f = fixture(true).await;
+        f.backend.no_adjust.store(true, Ordering::SeqCst);
+
+        f.mode.enable(wanted()).await.unwrap();
+
+        let calls = f.backend.calls.list();
+        assert!(
+            calls.contains(&"adjust_undo".to_string()),
+            "it is asked whether one is needed: {calls:?}"
+        );
+        assert!(
+            !calls.contains(&"adjust".to_string()),
+            "and none is written: {calls:?}"
+        );
+        assert_eq!(
+            f.store.snapshot().await.enhanced_backup,
+            Some(json!({"undo": [{"kind": "test", "step": "take_dns"}]})),
+            "the backup holds the takeover alone"
+        );
+    }
+
+    /// The backup says the machine was loosened once: writing it again is
+    /// idempotent, and it is what puts it back after another program applied
+    /// `sysctl.d` over it — so it is written even when `adjust_undo` asks for
+    /// none (the phase 3 / M4c plan's execution record row 40).
+    #[tokio::test]
+    async fn a_loosening_in_the_backup_is_written_again_when_none_is_asked_for() {
+        let mut f = fixture(true).await;
+        f.backend.no_adjust.store(true, Ordering::SeqCst);
+        f.store
+            .update(|s| {
+                s.enhanced_backup = Some(json!({"undo": [{"kind": "test", "step": "adjust"}]}));
+            })
+            .await;
+
+        f.mode.enable(wanted()).await.unwrap();
+
+        let calls = f.backend.calls.list();
+        assert!(
+            calls.contains(&"adjust".to_string()),
+            "what the backup holds is written again: {calls:?}"
+        );
+    }
+
+    /// A change of network goes the same way as the open: nothing asked for
+    /// and nothing in the backup, nothing is written (the phase 3 / M4c
+    /// plan's execution record row 40).
+    #[tokio::test]
+    async fn a_change_of_network_does_not_loosen_what_need_not_be() {
+        let mut f = fixture(true).await;
+        f.backend.no_adjust.store(true, Ordering::SeqCst);
+        f.mode.enable(wanted()).await.unwrap();
+
+        f.mode.follow(wanted(), true).await;
+
+        let calls = f.backend.calls.list();
+        assert_eq!(
+            calls.iter().filter(|call| *call == "adjust_undo").count(),
+            2,
+            "the open and the change of network both asked: {calls:?}"
+        );
+        assert!(
+            !calls.contains(&"adjust".to_string()),
+            "neither wrote: {calls:?}"
         );
     }
 
