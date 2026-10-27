@@ -60,11 +60,15 @@ pub fn service_devices(text: &str) -> Vec<(String, String)> {
 }
 
 /// A line of `-listnetworkserviceorder` that starts a service: `(1) Wi-Fi`,
-/// `(*) Bluetooth PAN`. The line that follows one starts with `(` too —
-/// `(Hardware Port: …, Device: …)` — and has nothing after its `)`, so it is
-/// not one.
+/// `(*) Bluetooth PAN`. What is in the brackets is a number or `*` and nothing
+/// else: a hardware port whose name holds a `)` — `(Hardware Port: Foo (bar),
+/// Device: en7)` — is not a service line, though its `(` and `)` would suggest
+/// it.
 fn numbered_service(line: &str) -> Option<String> {
-    let (_, name) = line.strip_prefix('(')?.split_once(')')?;
+    let (number, name) = line.strip_prefix('(')?.split_once(')')?;
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit() || c == '*') {
+        return None;
+    }
     let name = name.trim();
     match name.is_empty() {
         true => None,
@@ -452,7 +456,9 @@ impl System for MacSystem {
     /// The servers outside the enhanced mode (design 6.3, P10): before the first
     /// network change what `/etc/resolv.conf` held just before the takeover;
     /// after it, the servers the main interface's service had set by hand, or
-    /// the ones DHCP gave it, or none at all.
+    /// the ones DHCP gave it, or none at all. Never the responder: a service the
+    /// user pointed at `198.18.0.2` by hand would send rurge's own lookups to an
+    /// address this machine cannot reach (R16).
     fn physical_dns(
         &self,
         primary: Option<&str>,
@@ -491,21 +497,16 @@ impl System for MacSystem {
                 .iter()
                 .filter_map(mac_dns)
                 .find(|(name, _)| *name == service)
-                .map(|(_, servers)| servers)
+                .map(|(_, servers)| dns::without_rurge_space(servers.iter().copied()))
             && !servers.is_empty()
         {
-            return Some(servers.clone());
+            return Some(servers);
         }
 
-        // no server set by hand: the ones DHCP gave the interface
+        // no server set by hand — or none outside the enhanced mode: the ones
+        // DHCP gave the interface
         match self.ipconfig(&["getpacket", primary]) {
-            Ok(text) => {
-                let servers = dhcp_dns(&text);
-                match servers.is_empty() {
-                    true => Some(Vec::new()),
-                    false => Some(servers),
-                }
-            }
+            Ok(text) => Some(dns::without_rurge_space(dhcp_dns(&text))),
             Err(e) => {
                 tracing::debug!(
                     error = %e,
@@ -561,6 +562,9 @@ mod tests {
         "\n",
         "(*) Bluetooth PAN\n",
         "(Hardware Port: Bluetooth PAN, Device: en6)\n",
+        "\n",
+        "(3) USB 2.0 Hub (left)\n",
+        "(Hardware Port: USB 2.0 Hub (left), Device: en7)\n",
         "\n",
         "(4) Thunderbolt Bridge\n",
         "(Hardware Port: Thunderbolt Bridge, Device: )\n",
@@ -628,7 +632,8 @@ mod tests {
     }
 
     /// Each service with the device it goes through, disabled ones too; the
-    /// one whose device is empty is left out.
+    /// one whose device is empty is left out. A hardware port with a `)` in its
+    /// name is still no service line, and its service is still paired.
     #[test]
     fn service_devices_pair_each_service_with_its_device() {
         let pairs = service_devices(SERVICE_ORDER);
@@ -638,6 +643,7 @@ mod tests {
                 ("Wi-Fi".to_string(), "en0".to_string()),
                 ("USB 10/100/1000 LAN".to_string(), "en5".to_string()),
                 ("Bluetooth PAN".to_string(), "en6".to_string()),
+                ("USB 2.0 Hub (left)".to_string(), "en7".to_string()),
             ]
         );
         assert!(!pairs.iter().any(|(name, _)| name == "Thunderbolt Bridge"));
@@ -1059,6 +1065,27 @@ mod tests {
         assert_eq!(
             system.physical_dns(Some("en0"), &backup, true),
             Some(Vec::new())
+        );
+    }
+
+    /// A service the user pointed at the responder by hand — the way 5.2's
+    /// warning suggests — is no server of the network either: rurge's own
+    /// lookups would go to an address this machine cannot reach. After a change
+    /// the DHCP servers of the main interface are used instead (R16).
+    #[test]
+    fn a_saved_responder_is_no_physical_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        runner.reply(
+            "/usr/sbin/networksetup -listnetworkserviceorder",
+            SERVICE_ORDER,
+        );
+        runner.reply("/usr/sbin/ipconfig getpacket en0", PACKET);
+        let system = system_of(dir.path(), &runner);
+
+        assert_eq!(
+            system.physical_dns(Some("en0"), &[saved("Wi-Fi", &["198.18.0.2"])], true),
+            Some(vec![ip("192.168.4.1")])
         );
     }
 
