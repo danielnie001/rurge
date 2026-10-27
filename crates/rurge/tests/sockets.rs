@@ -68,7 +68,7 @@ const LISTED: [(&str, &str, &str); 24] = [
     (
         "crates/rurge-engine/src/stack.rs",
         "NoopSocketHook)",
-        "`resource_client()`: the commands that do not run an engine (`check` and the like) and the tests; the daemon's two download clients use `resource_client_with`",
+        "`resource_client()`: the download of the profile's remote sources while `rurge run` starts, before it has an engine (`run.rs`'s own row), and the tests; the daemon's two download clients use `resource_client_with`",
     ),
     (
         "crates/rurge-engine/src/stack.rs",
@@ -168,7 +168,7 @@ const LISTED: [(&str, &str, &str); 24] = [
     (
         "crates/rurge/src/cli/run.rs",
         "resource_client(",
-        "`waiting`: the run that has not built its engine yet, which asks nothing of the network with it",
+        "`wait_for_the_sources`: the downloads of the profile's remote sources before the engine is built; the enhanced mode cannot be on yet, so there is no egress table and a hook would answer that nothing is bound",
     ),
     (
         "crates/rurge/src/cli/runtime.rs",

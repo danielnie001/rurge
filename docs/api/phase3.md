@@ -604,7 +604,7 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 
 #### 资源下载与 Profile 来源
 
-守护进程下载外部资源与 Profile 来源用的是 `resource_client_with(钩子, OwnResolve)`：直连带平台钩子（所以按出口绑网卡），名字由 `OwnResolve` 查——平时是系统解析库，接管期间（`enhanced_mode()` 为真、且这一代的解析器已经发布）改问这一代的解析器，于是拿到真地址。不起引擎的命令（`rurge check` 一类）与用例用 `resource_client()`，不绑、走系统解析库。
+守护进程下载外部资源与 Profile 来源用的是 `resource_client_with(钩子, OwnResolve)`：直连带平台钩子（所以按出口绑网卡），名字由 `OwnResolve` 查——平时是系统解析库，接管期间（`enhanced_mode()` 为真、且这一代的解析器已经发布）改问这一代的解析器，于是拿到真地址。一个例外：`rurge run` 启动时、引擎建起来之前等 Profile 来源的那一次下载（`run.rs` 的 `wait_for_the_sources`）用 `resource_client()`：那时引擎还没有、增强模式还开不了，出口表是空的，带了钩子也只会答“不绑”；用例也用它（不绑、走系统解析库），不起引擎的命令（`rurge check` 一类）不下载、也不调它。
 
 #### ICMP 回显
 
