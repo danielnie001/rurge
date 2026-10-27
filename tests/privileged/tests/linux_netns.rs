@@ -224,6 +224,13 @@ fn rurges_own_dns_queries_do_not_enter_the_adapter() {
 /// `kill -9` with the enhanced mode on: the next start puts back what the dead
 /// run left in `state.json` and says so. On Linux that is `rp_filter`, which
 /// `/proc/sys` keeps per namespace and which outlives the process.
+///
+/// This is the main path of the recovery: the Profile has no remote sources,
+/// so the start waits for none and restores where the run itself starts; the
+/// line that says so is INFO, and INFO goes to standard output. The other
+/// path — before the Profile's remote sources are waited for (R10) — is
+/// tested with the file backend in `crates/rurge/tests/run/enhanced_mode.rs`;
+/// this test does not go through it.
 #[test]
 fn a_killed_run_is_undone_by_the_next_start() {
     if !permitted() {
@@ -247,22 +254,37 @@ fn a_killed_run_is_undone_by_the_next_start() {
 
     let mut run = lab.start_rurge(&profile, &data, true);
     run.wait_for_the_enhanced_mode();
-    assert_eq!(
-        lab.rp_filter(&ns, "all"),
-        "2",
-        "the enhanced mode did not loosen the strict rp_filter"
-    );
+    // Loosening `all` may wait for the network task to read the network: an
+    // open with no primary interface yet does it at the first change of
+    // network (`adjust_again`), so the value is read for a while rather than
+    // once — ten seconds, a read every 100 milliseconds (the phase 3 / M4c
+    // plan's execution record rows 40 and 41).
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let all = lab.rp_filter(&ns, "all");
+        if all == "2" {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "the enhanced mode did not loosen the strict rp_filter: all is {all}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     // gone, as a crash leaves it: no chance to put anything back
     lab.kill(run.id);
     lab.await_the_adapter_gone();
 
-    // the next start, this time without the enhanced mode, undoes it
+    // the next start, this time without the enhanced mode, undoes it. The
+    // line is INFO on standard output, the main path's: standard error would
+    // have the R10 path's warning, which this Profile does not take (the
+    // phase 3 / M4c plan's execution record row 41).
     let mut next = lab.start_rurge(&profile, &data, false);
-    next.stderr.wait_for(
+    next.stdout.wait_for(
         Duration::from_secs(30),
-        "the line that says what the dead run left was undone",
-        |line| line.contains("a previous run left changes of the enhanced mode; they were undone"),
+        "the line that says what the dead run left was restored",
+        |line| line.contains("restored what the enhanced mode left last time"),
     );
     assert_eq!(
         lab.rp_filter(&ns, "all"),
@@ -551,7 +573,7 @@ impl Lab {
         Started {
             id: self.children.len() - 1,
             stdout,
-            stderr,
+            _stderr: stderr,
         }
     }
 
@@ -668,7 +690,10 @@ impl Drop for Lab {
 struct Started {
     id: usize,
     stdout: Lines,
-    stderr: Lines,
+    /// Read line by line, and kept: dropping it would stop the reader thread
+    /// and let the pipe fill. No test here waits on it — the line a close or
+    /// a recovery writes to standard error is in the CLI tests.
+    _stderr: Lines,
 }
 
 impl Started {
