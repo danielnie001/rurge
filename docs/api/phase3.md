@@ -642,11 +642,11 @@ TUN 的 `Pinger` 现在是可执行文件的 `PlatformPinger`（`crates/rurge/sr
 
 阶段 3 / M4c（计划 `docs/superpowers/plans/2026-10-26-phase3-m4c-linux-macos-plan.md`，下面写“M4c 记录第 N 行”“M4c 延后第 N 行”指它末尾的两张表，写“P N”指它的「计划期决定」）做的是这两个平台的系统一侧：虚拟网卡、地址与路由、系统 DNS 的接管、Linux 的 `rp_filter`，以及接管期间问哪里的 DNS 服务器。**本节订正上面几句，那是 M4a 与 M4b 当时的事实**（规矩是历史的段落不逐处改、由后写的段落订正）：
 
-- M4 一节开头粗体的“这一版开不了增强模式”与它下面三条，在 Linux 与 macOS 上不成立了：`rurge run --enhanced-mode` 与 `POST /v1/features/enhanced_mode` 带 `{"enabled": true}` 有了平台后端的代码（不再答“不可用”），照代码会建虚拟网卡、配地址、装路由、接管系统 DNS，Linux 上按需要改 `net.ipv4.conf.all.rp_filter`；**这段代码一次也没有编译过（开发机编译不到，CI 还没有见过）、真机上没有跑过**。**Windows 上照旧**：平台后端仍是 `Unsupported`，答 `the enhanced mode is not available on this platform in this version`，以 M4d 为准。
-- 「只供测试的后端」里“（这一版对每个动作答‘不可用’）”与 M4b 一节里“平台后端仍然答‘这一版还不能’，所以使用者仍然开不了增强模式”同样以这一段为准：不设 `RURGE_ENHANCED_BACKEND` 时，Linux 与 macOS 用的是这一节说的平台后端的代码（照代码会做那些事；这段代码一次也没有编译过、真机上没有跑过），Windows 才是那个什么都答不行的 `Unsupported`。上面的出口判定、接管期间的 DNS、外部程序一律 DIRECT 那几节写的道理不变，只是 `physical` 从此有人写。
+- M4 一节开头粗体的“这一版开不了增强模式”与它下面三条，在 Linux 与 macOS 上不成立了：`rurge run --enhanced-mode` 与 `POST /v1/features/enhanced_mode` 带 `{"enabled": true}` 有了平台后端的代码（不再答“不可用”），照代码会建虚拟网卡、配地址、装路由、接管系统 DNS，Linux 上按需要改 `net.ipv4.conf.all.rp_filter`；**其中开设备的代码与挑平台的 `cfg` 一次也没有编译过（这台开发机编译不到，CI 还没有见过），动系统的那一半在这台开发机上编译、只用假的执行器测过，真机上都没有跑过**。**Windows 上照旧**：平台后端仍是 `Unsupported`，答 `the enhanced mode is not available on this platform in this version`，以 M4d 为准。
+- 「只供测试的后端」里“（这一版对每个动作答‘不可用’）”与 M4b 一节里“平台后端仍然答‘这一版还不能’，所以使用者仍然开不了增强模式”同样以这一段为准：不设 `RURGE_ENHANCED_BACKEND` 时，Linux 与 macOS 用的是这一节说的平台后端的代码（照代码会做那些事；开设备与挑平台的代码一次也没有编译过，动系统的一半只用假的执行器测过，真机上都没有跑过），Windows 才是那个什么都答不行的 `Unsupported`。上面的出口判定、接管期间的 DNS、外部程序一律 DIRECT 那几节写的道理不变，只是 `physical` 从此有人写。
 - 下面「没有覆盖的」一节里的“没有真实的设备”、“接管期间的去处只在单元用例里”那句里的“`physical` 今天没有人写（M4c）”、与“防环没有在真机上验过”里“随 M4c 接上平台后端”那半句，也都不成立了；今天还没有做到的事以本节末尾的「没有覆盖的」为准。
 
-**这两个平台的代码在这台 Windows 开发机上编译不到，CI 还没有见过 M4c 的提交**（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986），真机上没有跑过。所以下面写的是代码的行为，不是观察到的行为。
+**这两个平台开设备与挑平台的代码在这台 Windows 开发机上编译不到，CI 还没有见过 M4c 的提交**（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986）；动系统的那一半不带 `cfg`，在这台开发机上编译、只用假的执行器测过；真机上都没有跑过。所以下面写的是代码的行为，不是观察到的行为。
 
 #### 打开时改了什么，怎样回去
 
@@ -751,7 +751,7 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
 
 #### 没有覆盖的
 
-- **两个平台的设备与系统改动没有在真机上跑过**：Linux 与 macOS 的代码在这台 Windows 开发机上编译不到，CI 还没有见过 M4c 的提交（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986）；设备、地址、路由、`networksetup` 那几条命令一条也没有在真机上执行过。系统一侧（`LinuxSystem` / `MacSystem`）只在开发机上用假的执行器与临时目录测过。
+- **两个平台的设备与系统改动没有在真机上跑过**：Linux 与 macOS 开设备与挑平台的代码在这台 Windows 开发机上编译不到，CI 还没有见过 M4c 的提交（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986）；设备、地址、路由、`networksetup` 那几条命令一条也没有在真机上执行过。系统一侧（`LinuxSystem` / `MacSystem`）只在开发机上用假的执行器与临时目录测过。
 - **L2 特权用例写好了，没有运行过**（计划任务 9；门控与跑法见 `docs/testing.md` 的「阶段 3 / M4c 起」与 `tests/privileged/README.md`）：经虚拟网卡的一个往返、rurge 自己的 DNS 查询不进虚拟网卡、`rp_filter` 的放宽与写回，都还没有在虚拟机上跑过。
 - **macOS 的 `-listnetworkserviceorder` 输出格式与公开的样本对得上**（两个出处：Apple Support Communities 的帖子贴的原样输出，每个服务两行 `(N) 名字` 与下一行 `(Hardware Port: …, Device: …)`，VPN 服务的 `Device:` 可以是空的、服务名里可以有括号；Jamf Nation 的帖子是另一种排版的同一份）：服务与网卡的配对、与 `ipconfig getpacket` 周围的行走仍要等手工清单核对（M4d；M4c 记录第 49 行、延后第 2 行仍然开着）。
 - **交给管理器的物理网卡服务器没有端到端用例**：`run.rs` 里把 `physical` 交给管理器的那一行没有用例走到（`server:system` 在测试里会去问这台机器真的系统 DNS，失败时就离开了回环，`CLAUDE.md`「测试约定」）。

@@ -361,9 +361,9 @@ M4b 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 
 ### M4c（Linux 与 macOS）
 
-M4c 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4c-linux-macos-plan.md`，下面写“M4c 记录第 N 行”“M4c 延后第 N 行”指它末尾的两张表，写“P N”指它的「计划期决定」）。**上一节 M4b 的四条以这一段为准**（那四条是当时的事实；规矩是历史的段落不逐处改、由后写的段落订正）：“这一版 `rurge run --enhanced-mode` 在每个平台上仍然以 1 退出”不成立了——**Linux 与 macOS 上有了平台后端的代码（不再答“不可用”），照代码会开增强模式**；这段代码一次也没有编译过（开发机编译不到，CI 还没有见过）、真机上没有跑过；“`physical` 没有人写”不成立了——两个平台各有一段（见下面）；“防环……随 M4c 接上平台后端”里的那半句也不成立了——`PlatformBackend::subnets` 现在真的读本机网卡，三条 L2 用例就是为它写的（但没有运行过，所以 M4b 延后第 11 行仍然开着）；“设计第 14 节的 L2 特权用例还没有写”不成立了——写好了，没有运行过。M4c 由协调的会话逐个任务调 Pi 做、逐个任务评审；任务 10（等 CI）与 M4d 的任务 8 挪到最后一起做（协调者的裁定 R3，M4c 记录第 9 行），所以做完任务 9 接着做任务 11，不在任务 11 之后停下。
+M4c 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4c-linux-macos-plan.md`，下面写“M4c 记录第 N 行”“M4c 延后第 N 行”指它末尾的两张表，写“P N”指它的「计划期决定」）。**上一节 M4b 的四条以这一段为准**（那四条是当时的事实；规矩是历史的段落不逐处改、由后写的段落订正）：“这一版 `rurge run --enhanced-mode` 在每个平台上仍然以 1 退出”不成立了——**Linux 与 macOS 上有了平台后端的代码（不再答“不可用”），照代码会开增强模式**；其中开设备的代码与挑平台的 `cfg` 一次也没有编译过（这台开发机编译不到，CI 还没有见过），动系统的那一半在这台开发机上编译、只用假的执行器测过，真机上都没有跑过；“`physical` 没有人写”不成立了——两个平台各有一段（见下面）；“防环……随 M4c 接上平台后端”里的那半句也不成立了——`PlatformBackend::subnets` 现在真的读本机网卡，三条 L2 用例就是为它写的（但没有运行过，所以 M4b 延后第 11 行仍然开着）；“设计第 14 节的 L2 特权用例还没有写”不成立了——写好了，没有运行过。M4c 由协调的会话逐个任务调 Pi 做、逐个任务评审；任务 10（等 CI）与 M4d 的任务 8 挪到最后一起做（协调者的裁定 R3，M4c 记录第 9 行），所以做完任务 9 接着做任务 11，不在任务 11 之后停下。
 
-做了什么：一句话说，这两个平台的增强模式从“只生成为数据”变成有了动系统的代码（照代码会建虚拟网卡、配地址、装路由、接管系统 DNS 并交还、需要时改 Linux 的 `rp_filter`，以及接管期间问物理网卡的哪些服务器），但这段代码一次也没有编译过、真机上没有跑过：
+做了什么：一句话说，这两个平台的增强模式从“只生成为数据”变成有了动系统的代码（照代码会建虚拟网卡、配地址、装路由、接管系统 DNS 并交还、需要时改 Linux 的 `rp_filter`，以及接管期间问物理网卡的哪些服务器），但开设备与挑平台的代码一次也没有编译过、动系统的一半只用假的执行器测过，真机上都没有跑过（一次也没有编译过的是哪些，见下面「本机没有编译过的代码」一条）：
 
 - **设备的接口与帧**（`crates/rurge-platform/src/tun/`）：`mod.rs` 定接口约定（`open` / `read` / `try_read` / `try_write` / `no_room`）与平台无关的三块——`drain`（先把等到的那一个放进去，再把已经在了的搬出来）、`write_all`（写不进就丢、计数，第一次 WARN、之后 DEBUG）、`RX_MAX` 64 KiB；`frame.rs` 不带 `cfg`（`ifname`、`name_of`、`packet_len`、`utun_header`、`utun_packet`、`utun_to_front`、`explained`），在本机能测；`unsupported.rs` 给没有设备的平台。
 - **两个平台真的设备**：Linux 的 `/dev/net/tun`（`tun/linux.rs`，`set_iff` 包 `ioctl(TUNSETIFF)`、`IFF_TUN | IFF_NO_PI`）、macOS 的 utun（`tun/macos.rs`，`utun_connect` 包 `ioctl(CTLIOCGINFO)`、`connect` 与 `getsockopt(UTUN_OPT_IFNAME)`）；两个 `unsafe` 函数进 `LISTED`（现在 9 个），`CLAUDE.md` 同步。
@@ -380,7 +380,7 @@ M4c 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 
 没做的，与不要当成已经有的：
 
-- **两个平台的设备与系统改动没有在真机上跑过**：Linux 与 macOS 的代码在这台 Windows 开发机上编译不到，CI 还没有见过 M4c 的提交（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986）；系统一侧只在开发机上用假的执行器与临时目录测过，`ifconfig` / `route` / `networksetup` / `ip` / `resolvectl` 一条也没有在真机上执行过。
+- **两个平台的设备与系统改动没有在真机上跑过**：Linux 与 macOS 开设备与挑平台的代码在这台 Windows 开发机上编译不到，CI 还没有见过 M4c 的提交（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986）；系统一侧只在开发机上用假的执行器与临时目录测过，`ifconfig` / `route` / `networksetup` / `ip` / `resolvectl` 一条也没有在真机上执行过。
 - **L2 的用例没有运行过**：`tests/privileged` 写好、在本机只编译到 `#![cfg(target_os = "linux")]` 之后是一个空文件；在虚拟机上跑要项目所有者决定（总设计 Q4）。
 - **`PlatformDevice` 的两个 future 在 Linux / macOS 上是不是 `Send` 没有编译过**（任务 8 的顾虑）：`rurge_net::BoxFuture` 要求 `Send`，而 `crates/rurge/src/cli/enhanced/device.rs` 的 `Box::pin(self.0.recv(…))` / `send(…)` 要等 `TunDevice` 的那两个 `async fn` 在带 `cfg` 的平台上也是 `Send`；只有 CI 的 Linux 与 macOS 编得到那一段（`recv` 里那把 `Mutex` 的守卫在 `await` 两侧各自取、各自放，正是为此）。
 - **`physical` 交给管理器的那一行没有端到端用例**：`run.rs` 里把它写进 `Links` 的那一处没有用例走到（`server:system` 在测试里会去问这台机器真的系统 DNS，失败时就离开了回环，`CLAUDE.md`「测试约定」）。
