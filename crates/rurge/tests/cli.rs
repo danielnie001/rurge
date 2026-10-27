@@ -53,6 +53,10 @@ fn unknown_network() -> (&'static str, String) {
 /// routes and DNS, and no test that is not about it may get near that. A test
 /// that wants the file backend sets the variable after the constructor
 /// (`.env("RURGE_ENHANCED_BACKEND", format!("file:{}", path.display()))`).
+///
+/// A `RURGE_WINTUN_DLL` in the developer's own environment is dropped: where
+/// `wintun.dll` is is Windows's business, and off Windows the option ends a
+/// start as a usage error (the phase 3 / M4d plan's execution record row 17).
 fn rurge_command() -> Command {
     let mut cmd = Command::cargo_bin("rurge").unwrap();
     cmd.envs(default_directories())
@@ -60,7 +64,8 @@ fn rurge_command() -> Command {
         .env("RURGE_PROCESS_BACKEND", "off")
         .env("RURGE_ENHANCED_BACKEND", "off")
         .env_remove("RURGE_DATA_DIR")
-        .env_remove("RURGE_LOG_FILE");
+        .env_remove("RURGE_LOG_FILE")
+        .env_remove("RURGE_WINTUN_DLL");
     cmd
 }
 
@@ -74,7 +79,8 @@ fn rurge_process() -> std::process::Command {
         .env("RURGE_PROCESS_BACKEND", "off")
         .env("RURGE_ENHANCED_BACKEND", "off")
         .env_remove("RURGE_DATA_DIR")
-        .env_remove("RURGE_LOG_FILE");
+        .env_remove("RURGE_LOG_FILE")
+        .env_remove("RURGE_WINTUN_DLL");
     cmd
 }
 
@@ -147,6 +153,43 @@ fn help_says_that_a_listen_option_replaces_every_address_of_its_kind() {
 }
 
 use std::fs;
+
+/// `--wintun-dll` is an option of every platform's `rurge run`, so that a
+/// start written for Windows reads the same everywhere; off Windows it is a
+/// usage error rather than a value silently dropped (M4 design 9.6). It ends a
+/// start before anything is read: the profile is not loaded and the data
+/// directory is not made.
+///
+/// Compiled on Windows as well, but only run elsewhere: there the option is
+/// the ordinary one, and a start carrying it would go on to the platform
+/// backend — which opens a device, which no test may do on this machine (the
+/// M4d plan's P19).
+#[cfg_attr(not(windows), test)]
+#[cfg_attr(windows, allow(dead_code))]
+fn the_wintun_dll_option_is_a_usage_error_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write(&dir, "t.conf", VALID);
+    let data = dir.path().join("data");
+    let out = rurge_command()
+        .args(["run", "-c"])
+        .arg(&conf)
+        .arg("--data-dir")
+        .arg(&data)
+        .arg("--wintun-dll")
+        .arg(dir.path().join("elsewhere/wintun.dll"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("error: --wintun-dll is only for Windows"),
+        "{stderr}"
+    );
+    assert!(
+        !data.exists(),
+        "the start left a data directory behind: {data:?}"
+    );
+}
 
 const VALID: &str = "[General]\nloglevel = notify\n[Rule]\nGEOIP,CN,DIRECT\nFINAL,DIRECT\n";
 const WARNING: &str = "[General]\nmystery = 1\n[Rule]\nFINAL,DIRECT\n";
@@ -2530,7 +2573,8 @@ mod run {
             .env_remove("RURGE_ENHANCED_MODE")
             .env_remove("RURGE_EMPTY_GROUP_REJECT")
             .env_remove("RURGE_LISTEN_HTTP")
-            .env_remove("RURGE_LISTEN_SOCKS5");
+            .env_remove("RURGE_LISTEN_SOCKS5")
+            .env_remove("RURGE_WINTUN_DLL");
         cmd
     }
 
@@ -3512,7 +3556,8 @@ loglevel = notify",
             .env_remove("RURGE_SYSTEM_PROXY")
             .env_remove("RURGE_EMPTY_GROUP_REJECT")
             .env_remove("RURGE_LISTEN_HTTP")
-            .env_remove("RURGE_LISTEN_SOCKS5");
+            .env_remove("RURGE_LISTEN_SOCKS5")
+            .env_remove("RURGE_WINTUN_DLL");
         let daemon = spawn_command(cmd);
         wait_until(
             "state.json in the data directory the environment names",

@@ -99,12 +99,15 @@ pub trait Backend: Send + Sync {
 /// An unknown value is an error: silently falling back would let a typo in a
 /// test take over the machine's routes and DNS. `data_dir` is where the
 /// platform's scripts go (its `enhanced/` directory, M4c plan P12).
-pub fn backend(data_dir: &Path) -> anyhow::Result<Arc<dyn Backend>> {
+/// `wintun_dll` is where `wintun.dll` is (`--wintun-dll`), or `None` for next
+/// to `rurge.exe`; only Windows reads it (the M4d plan's task 6).
+pub fn backend(data_dir: &Path, wintun_dll: Option<&Path>) -> anyhow::Result<Arc<dyn Backend>> {
     match std::env::var_os(BACKEND_ENV) {
         None => Ok(Arc::new(PlatformBackend {
-            // `wintun.dll` is looked for next to rurge.exe; `--wintun-dll`
-            // gives its place instead (the M4d plan's task 6)
-            system: rurge_platform::enhanced::system(data_dir.join("enhanced"), None),
+            system: rurge_platform::enhanced::system(
+                data_dir.join("enhanced"),
+                wintun_dll.map(Path::to_path_buf),
+            ),
         })),
         Some(value) => backend_from(&value.to_string_lossy()),
     }

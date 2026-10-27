@@ -87,6 +87,9 @@ pub struct RunArgs {
     /// (the enhanced mode). Needs root or Administrator.
     #[arg(long, env = "RURGE_ENHANCED_MODE", value_parser = switch())]
     pub enhanced_mode: bool,
+    /// Windows: where wintun.dll is (default: next to rurge.exe)
+    #[arg(long, env = "RURGE_WINTUN_DLL", value_name = "PATH")]
+    pub wintun_dll: Option<PathBuf>,
     /// A policy group without members rejects instead of going DIRECT
     #[arg(long, env = "RURGE_EMPTY_GROUP_REJECT", value_parser = switch())]
     pub empty_group_reject: bool,
@@ -208,6 +211,17 @@ fn init_logging(
             Ok((None, handle))
         }
     }
+}
+
+/// Windows is the only platform whose enhanced mode loads `wintun.dll`, so
+/// the option that names it is a usage error elsewhere rather than a value
+/// nobody reads (M4 design 9.6). `windows` is `cfg!(windows)`, passed rather
+/// than read so that both answers are tested on every platform's build.
+fn wintun_dll_applies(given: bool, windows: bool) -> Result<(), String> {
+    if given && !windows {
+        return Err("--wintun-dll is only for Windows".to_string());
+    }
+    Ok(())
 }
 
 fn mode_name(mode: &OutboundMode) -> String {
@@ -1276,7 +1290,9 @@ fn restore_the_enhanced_mode(dir: &Path) {
     if !left_to_undo(&path).enhanced {
         return;
     }
-    let backend = match super::enhanced::backend(dir) {
+    // Undoing never opens the device, so where `wintun.dll` is does not matter
+    // here: the recovery hands `None`, the place next to `rurge.exe`.
+    let backend = match super::enhanced::backend(dir, None) {
         Ok(backend) => backend,
         Err(e) => {
             eprintln!("warning: {e}; the enhanced mode's changes were not undone");
@@ -1470,6 +1486,14 @@ fn wait_for_the_sources(
 }
 
 pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
+    // The place of `wintun.dll` matters only where there is a device to load
+    // it into: the option is a usage error on the platforms without one, and
+    // ends the start before anything is read (M4 design 9.6).
+    if let Err(message) = wintun_dll_applies(args.wintun_dll.is_some(), cfg!(windows)) {
+        eprintln!("error: {message}");
+        recover_without_a_log(&args.runtime);
+        return Ok(ExitCode::from(2));
+    }
     // Before the profile: the listen options are a command-line matter, and a
     // start that ends on one ends the way a profile that does not load does.
     let overrides =
@@ -1512,7 +1536,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     // platform's scripts go under the data directory (M4c plan P12), so that
     // path is worked out first — it is a path, not a directory made here.
     let data_dir = args.runtime.data_dir();
-    let enhanced_backend = match super::enhanced::backend(&data_dir) {
+    let enhanced_backend = match super::enhanced::backend(&data_dir, args.wintun_dll.as_deref()) {
         Ok(backend) => backend,
         Err(e) => {
             eprintln!("error: {e}");
@@ -2364,6 +2388,22 @@ mod tests {
                 assert!(!message.contains(value), "{message}");
             }
         }
+    }
+
+    /// `--wintun-dll` names where `wintun.dll` is, and Windows is the only
+    /// platform whose enhanced mode loads it: off Windows the option is a
+    /// usage error rather than a value quietly ignored (M4 design 9.6). The
+    /// platform is an argument, so that all four answers are asked for on
+    /// every platform's build; `run` passes `cfg!(windows)`.
+    #[test]
+    fn wintun_dll_is_only_for_windows() {
+        assert_eq!(wintun_dll_applies(false, false), Ok(()));
+        assert_eq!(wintun_dll_applies(false, true), Ok(()));
+        assert_eq!(wintun_dll_applies(true, true), Ok(()));
+        assert_eq!(
+            wintun_dll_applies(true, false),
+            Err("--wintun-dll is only for Windows".to_string())
+        );
     }
 
     /// `Overrides` is printable: a password is `<redacted>`.
