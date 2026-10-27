@@ -6,9 +6,11 @@
 //!
 //! ```text
 //! impl Device {
-//!     /// Opens the adapter: the device and the name the kernel gave it.
-//!     /// Errors go through `frame::explained` in the platform's module.
-//!     pub(super) fn open(spec: &DeviceSpec) -> io::Result<(Device, String)>;
+//!     /// Opens the adapter: the device, and the adapter the steps name (its
+//!     /// name, and on Windows its interface index). Errors go through
+//!     /// `frame::explained` in the platform's module, except the ones before
+//!     /// the adapter exists (wintun.dll's own).
+//!     pub(super) fn open(spec: &DeviceSpec) -> io::Result<(Device, Adapter)>;
 //!     /// Waits until a packet is there, then reads it into `buf`: the IP
 //!     /// packet's length. A datagram that is no IP packet is skipped here; an
 //!     /// empty read is the device gone, and an error ([`frame::packet_len`]).
@@ -96,10 +98,10 @@ impl TunDevice {
     /// the descriptor is registered with its reactor. Only the platform's
     /// `System::open` calls it, and no test does (M4c plan P19).
     pub fn open(spec: &DeviceSpec) -> io::Result<TunDevice> {
-        let (imp, name) = Imp::open(spec)?;
+        let (imp, adapter) = Imp::open(spec)?;
         Ok(TunDevice {
             imp,
-            adapter: Adapter { name, index: None },
+            adapter,
             mtu: spec.mtu,
             dropped: AtomicU64::new(0),
             warned: AtomicBool::new(false),

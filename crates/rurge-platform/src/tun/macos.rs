@@ -29,6 +29,7 @@ use tokio::io::unix::AsyncFd;
 
 use super::DeviceSpec;
 use super::frame::{self, Os};
+use crate::enhanced::Adapter;
 
 /// The kernel control the utun sockets are units of (`<net/if_utun.h>`).
 const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control";
@@ -41,9 +42,10 @@ pub(super) struct Device {
 
 impl Device {
     /// Opens the next unit of utun. The kernel picks the name, so `spec`'s is
-    /// not used; what comes back is the one the adapter has. A failure to open
-    /// is put into the words of [`frame::explained`].
-    pub(super) fn open(_spec: &DeviceSpec) -> io::Result<(Device, String)> {
+    /// not used; the adapter it gives back carries the one the interface has,
+    /// and no index: macOS's steps name it by the name. A failure to open is
+    /// put into the words of [`frame::explained`].
+    pub(super) fn open(_spec: &DeviceSpec) -> io::Result<(Device, Adapter)> {
         // socket2 makes it close-on-exec, and the reads and writes of this
         // socket are the non-blocking kind
         let socket = Socket::new(
@@ -55,7 +57,7 @@ impl Device {
         let name = utun_connect(socket.as_raw_fd())?;
         socket.set_nonblocking(true)?;
         let fd = AsyncFd::with_interest(socket, Interest::READABLE)?;
-        Ok((Device { fd }, name))
+        Ok((Device { fd }, Adapter { name, index: None }))
     }
 
     /// Waits until a packet is there, then reads it into `buf`.

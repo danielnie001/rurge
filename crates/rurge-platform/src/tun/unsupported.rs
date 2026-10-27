@@ -8,14 +8,14 @@
 use std::io;
 
 use super::DeviceSpec;
-use crate::enhanced::NOT_AVAILABLE;
+use crate::enhanced::{Adapter, NOT_AVAILABLE};
 
 pub(super) enum Device {}
 
 impl Device {
-    /// Opens the adapter: the device and the name the kernel gave it. There is
+    /// Opens the adapter: the device and the adapter the steps name. There is
     /// no adapter on this platform in this version, so this always fails.
-    pub(super) fn open(_spec: &DeviceSpec) -> io::Result<(Device, String)> {
+    pub(super) fn open(_spec: &DeviceSpec) -> io::Result<(Device, Adapter)> {
         Err(io::Error::new(io::ErrorKind::Unsupported, NOT_AVAILABLE))
     }
 

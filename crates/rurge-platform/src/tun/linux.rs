@@ -27,6 +27,7 @@ use tokio::io::unix::AsyncFd;
 
 use super::DeviceSpec;
 use super::frame::{self, Os};
+use crate::enhanced::Adapter;
 
 /// The kernel's tun device: the descriptor, registered with the reactor for
 /// reads.
@@ -36,10 +37,10 @@ pub(super) struct Device {
 
 impl Device {
     /// Opens `/dev/net/tun` and asks the kernel for an interface called
-    /// `spec.name`, carrying bare IP packets. The name it gives back is the
-    /// one the interface has. A failure to open is put into the words of
-    /// [`frame::explained`].
-    pub(super) fn open(spec: &DeviceSpec) -> io::Result<(Device, String)> {
+    /// `spec.name`, carrying bare IP packets. The adapter it gives back carries
+    /// the name the interface has, and no index: Linux's steps name it by the
+    /// name. A failure to open is put into the words of [`frame::explained`].
+    pub(super) fn open(spec: &DeviceSpec) -> io::Result<(Device, Adapter)> {
         let name = frame::ifname(&spec.name)?;
         let file = OpenOptions::new()
             .read(true)
@@ -51,7 +52,7 @@ impl Device {
             .map_err(|e| frame::explained(e, Os::Linux))?;
         let name = set_iff(file.as_raw_fd(), &name)?;
         let fd = AsyncFd::with_interest(file, Interest::READABLE)?;
-        Ok((Device { fd }, name))
+        Ok((Device { fd }, Adapter { name, index: None }))
     }
 
     /// Waits until a packet is there, then reads it into `buf`.
