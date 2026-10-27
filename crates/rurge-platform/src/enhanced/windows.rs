@@ -471,6 +471,10 @@ Configuration for interface \"rurge\"
 Configuration for interface \"rurge\"
     Statically Configured DNS Servers:    fd00:6152::2
 ";
+    const DNS_V6_OTHER: &str = "\
+Configuration for interface \"rurge\"
+    Statically Configured DNS Servers:    fd00:6151::53
+";
 
     /// The programs at the place a real system has them. Nothing here runs one.
     fn tools() -> WindowsTools {
@@ -857,6 +861,56 @@ Configuration for interface \"rurge\"
                 netsh("interface ipv6 show dnsservers name=12"),
             ]
         );
+    }
+
+    /// An IPv6 list without the responder after the takeover costs IPv6, not
+    /// the open: one WARN, and the call answers `Ok(true)` (the phase 3 / M4d
+    /// plan's execution record row 62). The WARN names neither the adapter nor
+    /// a server: what a user reads at WARN says nothing of either (M4 design
+    /// 13); the readback's own DEBUG lines are where those may be.
+    #[test]
+    fn a_missing_ipv6_dns_is_one_warn_and_still_ok() {
+        let captured = LogCapture::start();
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        runner.reply(&netsh("interface ipv4 show dnsservers name=12"), DNS_V4);
+        // the IPv6 list holds a server that is not the responder; a readback
+        // that printed nothing reads the same way
+        runner.reply(
+            &netsh("interface ipv6 show dnsservers name=12"),
+            DNS_V6_OTHER,
+        );
+        let system = system_of(dir.path(), runner.clone());
+
+        assert_eq!(system.take_dns(&dev(), true), Ok(true));
+
+        let warns: Vec<String> = captured
+            .lines()
+            .into_iter()
+            .filter(|line| line.starts_with("WARN"))
+            .collect();
+        assert_eq!(warns.len(), 1, "one WARN: {warns:?}");
+        assert_eq!(
+            warns[0],
+            "WARN the system's IPv6 DNS could not be pointed at the enhanced mode; it is left as \
+             it is"
+        );
+        // the line itself names neither the adapter nor a server: what is said
+        // at WARN is read by every user of the enhanced mode, and the names and
+        // addresses are DEBUG only (M4 design 13). The DEBUG lines are not
+        // checked: they repeat what netsh printed, the interface's name in it.
+        for found in [
+            "rurge",
+            "198.18.0.1",
+            "198.18.0.2",
+            "fd00:6152::",
+            "fd00:6151::",
+        ] {
+            assert!(
+                !warns[0].contains(found),
+                "{found} is DEBUG only: {warns:?}"
+            );
+        }
     }
 
     /// Servers that are not the responder after the takeover is the error of
