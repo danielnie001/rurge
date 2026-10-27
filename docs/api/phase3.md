@@ -758,6 +758,75 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
 - **Windows 照旧不能开**：平台后端在 Windows 上仍是 `Unsupported`，`rurge run --enhanced-mode` 以 1 退出、`POST` 回 500，见 M4d。
 - **手工验收没有做**：`docs/acceptance/phase3-manual.md` 还没有 M4 一节（只有 M1、M2、M3），M4d 写它。
 
+### M4d：Windows 与收尾
+
+阶段 3 / M4d（计划 `docs/superpowers/plans/2026-10-26-phase3-m4d-windows-wrapup-plan.md`，下面写“M4d 记录第 N 行”指它末尾的「执行期修正记录」）做的是 Windows 那一半：Wintun 的设备、`wintun.dll` 的查找与签名校验、`netsh` 的步骤与读回、`--wintun-dll`，以及 M4 的文档收尾。**本节订正上面几句**（规矩是历史的段落不逐处改、由后写的段落订正）：
+
+- M4 一节开头的“这一版开不了增强模式”在**三个平台**上都不成立了：Windows 的平台后端不再答 `Unsupported`，它答 `WindowsSystem` 与 Wintun 的设备——照代码会建名叫 `rurge` 的适配器、配地址与 MTU、装路由、把系统 DNS 指向应答器，关闭或崩溃之后的下一次启动把它们还回去。**Windows 的代码与不带 `cfg` 的部分在这台 Windows 11 x86-64 的开发机上编译、单元用例通过（一台机器上的一次运行，不是 CI）；Wintun 的设备与那十个放开的函数没有在任何地方运行过**（没有一条缺省的用例开设备，`RURGE_TEST_WINTUN_DLL` 也不设，M4d 记录第 70 行），真机上也没有跑过。
+- 「外部程序一律 DIRECT」一节里“Windows 上 M4d 之前只认程序本身”与本节末尾「没有覆盖的」里“Windows 的 `ProcessTree::contains` 恒假”都不成立了：Windows 上它经 `in_job`（`IsProcessInJob`，M4d 任务 1）回答，程序拉起的子进程算在里面；端到端用例 `what_the_program_started_goes_direct_too` 三个平台都编译、在这台开发机上跑过（`crates/rurge-platform/src/process.rs` 的三条用例 `a_child_in_the_job_is_contained_and_this_process_is_not`、`an_exited_child_whose_handle_is_still_open_is_not_contained`、`a_process_that_is_gone_is_not_contained`）。
+- 「没有覆盖的」里“本机没有编译过的 Unix 代码”中列着的 `what_the_program_started_goes_direct_too` 与 `ProcessTree::contains` 的 `#[cfg(unix)]` 一段照旧，只是那一条端到端用例不再是 Unix 专属。
+
+#### 打开 Windows 的增强模式要什么
+
+- 一个 **WireGuard LLC 签名的 `wintun.dll` 0.14 或更新**：0.13 没有 `WintunCloseAdapter`（那时是 `WintunFreeAdapter` / `WintunDeleteAdapter`），加载时因缺入口被拒，文字是 `wintun.dll has no WintunCloseAdapter: is it wintun.dll?`。往下取：<https://www.wintun.net/>。
+- 它放在 `rurge.exe` 旁边，或用 `--wintun-dll <PATH>`（环境变量 `RURGE_WINTUN_DLL`）指出。**别的平台给出这个选项是用法错误**：`--wintun-dll is only for Windows`，退出码 2，在 `Overrides::parse` 与读配置之前（`crates/rurge/src/cli/run.rs` 的 `wintun_dll_applies`，`:220`；`--help` 里这个选项照抄 `RunArgs` 的说明“Windows: where wintun.dll is (default: next to rurge.exe)”，与别的路径选项一样连 `RURGE_WINTUN_DLL` 的值一起显示，M4d 记录第 74、75、76 行）。
+- 它以**管理员**运行：不是管理员的错误是 `the enhanced mode needs to run as Administrator`（`crates/rurge-platform/src/tun/frame.rs` 的 `explained`，在 `rurge run` 的标准错误里是 `error: cannot turn the enhanced mode on: <这一句>`，在 API 里是 500 的 `{"error":"<这一句>"}`）。
+- **`wintun.dll` 所在的目录应当只有管理员能写**：rurge 校验的是那个文件、加载的也是它，但一个能被普通用户换掉的目录里，换文件与换签名是一回事（M4d 计划 P7）。
+
+#### `wintun.dll` 的查找与签名校验（各句错误）
+
+查找在 `crates/rurge-platform/src/tun/dll.rs` 的 `wintun_dll`：`--wintun-dll` 给的相对路径按当前目录补成绝对路径（加载器只查给它的那一个绝对路径），没给时是可执行文件旁边的 `wintun.dll`。校验与加载在 `crates/rurge-platform/src/tun/windows/wintun.rs` 的 `loaded`：**先以只许读的共享方式开着那个文件**（`share_mode(FILE_SHARE_READ)`，别人不能写它、删它或给它改名），**校验的就是这个开着的文件**（`WINTRUST_FILE_INFO` 的 `hFile`），签名者对**恰好**是 `WireGuard LLC`，校验不联网（`WTD_REVOKE_NONE` 与 `WTD_CACHE_ONLY_URL_RETRIEVAL`，`WTD_UI_NONE`），校验完到 `LoadLibraryExW` 之间文件一直开着；加载只从那个绝对路径找，它的依赖只从 System32 找（`LOAD_LIBRARY_SEARCH_SYSTEM32`）。模块在进程的一生里只载一次、从不卸载。
+
+每一句错误都是英文，**不带路径**（路径可能在 `rurge.exe` 旁边、带着账户名，错误会进 API 的 500；路径只在 DEBUG 那一行 `wintun.dll` 里），种类照系统给的那一个（没有这个文件是 `NotFound`，签名为空 / 签名者不对 / 不受信任是 `PermissionDenied`，缺入口是 `InvalidData`）：
+
+| 情形 | 文本 |
+| --- | --- |
+| 没给 `--wintun-dll`，又不知道 `rurge.exe` 在哪里 | `cannot tell where rurge.exe is, to find wintun.dll next to it: give --wintun-dll` |
+| `--wintun-dll` 是相对路径，又读不到当前目录 | `cannot tell where the current directory is, to make --wintun-dll absolute: give an absolute path` |
+| 文件不在 | `cannot find wintun.dll (next to rurge.exe, or where --wintun-dll points): get it from https://www.wintun.net/` |
+| 文件在，但打不开（`NotFound` 以外） | `cannot open wintun.dll: <系统的错误>` |
+| 没有签名 | `wintun.dll is not signed` |
+| 签名者不是 `WireGuard LLC` | `wintun.dll is not signed by WireGuard LLC (it is signed by <签名者的名字>)`（签名者的简单显示名可以带，它不是个人信息） |
+| 签名不可信 | `wintun.dll's signature cannot be trusted (0x<状态码>)` 或 `… (no signer)` |
+| 不是能加载的 PE 文件 | `cannot load wintun.dll: <系统的错误>`（这台开发机上量到的是一行 `cannot load wintun.dll: …`，用例 `a_file_that_is_not_a_dll_cannot_be_loaded`） |
+| 缺少一个入口（含 0.13 的 `WintunCloseAdapter`） | `wintun.dll has no <入口>: is it wintun.dll?` |
+| 路径里有 NUL | `the path of wintun.dll has a NUL in it` |
+
+这些错误不经 `frame::explained`（那里 `PermissionDenied` 一律被说成“要管理员”，签名不对会被说成缺管理员权限，M4d 记录第 59 行）。`--wintun-dll` 在 Windows 上给了而文件不在时，打开以 `cannot find wintun.dll …` 失败，增强模式不开，其余照旧运行。
+
+#### 网卡、序号与“正在被使用”
+
+设备在 `crates/rurge-platform/src/tun/windows/mod.rs`：**先探后建，不复用**（M4d 计划 P8）——先 `WintunOpenAdapter("rurge")` 探名字，探到就答 `the virtual adapter is in use: is another rurge running with the enhanced mode on?`（种类 `ResourceBusy`）；探不到才 `WintunCreateAdapter` 建一个名字 `rurge`、类型 `rurge`、**固定 GUID** 的适配器，环 8 MiB。建好之后每 100 毫秒问一次接口序号，至多 5 秒（`INDEX_WITHIN`），仍没有是 `the virtual adapter has no interface index 5 seconds after it was made: <系统的话>`。适配器随建它的进程消失（Wintun 用 `SwDeviceCreate`，寿命跟着句柄，这是读源码与邮件列表得出的，**真机没有核对**，手工清单的一项），所以 `taskkill /F` 之后的下一次启动不会撞上“正在被使用”。
+
+设备的关闭在最后一个 `Arc` 放掉时（`Drop`），次序是：置停止标志 → 关读线程那个通道的接收端（卡在满通道上的 `blocking_send` 因此醒来）→ 等读线程 → `WintunEndSession` → `WintunCloseAdapter`（它把 `WintunCreateAdapter` 建的适配器从系统里移除）。正常的关闭经 `call`（`spawn_blocking`）交出管理器那一份，这几步不在 tokio 的工作线程上；TUN 3 秒内没结束的那一种，最后一份在 TUN 的任务里放掉，那时 `Drop` 会占住一个工作线程（M4d 记录第 29 行；这个次序与“两枚停止标志”的缺陷见 `docs/status.md` 的 M4d 一节）。
+
+发包不等：`WintunAllocateSendPacket` 回空（环满）就是 `WouldBlock`，TUN 按“没有地方”丢掉并计数（`the system had no room for a packet; …` 那一行 WARN，与 Linux / macOS 同一条路）；包长超过 `wintun.h` 的 `WINTUN_MAX_IP_PACKET_SIZE`（`MAX_PACKET`，65535）的在放开的函数之前就被拒（`a packet for the virtual adapter is longer than 65535 bytes`），否则驱动会把整个发送环当成坏的。
+
+#### `netsh` 的步骤与读回
+
+系统一侧在 `crates/rurge-platform/src/enhanced/windows.rs`（不带 `cfg`，用例用假的执行器），翻译在 `crates/rurge-platform/src/route/windows.rs`。程序是 `<SystemRoot>\System32\netsh.exe` 与 `ipconfig.exe`（`SystemRoot` 没有时是 `C:\Windows`），经 `TimedRunner`，每个程序 30 秒为限。**每一步都当作“可能失败”执行**（`OnFailure::Ignore`），`netsh` 的退出码与输出只进 DEBUG；成没成只看之后的读回（M4d 计划 P10）。
+
+| 改什么 | 一行一条的 `netsh` 写法 | 读回 |
+| --- | --- | --- |
+| 地址与 MTU | `interface ipv4 add address name=<序号> address=198.18.0.1 mask=255.254.0.0 store=active`、`interface ipv4 set interface interface=<序号> forwarding=disabled weakhostsend=disabled weakhostreceive=disabled store=active`、`interface ipv4 set interface interface=<序号> metric=1 store=active`、`interface ipv4 set subinterface interface=<序号> mtu=1500 store=active`（IPv6 同，地址是 `fd00:6152::1/64`） | `show addresses` 里有 `198.18.0.1`、`show subinterfaces` 的第一个数是 1500；缺了分别是 `the virtual adapter did not get its address` 与 `the virtual adapter's MTU is not 1500`（MTU 读回是必须的：Wintun 适配器的缺省 MTU 没有文档，比 1500 大会让系统往协议栈送更大的包） |
+| 路由 | `interface ipv4 add route prefix=<前缀> interface=<序号> metric=1 store=active`（一行一条，不写下一跳；减的时候 `delete route`，减不掉不算错） | `show route` 里按**序号**筛出的行要有这一条前缀（`show route` 没有网卡的参数）；IPv4 缺了先撤掉这一批、再回 `<n> of the routes are missing after netsh added them`，IPv6 缺了回 `Ok(false)`，由 `run_routes` 写那一行 WARN 并撤掉新加的 |
+| 系统 DNS | `interface ipv4 set dnsservers name=<序号> source=static address=198.18.0.2 register=none validate=no`（IPv6 是 `fd00:6152::2`；IPv6 没开时另跑一行 `address=none` 清掉 IPv6 的名单） | `show dnsservers` 里有应答器的地址；IPv4 没有是 `the system's DNS could not be pointed at the enhanced mode`，IPv6 没有只一行 WARN `the system's IPv6 DNS could not be pointed at the enhanced mode; it is left as it is`（M4d 记录第 62 行） |
+| 清缓存 | `ipconfig /flushdns`（失败不算错） | —— |
+
+**网卡的度量与转发设置**：接口度量 `1`（比系统给物理网卡的低，也不写含义没有文档的 `0`），单独一行——现行的 `netsh interface` 页里 `set interface` 没有 `metric`，一行里有一个系统不认的参数可能整行失败，拆开之后失败的代价只是度量（M4d 计划 P9）；虚拟网卡自己的**转发、weak host send 与 weak host receive 都关掉**，这是防环的 Windows 一半（另一部分是 `IP_UNICAST_IF` / `IPV6_UNICAST_IF` 绑网卡），不动别的网卡（设计第 7.4 节、M4-D11）。
+
+读回只认前缀、序号、地址与数字，不认任何文字，所以系统的语言不影响结论；输出按 `from_utf8_lossy` 读，中文系统上汉字会坏、数字与地址不坏（夹具 `ROUTES_ZH`、`ADDRESSES_ZH`、`DNS_ZH`、`MTU_ZH` 是手写的，注明了不是从机器上取的，M4d 计划 P17）。每一步的 DEBUG 行是 `running a step of the enhanced mode`（带程序、参数与脚本全文）与 `reading back a setting of the enhanced mode`、`what the readback printed`；脚本写在数据目录的 `enhanced/` 下、`rurge-steps-<pid>-<n>.txt`、`create_new`、跑完删掉、崩溃留下的下一次 `open` 删，错误里脚本的路径换成 `…`。
+
+#### 测试后端与没有覆盖的
+
+`RURGE_ENHANCED_BACKEND` 的三个取值不变（上面「只供测试的后端」一节与 `docs/testing.md`）；**不设时 Windows 上也是平台后端**——`WindowsSystem` 与 Wintun 的设备（`crates/rurge-platform/src/enhanced/mod.rs` 的 `system()` 第三支）。这一节的说法订正了 `docs/testing.md` 的 `RURGE_ENHANCED_BACKEND` 一段里“Windows 上对每个动作都答不可用”那一句。
+
+- **Windows 的设备与系统改动没有在任何地方运行过**：`tun/windows/mod.rs`、`tun/windows/wintun.rs` 与 `enhanced/windows.rs` 在这台开发机上编译、`clippy -D warnings` 过，单元用例用的是假的执行器与临时目录；没有一条用例调 `TunDevice::open` 或 `wintun::` 的函数（`RURGE_TEST_WINTUN_DLL` 不设），真机上也没有跑过（M4d 记录第 70 行）。
+- **`a_real_wintun_dll_passes` 在本机没有真正跑过**（没有 `wintun.dll`，它打印原因就返回）：真的 `wintun.dll` 的签名者读成 `WireGuard LLC`、只读共享开着文件时 `LoadLibraryExW` 照样能载入，都由 `RURGE_TEST_WINTUN_DLL` 与手工清单核对（M4d 计划 P5、P7）。
+- **`the_wintun_dll_option_is_a_usage_error_elsewhere` 在这台开发机上只编译、不运行**（Windows 上这个选项是寻常的那个，那一句用法错误只出现在别的平台），第一次运行是 Linux / macOS 的 CI（M4d 记录第 75、76 行）。
+- **`TunDevice::dropped()` 今天没有读者**：设备写不进的丢包只记在设备自己的计数与那一行 WARN 里，不进 `GET /v1/features/enhanced_mode` 的 `dropped`（那是 `rurge-tun` 的原因表，设计第 3、13 节）。
+- 全部用例只在一台 Windows 11 x86-64 的开发机上跑过；M4 的提交 CI 一个也没有见过（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986）。
+
 ### 没有覆盖的
 
 - **没有真实的设备**：这一版没有任何代码执行系统命令、建虚拟网卡、改路由或系统 DNS。三个平台的步骤只生成为数据（`rurge-platform::route::{linux,macos,windows}`，任何平台上都编译、都测），执行它们、建真的设备、拿权限都在 M4c / M4d。`RURGE_ENHANCED_BACKEND` 缺省时 `rurge run --enhanced-mode` 在每个平台上都以 1 退出，见本节开头。M4b 之后仍是。
