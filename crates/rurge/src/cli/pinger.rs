@@ -90,10 +90,10 @@ impl PlatformPinger {
         Ok(socket)
     }
 
-    /// Drops the carrier `socket` and ends its receive task (M4b 终审 M2,
-    /// 协调者的裁定 R12). By pointer, not by (family, egress): a carrier made
-    /// again under the same key must not be taken by a late failure of the one
-    /// it replaced.
+    /// Drops the carrier `socket` and ends its receive task (the phase 3 / M4d
+    /// plan's execution record row 48). By pointer, not by (family, egress): a
+    /// carrier made again under the same key must not be taken by a late
+    /// failure of the one it replaced.
     fn forget(&self, socket: &Arc<UdpSocket>) {
         let mut carriers = self.carriers.lock().unwrap_or_else(|e| e.into_inner());
         let Some(at) = carriers
@@ -166,7 +166,8 @@ impl Pinger for PlatformPinger {
             if let Err(error) = socket.send_to(&request, SocketAddr::new(dst, 0)).await {
                 // a socket that cannot send is not kept: an interface that
                 // changed its address or its index would otherwise leave ICMP
-                // broken until rurge restarted (M4b 终审 M2, R12)
+                // broken until rurge restarted (the phase 3 / M4d plan's
+                // execution record row 48)
                 self.forget(&socket);
                 tracing::debug!(
                     %error,
@@ -529,8 +530,9 @@ mod tests {
 
     /// A carrier whose send fails is dropped, so the next echo makes a new one:
     /// an interface that changed its address or its index does not leave ICMP
-    /// broken until rurge restarts (M4b 终审 M2, R12). The 70,000-byte payload
-    /// is only one way to make `send_to` fail; every send error does this.
+    /// broken until rurge restarts (the phase 3 / M4d plan's execution record
+    /// row 48). The 70,000-byte payload is only one way to make `send_to`
+    /// fail; every send error does this.
     #[tokio::test]
     async fn a_carrier_that_fails_to_send_is_made_again() {
         let pinger = pinger();
