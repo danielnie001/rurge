@@ -29,17 +29,30 @@ const RECV_BUFFER: usize = 64 * 1024;
 /// answer sitting in the buffer (`rurge-dns`'s UDP upstream does the same).
 const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
+/// How many carriers that failed to send keep running at once, each waiting
+/// out one echo timeout before it stops (R24): a destination whose sends keep
+/// failing retires a carrier on every echo, and without a limit those sockets
+/// would pile up. The fifth one retires, the oldest stops at once.
+const RETIRING_MAX: usize = 4;
+
 /// `rurge_tun::Pinger` on the platform's ICMP sockets, each bound where rurge's
 /// own sockets go (the egress of `PlatformSockets`).
 pub struct PlatformPinger {
     sockets: Arc<PlatformSockets>,
     waiters: Arc<Mutex<Waiters>>,
     carriers: Mutex<Vec<Carrier>>,
+    /// Carriers that failed to send and are still reading their replies:
+    /// replies to echoes already sent on those sockets come to them, so they
+    /// run for one echo timeout before they stop (R24).
+    retiring: Mutex<Vec<Retirement>>,
+    /// How long a retired carrier keeps reading: the TUN's own
+    /// `echo_timeout`, so that a reply it is still waiting for can arrive.
+    echo_timeout: Duration,
     failed: AtomicBool,
 }
 
 impl PlatformPinger {
-    pub fn new(sockets: Arc<PlatformSockets>) -> PlatformPinger {
+    pub fn new(sockets: Arc<PlatformSockets>, echo_timeout: Duration) -> PlatformPinger {
         // the identifier is this pinger's own: a raw socket sees every ICMP
         // message the machine gets, and only these answers are its (P14)
         let ident = getrandom::u32().map_or(0, |random| random as u16);
@@ -47,6 +60,8 @@ impl PlatformPinger {
             sockets,
             waiters: Arc::new(Mutex::new(Waiters::new(ident))),
             carriers: Mutex::new(Vec::new()),
+            retiring: Mutex::new(Vec::new()),
+            echo_timeout,
             failed: AtomicBool::new(false),
         }
     }
@@ -54,7 +69,8 @@ impl PlatformPinger {
     /// The socket an echo request to `family` goes out on, bound to `egress`
     /// like every other socket rurge makes: made on first use, and a failure
     /// is not kept, so the next echo tries again — neither a socket that could
-    /// not be made nor one whose send failed (`forget`).
+    /// not be made nor one whose send failed (that one is retired by
+    /// [`PlatformPinger::forget`]).
     fn carrier(&self, family: Family, egress: Option<&str>) -> io::Result<Arc<UdpSocket>> {
         let mut carriers = self.carriers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(carrier) = carriers
@@ -90,10 +106,14 @@ impl PlatformPinger {
         Ok(socket)
     }
 
-    /// Drops the carrier `socket` and ends its receive task (the phase 3 / M4d
-    /// plan's execution record row 48). By pointer, not by (family, egress): a
-    /// carrier made again under the same key must not be taken by a late
-    /// failure of the one it replaced.
+    /// Drops the carrier `socket` and retires its receive task: the task reads
+    /// on for one echo timeout and is stopped then, so that replies to echoes
+    /// already sent on that socket still reach their waiters (R24; a Linux
+    /// datagram socket only ever sees the answers to its own requests). At
+    /// most [`RETIRING_MAX`] retire at once; the oldest stops when one more
+    /// would. By pointer, not by (family, egress): a carrier made again under
+    /// the same key must not be taken by a late failure of the one it replaced
+    /// (the phase 3 / M4d plan's execution record row 48).
     fn forget(&self, socket: &Arc<UdpSocket>) {
         let mut carriers = self.carriers.lock().unwrap_or_else(|e| e.into_inner());
         let Some(at) = carriers
@@ -103,7 +123,22 @@ impl PlatformPinger {
             return;
         };
         let carrier = carriers.remove(at);
-        carrier.task.abort();
+        let receive = carrier.task.abort_handle();
+        let timeout = self.echo_timeout;
+        let stop = tokio::spawn({
+            let receive = receive.clone();
+            async move {
+                tokio::time::sleep(timeout).await;
+                receive.abort();
+            }
+        });
+        let mut retiring = self.retiring.lock().unwrap_or_else(|e| e.into_inner());
+        retiring.push(Retirement { receive, stop });
+        while retiring.len() > RETIRING_MAX {
+            let oldest = retiring.remove(0);
+            oldest.receive.abort();
+            oldest.stop.abort();
+        }
     }
 
     /// A socket for echo requests of `family`, bound where rurge's own sockets
@@ -142,10 +177,16 @@ impl PlatformPinger {
 impl Drop for PlatformPinger {
     fn drop(&mut self) {
         // nothing reads these sockets once the pinger is gone, and a task left
-        // running would hold them
+        // running would hold them; a carrier still waiting out its retirement
+        // is stopped now (R24)
         let carriers = self.carriers.lock().unwrap_or_else(|e| e.into_inner());
         for carrier in carriers.iter() {
             carrier.task.abort();
+        }
+        let retiring = self.retiring.lock().unwrap_or_else(|e| e.into_inner());
+        for retirement in retiring.iter() {
+            retirement.receive.abort();
+            retirement.stop.abort();
         }
     }
 }
@@ -164,10 +205,12 @@ impl Pinger for PlatformPinger {
                 .ok_or_else(|| io::Error::other("every ICMP sequence number waits for a reply"))?;
             let request = icmp::request(family, waiting.ident, waiting.seq, payload);
             if let Err(error) = socket.send_to(&request, SocketAddr::new(dst, 0)).await {
-                // a socket that cannot send is not kept: an interface that
-                // changed its address or its index would otherwise leave ICMP
-                // broken until rurge restarted (the phase 3 / M4d plan's
-                // execution record row 48)
+                // a socket that cannot send does not take new echoes: an
+                // interface that changed its address or its index would
+                // otherwise leave ICMP broken until rurge restarted. It keeps
+                // reading for one echo timeout, so the replies to the echoes
+                // already sent on it are not lost (R24; the phase 3 / M4d
+                // plan's execution record row 48)
                 self.forget(&socket);
                 tracing::debug!(
                     %error,
@@ -185,8 +228,18 @@ struct Carrier {
     family: Family,
     egress: Option<String>,
     socket: Arc<UdpSocket>,
-    /// Ends when the pinger is dropped.
+    /// Reads the socket's replies, until the pinger is dropped or a failure
+    /// retires it.
     task: JoinHandle<()>,
+}
+
+/// A carrier that failed to send, still reading its socket for replies to the
+/// echoes that went out on it before it: `receive` stops it after one echo
+/// timeout (or at once when it is the oldest of more than [`RETIRING_MAX`]),
+/// and `stop` is the task that would have stopped it then.
+struct Retirement {
+    receive: tokio::task::AbortHandle,
+    stop: JoinHandle<()>,
 }
 
 /// Reads the replies off one socket until the pinger is gone, and hands each
@@ -437,9 +490,10 @@ mod tests {
     /// why and skips.
     #[tokio::test]
     async fn pings_the_loopback() {
-        let pinger = PlatformPinger::new(Arc::new(PlatformSockets::new(
-            super::super::enhanced::egress_slot(),
-        )));
+        let pinger = PlatformPinger::new(
+            Arc::new(PlatformSockets::new(super::super::enhanced::egress_slot())),
+            echo_timeout(),
+        );
         for dst in ["127.0.0.1", "::1"] {
             let dst: IpAddr = dst.parse().unwrap();
             let family = if dst.is_ipv4() {
@@ -461,11 +515,24 @@ mod tests {
         }
     }
 
-    /// A pinger with no egress, as `pings_the_loopback` builds one.
+    /// The TUN's own wait for an echo reply, which is how long a retired
+    /// carrier keeps reading.
+    fn echo_timeout() -> Duration {
+        rurge_tun::TunOptions::default().echo_timeout
+    }
+
+    /// A pinger with no egress, as `pings_the_loopback` builds one, and a
+    /// retirement as long as the TUN's wait.
     fn pinger() -> PlatformPinger {
-        PlatformPinger::new(Arc::new(PlatformSockets::new(
-            super::super::enhanced::egress_slot(),
-        )))
+        pinger_with(echo_timeout())
+    }
+
+    /// The same, with a retirement of another length.
+    fn pinger_with(echo_timeout: Duration) -> PlatformPinger {
+        PlatformPinger::new(
+            Arc::new(PlatformSockets::new(super::super::enhanced::egress_slot())),
+            echo_timeout,
+        )
     }
 
     /// A carrier nothing reads: a loopback socket of the test's own, and a task
@@ -487,12 +554,15 @@ mod tests {
         )
     }
 
-    /// `forget` drops the carrier it is given, and only that one: the match is
-    /// by pointer, so a carrier made again under the same (family, egress) is
-    /// not taken by a late failure of the one it replaced (R12).
+    /// `forget` retires the carrier it is given, and only that one: the match
+    /// is by pointer, so a carrier made again under the same (family, egress)
+    /// is not taken by a late failure of the one it replaced (R12). Its
+    /// receive task reads on for one echo timeout, so that the replies to the
+    /// echoes already sent on that socket still arrive, and is stopped then
+    /// (R24).
     #[tokio::test]
-    async fn forget_drops_only_the_carrier_that_failed() {
-        let pinger = pinger();
+    async fn forget_retires_only_the_carrier_that_failed() {
+        let pinger = pinger_with(Duration::from_millis(50));
         let (first, first_socket, first_task) = spare_carrier(Family::V4).await;
         let (second, second_socket, _second_task) = spare_carrier(Family::V4).await;
         {
@@ -511,21 +581,70 @@ mod tests {
                 "the other one stays"
             );
         }
-        // the dropped carrier's receive task is not left running: it ends well
-        // within a second (the wait is on the clock, 10 ms at a time)
+        assert!(!first_task.is_finished(), "a retired carrier reads on");
+        // ten of its fifty milliseconds gone: still reading — the wait below
+        // asserting nothing has happened yet, with forty milliseconds to spare
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !first_task.is_finished(),
+            "a retired carrier reads on for its echo timeout"
+        );
+        // it stops one echo timeout later (the wait is on the clock, 10 ms at
+        // a time)
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while std::time::Instant::now() < deadline && !first_task.is_finished() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
             first_task.is_finished(),
-            "the dropped carrier's task still runs"
+            "the retired carrier's task still runs"
         );
 
         // one that is not in the list at all: nothing happens
         let stranger = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         pinger.forget(&stranger);
         assert_eq!(pinger.carriers.lock().unwrap().len(), 1);
+    }
+
+    /// At most four carriers keep reading while retired: the fifth one retires
+    /// the oldest at once, and dropping the pinger stops all of them (R24).
+    #[tokio::test]
+    async fn at_most_four_carriers_keep_reading_while_retired() {
+        let pinger = pinger_with(Duration::from_secs(60));
+        let mut watches = Vec::new();
+        let mut sockets = Vec::new();
+        for _ in 0..5 {
+            let (carrier, socket, watch) = spare_carrier(Family::V4).await;
+            pinger.carriers.lock().unwrap().push(carrier);
+            watches.push(watch);
+            sockets.push(socket);
+        }
+        for socket in sockets.iter() {
+            pinger.forget(socket);
+        }
+        // the oldest stops at once; the other four read on for their minute
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline && !watches[0].is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(watches[0].is_finished(), "the fifth retires the oldest");
+        for (at, watch) in watches.iter().enumerate().skip(1) {
+            assert!(!watch.is_finished(), "retired carrier {at} reads on");
+        }
+        assert_eq!(pinger.retiring.lock().unwrap().len(), RETIRING_MAX);
+
+        // nothing outlives the pinger
+        drop(pinger);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline && watches.iter().any(|w| !w.is_finished()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for (at, watch) in watches.iter().enumerate() {
+            assert!(
+                watch.is_finished(),
+                "retired carrier {at} outlives the pinger"
+            );
+        }
     }
 
     /// A carrier whose send fails is dropped, so the next echo makes a new one:

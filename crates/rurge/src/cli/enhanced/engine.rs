@@ -14,9 +14,13 @@ use std::sync::Arc;
 /// The starter `rurge run` gives its manager: the engine's TUN, with the
 /// platform's own echo requests (M4 design §10).
 pub fn starter(engine: Arc<Engine>, sockets: Arc<PlatformSockets>) -> Arc<dyn Starter> {
+    // one set of options for both: a retired ICMP carrier reads for as long as
+    // the TUN waits for an echo reply, so the two cannot drift apart (R24)
+    let options = TunOptions::default();
     Arc::new(EngineStarter {
         engine,
-        pinger: Arc::new(PlatformPinger::new(sockets)),
+        pinger: Arc::new(PlatformPinger::new(sockets, options.echo_timeout)),
+        options,
     })
 }
 
@@ -24,6 +28,8 @@ struct EngineStarter {
     engine: Arc<Engine>,
     /// Kept between opens: the sockets it made live as long as the run does.
     pinger: Arc<PlatformPinger>,
+    /// What the TUN is started with.
+    options: TunOptions,
 }
 
 impl Starter for EngineStarter {
@@ -32,7 +38,7 @@ impl Starter for EngineStarter {
         let pinger: Arc<dyn Pinger> = self.pinger.clone();
         Box::pin(async move {
             let handle = engine
-                .start_tun(device, pinger, TunOptions::default())
+                .start_tun(device, pinger, self.options.clone())
                 .await?;
             let tun: Arc<dyn RunningTun> = Arc::new(EngineTun { handle, engine });
             Ok(tun)
