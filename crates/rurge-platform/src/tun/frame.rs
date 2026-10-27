@@ -46,6 +46,23 @@ pub fn name_of(buf: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
+/// What a read of `read` bytes from the adapter gave: the length of the packet
+/// it read, or — nothing read — the end of the device.
+///
+/// Neither kernel gives an empty read for a buffer that is not empty, so an
+/// empty one is the device gone, and reading again would only spin on a
+/// descriptor whose readiness never goes away (M4 design 8.1). Both platforms'
+/// devices take their reads through this.
+pub fn packet_len(read: usize) -> io::Result<usize> {
+    if read == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the virtual adapter closed",
+        ));
+    }
+    Ok(read)
+}
+
 /// The four bytes utun wants before `packet`, from its IP version; `None` for
 /// neither 4 nor 6.
 pub fn utun_header(packet: &[u8]) -> Option<[u8; 4]> {
@@ -187,6 +204,18 @@ mod tests {
         assert_eq!(utun_packet(&[]), None);
         assert_eq!(utun_packet(&[0, 0, 0]), None);
         assert_eq!(utun_packet(&DARWIN_AF_INET.to_be_bytes()), None);
+    }
+
+    /// A read of the adapter gave a packet of that length; a read that gave
+    /// nothing is the device gone (M4 design 8.1).
+    #[test]
+    fn a_read_of_nothing_is_the_device_gone() {
+        let error = packet_len(0).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "the virtual adapter closed");
+
+        assert_eq!(packet_len(20).unwrap(), 20);
+        assert_eq!(packet_len(1).unwrap(), 1);
     }
 
     /// Every failure says what is missing, under the platform's words, and the

@@ -8,8 +8,8 @@
 //! platform (M4c plan P2). What a platform has of its own is its device
 //! (`tun`) and the `system` below.
 //!
-//! This task's `system` answers [`Unsupported`] on every platform: M4c's tasks
-//! 6 and 7 put Linux's and macOS's in its `cfg`s, and M4d Window's.
+//! `system` gives a platform that has one in this version its own system —
+//! Linux's is [`linux::LinuxSystem`] — and [`Unsupported`] to the rest.
 
 pub mod linux;
 pub mod macos;
@@ -88,11 +88,23 @@ pub trait System: Send + Sync {
     ) -> Option<Vec<IpAddr>>;
 }
 
-/// This platform's (Linux and macOS: M4c; Windows: M4d); [`Unsupported`] elsewhere.
-/// Scripts go to `scratch` (the data directory's `enhanced`).
-///
-/// In this task it is [`Unsupported`] on every platform: M4c's tasks 6 and 7
-/// put Linux's and macOS's here.
+/// The system of this platform: its own where it has one in this version, and
+/// [`Unsupported`] elsewhere. Linux's is [`linux::LinuxSystem`], over the
+/// programs the system's own runner runs and the files under `/`. Scripts go
+/// to `scratch` (the data directory's `enhanced`).
+#[cfg(target_os = "linux")]
+pub fn system(scratch: PathBuf) -> Box<dyn System> {
+    Box::new(linux::LinuxSystem::new(
+        std::sync::Arc::new(crate::command::TimedRunner(STEP_TIMEOUT)),
+        "/".into(),
+        scratch,
+    ))
+}
+
+/// The system of a platform that has none in this version: [`Unsupported`],
+/// which says so to every action. `scratch` (the data directory's `enhanced`)
+/// has nothing to hold here.
+#[cfg(not(target_os = "linux"))]
 pub fn system(_scratch: PathBuf) -> Box<dyn System> {
     Box::new(Unsupported)
 }

@@ -10,8 +10,8 @@
 //!     /// Errors go through `frame::explained` in the platform's module.
 //!     pub(super) fn open(spec: &DeviceSpec) -> io::Result<(Device, String)>;
 //!     /// Waits until a packet is there, then reads it into `buf`: the IP
-//!     /// packet's length. An empty read, or a datagram that is no IP packet,
-//!     /// is skipped here.
+//!     /// packet's length. A datagram that is no IP packet is skipped here; an
+//!     /// empty read is the device gone, and an error ([`frame::packet_len`]).
 //!     pub(super) async fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
 //!     /// Reads a packet without waiting: `WouldBlock` when none is there.
 //!     pub(super) fn try_read(&self, buf: &mut [u8]) -> io::Result<usize>;
@@ -23,10 +23,8 @@
 //! pub(super) fn no_room(err: &io::Error) -> bool;
 //! ```
 //!
-//! There is one platform's module at a time, chosen by the `use` below: this
-//! task has only `unsupported`, so that all three platforms build; M4c's tasks
-//! 6 and 7 put Linux's and macOS's beside it under their `cfg`s, and
-//! `unsupported` stays for the rest.
+//! There is one platform's module at a time, chosen by the `cfg`s below; a
+//! platform that has none in this version gets `unsupported`.
 //!
 //! Deciding when a packet has no room, counting the dropped ones and the two
 //! log lines are [`write_all`]'s here, without a platform in them. Reading a
@@ -45,9 +43,15 @@ use crate::enhanced::Adapter;
 
 pub mod frame;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux::{Device as Imp, no_room};
+
+#[cfg(not(target_os = "linux"))]
 mod unsupported;
-use unsupported::Device as Imp;
-use unsupported::no_room;
+#[cfg(not(target_os = "linux"))]
+use unsupported::{Device as Imp, no_room};
 
 /// The buffer a read goes into (M4c plan P14): larger than any MTU, so that a
 /// packet is never cut short into something that is not the packet.
