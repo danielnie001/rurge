@@ -41,8 +41,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::enhanced::Adapter;
 
+pub mod dll;
 pub mod frame;
 pub mod reader;
+
+#[cfg(windows)]
+mod windows;
 
 #[cfg(target_os = "linux")]
 mod linux;
