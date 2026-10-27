@@ -10,10 +10,13 @@
 //!
 //! `system` gives a platform that has one in this version its own system —
 //! Linux's is [`linux::LinuxSystem`], macOS's [`macos::MacSystem`] — and
-//! [`Unsupported`] to the rest.
+//! [`Unsupported`] to the rest. Windows's is [`windows::WindowsSystem`], which
+//! `system` is not asked for yet: its device comes in the M4d plan's task 5
+//! (the phase 3 / M4d plan's execution record row 12).
 
 pub mod linux;
 pub mod macos;
+pub mod windows;
 
 use std::io;
 use std::net::IpAddr;
