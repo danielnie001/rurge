@@ -180,7 +180,7 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 
 `RURGE_PROCESS_BACKEND=off` 让 `rurge run` 不去查会话来自的进程（`shared.owners` 留空，请求记录里没有进程，`PROCESS-NAME` 一律按不知道判），是仅供自动化测试使用的开关（没设时查本机，恰好 `off` 才关，`OFF` 不行；别的取值会报错、以 2 退出——先恢复上一次崩溃留下的系统代理，在绑定任何端口之前——，从不退回真实的查找），不要在正常使用中设置它，它也不是给使用者的"关掉查找"的开关（M2-D3）。它不是命令行选项，所以不在 `--help` 里，也没有对应的隐藏选项；`rurge check`、`rule match`、`dns lookup` 不读它（它们不查进程）；`external` 策略拉起的程序拿不到它（那里没有任何以 `RURGE_` 开头的变量），嵌套的 `rurge run` 照常查本机，查找只读系统的表，不影响用例。
 
-`RURGE_ENHANCED_BACKEND` 把增强模式要动的那套系统换掉（`crates/rurge/src/cli/enhanced/backend.rs`），是仅供自动化测试使用的后端，不要在正常使用中设置它。不设时是平台后端：**Linux 与 macOS 上是平台后端的代码**（`rurge_platform::enhanced::system`：照代码会建网卡、用 `ip` / `resolvectl` / `ifconfig` / `route` / `networksetup`、改 `rp_filter`；其中开设备的代码与挑平台的 `cfg` 一次也没有编译过（这台开发机编译不到，CI 还没有见过），动系统的那一半在这台开发机上编译、只用假的执行器测过，真机上都没有跑过），**Windows 上对每个动作都答 `the enhanced mode is not available on this platform in this version`**，所以 `rurge run --enhanced-mode` 在 Windows 上以 1 退出、`POST /v1/features/enhanced_mode` 回 500（M4d）。三个取值：
+`RURGE_ENHANCED_BACKEND` 把增强模式要动的那套系统换掉（`crates/rurge/src/cli/enhanced/backend.rs`），是仅供自动化测试使用的后端，不要在正常使用中设置它。不设时是平台后端：**三个平台都是平台后端的代码**（`rurge_platform::enhanced::system`：Linux 用 `ip` / `resolvectl`，macOS 用 `ifconfig` / `route` / `networksetup`，Windows 用 `netsh -f` 与 `ipconfig`，Linux 上需要时改 `rp_filter`；设备是 `/dev/net/tun`、utun 与 Wintun）。Windows 一侧与不带 `cfg` 的部分在一台 Windows 11 x86-64 的开发机上编译、单元用例通过（一台机器上的一次运行，不是 CI）；Linux 与 macOS 专有的代码（`tun/linux.rs`、`tun/macos.rs` 与挑平台的 `cfg`）CI 还没有见过；三个平台都没有在真机上跑过（阶段 3 / M4d）。三个取值：
 
 - `RURGE_ENHANCED_BACKEND=file:<路径>`：把系统当成一个 JSON 文件（`crates/rurge/src/cli/enhanced/file.rs`）。文件里当前开着的各项是 `open`（设备开着没有）、`ipv6`（网卡有 IPv6 的一半没有）、`routes`（装着的前缀，字符串数组，排序并去重）、`dns`（系统 DNS 被接管没有）、`adjusted`（系统自己的调整做着没有），做过的动作按次序在 `actions` 里，每条一个字符串：`open`、`configure`、`configure_ipv6`、`unconfigure_ipv6`、`routes +<加了几条> -<减了几条>`、`take_dns`、`give_dns_back`、`adjust`、`close`、`undo <撤销动作的名字>`（`undo take_dns`、`undo adjust`、`undo rp_filter <值>`、`undo mac_dns <服务>`）。文件里不认识的键原样留着，所以用例可以在里面写下面三个。**失败的动作不记**，它对应的字段也不改：`actions` 里只有真的做成了的。
   - `"fail": "<动作名>"`：让那一个动作失败（错误 `<动作名> failed (test)`），只对着一个名字。`fail: routes` 只让"加"的那一半失败（`add` 非空时），关闭时减的那一半照做；`fail: configure_ipv6` 不算失败：`configure` 与 `configure_ipv6` 答"没有 IPv6"（打开与重载照常往下、管理器记一行 WARN），`configure` 那一步照样记一条 `configure`，`configure_ipv6` 什么也不记。
@@ -277,3 +277,19 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 五、两份名单的数目：`crates/rurge/tests/sockets.rs` 的 `LISTED` 现在 25 行（M4c 加的是 macOS 的 utun 控制套接字那一行），`crates/rurge-platform/tests/unsafe_functions.rs` 的 `LISTED` 现在 9 个函数（`set_iff` 与 `utun_connect`）——加一处建套接字的地方、加一个放开的函数时就地改，那两条扫描用例会逐处报错。
 
 六、**CI 的 clippy 错误在注解里**（计划的任务 1）：`.github/workflows/ci.yml` 的 clippy 一步有名字、输出 `tee` 到 `$RUNNER_TEMP/clippy.log`，“Report the failed tests”按 `steps.clippy.outcome` 选读哪一份日志，报告脚本把 `error[E….]:` 与 `error: ` 两类行发成 `::error title=compile error::` 注解。M4c 的 Linux / macOS 代码只有 CI 编译，而任务日志要登录才能读；这一改让编译错误在公开可读的注解里就能看到（M4c 记录第 10 行）。
+
+### 阶段 3 / M4d 起：Windows 的设备与读回
+
+阶段 3 / M4d 起另有几条：
+
+一、**有真的 `wintun.dll` 的用例由 `RURGE_TEST_WINTUN_DLL` 放开**，缺省不设：设了它的那一条（`crates/rurge-platform/src/tun/windows/wintun.rs` 的 `a_real_wintun_dll_passes`）校验签名者（必须是 `WireGuard LLC`）并把模块加载起来，只读、只在用例自己的进程里；没设时它打印原因并返回，不失败。Pi 不设它、也不下载 `wintun.dll`（M4d 计划的「全局约束」）。**本机一次也没有真的跑过它**，真的 `wintun.dll` 的签名者由手工清单核对（`docs/acceptance/phase3-manual.md` 的 W36）。
+
+二、**Windows 的读回夹具是手写的**（M4d 计划 P17）：`crates/rurge-platform/src/route/windows.rs` 的 `ROUTES_EN` / `ROUTES_ZH` / `ADDRESSES_EN` / `ADDRESSES_ZH` / `DNS_EN` / `DNS_ZH` / `MTU_EN` / `MTU_ZH` 与 `crates/rurge-platform/src/enhanced/windows.rs` 的 `ADDRESSES_V4` 一族，每份旁边写着 “not taken from a machine”。解析只认前缀、序号、地址与数字，不认文字，所以夹具里的字写错了也不影响结论；中文系统上真的 `netsh` 输出由手工清单的 W32 核对（英文与中文各一台）。
+
+三、**`WindowsSystem` 的用例只用假的执行器与临时目录**：程序经 `CommandRunner`（`crate::command::testing::FakeRunner`），脚本写进用例自己的 `tempfile::TempDir`，一条命令也不真的执行（M4d 计划的「全局约束」）。缺省的 `cargo test` 里允许的只读系统调用只有四样：校验测试二进制自己的签名（`WinVerifyTrust`，不联网）、从 System32 载入 `kernel32.dll` 看缺入口时的错误、回环套接字上的 `IP_UNICAST_IF`、测试自己起的子进程上的 `IsProcessInJob`。
+
+四、**没有一条缺省的用例开 Windows 的设备**（同 M4c 那一条，M4d 计划 P19）：`TunDevice::open` 与真实平台的 `System::open` 不被任何缺省用例调用；Windows 的 CI 机器以管理员运行，谁调了 `TunDevice::open`，就真的装了驱动、建了网卡。要测打开之后的事，用文件后端或 `Unsupported`。
+
+五、**`--wintun-dll` 的那一条只在非 Windows 上运行**：`crates/rurge/tests/cli.rs` 的 `the_wintun_dll_option_is_a_usage_error_elsewhere` 是 `#[cfg_attr(not(windows), test)]` 加 `#[cfg_attr(windows, allow(dead_code))]`，在这台开发机上只编译、不运行（Windows 上这个选项是寻常的那个，带着它起的 `rurge run` 会成功并一直跑下去）；第一次运行是 Linux / macOS 的 CI（M4d 记录第 75、76 行）。`wintun_dll_applies` 自己的单元用例（`crates/rurge/src/cli/run.rs` 的 `wintun_dll_is_only_for_windows`）三个平台都跑。
+
+六、两份名单的数目（阶段 3 / M4d 之后）：`crates/rurge/tests/sockets.rs` 的 `LISTED` 仍是 25 行（M4d 的生产代码不新建套接字，Wintun 不是套接字，`unicast_if` 设在已有的套接字上），`crates/rurge-platform/tests/unsafe_functions.rs` 的 `LISTED` 现在 23 个函数（M4d 加了 `unicast_if`、`in_job` 与 `tun/windows/wintun.rs` 的十个）——加一处建套接字的地方、加一个放开的函数时就地改，那两条扫描用例会逐处报错。
