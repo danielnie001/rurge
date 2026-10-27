@@ -15,9 +15,13 @@ use super::{ADAPTER_V4, ADAPTER_V6, MTU, SPACE_V4};
 /// The programs at the paths design 5.1 gives them: never looked up in `PATH`.
 const IFCONFIG: &str = "/sbin/ifconfig";
 const ROUTE: &str = "/sbin/route";
-const NETWORKSETUP: &str = "/usr/sbin/networksetup";
+/// Also what the system side runs (M4c task 5), so the path stands in one place.
+pub(crate) const NETWORKSETUP: &str = "/usr/sbin/networksetup";
 const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
 const KILLALL: &str = "/usr/bin/killall";
+/// Reads the DHCP packet of an interface: its `domain_name_server` is where the
+/// servers of a service that was given its DNS by DHCP come from (design 6.3).
+pub(crate) const IPCONFIG: &str = "/usr/sbin/ipconfig";
 
 /// What `networksetup` is given when there is no server to write: its word for
 /// an empty list, in the case its manual page spells it — the page says to type

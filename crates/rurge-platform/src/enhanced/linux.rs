@@ -171,19 +171,13 @@ impl System for LinuxSystem {
 
     fn routes(&self, dev: &Adapter, add: &RouteSet, remove: &RouteSet) -> Result<bool, String> {
         let tools = self.tools()?;
-        let added = self.run(&translation::add_routes(tools, &dev.name, add))?;
-        if !added {
-            // what of the IPv6 half did go in goes out again: the open goes on
-            // without IPv6 (M4-D17)
-            let v6 = RouteSet {
-                v4: Vec::new(),
-                v6: add.v6.clone(),
-            };
-            self.run(&translation::remove_routes(tools, &dev.name, &v6))?;
-        }
-        // removing goes on past errors and is no error of its own
-        self.run(&translation::remove_routes(tools, &dev.name, remove))?;
-        Ok(added)
+        super::run_routes(
+            add,
+            remove,
+            |steps| self.run(steps),
+            |set| translation::add_routes(tools, &dev.name, set),
+            |set| translation::remove_routes(tools, &dev.name, set),
+        )
     }
 
     /// resolved's per-link settings go with the device: nothing outlives rurge,

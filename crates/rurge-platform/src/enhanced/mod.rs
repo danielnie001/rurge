@@ -12,6 +12,7 @@
 //! 6 and 7 put Linux's and macOS's in its `cfg`s, and M4d Window's.
 
 pub mod linux;
+pub mod macos;
 
 use std::io;
 use std::net::IpAddr;
@@ -19,6 +20,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::route::RouteSet;
+use crate::route::steps::Step;
 use crate::tun::TunDevice;
 
 /// How the steps name the virtual adapter.
@@ -93,6 +95,32 @@ pub trait System: Send + Sync {
 /// put Linux's and macOS's here.
 pub fn system(_scratch: PathBuf) -> Box<dyn System> {
     Box::new(Unsupported)
+}
+
+/// The order of [`System::routes`], the same on Linux and macOS: add, and when
+/// the IPv6 half of that failed, take that half out again and go on without
+/// IPv6 (M4-D17); then remove, going on past errors. `run` runs a batch of
+/// steps, `add` and `remove` translate one set of prefixes into its steps.
+fn run_routes(
+    add: &RouteSet,
+    remove: &RouteSet,
+    run: impl Fn(&[Step]) -> Result<bool, String>,
+    add_steps: impl Fn(&RouteSet) -> Vec<Step>,
+    remove_steps: impl Fn(&RouteSet) -> Vec<Step>,
+) -> Result<bool, String> {
+    let added = run(&add_steps(add))?;
+    if !added {
+        // what of the IPv6 half did go in goes out again: the open goes on
+        // without IPv6
+        let v6 = RouteSet {
+            v4: Vec::new(),
+            v6: add.v6.clone(),
+        };
+        run(&remove_steps(&v6))?;
+    }
+    // removing goes on past errors and is no error of its own
+    run(&remove_steps(remove))?;
+    Ok(added)
 }
 
 /// The system of a platform that has no enhanced mode in this version: every
