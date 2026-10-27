@@ -173,6 +173,84 @@ fn what_a_dead_run_left_is_undone_even_when_the_profile_does_not_load() {
     assert!(read_json(&data.join("state.json"))["enhanced_backup"].is_null());
 }
 
+/// `run_with_the_file_backend` with the network on: the profile's sources are
+/// downloaded, and the GeoIP databases it would fetch go to `geo`, on the
+/// loopback.
+fn run_with_the_file_backend_online(
+    conf: &Path,
+    data: &Path,
+    file: &Path,
+    geo: &TestServer,
+) -> Command {
+    let mut cmd = rurge_run_online(conf, data, geo);
+    cmd.env("RURGE_ENHANCED_BACKEND", format!("file:{}", file.display()));
+    cmd
+}
+
+/// The recovery goes before the wait for the profile's sources, not after it
+/// (M4 design 9.5: once the lock is in hand, before any new change; M4c plan's
+/// execution record row 32): a crashed run may leave the machine's DNS pointing
+/// at a responder that is gone, and the downloads before the log ask the
+/// system's resolver — waiting for them first would wait for timeouts. The
+/// profile has an error, so the start ends by itself with 2 after the wait,
+/// and the whole of standard error can be read. The error path recovers a
+/// second time, which does nothing: each undo went back once.
+#[test]
+fn what_a_dead_run_left_goes_back_before_the_sources_are_waited_for() {
+    // The daemon blocks the test's thread, so the server gets threads of its
+    // own and keeps answering meanwhile.
+    let servers = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let geo = servers.block_on(TestServer::spawn());
+
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("t.conf");
+    // the profile itself has an error — a rule this version does not know —
+    // and a source that must be downloaded: the start waits, then ends with 2
+    geo.set("/rules.dconf", "[Rule]\nDOMAIN,included.test,REJECT\n");
+    let included = geo.url("/rules.dconf");
+    std::fs::write(
+        &conf,
+        format!(
+            "[General]\n{LISTENERS}\n[Proxy]\n[Rule]\nNOT-A-RULE,x,DIRECT\n#!include {included}\nFINAL,DIRECT\n"
+        ),
+    )
+    .unwrap();
+    let (data, file) = left_by_a_dead_run(dir.path(), json!({}));
+
+    let (code, stderr) = give_up(run_with_the_file_backend_online(&conf, &data, &file, &geo));
+    assert_eq!(code, Some(2), "{stderr}");
+    let restored = stderr
+        .find("a previous run left changes of the enhanced mode")
+        .unwrap_or_else(|| panic!("the recovery was not said: {stderr}"));
+    let waiting = stderr
+        .find("waiting for the profile's remote sources")
+        .unwrap_or_else(|| panic!("the wait was not said: {stderr}"));
+    assert!(
+        restored < waiting,
+        "the recovery comes before the wait: {stderr}"
+    );
+    assert_eq!(
+        actions(&file),
+        [
+            "open",
+            "configure",
+            "take_dns",
+            "adjust",
+            "undo adjust",
+            "undo take_dns",
+        ],
+        "each undo went back once"
+    );
+    assert!(
+        read_json(&data.join("state.json"))["enhanced_backup"].is_null(),
+        "nothing of the backup is left"
+    );
+}
+
 /// An undo that fails stays in `state.json` and is tried again by the next
 /// start; the one that went back does not come back with it.
 #[test]

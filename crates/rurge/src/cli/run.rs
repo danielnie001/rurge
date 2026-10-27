@@ -1399,6 +1399,12 @@ fn wait_for_the_sources(
         }
     };
     let limits = BootLimits::default();
+    // A run that died may have left the machine's DNS at a responder that is
+    // gone, and the downloads below ask the system's resolver: what it left goes
+    // back now, once the lock is in hand and before anything new is done (M4
+    // design 9.5). Undoing twice is harmless, and the paths out of this
+    // function recover again for a start that has not got this far.
+    lock.recover(&args.runtime);
     eprintln!(
         "waiting for the profile's remote sources (at most {} s)",
         limits.total.as_secs()
