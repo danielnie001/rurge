@@ -642,8 +642,8 @@ TUN 的 `Pinger` 现在是可执行文件的 `PlatformPinger`（`crates/rurge/sr
 
 阶段 3 / M4c（计划 `docs/superpowers/plans/2026-10-26-phase3-m4c-linux-macos-plan.md`，下面写“M4c 记录第 N 行”“M4c 延后第 N 行”指它末尾的两张表，写“P N”指它的「计划期决定」）做的是这两个平台的系统一侧：虚拟网卡、地址与路由、系统 DNS 的接管、Linux 的 `rp_filter`，以及接管期间问哪里的 DNS 服务器。**本节订正上面几句，那是 M4a 与 M4b 当时的事实**（规矩是历史的段落不逐处改、由后写的段落订正）：
 
-- M4 一节开头粗体的“这一版开不了增强模式”与它下面三条，在 Linux 与 macOS 上不成立了：`rurge run --enhanced-mode` 与 `POST /v1/features/enhanced_mode` 带 `{"enabled": true}` 真的开虚拟网卡、配地址、装路由、接管系统 DNS，Linux 上按需要改 `net.ipv4.conf.all.rp_filter`。**Windows 上照旧**：平台后端仍是 `Unsupported`，答 `the enhanced mode is not available on this platform in this version`，以 M4d 为准。
-- 「只供测试的后端」里“（这一版对每个动作答‘不可用’）”与 M4b 一节里“平台后端仍然答‘这一版还不能’，所以使用者仍然开不了增强模式”同样以这一段为准：不设 `RURGE_ENHANCED_BACKEND` 时，Linux 与 macOS 用的是这一节说的真的系统一侧，Windows 才是那个什么都答不行的 `Unsupported`。上面的出口判定、接管期间的 DNS、外部程序一律 DIRECT 那几节写的道理不变，只是 `physical` 从此有人写。
+- M4 一节开头粗体的“这一版开不了增强模式”与它下面三条，在 Linux 与 macOS 上不成立了：`rurge run --enhanced-mode` 与 `POST /v1/features/enhanced_mode` 带 `{"enabled": true}` 有了平台后端的代码（不再答“不可用”），照代码会建虚拟网卡、配地址、装路由、接管系统 DNS，Linux 上按需要改 `net.ipv4.conf.all.rp_filter`；**这段代码一次也没有编译过（开发机编译不到，CI 还没有见过）、真机上没有跑过**。**Windows 上照旧**：平台后端仍是 `Unsupported`，答 `the enhanced mode is not available on this platform in this version`，以 M4d 为准。
+- 「只供测试的后端」里“（这一版对每个动作答‘不可用’）”与 M4b 一节里“平台后端仍然答‘这一版还不能’，所以使用者仍然开不了增强模式”同样以这一段为准：不设 `RURGE_ENHANCED_BACKEND` 时，Linux 与 macOS 用的是这一节说的平台后端的代码（照代码会做那些事；这段代码一次也没有编译过、真机上没有跑过），Windows 才是那个什么都答不行的 `Unsupported`。上面的出口判定、接管期间的 DNS、外部程序一律 DIRECT 那几节写的道理不变，只是 `physical` 从此有人写。
 - 下面「没有覆盖的」一节里的“没有真实的设备”、“接管期间的去处只在单元用例里”那句里的“`physical` 今天没有人写（M4c）”、与“防环没有在真机上验过”里“随 M4c 接上平台后端”那半句，也都不成立了；今天还没有做到的事以本节末尾的「没有覆盖的」为准。
 
 **这两个平台的代码在这台 Windows 开发机上编译不到，CI 还没有见过 M4c 的提交**（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986），真机上没有跑过。所以下面写的是代码的行为，不是观察到的行为。
@@ -657,9 +657,9 @@ TUN 的 `Pinger` 现在是可执行文件的 `PlatformPinger`（`crates/rurge/sr
 | 虚拟网卡 | `/dev/net/tun`，名字 `rurge`，`IFF_TUN \| IFF_NO_PI`（`crates/rurge-platform/src/tun/linux.rs` 的 `set_iff`）。不持久：描述符一关，网卡连同它的地址与路由一起没有 | utun：`com.apple.net.utun_control` 的控制套接字，名字由内核挑（`utunN`，`crates/rurge-platform/src/tun/macos.rs` 的 `utun_connect`） | 设备随关闭与进程结束消失；`PlatformBackend::close` 丢掉最后一个所有者 |
 | 地址与 MTU | `ip -batch`：`link set dev rurge mtu 1500`、`addr add 198.18.0.1/15 dev rurge`、`link set dev rurge up`；IPv6 单独一批：`addr add fd00:6152::1/64 dev rurge` | `ifconfig utunN inet 198.18.0.1 198.18.0.1 netmask 255.254.0.0 mtu 1500 up`；IPv6 单独一条：`ifconfig utunN inet6 fd00:6152::1 prefixlen 128 alias`（`/128` 与 `alias` 的理由见 P5） | 随网卡走。IPv6 从开到关时显式撤一次：`addr del …` / `ifconfig … inet6 … delete` |
 | 路由 | `ip -batch`，一行一条 `route add <前缀> dev rurge`（IPv4 一批，IPv6 一批）；减的时候 `route del` 一批，`ip -force -batch` 走过失败的 | 一条一个进程：`route -n add -inet <前缀> -interface utunN`（IPv6 用 `-inet6`） | 随网卡走；打开失败与重载 / 网络变化时显式减（`route del` / `route -n delete`，减不掉不算错） |
-| 系统 DNS | 只在 `/etc/resolv.conf` 是 systemd-resolved 的存根（唯一的服务器是 `127.0.0.53`）且找得到 `resolvectl` 时接管，且只是这一条链路的设置：`resolvectl dns rurge 198.18.0.2 [fd00:6152::2]`、`resolvectl domain rurge ~.`、`resolvectl default-route rurge yes`（这一步失败不算错，P4）、`resolvectl flush-caches` | 每一个启用的网络服务：先 `networksetup -getdnsservers <服务>` 读原值，再 `networksetup -setdnsservers <服务> 198.18.0.2 [fd00:6152::2]`；全部改完 `dscacheutil -flushcache` 与 `killall -HUP mDNSResponder` | Linux 的设置随链路走，设备没了就没了（交还时另做一次 `resolvectl revert rurge`）；**macOS 的改动会留在系统里**：原值进 `state.json` 的备份，撤销时按原值写回（原来一条也没有的写 `networksetup -setdnsservers <服务> empty`），服务已经被删掉的算做完（P9） |
+| 系统 DNS | 只在 `/etc/resolv.conf` 是 systemd-resolved 的存根（唯一的服务器是 `127.0.0.53`）且找得到 `resolvectl` 时接管，且只是这一条链路的设置，次序是：`resolvectl llmnr rurge no`、`resolvectl mdns rurge no`、`resolvectl dnssec rurge no`、`resolvectl dnsovertls rurge no`（四步都是尽力而为，失败不算错：全局的 DoT 会让发往 `198.18.0.2` 的查询走 853 上的 TLS、DNSSEC 验不过 fake 应答、LLMNR / mDNS 会把单标签名字与 `.local` 的组播发到这条链路上），然后 `resolvectl dns rurge 198.18.0.2 [fd00:6152::2]`、`resolvectl domain rurge ~.`（这两步失败就是这次不接管）、`resolvectl default-route rurge yes`（失败不算错，P4）、`resolvectl flush-caches`（失败不算错：只是缓存里已有的名字到期之前照旧是真地址） | 每一个启用的网络服务：先 `networksetup -getdnsservers <服务>` 读原值，再 `networksetup -setdnsservers <服务> 198.18.0.2 [fd00:6152::2]`；全部改完 `dscacheutil -flushcache` 与 `killall -HUP mDNSResponder` | Linux 的设置随链路走，设备没了就没了（交还时另做一次 `resolvectl revert rurge`）；**macOS 的改动会留在系统里**：原值进 `state.json` 的备份，撤销时按原值写回（原来一条也没有的写 `networksetup -setdnsservers <服务> empty`），服务已经被删掉的算做完（P9） |
 | `rp_filter` | 只在主网卡的有效值（`all` 与主网卡自己的两个值里大的那个）是 1 时，把 `all` 写成 2（直接写 `/proc/sys/net/ipv4/conf/all/rp_filter`，不经 `sysctl`） | 没有这一步 | **会留在系统里**：`all` 的原值进备份，撤销时写回 |
-| 脚本文件 | 数据目录的 `enhanced/` 下，`rurge-steps-<pid>-<n>.txt`，程序读完就删 | 同左（`networksetup` / `ipconfig` 不走脚本，`ifconfig` 与 `route` 的参数直接在命令行上） | 跑完就删；崩溃留下的在下一次 `open` 时删（P12） |
+| 脚本文件 | 数据目录的 `enhanced/` 下，`rurge-steps-<pid>-<n>.txt`，程序读完就删 | 没有这一步：macOS 每一步一个进程，`route/macos.rs` 里没有 `SCRIPT`，`ifconfig` / `route` / `networksetup` / `ipconfig` 的参数都在命令行上 | 跑完就删；崩溃留下的在下一次 `open` 时删（P12） |
 
 macOS 上读不了原值的那个服务不接管（WARN 一行，它照旧按原来的服务器解析——P8）；一个服务也接管不了时 `take_dns` 回 `Ok(false)`，与 Linux 没有 resolved 的情形一样，增强模式照开。
 
@@ -669,7 +669,7 @@ macOS 上读不了原值的那个服务不接管（WARN 一行，它照旧按原
 
 | 级别 | 文本 | 字段 | 什么时候 |
 | --- | --- | --- | --- |
-| INFO | `loosened net.ipv4.conf.all.rp_filter to 2: replies to rurge's own connections come in on another interface than the routes to their senders` | | Linux 打开的第 8 步放宽了 `all`（`LinuxSystem::adjust`） |
+| INFO | `loosened net.ipv4.conf.all.rp_filter to 2: replies to rurge's own connections come in on another interface than the routes to their senders` | | Linux 打开的第 8 步或一次网络变化放宽了 `all`（`LinuxSystem::adjust`）：主网卡的有效值是 1 时，或备份里已有 `all` 的原值、换网络之后再写一次时；不需要放宽的机器不写、也没有这一行（F1，M4c 记录第 40 行） |
 | INFO | `put net.ipv4.conf.all.rp_filter back to {value}` | | 撤销那一条，写回原值（`LinuxSystem::undo`） |
 | INFO | `a network service the enhanced mode changed is gone; there is nothing to put back for it` | | macOS 撤销时那个网络服务已经不在了，算做完（P9） |
 | WARN | `the system's DNS is not systemd-resolved's stub; it is left as it is: write hijack-dns = *:53, or point the system's DNS at 198.18.0.2` | | Linux 不接管系统 DNS：`/etc/resolv.conf` 不是存根，或找不到 `resolvectl`。一次打开至多一行（重载不再写） |
@@ -685,7 +685,7 @@ macOS 上读不了原值的那个服务不接管（WARN 一行，它照旧按原
 | DEBUG | `a step that may fail failed; going on` | `error` | 标 `Ignore` 的一步失败（`route::exec::run`）：撤销、`default-route`、`flush` 一类 |
 | DEBUG | `a packet with no room in the system is dropped` | `error` | 上面那条 WARN 之后的每一次（`tun/mod.rs` 的 `write_all`） |
 | DEBUG | `a datagram from the virtual adapter that is no IP packet is skipped` | `read`（这一次读到的字节数） | macOS 从 utun 读到的数据报前面不是已知的地址族、或后面没有包（`tun/macos.rs` 的 `skipped`） |
-| DEBUG | `cannot read /etc/resolv.conf` | `error` | Linux 判存根、macOS 记接管之前的服务器时读不出来：分别当成“不是存根”与一份空名单 |
+| DEBUG | `cannot read /etc/resolv.conf` | `error` | Linux 判存根、macOS 记接管之前的服务器时读不出来：分别当成“不是存根”与一份空名单（macOS 的空名单当不知道，往下读服务原值与 DHCP，F8） |
 | DEBUG | `no resolvectl in the system directories: the resolver's per-link settings cannot be made` | | Linux 找不到 `resolvectl`（systemd 239 之前）：不接管系统 DNS |
 | DEBUG | `cannot read resolved's resolv.conf; no servers outside the enhanced mode are known` | `error` | Linux 接管着、但读不出 `/run/systemd/resolve/resolv.conf`：`server:system` 的名单是空的 |
 | DEBUG | `cannot list the network services' devices` | `error` | macOS 读 `-listnetworkserviceorder` 失败：找不到主网卡所在的服务，只能去问 DHCP |
@@ -702,7 +702,7 @@ macOS 上读不了原值的那个服务不接管（WARN 一行，它照旧按原
 上面的「接管期间的名字去哪里问」一表说的是四种去处；物理网卡的服务器由平台一侧给（`System::physical_dns`，管理器的 `read_physical` 抄进 `PlatformSystemDns`）。两个平台各一段：
 
 - **Linux**：问的是 resolved 的上游名单，`/run/systemd/resolve/resolv.conf`——resolved 写给整台机器的那一份（P10）；它只在这一次真的接管了系统 DNS 之后才有（没接管时回答“机器自己的列表是对的”，即 `None`，用 `rurge_platform::dns::servers()`）。文件读不出来时是空的列表：查找失败，**不退回机器自己的列表**。
-- **macOS**：打开时是接管之前的 `/etc/resolv.conf`（`dns_saved` 在改任何服务之前读的那一份；崩溃之后它可能还指着应答器，去掉 rurge 的地址空间之后就是空的）。换过网络之后那一份作废，改成主网卡所在的那个网络服务在备份里原来手动设的服务器；一条也没有的，是 `ipconfig getpacket <主网卡>` 给的 DHCP 服务器；两个都没有时是空的列表，查找失败、不退回系统解析库。没有主网卡时（没有路由可以出去）同样是空的列表。
+- **macOS**：打开时是接管之前的 `/etc/resolv.conf`（`dns_saved` 在改任何服务之前读的那一份；崩溃之后它可能还指着应答器，去掉 rurge 的地址空间之后可能是空的）。**空的当不知道，不当成“没有服务器”**：往下读服务原值与 DHCP（F8，M4c 记录第 47 行）——`/etc/resolv.conf` 由 configd 异步重写，关闭之后马上再打开、或崩溃恢复刚写回就打开时，读到的可能只有应答器。换过网络之后那一份作废，改成主网卡所在的那个网络服务在备份里原来手动设的服务器；一条也没有的，是 `ipconfig getpacket <主网卡>` 给的 DHCP 服务器；两个都没有时是空的列表，查找失败、不退回系统解析库。没有主网卡时（没有路由可以出去）同样是空的列表。
 
 三处都先去掉 rurge 的地址空间（协调者的裁定 R16）：使用者照那句 WARN 的提示把服务的 DNS 手动设成 `198.18.0.2` 时，原值就是应答器，问它必然失败。**读的那一步本身没有回来**（阻塞的任务没了）也是空的列表，不是“机器自己的列表”（协调者的裁定 R19）：`PlatformSystemDns` 里的槽留着 `Some(空)`，只有后端自己该答 `None` 的那几种（Linux 还没接管、文件后端没有那个键、`RURGE_ENHANCED_BACKEND=off`、以后的 Windows）才是 `None`。
 
@@ -718,17 +718,17 @@ macOS 上读不了原值的那个服务不接管（WARN 一行，它照旧按原
 
 | 平台 | 情形 | 文本 |
 | --- | --- | --- |
-| Linux | `PermissionDenied` | `the enhanced mode needs root or CAP_NET_ADMIN` |
+| Linux | `PermissionDenied` | `the enhanced mode needs root (in a container, root with CAP_NET_ADMIN)` |
 | Linux | `NotFound`（`/dev/net/tun` 不在） | `there is no /dev/net/tun: the kernel's tun module is not loaded` |
 | Linux | `ResourceBusy` | `the virtual adapter is in use: is another rurge running with the enhanced mode on?` |
 | macOS | `PermissionDenied` | `the enhanced mode needs root` |
 | 两个平台 | 其余 | `cannot open the virtual adapter: <系统的原话>` |
 
-它出现在 `rurge run --enhanced-mode` 的标准错误（`error: cannot turn the enhanced mode on: <这一句>`）与 `POST /v1/features/enhanced_mode` 的 500 体（`{"error":"<这一句>"}`）里；打开失败已经把它做过的倒着撤销了。
+它出现在 `rurge run --enhanced-mode` 的标准错误（`error: cannot turn the enhanced mode on: <这一句>`）与 `POST /v1/features/enhanced_mode` 的 500 体（`{"error":"<这一句>"}`）里；打开失败已经把它做过的倒着撤销了。Linux 那一句只说 root：`ip` 与 `resolvectl` 是机器上的外部程序，只给 rurge 自己的文件能力（`setcap`）到不了它们（`ip` 配地址那一步才以 `Operation not permitted` 失败），而容器里的 root 又可能被拿掉 `CAP_NET_ADMIN`（F7，M4c 记录第 46 行）。
 
 #### 脚本与程序
 
-- 要程序读的一批命令写成脚本文件，放在数据目录的 `enhanced/` 下（以 root 运行时那个目录属于 root；不写 `/tmp`，别人可能在那里预先放好符号链接），名字 `rurge-steps-<pid>-<n>.txt`，用 `create_new` 建（P12）。程序跑完就删；删不掉不算错，崩溃留下的在下一次 `open` 时由 `exec::remove_leftovers` 删掉，只删这个名字形状的普通文件。
+- 要程序读的一批命令写成脚本文件，放在数据目录的 `enhanced/` 下（以 root 运行时那个目录属于 root；不写 `/tmp`，别人可能在那里预先放好符号链接），名字 `rurge-steps-<pid>-<n>.txt`，用 `create_new` 建（P12）。程序跑完就删；删不掉不算错，崩溃留下的在下一次 `open` 时由 `exec::remove_leftovers` 删掉，只删这个名字形状的普通文件。**只有 Linux 走脚本**：macOS 每一步一个进程，命令行的参数就是全部（`route/macos.rs` 里没有 `SCRIPT`）；Windows 的 `netsh -f` 以后也写（M4d）。写了脚本的步骤失败时，错误里脚本的路径每一处都换成 `…`（命令行的与工具原文里的都换，`ip -batch` 自己会写 `Command failed <路径>:<行>`），DEBUG 那一行照旧带路径（F5，M4c 记录第 44 行）。
 - 程序一律用绝对路径（`LinuxTools::find` 在 `/usr/sbin`、`/sbin`、`/usr/bin`、`/bin` 里找，不查 `PATH`），一律经 `TimedRunner` 执行，**每个程序 30 秒为限**（P11）：到时杀掉，那一步失败，挂住的工具（比如 D-Bus 卡住的 `resolvectl`）不会让主循环一直等。一批几十条路由的 `ip -batch` 只要毫秒；`networksetup` 慢的时候要几秒。
 - 程序与参数、脚本的内容都只在 DEBUG（上面那张表的两行 `running a step …` / `running a command …`）：macOS 的命令行里有使用者自己起的网络服务名。带服务名的命令失败时，回到管理器的错误是固定的一句，工具的原文只在 DEBUG（P7）。
 
@@ -753,7 +753,7 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
 
 - **两个平台的设备与系统改动没有在真机上跑过**：Linux 与 macOS 的代码在这台 Windows 开发机上编译不到，CI 还没有见过 M4c 的提交（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986）；设备、地址、路由、`networksetup` 那几条命令一条也没有在真机上执行过。系统一侧（`LinuxSystem` / `MacSystem`）只在开发机上用假的执行器与临时目录测过。
 - **L2 特权用例写好了，没有运行过**（计划任务 9；门控与跑法见 `docs/testing.md` 的「阶段 3 / M4c 起」与 `tests/privileged/README.md`）：经虚拟网卡的一个往返、rurge 自己的 DNS 查询不进虚拟网卡、`rp_filter` 的放宽与写回，都还没有在虚拟机上跑过。
-- **macOS 的 `-listnetworkserviceorder` 输出格式凭记忆写**（P20 没有可引用的样本）：服务与网卡的配对、与 `ipconfig getpacket` 周围的行走，都要等手工清单核对（M4d）。
+- **macOS 的 `-listnetworkserviceorder` 输出格式与公开的样本对得上**（两个出处：Apple Support Communities 的帖子贴的原样输出，每个服务两行 `(N) 名字` 与下一行 `(Hardware Port: …, Device: …)`，VPN 服务的 `Device:` 可以是空的、服务名里可以有括号；Jamf Nation 的帖子是另一种排版的同一份）：服务与网卡的配对、与 `ipconfig getpacket` 周围的行走仍要等手工清单核对（M4d；M4c 记录第 49 行、延后第 2 行仍然开着）。
 - **交给管理器的物理网卡服务器没有端到端用例**：`run.rs` 里把 `physical` 交给管理器的那一行没有用例走到（`server:system` 在测试里会去问这台机器真的系统 DNS，失败时就离开了回环，`CLAUDE.md`「测试约定」）。
 - **Windows 照旧不能开**：平台后端在 Windows 上仍是 `Unsupported`，`rurge run --enhanced-mode` 以 1 退出、`POST` 回 500，见 M4d。
 - **手工验收没有做**：`docs/acceptance/phase3-manual.md` 还没有 M4 一节（只有 M1、M2、M3），M4d 写它。

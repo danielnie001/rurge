@@ -96,7 +96,7 @@ Surge 是 Apple 平台上功能最完整的网络代理与调试工具之一：�
 | 平台 | 版本 | 架构 | 说明 |
 | --- | --- | --- | --- |
 | Windows | 10 及以上 | x86_64、aarch64 | 增强模式需要管理员权限（Wintun 驱动） |
-| Linux | 主流发行版（glibc）；musl 静态构建为次要目标 | x86_64、aarch64 | 增强模式需要 `CAP_NET_ADMIN` |
+| Linux | 主流发行版（glibc）；musl 静态构建为次要目标 | x86_64、aarch64 | 增强模式需要 root（容器里还要 `CAP_NET_ADMIN`） |
 | macOS | 12 及以上 | arm64、x86_64 | 增强模式需要 root（utun） |
 
 ### 2.2 产品形态
@@ -471,7 +471,7 @@ flowchart LR
 
 | 能力 | Windows | Linux | macOS | 说明 |
 | --- | --- | --- | --- | --- |
-| 虚拟网卡 | Wintun（管理员） | `/dev/net/tun`（`CAP_NET_ADMIN`） | utun（root） | 阶段 3 |
+| 虚拟网卡 | Wintun（管理员） | `/dev/net/tun`（root；容器里还要 `CAP_NET_ADMIN`） | utun（root） | 阶段 3 |
 | 系统代理设置 | 注册表 `ProxyServer` / `ProxyOverride` + WinINet 刷新 | GNOME / KDE 设置；其他桌面输出环境变量提示 | SystemConfiguration | 阶段 1 |
 | 进程识别 | TCP / UDP 连接表 + 进程映像路径 | `/proc/net/*` + `/proc/<pid>/exe` | `sysctl` 的 PCB 表 + `proc_pidpath` | 阶段 3 |
 | 出站网卡绑定 | `IP_UNICAST_IF` / 绑定源地址 | `SO_BINDTODEVICE` | `IP_BOUND_IF` | 阶段 2 |

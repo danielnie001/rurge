@@ -361,20 +361,22 @@ M4b 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 
 ### M4c（Linux 与 macOS）
 
-M4c 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4c-linux-macos-plan.md`，下面写“M4c 记录第 N 行”“M4c 延后第 N 行”指它末尾的两张表，写“P N”指它的「计划期决定」）。**上一节 M4b 的四条以这一段为准**（那四条是当时的事实；规矩是历史的段落不逐处改、由后写的段落订正）：“这一版 `rurge run --enhanced-mode` 在每个平台上仍然以 1 退出”不成立了——**Linux 与 macOS 上真的能开**；“`physical` 没有人写”不成立了——两个平台各有一段（见下面）；“防环……随 M4c 接上平台后端”里的那半句也不成立了——`PlatformBackend::subnets` 现在真的读本机网卡，三条 L2 用例就是为它写的（但没有运行过，所以 M4b 延后第 11 行仍然开着）；“设计第 14 节的 L2 特权用例还没有写”不成立了——写好了，没有运行过。M4c 由协调的会话逐个任务调 Pi 做、逐个任务评审；任务 10（等 CI）与 M4d 的任务 8 挪到最后一起做（协调者的裁定 R3，M4c 记录第 9 行），所以做完任务 9 接着做任务 11，不在任务 11 之后停下。
+M4c 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4c-linux-macos-plan.md`，下面写“M4c 记录第 N 行”“M4c 延后第 N 行”指它末尾的两张表，写“P N”指它的「计划期决定」）。**上一节 M4b 的四条以这一段为准**（那四条是当时的事实；规矩是历史的段落不逐处改、由后写的段落订正）：“这一版 `rurge run --enhanced-mode` 在每个平台上仍然以 1 退出”不成立了——**Linux 与 macOS 上有了平台后端的代码（不再答“不可用”），照代码会开增强模式**；这段代码一次也没有编译过（开发机编译不到，CI 还没有见过）、真机上没有跑过；“`physical` 没有人写”不成立了——两个平台各有一段（见下面）；“防环……随 M4c 接上平台后端”里的那半句也不成立了——`PlatformBackend::subnets` 现在真的读本机网卡，三条 L2 用例就是为它写的（但没有运行过，所以 M4b 延后第 11 行仍然开着）；“设计第 14 节的 L2 特权用例还没有写”不成立了——写好了，没有运行过。M4c 由协调的会话逐个任务调 Pi 做、逐个任务评审；任务 10（等 CI）与 M4d 的任务 8 挪到最后一起做（协调者的裁定 R3，M4c 记录第 9 行），所以做完任务 9 接着做任务 11，不在任务 11 之后停下。
 
-做了什么：一句话说，这两个平台的增强模式从“只生成为数据”变成真的动系统——真的虚拟网卡、地址、路由、系统 DNS 的接管与交还、Linux 的 `rp_filter`，以及接管期间问物理网卡的哪些服务器：
+做了什么：一句话说，这两个平台的增强模式从“只生成为数据”变成有了动系统的代码（照代码会建虚拟网卡、配地址、装路由、接管系统 DNS 并交还、需要时改 Linux 的 `rp_filter`，以及接管期间问物理网卡的哪些服务器），但这段代码一次也没有编译过、真机上没有跑过：
 
 - **设备的接口与帧**（`crates/rurge-platform/src/tun/`）：`mod.rs` 定接口约定（`open` / `read` / `try_read` / `try_write` / `no_room`）与平台无关的三块——`drain`（先把等到的那一个放进去，再把已经在了的搬出来）、`write_all`（写不进就丢、计数，第一次 WARN、之后 DEBUG）、`RX_MAX` 64 KiB；`frame.rs` 不带 `cfg`（`ifname`、`name_of`、`packet_len`、`utun_header`、`utun_packet`、`utun_to_front`、`explained`），在本机能测；`unsupported.rs` 给没有设备的平台。
 - **两个平台真的设备**：Linux 的 `/dev/net/tun`（`tun/linux.rs`，`set_iff` 包 `ioctl(TUNSETIFF)`、`IFF_TUN | IFF_NO_PI`）、macOS 的 utun（`tun/macos.rs`，`utun_connect` 包 `ioctl(CTLIOCGINFO)`、`connect` 与 `getsockopt(UTUN_OPT_IFNAME)`）；两个 `unsafe` 函数进 `LISTED`（现在 9 个），`CLAUDE.md` 同步。
 - **系统一侧不带 `cfg`**（P2）：`enhanced/linux.rs` 的 `LinuxSystem`（`ip -batch` 配地址与路由、`resolvectl` 逐链路接管系统 DNS、`/proc` 里的 `rp_filter`、resolved 的上游名单）与 `enhanced/macos.rs` 的 `MacSystem`（`ifconfig` / `route` / `networksetup` / `dscacheutil`、`-listallnetworkservices` / `-getdnsservers` / `-listnetworkserviceorder` / `ipconfig getpacket` 的解析、每个网络服务的备份与写回）在这台 Windows 上也编译、也测；`enhanced/mod.rs` 的 `run_routes`（加、IPv6 一半失败时撤那一半、再减）两边共用（R15，M4c 记录第 29 行）。
 - **执行**：`route/exec.rs`（`TimedRunner` 每个程序 30 秒，P11；脚本写进数据目录的 `enhanced/`、`create_new`、用完删掉、崩溃留下的下一次 `open` 删，P12），`route/macos.rs` 的 IPv6 地址用 `/128 … alias`（P5）、`resolvectl default-route` 失败不算错（P4）、Linux 用 `route add` 不 `replace`（P3）。
-- **可执行文件接上**：`backend(data_dir)` 建 `rurge_platform::enhanced::system(data_dir.join("enhanced"))`，`PlatformBackend` 每个方法转给它，`PlatformDevice` 把 `TunDevice` 的 `recv` / `send` 包成 `BoxFuture`；`Undo` ↔ `Saved` 的映射是 `saved_of` / `undo_of`，平台后端不认识的撤销动作 WARN 一行丢掉（P9）。`Backend::physical_dns` 加了，管理器在三处写它的结果（R6，M4c 记录第 31 行），读的那一步没回来时写空列表而不是 `None`（R19，第 33 行）。`wait_for_the_sources` 拿到实例锁之后、下载 Profile 的远程来源之前先恢复一次（R10，第 32 行）。M4a 的 `the_platform_backend_is_not_available_in_this_version` 删掉（P19，它从 M4c 起会建真的网卡）。
-- **L2 特权用例**：新的工作区成员 `tests/privileged`（`rurge-privileged-tests`，`publish = false`）——两条网络命名空间、`l2-helper`、三条用例（TCP 往返与 `ping` 经虚拟网卡出去、rurge 自己的 DNS 查询不进虚拟网卡、`kill -9` 之后下一次启动撤销）（P17，协调者的裁定 R17、R20、R21）。**写好之后没有在任何地方运行过。**
+- **可执行文件接上**：`backend(data_dir)` 建 `rurge_platform::enhanced::system(data_dir.join("enhanced"))`，`PlatformBackend` 每个方法转给它，`PlatformDevice` 把 `TunDevice` 的 `recv` / `send` 包成 `BoxFuture`；`Undo` ↔ `Saved` 的映射是 `saved_of` / `undo_of`，平台后端不认识的撤销动作 WARN 一行丢掉（P9）。`Backend::physical_dns` 加了，管理器在三处写它的结果（R6，M4c 记录第 31 行），读的那一步没回来时写空列表而不是 `None`（R19，第 33 行）。`wait_for_the_sources` 拿到实例锁之后、下载 Profile 的远程来源之前先恢复一次（R10，第 32 行）。M4a 的 `the_platform_backend_is_not_available_in_this_version` 删掉（P19：从 M4c 起它会走到平台后端的设备代码，不再是一条缺省能跑的用例）。
+- **L2 特权用例**：新的工作区成员 `tests/privileged`（`rurge-privileged-tests`，`publish = false`）——两个网络命名空间、`l2-helper`、三条用例（TCP 往返与 `ping` 经虚拟网卡出去、rurge 自己的 DNS 查询不进虚拟网卡、`kill -9` 之后下一次启动撤销）（P17，协调者的裁定 R17、R20、R21）。**写好之后没有在任何地方运行过。**
 - **CI 的 clippy 日志**（任务 1，P18）：clippy 一步有名字、输出写进文件，失败时报告脚本读它、发成注解——M4c 的 Linux / macOS 编译错误因此公开可读（M4c 记录第 10 行）。
 - **文档**（任务 11）：`docs/api/phase3.md` 的 M4c 一节、`docs/testing.md` 的「阶段 3 / M4c 起」、`CLAUDE.md` 的「现在在哪里」、兼容性清单 9.1、本节的附录。
 
-门禁：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过，`cargo test -j 8 --workspace --no-fail-fast` **86 个结果行、4583 通过、0 失败、13 忽略**（一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；工作区的 `gate-task-11.log`；与 M4c 任务 9 的基线相同，这一次只改文档与一行注释）。
+门禁：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过，`cargo test -j 8 --workspace --no-fail-fast` **86 个结果行、4583 通过、0 失败、13 忽略**（一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；工作区的 `gate-task-11.log`；与 M4c 任务 9 的基线相同，这一次只改文档与 `steps.rs` 里的一处注释）。
+
+**整分支终审之后的一轮修正**（2026-10-27，同一个做法；M4c 记录第 40 ～ 49 行与延后第 6 ～ 10 行）：`rp_filter` 只在 `adjust_undo` 要或备份里已有时才放宽（F1）；L2 的崩溃恢复用例在主路径写在标准输出的那一句上等、对 `all` 有界轮询（F2，没有编译过、没有运行过）；做了一半的接管也当接管过、`give_dns_back` 照撤（F3）；关闭时设备先关、再写回 `rp_filter`（F4）；带脚本的步骤的错误不带脚本的路径（F5）；接管时关掉 rurge 链路上的 DoT、DNSSEC、LLMNR、mDNS，`flush-caches` 失败不算错（F6）；Linux 的权限提示只说 root（F7）；macOS 接管之前的空名单当作不知道（F8）。门禁：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过，`cargo test -j 8 --workspace --no-fail-fast` **86 个结果行、4590 通过、0 失败、13 忽略**（一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；工作区的 `gate-final-fix.log`；比上一次多 7 条，就是这一轮新加的：F1 三条、F3 ～ F5 与 F8 各一条；F6 改的是两条现有用例的期望，F7 改的是一条现有用例的期望）。
 
 没做的，与不要当成已经有的：
 
@@ -383,7 +385,8 @@ M4c 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 - **`PlatformDevice` 的两个 future 在 Linux / macOS 上是不是 `Send` 没有编译过**（任务 8 的顾虑）：`rurge_net::BoxFuture` 要求 `Send`，而 `crates/rurge/src/cli/enhanced/device.rs` 的 `Box::pin(self.0.recv(…))` / `send(…)` 要等 `TunDevice` 的那两个 `async fn` 在带 `cfg` 的平台上也是 `Send`；只有 CI 的 Linux 与 macOS 编得到那一段（`recv` 里那把 `Mutex` 的守卫在 `await` 两侧各自取、各自放，正是为此）。
 - **`physical` 交给管理器的那一行没有端到端用例**：`run.rs` 里把它写进 `Links` 的那一处没有用例走到（`server:system` 在测试里会去问这台机器真的系统 DNS，失败时就离开了回环，`CLAUDE.md`「测试约定」）。
 - **M4b 延后第 11 行仍然开着**：`rurge_platform::socket::egress::subnets` 读本机网卡的那一步现在有 `PlatformBackend::subnets` 的调用者，但只有 L2 的用例会真的走到它，而那些用例没有运行过；防环没有在真机上验过。
-- **macOS 的 `-listnetworkserviceorder` 的输出格式凭记忆写**（P20 没有可引用的样本）：服务与网卡的配对要等手工清单核对（M4d）。
+- **macOS 的 `-listnetworkserviceorder` 的输出格式与公开的样本对得上**（两个出处：Apple Support Communities 的帖子贴的原样输出，每个服务两行 `(N) 名字` 与下一行 `(Hardware Port: …, Device: …)`，VPN 服务的 `Device:` 可以是空的、服务名里可以有括号；Jamf Nation 的帖子是另一种排版的同一份），`numbered_service` 与它对得上；服务与网卡的配对与 `ipconfig getpacket` 周围的行走仍要真机核（M4d 的手工清单；M4c 记录第 49 行、延后第 2 行仍然开着）。
+- **终审的四处存疑在手工清单上**：`networksetup` 失败时的退出码、一个服务读得了原值却改不了、运行期间网络服务改名、NetworkManager 会不会盖掉 rurge 链路上的逐链路设置（Q1 ～ Q3、Q6；M4c 延后第 6 ～ 9 行），都要在 M4 一节的手工验收里核。
 - **Windows 照旧不能开**：平台后端在 Windows 上仍是 `Unsupported`，`rurge run --enhanced-mode` 以 1 退出、`POST /v1/features/enhanced_mode` 回 500（M4d）。
 - **手工验收没有做**：`docs/acceptance/phase3-manual.md` 还没有 M4 一节（只有 M1、M2、M3），M4d 写它。
 - **本机没有编译过的代码**（第一次 CI 核对）：`tun/linux.rs` 与 `tun/macos.rs` 的全部，`tun/mod.rs` 与 `enhanced/mod.rs` 里挑平台的 `cfg`（`system()` 的两支与 `mod` / `use` 的三支），`tests/privileged/tests/linux_netns.rs` 的 `#![cfg(target_os = "linux")]` 之后那一大段（它在本机是一个空文件，0 条用例）。
@@ -402,9 +405,13 @@ M4c 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 - **撤销的两种例外**（P9）：服务已经被删掉算做完（INFO 一行）；别的平台的撤销动作与平台后端不认识的 `Test` WARN 一行丢掉——留着的话每次启动都失败一次，永远去不掉。`Saved` / `Undo` 的映射在 `crates/rurge/src/cli/enhanced/backend.rs` 的 `saved_of` / `undo_of`，加新的 `Saved` 时三处一起改（`Undo`、平台一侧、管理器的备份）。
 - **没有 resolved 的 Linux 与读不了原值的 macOS 服务不接管**（P4、P8）：`take_dns` 回 `Ok(false)` 是“这一次没有系统 DNS”，不是失败；一次打开只 WARN 一次。`resolvectl default-route` 失败不算错。
 - **CI 的 clippy 错误在注解里**（P18，M4c 记录第 10 行）：报告脚本读 `clippy.log` 或 `test.log`，`error[E….]:` 与 `error: ` 两类行发成 `::error title=compile error::`。任务日志要登录才能读，注解不用。
+- **`rp_filter` 只在需要或备份里已有时放宽**（F1，M4c 记录第 40 行）：`adjust` 由管理器在打开的第 8 步与 `adjust_again` 里按“这一次 `adjust_undo` 回了 `Some`，或者备份里已有 `Stage::Adjust` 的一项”调；`on.adjust = true` 照旧说这一阶段到过。不需要放宽的机器（有效值不是 1、打开时还没有主网卡）既不改全机的设置、也不留下没有备份的改动。
+- **带脚本的步骤的错误不带脚本路径**（F5，M4c 记录第 44 行）：`run_step` 把错误里脚本路径的每一处换成 `…`（命令行里的与 `ip -batch` 原文里的都换），路径只在 DEBUG。
+- **接管时关掉 rurge 链路上的四项**（F6，M4c 记录第 45 行）：`take_dns` 先 `llmnr`、`mdns`、`dnssec`、`dnsovertls` 各设 `no`（都是 `Ignore`）再设服务器；`flush-caches` 也是 `Ignore`，失败只是缓存里已有的名字到期之前照旧是真地址。
+- **Linux 的权限提示**（F7，M4c 记录第 46 行）：`the enhanced mode needs root (in a container, root with CAP_NET_ADMIN)`——`ip` 与 `resolvectl` 是外部程序，`setcap` 给 rurge 的文件能力到不了它们。
 - **两份名单**：`crates/rurge/tests/sockets.rs` 的 `LISTED` 现在 25 行（macOS 的 utun 控制套接字那一行），`crates/rurge-platform/tests/unsafe_functions.rs` 的 `LISTED` 现在 9 个函数（加了 `set_iff` 与 `utun_connect`）——加建套接字的地方、加放开的函数时照 `docs/testing.md` 的规矩改。
 
-去向写着项目所有者的（后来的会话不要自己定）：**推送**（M4a、M4b、M4c 的提交都在本地，`origin/main` 仍是 `ac0a98a`；推送之后 M4c 的任务 10 与 M4d 的任务 8 一起读回 CI，先修掉它列出的失败）；**手工验收**（M4 一节要 M4c / M4d 之后，M3、M4 两节都还没做；macOS 的 `-listnetworkserviceorder` 与 `ipconfig getpacket` 的实际输出也在那一份单子里核对）；**L2 特权用例在 CI 上启用**（总设计 Q4）与设计第 20 节的 Q2（改用现成的包或开 `nix` 的特性）、Q3（发行包随附 `wintun.dll`）、Q5（Windows 防 DNS 泄漏的严格模式）照旧。
+去向写着项目所有者的（后来的会话不要自己定）：**推送**（M4a、M4b、M4c 的提交都在本地，`origin/main` 仍是 `ac0a98a`；推送之后 M4c 的任务 10 与 M4d 的任务 8 一起读回 CI，先修掉它列出的失败）；**手工验收**（M4 一节要 M4c / M4d 之后，M3、M4 两节都还没做；macOS 的 `-listnetworkserviceorder` 与 `ipconfig getpacket` 的实际输出也在那一份单子里核对）；**错误里 rurge 自己的网卡名、地址与前缀**（含 `tun-excluded-routes` 的前缀；非 `networksetup` 步骤失败时它们进 ERROR、`rurge run` 的标准错误与 API 的 500）：要不要照 P7 改成固定的一句、原文进 DEBUG（M4c 延后第 10 行）；**L2 特权用例在 CI 上启用**（总设计 Q4）与设计第 20 节的 Q2（改用现成的包或开 `nix` 的特性）、Q3（发行包随附 `wintun.dll`）、Q5（Windows 防 DNS 泄漏的严格模式）照旧。
 
 ## 附：依赖方向一条的原文（原在 `CLAUDE.md`「计划中的架构」）
 
