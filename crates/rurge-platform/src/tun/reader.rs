@@ -68,6 +68,7 @@ pub fn read_loop(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::mpsc::RecvTimeoutError;
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::Instant;
@@ -170,6 +171,9 @@ mod tests {
                 None => return Ok(None),
             };
             inner.received += 1;
+            // a test waiting for the loop to have taken this one has to wake
+            // up now, not when its deadline passes
+            self.arrived.notify_all();
             answer
         }
 
@@ -223,6 +227,14 @@ mod tests {
             self.ended
                 .recv_timeout(timeout)
                 .unwrap_or_else(|_| panic!("the loop did not end within {timeout:?}"));
+        }
+
+        /// Whether the loop's thread is still running after `timeout`: the one
+        /// fixed wait these tests make, for asserting that nothing happened. A
+        /// thread that ended, or that panicked before its last act, is not
+        /// still running.
+        fn still_running_after(&self, timeout: Duration) -> bool {
+            self.ended.recv_timeout(timeout) == Err(RecvTimeoutError::Timeout)
         }
 
         fn stop(&self) {
@@ -335,6 +347,16 @@ mod tests {
         assert!(
             ring.received_within(2, TIMEOUT),
             "the loop takes a second packet while the channel is full"
+        );
+        // The one fixed wait in these tests, and it asserts that nothing
+        // happened: the loop took the second packet and is now held in
+        // `blocking_send` for room, so it must not end before the channel is
+        // closed. Two hundred milliseconds are orders of magnitude above what
+        // that one call takes; waiting too little can only let an early end go
+        // unseen, never fail a correct loop.
+        assert!(
+            reader.still_running_after(Duration::from_millis(200)),
+            "the loop ends on its own while the channel is full"
         );
         rx.close();
 

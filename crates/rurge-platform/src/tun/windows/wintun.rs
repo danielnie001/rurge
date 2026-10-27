@@ -103,6 +103,12 @@ pub(super) struct Wintun {
 /// (`PermissionDenied` when it is not), and the module has to be a Wintun
 /// (`InvalidData` when an entry point is missing). A failed attempt is not
 /// remembered: the next open tries again.
+///
+/// Any other failure is the system's, with what it is about in front of it
+/// (`cannot open wintun.dll: …`, `cannot load wintun.dll: …`) and the kind the
+/// system gave. The words `frame::explained` puts in front of a failed open
+/// stand for the adapter, not for these, so the caller passes these on as they
+/// are (the plan's execution record row 59). No message names the path (P16).
 // Read from task 5 on (the phase 3 / M4d plan's execution record row 55).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn loaded(path: &Path) -> io::Result<Arc<Wintun>> {
@@ -123,7 +129,7 @@ pub(super) fn loaded(path: &Path) -> io::Result<Arc<Wintun>> {
         .open(path)
         .map_err(|error| match error.kind() {
             io::ErrorKind::NotFound => io::Error::new(io::ErrorKind::NotFound, NOT_FOUND),
-            _ => error,
+            kind => io::Error::new(kind, format!("cannot open wintun.dll: {error}")),
         })?;
     // the file stays open until the module is loaded: what is checked is this
     // file, and nothing can be swapped for it in between
@@ -300,7 +306,11 @@ fn load(path: &Path) -> io::Result<Wintun> {
         )
     };
     if module.is_null() {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("cannot load wintun.dll: {error}"),
+        ));
     }
     // one entry point of wintun.h's shape, or the module is freed and the entry
     // point that was missing is named
@@ -466,6 +476,48 @@ mod tests {
             error.to_string(),
             "wintun.dll has no WintunCreateAdapter: is it wintun.dll?"
         );
+    }
+
+    /// A file that is no DLL at all is refused by the loader, and the error
+    /// says what failed with the system's own words.
+    #[test]
+    fn a_file_that_is_not_a_dll_cannot_be_loaded() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let text = dir.path().join("not-a-dll.dll");
+        fs::write(&text, b"this is not a PE image").expect("a text file");
+
+        let Err(error) = load(&text) else {
+            panic!("a text file was loaded as a DLL");
+        };
+        assert!(
+            error.to_string().starts_with("cannot load wintun.dll: "),
+            "{error}"
+        );
+    }
+
+    /// A file somebody else has open without sharing cannot be opened, and the
+    /// error says so with the system's own words.
+    #[test]
+    fn a_file_that_is_held_open_cannot_be_opened() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let held = dir.path().join("wintun.dll");
+        fs::write(&held, b"held open by somebody else").expect("a file to hold");
+        // shared with nothing at all: a second open of the same file is
+        // refused, as it is for a wintun.dll somebody has open for writing
+        let _held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&held)
+            .expect("the test holds the file");
+
+        let Err(error) = loaded(&held) else {
+            panic!("a file nobody else can open was opened");
+        };
+        assert!(
+            error.to_string().starts_with("cannot open wintun.dll: "),
+            "{error}"
+        );
+        assert_ne!(error.kind(), io::ErrorKind::NotFound, "the file is there");
     }
 
     /// A real `wintun.dll`, when the run says where one is
