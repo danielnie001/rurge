@@ -31,12 +31,13 @@ const SUFFIX: &str = ".txt";
 /// arguments; the file is removed once the program has run.
 ///
 /// A step that fails: `Fail` ends the run with its error (the steps after it do
-/// not run); `Ipv6Off` warns once and skips the other `Ipv6Off` steps of this
-/// run, which goes on; `Ignore` is a debug line, and the run goes on.
+/// not run); `Ipv6Off` skips the other `Ipv6Off` steps of this run and goes on,
+/// with a DEBUG line for the failure — whether it costs the user IPv6 is the
+/// caller's to say and to warn about (the manager for the adapter's address,
+/// `run_routes` for the routes); `Ignore` is a debug line, and the run goes on.
 /// `Ok(false)`: an `Ipv6Off` step failed.
 pub fn run(steps: &[Step], runner: &dyn CommandRunner, scratch: &Path) -> Result<bool, String> {
     let mut ipv6 = true;
-    let mut warned = false;
     for step in steps {
         if !ipv6 && step.on_failure == OnFailure::Ipv6Off {
             continue;
@@ -48,13 +49,6 @@ pub fn run(steps: &[Step], runner: &dyn CommandRunner, scratch: &Path) -> Result
                 OnFailure::Ipv6Off => {
                     ipv6 = false;
                     tracing::debug!(error, "a step of the IPv6 half failed");
-                    if !warned {
-                        warned = true;
-                        tracing::warn!(
-                            "IPv6 could not be set up on the virtual adapter; \
-                             the enhanced mode goes on without IPv6"
-                        );
-                    }
                 }
                 OnFailure::Ignore => {
                     tracing::debug!(error, "a step that may fail failed; going on");
@@ -168,6 +162,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::log_capture::LogCapture;
 
     /// A command a run executed, and what the program would have read: the
     /// script as it was on disk at that moment.
@@ -315,9 +310,13 @@ mod tests {
     }
 
     /// A step of the IPv6 half that fails skips the other IPv6 steps of this
-    /// open — the rest goes on, and the caller learns that IPv6 is off.
+    /// open — the rest goes on, and the caller learns that IPv6 is off. The
+    /// failure is a DEBUG line: whether it costs the user anything is the
+    /// caller's to say (the manager for the address, `run_routes` for the
+    /// routes), and it warns about it there.
     #[test]
     fn an_ipv6_failure_skips_the_other_ipv6_steps_and_goes_on() {
+        let captured = LogCapture::start();
         let dir = tempfile::tempdir().unwrap();
         let scratch = dir.path().join("enhanced");
         let steps = [
@@ -355,6 +354,13 @@ mod tests {
             calls[1].script
         );
         assert!(!calls.iter().any(|call| call.script.contains("100::/8")));
+
+        let warns: Vec<String> = captured
+            .lines()
+            .into_iter()
+            .filter(|line| line.starts_with("WARN"))
+            .collect();
+        assert!(warns.is_empty(), "the caller warns, not this: {warns:?}");
     }
 
     /// A step that fails with `Ignore` is a line in the log: the run goes on

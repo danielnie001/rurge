@@ -797,9 +797,11 @@ mod tests {
     }
 
     /// The adapter comes up in one batch — or two with IPv6 — and the IPv6
-    /// batch failing leaves the open without IPv6 rather than failing it.
+    /// batch failing leaves the open without IPv6 rather than failing it. The
+    /// failure itself is no WARN here: the manager writes that line.
     #[test]
     fn configure_with_ipv6_runs_two_batches_and_an_ipv6_failure_is_ok_false() {
+        let captured = LogCapture::start();
         let dir = tempfile::tempdir().unwrap();
         with_tools(dir.path());
         let runner = Arc::new(Fake::default());
@@ -834,12 +836,23 @@ mod tests {
         system.unconfigure_ipv6(&dev()).unwrap();
         assert_eq!(runner.lines(), ["/usr/sbin/ip -force -batch {script}"]);
         assert_eq!(runner.scripts(), ["addr del fd00:6152::1/64 dev rurge\n"]);
+
+        let warns: Vec<String> = captured
+            .lines()
+            .into_iter()
+            .filter(|line| line.starts_with("WARN"))
+            .collect();
+        assert!(warns.is_empty(), "the manager warns, not this: {warns:?}");
     }
 
     /// The IPv6 half of the routes failing takes that half out again, and the
     /// routes to remove go all the same; the open then goes on without IPv6.
+    /// The routes are this system's half of the open, so the one WARN about
+    /// them is written here — by `run_routes`, once, without a name or a
+    /// prefix in it (M4c plan's execution record row 29).
     #[test]
     fn an_ipv6_route_failure_takes_the_ipv6_routes_out_again() {
+        let captured = LogCapture::start();
         let dir = tempfile::tempdir().unwrap();
         with_tools(dir.path());
         let runner = Arc::new(Fake::default());
@@ -866,6 +879,17 @@ mod tests {
                 "route del 100::/8 dev rurge\n",
                 "route del 2.0.0.0/8 dev rurge\n",
             ]
+        );
+
+        let warns: Vec<String> = captured
+            .lines()
+            .into_iter()
+            .filter(|line| line.starts_with("WARN"))
+            .collect();
+        assert_eq!(warns.len(), 1, "one WARN: {warns:?}");
+        assert_eq!(
+            warns[0],
+            "WARN the IPv6 routes could not be added to the virtual adapter; they are left out"
         );
     }
 

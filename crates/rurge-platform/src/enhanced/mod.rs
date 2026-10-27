@@ -125,9 +125,11 @@ pub fn system(_scratch: PathBuf) -> Box<dyn System> {
 }
 
 /// The order of [`System::routes`], the same on Linux and macOS: add, and when
-/// the IPv6 half of that failed, take that half out again and go on without
-/// IPv6 (M4-D17); then remove, going on past errors. `run` runs a batch of
-/// steps, `add` and `remove` translate one set of prefixes into its steps.
+/// the IPv6 half of that failed, say so (one WARN, without a name or a prefix
+/// in it), take that half out again and go on without it (M4-D17); then remove,
+/// going on past errors. `run` runs a batch of steps, `add` and `remove`
+/// translate one set of prefixes into its steps. The address's own IPv6 step is
+/// the manager's to warn about, so `run` only logs its failure at DEBUG.
 fn run_routes(
     add: &RouteSet,
     remove: &RouteSet,
@@ -137,6 +139,12 @@ fn run_routes(
 ) -> Result<bool, String> {
     let added = run(&add_steps(add))?;
     if !added {
+        // What of it went in may still be there: the manager records the old
+        // IPv6 routes less the removed ones, so the user is told what is left
+        // out rather than that IPv6 is gone — on a reload it is not.
+        tracing::warn!(
+            "the IPv6 routes could not be added to the virtual adapter; they are left out"
+        );
         // what of the IPv6 half did go in goes out again: the open goes on
         // without IPv6
         let v6 = RouteSet {
