@@ -1,7 +1,7 @@
 //! ICMP (ICMPv6) echo sockets, and the echo requests and replies they carry
 //! (M4 design §10). Blocking socket calls only: the binary makes the socket
 //! asynchronous, binds it where rurge's own sockets go and matches the replies
-//! to what waits for them; this crate does not depend on tokio (P13).
+//! to what waits for them (P13).
 
 use crate::socket::Family;
 use socket2::{Domain, Protocol, Socket, Type};

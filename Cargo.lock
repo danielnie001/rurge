@@ -3429,6 +3429,7 @@ dependencies = [
  "serde_json",
  "socket2",
  "tempfile",
+ "tokio",
  "tracing",
  "windows-registry",
  "windows-sys 0.61.2",

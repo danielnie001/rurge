@@ -1,6 +1,6 @@
 [package]
 name = "rurge-platform"
-description = "Platform-specific helpers for rurge (directories, system DNS, system proxy, service install, external programs)"
+description = "Platform-specific helpers for rurge (directories, system DNS, system proxy, service install, external programs, the enhanced mode's virtual adapter, routes and DNS)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,7 @@ ipnet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 socket2.workspace = true
+tokio.workspace = true
 
 # `ipconfig`'s build script emits `cargo:rustc-link-lib=iphlpapi` unconditionally,
 # which breaks linking on Linux / macOS, so it is a Windows-only dependency.
@@ -38,10 +39,11 @@ tempfile.workspace = true
 
 # The workspace lints, except `unsafe_code`: notifying WinINet that the proxy
 # settings changed (`sysproxy::windows`), putting an external program in a
-# Job Object (`process`), and reading the tables of sockets and the paths of
-# processes (`procinfo`) are FFI calls. The lint stays `deny` here and only
-# the functions on the list in `tests/unsafe_functions.rs` opt out; every
-# other crate keeps `forbid`.
+# Job Object (`process`), reading the tables of sockets and the paths of
+# processes (`procinfo`), and asking the kernel for the virtual adapter
+# (`tun::linux`'s `set_iff`, `tun::macos`'s `utun_connect`) are FFI calls. The
+# lint stays `deny` here and only the functions on the list in
+# `tests/unsafe_functions.rs` opt out; every other crate keeps `forbid`.
 [lints.rust]
 unsafe_code = "deny"
 

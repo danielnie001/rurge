@@ -3,6 +3,7 @@
 pub mod command;
 pub mod dirs;
 pub mod dns;
+pub mod enhanced;
 pub mod icmp;
 pub mod netenv;
 pub mod process;
@@ -12,3 +13,4 @@ pub mod service;
 pub mod socket;
 pub mod sysinfo;
 pub mod sysproxy;
+pub mod tun;
