@@ -2,16 +2,20 @@
 //! M4-D27; M4c plan task 9, P17): a real virtual adapter, real routes and a
 //! real `rp_filter`, inside two network namespaces this file makes.
 //!
-//! `rl2-a-<pid>` is the machine rurge runs on and `rl2-b-<pid>` is the
+//! `rl2-a-<pid>-<n>` is the machine rurge runs on and `rl2-b-<pid>-<n>` is the
 //! internet: the two are joined by a veth pair that exists in no other
 //! namespace, `10.231.0.2/30` on a's end and `10.231.0.1/30` on b's, and the
 //! servers a test talks to are on b. The address beyond that pair,
 //! `10.231.1.1/32`, is b's own loopback: it is the address of everything on
 //! the internet, and a reaches it only through its default route, which is the
-//! veth. Nothing here touches the host: the addresses do not exist outside the
-//! two namespaces, and the only thing written outside them is the
-//! `/etc/netns/<a>/` directory that `ip netns exec` mounts over a's
-//! `/etc/resolv.conf`, so that a's resolver is not the machine's.
+//! veth. `<n>` is one lab's own: the tests run on threads of one process, so
+//! the process id alone would give three labs one name. Nothing here touches
+//! the host: the addresses do not exist outside the two namespaces, and the
+//! only things written outside them are the two namespaces themselves (under
+//! `/run/netns`, where `ip netns add` puts them) and the `/etc/netns/<a>/`
+//! directory that `ip netns exec` mounts over a's `/etc/resolv.conf`, so that
+//! a's resolver is not the machine's. One lab runs at a time
+//! ([`ONE_AT_A_TIME`]).
 //!
 //! Nothing here runs by default, on this machine or in CI. A test starts by
 //! asking for `RURGE_TEST_PRIVILEGED=1` and prints why it did not run when it
@@ -31,7 +35,9 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use rurge_platform::route::linux::LinuxTools;
@@ -48,6 +54,17 @@ const API_KEY: &str = "l2-key";
 /// internet for them (`CLAUDE.md`, the rules the tests follow). Nothing is kept
 /// from the attempt: no rule of these profiles is a `GEOIP` rule.
 const GEOIP: &str = "http://127.0.0.1:20001/unreachable";
+
+/// One lab at a time: three adapters, three runs and three interleaved sets of
+/// output do no good in a small VM, and the first `ip netns add` mounts
+/// `/run/netns`, which two of them doing at once would race on. A test that
+/// panics poisons it; the next one takes it anyway — one failure must not fail
+/// the rest.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// Which lab this is, for `<n>` in its names: the tests run on threads of one
+/// process, so the process id is the same in all of them.
+static NEXT: AtomicU64 = AtomicU64::new(0);
 
 /// Whether these tests may run: `RURGE_TEST_PRIVILEGED=1`, which only a
 /// disposable Linux VM, as root, sets. Nothing is built before this is asked.
@@ -176,7 +193,7 @@ fn rurges_own_dns_queries_do_not_enter_the_adapter() {
         "the answer is not the address the DNS server in b gives"
     );
 
-    // the resolver's query to it came out of the veth, not out of the adapter
+    // the query reached b, from a's veth address: it left a
     let from = dns.stdout.wait_for(
         Duration::from_secs(10),
         "the DNS server's line for the query",
@@ -188,7 +205,10 @@ fn rurges_own_dns_queries_do_not_enter_the_adapter() {
     );
 
     // and it did not come back into the adapter: a session through the adapter
-    // would have entered there, from the adapter's address
+    // would have entered there, from the adapter's address. This is what says
+    // the query did not go round the adapter; the source above says only that
+    // it left a — a query through the adapter would leave from the veth too,
+    // as a session of its own.
     let log = lab.request_log(api);
     let leaked = log.iter().any(|request| {
         request["dst"].as_str() == Some("10.231.1.1:53")
@@ -331,18 +351,24 @@ struct Lab {
     etc: PathBuf,
     dir: tempfile::TempDir,
     children: Vec<Child>,
+    /// Not read: held for as long as the lab is, so that the next one waits.
+    /// Last, so that it goes back after `drop` and after the temporary
+    /// directory is removed.
+    _one_at_a_time: MutexGuard<'static, ()>,
 }
 
 impl Lab {
     fn new() -> Lab {
+        let one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         let ip = match LinuxTools::find(Path::new("/")) {
             Ok(tools) => tools.ip,
             Err(e) => panic!("the L2 tests need iproute2: {e}"),
         };
         let rurge = rurge_binary();
         let pid = std::process::id();
-        let a = format!("rl2-a-{pid}");
-        let b = format!("rl2-b-{pid}");
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let a = format!("rl2-a-{pid}-{n}");
+        let b = format!("rl2-b-{pid}-{n}");
         let etc = PathBuf::from(format!("/etc/netns/{a}"));
         let dir = tempfile::tempdir().expect("a temporary directory");
         // built before its setup runs, so that a failing setup still removes
@@ -355,6 +381,7 @@ impl Lab {
             etc,
             dir,
             children: Vec::new(),
+            _one_at_a_time: one_at_a_time,
         };
         lab.set_up();
         lab
@@ -490,17 +517,24 @@ impl Lab {
         if enhanced {
             cmd.arg("--enhanced-mode");
         }
-        for name in [
-            "RURGE_ENHANCED_BACKEND",
-            "RURGE_NETWORK_BACKEND",
-            "RURGE_PROCESS_BACKEND",
-            "RURGE_ENHANCED_MODE",
-            "RURGE_SYSTEM_PROXY",
-            "RURGE_DATA_DIR",
-            "RURGE_LOG_FILE",
-        ] {
-            cmd.env_remove(name);
+        // every variable of rurge's own comes from the environment of the test,
+        // not from the profile: one left in it (the API's key, the request
+        // log's size, the outbound mode, the listeners, `--no-network`, a test
+        // backend, …) would change this run, and some of them would make it
+        // prove nothing. The tests' own two variables are not rurge's (nothing
+        // in `crates/rurge/src` reads them), so this takes nothing away from
+        // them.
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("RURGE_") {
+                cmd.env_remove(&name);
+            }
         }
+        // as the CLI tests keep rurge away from the machine's own defaults: the
+        // run is root's, and root's home is not where a test's files go.
+        // `--data-dir` is given, so this matters only to a start that ignored
+        // it.
+        cmd.env("XDG_DATA_HOME", self.path().join("xdg-data"));
+        cmd.env("XDG_CONFIG_HOME", self.path().join("xdg-config"));
         self.spawn(cmd)
     }
 

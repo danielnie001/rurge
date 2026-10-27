@@ -4,7 +4,7 @@
 
 ## 它们做什么
 
-`tests/linux_netns.rs` 每个用例先自己建两个网络命名空间：`rl2-a-<pid>` 当作"本机"，`rl2-b-<pid>` 当作"互联网"。两个命名空间之间是一对 veth，`10.231.0.2/30` 在 a 这一端、`10.231.0.1/30` 在 b 那一端；a 的默认路由经 `10.231.0.1`。b 的回环上另有 `10.231.1.1/32`，它就是"互联网上的服务器"：它不在 a 的任何直连路由里，但在 rurge 装进虚拟网卡的基础前缀（`8.0.0.0/5` 等）里，所以应用到它的流量必然进虚拟网卡，而 rurge 自己的连接只要绑在 veth 上就绕得开。`rurge` 经 `ip netns exec rl2-a-<pid>` 起在 a 里，`--data-dir` 是临时目录，`http-api` 在 a 的回环上。
+`tests/linux_netns.rs` 每个用例先自己建两个网络命名空间：`rl2-a-<pid>-<n>` 当作"本机"，`rl2-b-<pid>-<n>` 当作"互联网"（`<n>` 是一个进程内的计数器，三个用例同名会撞上）。两个命名空间之间是一对 veth，`10.231.0.2/30` 在 a 这一端、`10.231.0.1/30` 在 b 那一端；a 的默认路由经 `10.231.0.1`。b 的回环上另有 `10.231.1.1/32`，它就是"互联网上的服务器"：它不在 a 的任何直连路由里，但在 rurge 装进虚拟网卡的基础前缀（`8.0.0.0/5` 等）里，所以应用到它的流量必然进虚拟网卡，而 rurge 自己的连接只要绑在 veth 上就绕得开。`rurge` 经 `ip netns exec rl2-a-<pid>-<n>` 起在 a 里，`--data-dir` 是临时目录，`http-api` 在 a 的回环上。
 
 三条用例：
 
@@ -16,7 +16,7 @@
 
 ## 怎么跑
 
-只在一次性的 Linux 虚拟机里、以 root 跑。需要 `iproute2`、`ping`、`/dev/net/tun`，以及一个能用的账号（不用 systemd-resolved）：
+只在一次性的 Linux 虚拟机里、以 root 跑。需要：root；`iproute2`（`ip`）；**iputils** 的 `ping`（用例用它的 `-W`，busybox 的没有）；`/dev/net/tun`。**不需要** systemd-resolved：a 的 `resolv.conf` 由用例自己写（`/etc/netns/…/resolv.conf`），rurge 在 a 里看到的不是 resolved 的存根，它 WARN 一行、不接管 DNS。
 
 ```bash
 cargo build -p rurge
@@ -25,14 +25,14 @@ RURGE_TEST_PRIVILEGED=1 cargo test -p rurge-privileged-tests
 
 `rurge` 二进制先取 `RURGE_TEST_RURGE`；没有时取测试二进制旁边的那一个（`target/<profile>/rurge`），所以先 `cargo build -p rurge`。没有 `RURGE_TEST_PRIVILEGED=1` 时每条用例打印一行 `skipped: set RURGE_TEST_PRIVILEGED=1 in a disposable Linux VM, as root` 并返回，什么也不建。
 
+用例一次只跑一个 `Lab`（一个进程内的锁）：三条用例并行跑也没有好处，`ip` 第一次 `ip netns add` 还要把 `/run/netns` 挂成挂载点，并发的头一次会撞上。
+
 ## 它们改什么
 
-只改用例自己建的两个命名空间里的东西：命名空间、veth、地址、路由、`rp_filter`、`rurge` 网卡。宿主上看不到其中任何一样。
+只改用例自己建的两个命名空间里的东西：命名空间、veth、地址、路由、`rp_filter`、`rurge` 网卡。宿主上看到其中任何一样的地方只有两处：
 
-两处例外，都在 a 的 `/etc/` 与宿主之间：
-
-- `Lab` 在起 `rurge` 之前写 `/etc/netns/rl2-a-<pid>/resolv.conf`（一行 `nameserver 10.231.1.1`），用例结束时删掉 `/etc/netns/rl2-a-<pid>/` 整个目录（用例结束的清理里做，失败只打印到标准错误）。`ip netns exec` 会把 `/etc/netns/<名字>/` 下的文件绑到 `/etc/` 上，所以 a 里的 `rurge` 看到的是这份 `resolv.conf`，不是宿主的那份。不写它的话，在 resolved 的存根是缺省设置的虚拟机里，a 里的 `rurge` 会经 D-Bus 去对**宿主**的 resolved 执行 `resolvectl dns rurge …`，宿主看不到 a 里的网卡，接管失败、增强模式打不开。
-- 这两个命名空间本身（`ip netns del` 删掉）。
+- `ip netns` 的两个命名空间本身（`ip netns add` 把它们放在 `/run/netns/` 下，用例结束时 `ip netns del` 删掉）。
+- `/etc/netns/rl2-a-<pid>-<n>/`：`Lab` 在起 `rurge` 之前写它下面的 `resolv.conf`（一行 `nameserver 10.231.1.1`），用例结束时删掉这个目录（在用例结束的清理里做，失败只打印到标准错误）。`ip netns exec` 会把 `/etc/netns/<名字>/` 下的文件绑到 `/etc/` 上，所以 a 里的 `rurge` 看到的是这份 `resolv.conf`，不是宿主的那份。不写它的话，在 resolved 的存根是缺省设置的虚拟机里，a 里的 `rurge` 会经 D-Bus 去对**宿主**的 resolved 执行 `resolvectl dns rurge …`，宿主看不到 a 里的网卡，接管失败、增强模式打不开。`/etc/netns/` 本身原来是有的就用，原来没有时由用例建出来、用完留着（一个空目录）。
 
 用例从不改宿主的网卡、路由、DNS 或 `rp_filter`；也不需要宿主有网。
 

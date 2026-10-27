@@ -6,8 +6,9 @@
 //! an HTTP client), and of those only the DNS messages are worth testing
 //! without a machine to run them on. Kept in the package's library rather than
 //! in the program, they are compiled and tested on the development machine as
-//! well as on Linux; the program itself, and the tests that start it, are only
-//! ever compiled for Linux.
+//! well as on Linux. The helper program itself is not platform-specific either:
+//! it builds on every platform, and `clippy` sees it there. Only
+//! `tests/linux_netns.rs`, which starts it, is Linux's alone.
 //!
 //! Nothing here is platform-specific, and nothing here touches a machine.
 
