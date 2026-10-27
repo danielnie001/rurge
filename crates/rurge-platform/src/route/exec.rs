@@ -90,6 +90,15 @@ pub fn remove_leftovers(scratch: &Path) {
 
 /// Runs one step: writes its script, puts the file's path where [`SCRIPT`]
 /// stands, says what is about to run, runs it, and removes the script again.
+///
+/// A scripted step that fails names no script path in its error: the path is
+/// under the data directory, which may be under an account's home, and the
+/// error goes to the log, `rurge run`'s standard error and the API's 500 —
+/// while the DEBUG line above has the path and the file, which is for the log
+/// alone (the phase 3 / M4c plan's execution record row 44; M4 design 13).
+/// `ip -batch` puts the path in its own words too (`Command failed
+/// <path>:<line>`), so every occurrence in the error is replaced, not only the
+/// one in the command line.
 fn run_step(step: &Step, runner: &dyn CommandRunner, scratch: &Path) -> Result<(), String> {
     let mut written = None;
     if let Some(text) = &step.script {
@@ -114,7 +123,10 @@ fn run_step(step: &Step, runner: &dyn CommandRunner, scratch: &Path) -> Result<(
     if let Some((path, _)) = &written {
         remove_script(path);
     }
-    result
+    result.map_err(|error| match &written {
+        Some((path, _)) => error.replace(path.to_string_lossy().as_ref(), "…"),
+        None => error,
+    })
 }
 
 /// Writes `text` to a file of its own under `scratch`, made when missing, and
@@ -160,6 +172,7 @@ mod tests {
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::log_capture::LogCapture;
@@ -178,6 +191,10 @@ mod tests {
     struct Recording {
         calls: Mutex<Vec<Call>>,
         failures: Mutex<Vec<(String, String, String)>>,
+        /// Whether a failure echoes the command line and the tool's own words
+        /// as `command::failure` and `ip -batch` do — script path and all
+        /// (the phase 3 / M4c plan's execution record row 44).
+        echo_script_path: AtomicBool,
     }
 
     impl Recording {
@@ -218,7 +235,18 @@ mod tests {
                 .iter()
                 .find(|(name, text, _)| *name == program && script.contains(text.as_str()))
             {
-                Some((_, _, message)) => Err(io::Error::other(message.clone())),
+                Some((_, _, message)) => {
+                    let message = if self.echo_script_path.load(Ordering::SeqCst) {
+                        format!(
+                            "`{}` failed (exit status: 1): Command failed {}:1",
+                            cmd.join(" "),
+                            cmd[2]
+                        )
+                    } else {
+                        message.clone()
+                    };
+                    Err(io::Error::other(message))
+                }
                 None => Ok(String::new()),
             }
         }
@@ -412,6 +440,35 @@ mod tests {
         assert!(!error.contains("/usr/sbin/ip"), "{error}");
         // and the program was not run
         assert!(runner.calls().is_empty());
+    }
+
+    /// A scripted step that fails names no script path in its error, wherever
+    /// the path was: the command line's `-batch` argument and the tool's own
+    /// `Command failed <path>:<line>` both stand as `…`, and the rest of both
+    /// is kept (the phase 3 / M4c plan's execution record row 44).
+    #[test]
+    fn a_failing_script_leaves_its_path_out_of_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        let steps = [scripted(
+            "/usr/sbin/ip",
+            "route add 1.0.0.0/8 dev rurge\n",
+            OnFailure::Fail,
+        )];
+        let runner = Recording::default();
+        runner.fail("ip", "1.0.0.0/8", "the message is not used here");
+        runner.echo_script_path.store(true, Ordering::SeqCst);
+
+        let error = run(&steps, &runner, &scratch).unwrap_err();
+
+        let path = scratch.display().to_string();
+        assert!(
+            !error.contains(&path),
+            "the script's path is in it: {error}"
+        );
+        assert!(error.contains("-batch …"), "{error}");
+        assert!(error.contains("Command failed …:1"), "{error}");
+        assert!(error.contains("failed (exit status: 1)"), "{error}");
     }
 
     /// Only the files a run of its own left are removed: not the others, and
