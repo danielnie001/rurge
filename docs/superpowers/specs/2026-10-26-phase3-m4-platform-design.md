@@ -554,3 +554,47 @@ M4a ～ M4c 各自的最后一个任务更新它碰到的文档（`docs/api/phas
 23. 第 9.10 节测试后端的设备 `MemoryDevice` → 一个空设备，从不送包、丢掉写来的包（M4a 计划 P19）。
 24. 第 16 节"`CLAUDE.md` 的常用命令加 `--enhanced-mode`" → 不加：它改系统的路由与 DNS，以后的会话不应当照着手工跑；`CLAUDE.md` 收尾时只改「现在在哪里」与 `unsafe_code` 一段（M4d 计划任务 9）。
 25. 第 2 节与 M4-D1 的"M4c 有一个等 CI 的停点" → M4d 也有一个（它的任务 8）：M4d 不带 `cfg` 的改动在 Linux 与 macOS 上同样只有 CI 编译（M4d 计划 P18）。
+
+## 22. 执行期的订正
+
+四份计划（`…-m4a-skeleton-plan.md`、`…-m4b-loop-dns-plan.md`、`…-m4c-linux-macos-plan.md`、`…-m4d-windows-wrapup-plan.md`）的「执行期修正记录」在执行期改了正文下面这些地方；写法照第 21 节，每条末尾写明是哪份计划的第几行。正文不改。这些同样是代项目所有者作的裁定，所有者可以改。
+
+**Windows（第 5.4、6.3、8.4、9.5 节）**
+
+1. 第 5.4 节的 `set dnsservers` → IPv4 与 IPv6 两张名单分开改：IPv6 没开时另跑一行 `address=none` 清掉 IPv6 的那一份（否则网卡上不再拥有的地址还在被问），读回也分两张（M4a 记录第 96 行、M4d 记录第 62 行）。
+2. 第 13 节只有"IPv6 未配置"一行 WARN 的读法 → 分成三处说：地址那一半由管理器写 `IPv6 could not be configured; the enhanced mode goes on without it`，路由那一半由 `run_routes` 写 `the IPv6 routes could not be added to the virtual adapter; they are left out`，系统 DNS 的 IPv6 那一半写 `the system's IPv6 DNS could not be pointed at the enhanced mode; it is left as it is`；标 `Ipv6Off` 的步骤本身失败只写 DEBUG（M4c 记录第 29 行、M4d 记录第 13、23、62 行）。
+3. 第 8.4 节与第 9.5 节的"先 `WintunOpenAdapter` 复用残留的适配器" → 只是探一下：探到就答"正在被使用"，不复用（第 21 节第 5 条改了 8.4 与 M4-D12，第 9.5 节末句同样作废；M4d 记录第 68 行）。
+4. 第 8.4 节的 `send` 只由"环满"决定丢包 → 先检查包长不超过 `wintun.h` 的 `WINTUN_MAX_IP_PACKET_SIZE`（65,535）；超长的在放开的函数之前就以 `a packet for the virtual adapter is longer than 65535 bytes` 拒绝（用户态不查的话，驱动会把整个发送环当成坏的）（M4d 记录第 73 行）。
+5. 第 8.4 节与 M4-D13 的 `wintun.dll` → 要 0.14 或更新：0.13 没有 `WintunCloseAdapter`，缺入口就以 `wintun.dll has no <入口>: is it wintun.dll?` 被拒；加载之前的错误带自己的上下文（`cannot find wintun.dll (…): get it from https://www.wintun.net/`、`cannot open wintun.dll: …`、`wintun.dll is not signed …`、`wintun.dll is not signed by WireGuard LLC (it is signed by …)`），不经第 8.5 节那句权限的映射（M4d 记录第 59 行）。
+6. 第 9.4 节的"关设备" → 关在最后一个 `Arc` 放掉时（`Drop`）：正常的关闭经 `call`（`spawn_blocking`），TUN 3 秒内没结束的那一种最后由 TUN 的任务放掉、`Drop` 占住一个工作线程；次序是置停止标志 → 关通道接收端（第 21 节第 7 条）→ 等读线程 → `end_session` → `close_adapter`，`open` 与 `start` 用同一枚停止标志（M4d 记录第 29、72 行）。
+7. 第 13 节 Windows 的日志 → 加载好的那一行 DEBUG `wintun.dll is loaded` 带模块句柄，它也是 `Wintun::module` 唯一的生产读者；读回的每一步另有 `reading back a setting of the enhanced mode` 与 `what the readback printed`（M4d 记录第 69 行）。
+8. 第 9.6 节的 `--wintun-dll` 在别的平台上是用法错误 → 文字固定为 `--wintun-dll is only for Windows`，退出 2，在 `Overrides::parse` 与读配置之前；`--help` 与别的路径选项一样连 `RURGE_WINTUN_DLL` 的值一起显示（M4d 记录第 74、75、76 行）。
+
+**Linux 与 macOS（第 5.2、5.3、6.1、6.3、7.3、8.5、9.5、9.8 节）**
+
+9. 第 8.5 节 Linux 的 "root or CAP_NET_ADMIN" → `the enhanced mode needs root (in a container, root with CAP_NET_ADMIN)`（M4c 记录第 46 行）。
+10. 第 5.2 节接管系统 DNS 的四步之外 → 先把 rurge 链路上的 LLMNR、mDNS、DNSSEC、DNSOverTLS 各设成 `no`（都是尽力而为，老的 resolv.conf 全局设置会让发往应答器的查询走 853 的 TLS），再设服务器；`flush-caches` 失败不算错（M4c 记录第 45 行）。
+11. 第 6.1 节的读法 → `/etc/resolv.conf` 尽力读：认识的选项照用，不认识的合成一行 DEBUG，不让一份名单因一个选项变空（M4c 记录第 19 行）。
+12. 第 5.3 与第 6.3 节 macOS 的空名单 → `-getdnsservers` 输出全空是 `Some(空表)`（写回用 `empty`），不是"读不到"；接管之前的 `/etc/resolv.conf` 里只有应答器一类的空名单当作"不知道"，往下读服务原值与 DHCP（M4c 记录第 25、47 行）。
+13. 第 6.3 节的 `physical` → Linux 是 resolved 的上游名单，macOS 是接管之前的服务器、服务原值与 `ipconfig getpacket`；读的那一步没回来是 `Some(空)`（查找失败），`None` 只表示"机器自己的列表是对的"（Windows、文件后端没有那个键、`off`、Linux 还没接管）（M4c 记录第 31、33 行）。
+14. 第 5.2 与第 6.2 节"做了一半的接管" → 也算接管过：`take_dns` 先记标志、再跑步骤，失败时 `undo` 能把已改的还回去（M4c 记录第 42 行）。
+15. 第 7.3 节、第 9.3 节第 7 步与第 9.8 节"打开时与每次网络变化时" → `rp_filter` 只在需要时放宽：这一次 `adjust_undo` 回了 `Some`、或备份里已有那一项时（不需要的机器既不改、也不留下没有备份的改动）（M4c 记录第 40 行）。
+16. 第 9.5 节的恢复位置 → 多一处：`wait_for_the_sources` 在拿到锁之后、下载 Profile 的远程来源之前也恢复一次（macOS 崩溃留下的 DNS 还指着应答器时，那些下载要等到时限）（M4c 记录第 32 行）。
+17. 第 5.2 节带脚本的步骤失败时的错误 → 脚本的路径每一处（命令行的与工具原文里的）换成 `…`，路径只在 DEBUG（M4c 记录第 44 行）。
+
+**共同的（第 7、9、10、11、13、14 节）**
+
+18. 第 9.7 节 IPv6 从开到关的"反之" → 次序是"先交还系统 DNS、再按差减路由、最后撤地址"（网卡还有那个地址时交还最稳）（M4a 记录第 79 行）。
+19. 第 9.7 节路由的 IPv6 一半失败（`routes` 回 `Ok(false)`）→ 别当空集：记下的是旧集减去要减的（后端只撤新加的那一半），出口表换成它；这一次之前 IPv6 没开着的这一次按没开往下做（M4a 记录第 95 行）。
+20. 第 9.6 与第 9.9 节的关闭 → `POST false` 不论成败都把"想要的"记成关（关从不半途停下，回 500 只表示某条撤销没成）；关闭失败不影响"想要"（M4a 记录第 97 行）。
+21. 第 9.2 与第 9.5 节的恢复 → 备份为空而 `features.enhanced_mode` 为真时（Windows 的备份总是空、Linux 不用改 `rp_filter` 时也是），恢复把它写回 `false`（M4a 记录第 99 行）。
+22. 第 9.4 节的"关闭从不停在半路" → 等 TUN 用的 `ending()` 只看"被告诉结束"（停止或设备坏了），不等 TUN 的任务；关闭仍等 `join` 至多 3 秒（M4a 记录第 100 行）。
+23. 第 13 节的 ERROR 行 `step` → 只写种类（`mac_dns` 不带服务名，服务名在紧跟的 DEBUG 行），因为它可以是使用者改的任何文字（M4a 记录第 98 行）。
+24. 第 7.4 节的 `IP_UNICAST_IF` → 设不上只写一行 DEBUG、连接照走源地址绑定的那一层，不因此失败（M4d 记录第 39 行）。
+25. 第 10 节的 `Pinger` 载体 → 发送失败的载体不再留着（按 `Arc` 指针在表里找到、移除、停它的接收任务），下一次回显新建一个（M4d 记录第 48 行）。
+26. 第 7.1 节的直连子网 → 同一个子网挂在两块网卡上时留输入里先出现的那一块；`decide` 先把目的地址规范化（`::ffff:a.b.c.d` 按 IPv4 判）（M4b 记录第 13、15、71 行）。
+27. 第 7.2 节"活得比一次会话长的套接字" → 直连连接器的 `route()` 说它按哪一张出口表绑；WireGuard 的载体每个 `TICK`（250 毫秒）、QUIC 的连接每次取用都比一次，不同就重拨（INFO 一行）；管理器只在表的内容变了时才换 `Arc`（M4b 记录第 68、69 行）。
+28. 第 7.2 与第 7.6 节的重读 → `reread_system_servers` 也清 `[Host]` 的 `server:` 上游与经接口的上游；跟随写了另一张表而没有重新接管 DNS 时也调一次 `system_dns_changed`；启动时等 Profile 来源的那一次下载仍用 `resource_client()`（M4b 记录第 67、78 行）。
+29. 第 7.2 节的扫描用例 → 与名单**逐处**比对（同一个文件里同一种写法的第二处也要一行），认的写法扩到 15 种，名单 25 行（M4b 记录第 73 行）。
+30. 第 11 节的外部程序 → 程序拉起的子进程算在里面（Unix 的进程组、Windows 的 Job Object，`setsid` 出去的不算）；`runs(pid)` 也认程序自己的 PID；程序在跑时直连与全局模式的会话也等一次进程（没有程序在跑时一个字也不多等）（M4b 记录第 47、51 行、M4d 记录第 42 行）。
+31. 第 14 节的 L2 → 服务端放在只经默认路由可达的地址上（`10.231.1.1/32`）：rurge 的基础前缀比内核的直连路由短，直连网段上的流量不进虚拟网卡（M4c 记录第 34 行）。
