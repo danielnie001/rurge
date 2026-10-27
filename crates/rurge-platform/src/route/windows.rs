@@ -42,7 +42,8 @@ impl WindowsTools {
 
 /// Bring the adapter up with its address and MTU (design 5.4, 9.3 step 2):
 /// forwarding and weak host send / receive are off, which is half of keeping
-/// rurge's own traffic out of the adapter (design 7.4).
+/// rurge's own traffic out of the adapter (design 7.4), and the interface
+/// metric goes on a line of its own (plan P9).
 pub fn configure(t: &WindowsTools, index: u32) -> Step {
     let lines = [
         format!(
@@ -50,6 +51,7 @@ pub fn configure(t: &WindowsTools, index: u32) -> Step {
             SPACE_V4.netmask()
         ),
         interface_line(index, "ipv4"),
+        metric_line(index, "ipv4"),
         subinterface_line(index, "ipv4"),
     ];
     netsh_step(t, &lines, OnFailure::Fail)
@@ -64,6 +66,7 @@ pub fn configure_ipv6(t: &WindowsTools, index: u32) -> Step {
             SPACE_V6.prefix_len()
         ),
         interface_line(index, "ipv6"),
+        metric_line(index, "ipv6"),
         subinterface_line(index, "ipv6"),
     ];
     netsh_step(t, &lines, OnFailure::Ipv6Off)
@@ -263,8 +266,16 @@ fn family(v6: bool) -> &'static str {
 /// `set interface` for one family.
 fn interface_line(index: u32, family: &str) -> String {
     format!(
-        "interface {family} set interface interface={index} forwarding=disabled weakhostsend=disabled weakhostreceive=disabled metric={METRIC} store=active"
+        "interface {family} set interface interface={index} forwarding=disabled weakhostsend=disabled weakhostreceive=disabled store=active"
     )
+}
+
+/// The interface metric, on a line of its own (plan P9): the current `netsh
+/// interface` page lists no `metric` for `set interface`, and one parameter the
+/// system does not take may fail the whole line — a line of its own loses the
+/// metric and nothing else.
+fn metric_line(index: u32, family: &str) -> String {
+    format!("interface {family} set interface interface={index} metric={METRIC} store=active")
 }
 
 /// `set subinterface` for one family: the MTU.
@@ -368,7 +379,8 @@ mod tests {
             netsh(
                 concat!(
                     "interface ipv4 add address name=12 address=198.18.0.1 mask=255.254.0.0 store=active\n",
-                    "interface ipv4 set interface interface=12 forwarding=disabled weakhostsend=disabled weakhostreceive=disabled metric=1 store=active\n",
+                    "interface ipv4 set interface interface=12 forwarding=disabled weakhostsend=disabled weakhostreceive=disabled store=active\n",
+                    "interface ipv4 set interface interface=12 metric=1 store=active\n",
                     "interface ipv4 set subinterface interface=12 mtu=1500 store=active\n",
                 ),
                 OnFailure::Fail,
@@ -383,7 +395,8 @@ mod tests {
             netsh(
                 concat!(
                     "interface ipv6 add address interface=12 address=fd00:6152::1/64 store=active\n",
-                    "interface ipv6 set interface interface=12 forwarding=disabled weakhostsend=disabled weakhostreceive=disabled metric=1 store=active\n",
+                    "interface ipv6 set interface interface=12 forwarding=disabled weakhostsend=disabled weakhostreceive=disabled store=active\n",
+                    "interface ipv6 set interface interface=12 metric=1 store=active\n",
                     "interface ipv6 set subinterface interface=12 mtu=1500 store=active\n",
                 ),
                 OnFailure::Ipv6Off,
