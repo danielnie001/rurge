@@ -455,7 +455,7 @@ mod tests {
                     &["default-route", "rurge", "yes"],
                     OnFailure::Ignore,
                 ),
-                plain("/usr/sbin/resolvectl", &["flush-caches"], OnFailure::Ignore,),
+                plain("/usr/sbin/resolvectl", &["flush-caches"], OnFailure::Ignore),
             ]
         );
         // IPv6 off: the one IPv4 server, and the steps around it
