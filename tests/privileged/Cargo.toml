@@ -1,0 +1,21 @@
+[package]
+name = "rurge-privileged-tests"
+description = "The L2 privileged tests of the enhanced mode, and the small program they start inside two network namespaces (test-only, never published)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "l2-helper"
+path = "src/bin/l2-helper.rs"
+test = false
+
+[dev-dependencies]
+rurge-platform.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

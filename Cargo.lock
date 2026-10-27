@@ -3457,6 +3457,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rurge-privileged-tests"
+version = "0.1.0"
+dependencies = [
+ "rurge-platform",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "rurge-proto"
 version = "0.1.0"
 dependencies = [
