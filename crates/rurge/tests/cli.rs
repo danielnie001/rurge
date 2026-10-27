@@ -161,9 +161,13 @@ use std::fs;
 /// directory is not made.
 ///
 /// Compiled on Windows as well, but only run elsewhere: there the option is
-/// the ordinary one, and a start carrying it would go on to the platform
-/// backend — which opens a device, which no test may do on this machine (the
-/// M4d plan's P19).
+/// the ordinary one, so a start carrying it succeeds. Nothing would stop it on
+/// the way: `rurge_command()` sets `RURGE_ENHANCED_BACKEND=off` and `VALID`
+/// does not ask for the enhanced mode, so no platform backend is reached and
+/// no device is opened (the M4d plan's P19). The trouble is afterwards — the
+/// daemon goes on running, listening on the default local ports, which the
+/// test conventions of this repository forbid, and `output()` waits for it
+/// forever.
 #[cfg_attr(not(windows), test)]
 #[cfg_attr(windows, allow(dead_code))]
 fn the_wintun_dll_option_is_a_usage_error_elsewhere() {
