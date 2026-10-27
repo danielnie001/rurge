@@ -8,6 +8,9 @@ each test binary that exited abnormally, each compile error, and, when the
 log ends inside a test binary, the tests still running and the ones that had
 failed by then — where it can be seen without the log.
 
+The log of the clippy step is read the same way: it holds compile errors and
+lints only, all of them before the first test binary.
+
 Usage: report-test-failures.py <log file>
 
 Always exits 0: the job has failed already, and a report that cannot be made

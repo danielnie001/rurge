@@ -32,7 +32,14 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
+      # Also into a file: an error in code only CI compiles (Linux, macOS) is
+      # repeated as an annotation, which can be read without signing in.
+      - name: Run clippy
+        id: clippy
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clippy --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/clippy.log"
       # A reference server that cannot be installed — a download that fails,
       # an asset that moved — costs its own cases and nothing else: the step
       # does not end the job, RURGE_INTEROP_REQUIRED fails each case that
@@ -361,9 +368,13 @@ jobs:
       - name: Report the failed tests
         if: failure()
         shell: bash
+        env:
+          CLIPPY: ${{ steps.clippy.outcome }}
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then python=python; else python=python3; fi
-          "$python" .github/scripts/report-test-failures.py "$RUNNER_TEMP/test.log"
+          log="$RUNNER_TEMP/test.log"
+          if [ "$CLIPPY" = "failure" ]; then log="$RUNNER_TEMP/clippy.log"; fi
+          "$python" .github/scripts/report-test-failures.py "$log"
   bench:
     runs-on: ubuntu-latest
     steps:
