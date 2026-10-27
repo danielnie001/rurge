@@ -4,11 +4,13 @@
 
 **怎么核的**：把设计与四份计划的「用例」一栏里每个反引号括起来的名字，逐个用 `git grep -n "fn <名字>"` 在 `crates/` 与 `tests/` 里找；找到的再读它的属性（`#[test]` / `#[tokio::test]` / `#[cfg(...)]` / `#[cfg_attr(...)]`），以及它所在的模块有没有 `cfg`。计划末尾「执行期修正记录」改过的名字以记录为准（见第三节）。设备、执行器、网卡这些用例一条也没有跑过真东西——这是 P19，见第四节。
 
+**「本机跑过」是干什么**：这一份里说「本机跑过」的，是这台 Windows 11 x86-64 开发机上的一次全量运行（任务 7 的门禁：86 个结果行、4637 通过、0 失败、13 忽略）——**不是 CI**。M4（M4a ～ M4d）的提交 CI 一个也没有见过（`CLAUDE.md`：CI 最近一次运行在 `ac0a98a`）。
+
 **三种标记**（「编译与运行」一栏）：
 
-- **三平台（本机跑过）**：文件不带 `cfg`（或只带 `#[cfg(test)]`），三个平台都编译、都跑；这台 Windows 11 x86-64 开发机上跑过。
-- **只在 Windows（本机跑过）**：带 `#[cfg(windows)]`，只在 Windows 编译、运行；这台开发机上跑过，CI 的 Windows 也跑。Linux / macOS 上不编译。
-- **只在非 Windows（CI 还没有见过）**：带 `#[cfg_attr(not(windows), test)]` 一类，Linux / macOS 上才跑；这台开发机编译不到它的那一半，第一次运行是 CI。
+- **三平台（本机跑过）**：文件不带 `cfg`（或只带 `#[cfg(test)]`），三个平台都编译、都跑；这台 Windows 11 x86-64 开发机上跑过。CI 的三个平台任务会编译、运行它们；M4 的提交 CI 还没有见过。
+- **只在 Windows（本机跑过）**：带 `#[cfg(windows)]`，只在 Windows 编译、运行；这台开发机上跑过。CI 的 Windows 任务会编译、运行它们；M4 的提交 CI 还没有见过。Linux / macOS 上不编译。
+- **只在非 Windows（CI 还没有见过）**：带 `#[cfg_attr(not(windows), test)]` 一类，Windows 上只编译、不运行，Linux / macOS 上才跑；这台开发机只编译、不运行，第一次运行是 CI。
 - **L2（缺省跳过）**：`tests/privileged`，带 `#[cfg(target_os = "linux")]`，没有 `RURGE_TEST_PRIVILEGED` 时跳过并打印原因；只在 Linux 编译，任何地方都没有运行过。
 - **缺**：名单上有、代码里没有的。
 
@@ -108,10 +110,10 @@
 | ---- | ------------ | ---------- |
 | 1（`unicast_if` 与 `in_job`） | `unicast_if_on_a_loopback_socket_still_reaches_the_loopback`、`unicast_if_on_a_loopback_socket_still_reaches_the_loopback_over_ipv6`、`a_child_in_the_job_is_contained_and_this_process_is_not`、`an_exited_child_whose_handle_is_still_open_is_not_contained`、`a_process_that_is_gone_is_not_contained`；端到端 `what_the_program_started_goes_direct_too`（`tests/external/tests/engine.rs`，第 45 行起三平台都跑） | 只在 Windows（本机跑过）；端到端那条三平台 |
 | 2（读回的解析与 `configure` 的翻译） | `routes_are_read_from_the_english_table`、`routes_are_read_whatever_the_language`、`a_prefix_with_an_embedded_ipv4_address_is_read`、`lines_without_a_prefix_and_a_number_are_skipped`（另有 `addresses_are_read_from_the_english_output`、`addresses_are_read_whatever_the_language`、`an_address_with_a_zone_is_read_without_it`、`the_mtu_is_the_first_number_of_the_first_row`、`the_readback_commands_are_one_netsh_call_each`、`the_adapter_comes_up_in_one_script`、`ipv6_is_a_script_of_its_own`） | 三平台（本机跑过）：`route/windows.rs` 不带 `cfg` |
-| 3（`wintun.dll` 与读线程） | 读线程（三平台）：`packets_are_passed_on_in_order`、`an_empty_ring_is_waited_on`、`an_error_of_the_ring_is_passed_on_and_ends_the_loop`、`stop_ends_the_loop_within_one_wait`、`a_closed_receiver_ends_a_loop_blocked_on_a_full_channel`。加载（只在 Windows）：`an_unsigned_file_is_refused`、`a_missing_file_says_where_to_get_it`、`a_dll_without_the_wintun_entry_points_is_refused`、`a_file_that_is_not_a_dll_cannot_be_loaded`、`a_file_that_is_held_open_cannot_be_opened`、`a_packet_longer_than_wintun_takes_is_refused`、`a_real_wintun_dll_passes` | 读线程三平台（本机跑过，计时用例循环跑过二十次）；加载只在 Windows（本机跑过）。`a_real_wintun_dll_passes` 要有 `RURGE_TEST_WINTUN_DLL`，缺省打印原因、什么也不做——这台机器上没有 `wintun.dll`，所以**签名者一次也没有被读过** |
+| 3（`wintun.dll` 与读线程） | 读线程（三平台）：`packets_are_passed_on_in_order`、`an_empty_ring_is_waited_on`、`an_error_of_the_ring_is_passed_on_and_ends_the_loop`、`stop_ends_the_loop_within_one_wait`、`a_closed_receiver_ends_a_loop_blocked_on_a_full_channel`。加载（只在 Windows）：`an_unsigned_file_is_refused`、`a_missing_file_says_where_to_get_it`、`a_dll_without_the_wintun_entry_points_is_refused`、`a_file_that_is_not_a_dll_cannot_be_loaded`、`a_file_that_is_held_open_cannot_be_opened`、`a_real_wintun_dll_passes` | 读线程三平台（本机跑过，计时用例循环跑过二十次）；加载只在 Windows（本机跑过）。`a_real_wintun_dll_passes` 要有 `RURGE_TEST_WINTUN_DLL`，缺省打印原因、什么也不做——这台机器上没有 `wintun.dll`，所以**签名者一次也没有被读过** |
 | 4（`WindowsSystem`） | `without_wintun_dll_the_open_fails_before_the_device`、`configure_runs_the_script_then_reads_back_the_address_and_the_mtu`、`a_missing_address_fails_configure`、`an_mtu_that_is_not_1500_fails_configure`、`an_ipv6_address_that_is_missing_is_ok_false_and_taken_out_again`、`routes_are_read_back_by_the_adapter_s_index`、`missing_ipv4_routes_take_the_added_ones_out_and_fail`、`missing_ipv6_routes_are_ok_false`、`the_dns_is_read_back`、`a_missing_ipv6_dns_is_one_warn_and_still_ok`、`a_dns_that_did_not_change_fails_take_dns`、`netsh_s_exit_status_does_not_decide`、`the_windows_system_never_saves_and_drops_foreign_undos`、`physical_dns_is_the_system_s_own` | 三平台（本机跑过）：`enhanced/windows.rs` 不带 `cfg` |
-| 5（设备与读线程接上） | 设备本身没有缺省用例（P19）；这一任务点的是判据，不是用例 | 设备与 `wintun::` 的十个入口在这台机器上编译过，没有一条用例走到它们（记录第 70 行）；真机上第一次运行是手工清单 |
-| 6（`--wintun-dll`） | `wintun_dll_is_only_for_windows`（`crates/rurge/src/cli/run.rs`，三平台）；`the_wintun_dll_option_is_a_usage_error_elsewhere`（`crates/rurge/tests/cli.rs`，Windows 上只编译、不运行） | 前者三平台（本机跑过）；后者**只在非 Windows（CI 还没有见过）** |
+| 5（设备与读线程接上） | 设备本身没有缺省用例（P19）；这一个任务点的是判据，不是用例。修正第 1 轮加的 `a_packet_longer_than_wintun_takes_is_refused`（`crates/rurge-platform/src/tun/windows/wintun.rs`，第 73 行）算在这里：它只测发包长度的上限，不碰 Wintun（只在 Windows） | 设备与十个放开的函数在这台机器上编译过，没有一条用例走到它们（记录第 70 行）；`a_packet_longer_than_wintun_takes_is_refused` 只在 Windows、本机跑过；真机上第一次运行是手工清单 |
+| 6（`--wintun-dll`） | `wintun_dll_is_only_for_windows`（`crates/rurge/src/cli/run.rs`，三平台）；`the_wintun_dll_option_is_a_usage_error_elsewhere`（`crates/rurge/tests/cli.rs`，Windows 上只编译、不运行） | 前者三平台（本机跑过）；后者**只在非 Windows 上运行（Windows 上编译）——这台开发机只编译、不运行，CI 还没有见过** |
 | 7（这一份核对） | 没有新用例 | — |
 | 8、9 | 还没有做 | — |
 
@@ -165,7 +167,7 @@ crates/rurge-platform/src/enhanced/windows.rs:559:        let error = match syst
 | - | ---- |
 | 名单上的用例（去重） | **280** |
 | 本机跑过——三平台的 264 条加只在 Windows 的 12 条 | **276** |
-| 只在非 Windows 编译与运行（这台开发机编译不到，**CI 还没有见过**） | **1**：`the_wintun_dll_option_is_a_usage_error_elsewhere` |
+| 只在非 Windows 编译与运行（这台开发机只编译、不运行，**CI 还没有见过**） | **1**：`the_wintun_dll_option_is_a_usage_error_elsewhere` |
 | L2（只在 Linux 编译，缺省跳过，任何地方都没有运行过） | **3** |
 | 缺 | **0** |
 
