@@ -415,7 +415,7 @@ M4c 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 
 ### M4d（Windows 与收尾）
 
-M4d 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4d-windows-wrapup-plan.md`，下面写“M4d 记录第 N 行”指它末尾的「执行期修正记录」，写“P N”指它的「计划期决定」）。**上一节 M4c 的三条以这一段为准**（那是当时的事实；规矩是历史的段落不逐处改、由后写的段落订正）：“Windows 照旧不能开”不成立了——Windows 的平台后端不再是 `Unsupported`，它建 Wintun 的虚拟网卡；“三个平台都没有在真机上验证”照旧成立；“M4c 的提交 CI 都没有见过”的范围扩到 M4d。M4d 由协调的会话逐个任务调 Pi 做、逐个任务评审；任务 8（推送之后读 CI）不在这一轮，与 M4c 的任务 10 一起等所有者推送。文件里说“任务 9”：这一轮就是它（文档收尾）。
+M4d 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4d-windows-wrapup-plan.md`，下面写“M4d 记录第 N 行”指它末尾的「执行期修正记录」，写“P N”指它的「计划期决定」）。**上一节 M4c 的三条以这一段为准**（那是当时的事实；规矩是历史的段落不逐处改、由后写的段落订正）：“Windows 照旧不能开”不成立了——Windows 的平台后端不再是 `Unsupported`，它建 Wintun 的虚拟网卡；“三个平台都没有在真机上验证”照旧成立；“M4c 的提交 CI 都没有见过”的范围扩到 M4d。M4d 由协调的会话逐个任务调 Pi 做、逐个任务评审；这一轮做的是任务 9（M4 的文档收尾），任务 8（推送之后读 CI）不在这一轮，与 M4c 的任务 10 一起等所有者推送。
 
 做了什么：一句话说，Windows 上 `rurge run --enhanced-mode` 有了完整的代码（照代码会建名叫 `rurge` 的 Wintun 适配器、配地址与 MTU、装路由、把系统 DNS 指向应答器），M4 的文档也收尾了；**设备与提示没有在任何地方运行过**。逐项：
 
@@ -423,7 +423,7 @@ M4d 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 - **读回的解析**（任务 2）：`crates/rurge-platform/src/route/windows.rs` 的 `routes_in` / `addresses_in` / `mtu_in` 与四条读回命令，夹具手写（注明不是从机器上取的）；`set interface` 的度量拆成单独一行（P9）。
 - **`wintun.dll`**（任务 3）：`crates/rurge-platform/src/tun/dll.rs` 的查找（`--wintun-dll` 的相对路径补成绝对路径，否则 `rurge.exe` 旁边），`tun/windows/wintun.rs` 的签名校验（以只许读的共享方式开着那个文件、校验的就是它、签名者恰好是 `WireGuard LLC`、不联网）与加载（`LoadLibraryExW` 只查那个绝对路径，依赖只从 System32 找），每一句错误都不带路径。
 - **系统一侧**（任务 4）：`enhanced/windows.rs` 的 `WindowsSystem`（不带 `cfg`）：`netsh -f` 的脚本、每一步之后读回（地址、MTU、路由、DNS）、`ipconfig /flushdns`；`netsh` 的退出码不看、成败只由读回定（P10）；路由那一半经 `run_routes`，IPv6 的两行 WARN 与 M4c 的分工一致；Windows 从不写备份（P12）。
-- **设备**（任务 5）：`tun/windows/mod.rs` 与 `tun/windows/wintun.rs` 的十个放开的函数与设备：先探后建、不复用（P8），接口序号每 100 毫秒问一次、至多 5 秒，通道 1,024 个包，环 8 MiB，读线程的循环是 `tun/reader.rs`（不带 `cfg`）；关闭在最后一个 `Arc` 放掉时；`enhanced::system` 把 `wintun_dll` 一路传下去。
+- **设备**（任务 5）：`tun/windows/mod.rs` 与 `tun/windows/wintun.rs` 的设备与十二个放开的函数（其中 `verify_signer` 与 `load` 是任务 3 的）：先探后建、不复用（P8），接口序号每 100 毫秒问一次、至多 5 秒，通道 1,024 个包，环 8 MiB，读线程的循环是 `tun/reader.rs`（不带 `cfg`）；关闭在最后一个 `Arc` 放掉时；`enhanced::system` 把 `wintun_dll` 一路传下去。
 - **命令行**（任务 6）：`--wintun-dll` / `RURGE_WINTUN_DLL`（说明 `Windows: where wintun.dll is (default: next to rurge.exe)`），别的平台上是用法错误（`--wintun-dll is only for Windows`，退出 2，在 `Overrides::parse` 与读配置之前）；`--help` 与别的路径选项一样连取值一起显示（R21）。
 - **L1 的核对**（任务 7）：`docs/acceptance/phase3-m4-l1-checklist.md`——280 条（本机跑过 276、只在非 Windows 运行 1、L2 3、缺 0），`CLAUDE.md` 与本节引用它，数照它写。
 - **文档**（任务 9，这一轮）：兼容性清单 9.1、6.3、10.3、10.4 节与两行新登记；`docs/api/phase3.md` 的「M4d」一节；`docs/acceptance/phase3-manual.md` 的 M4 一节（W19 ～ W41、M17 ～ M30、L18 ～ L32、P29 ～ P31）；`docs/testing.md` 的「阶段 3 / M4d 起」与 `RURGE_ENHANCED_BACKEND` 一段；两份 README；需求文档第 7 节阶段 3 的状态行；`CLAUDE.md` 的「现在在哪里」；设计末尾的「执行期的订正」。
@@ -434,7 +434,7 @@ M4d 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 
 没做的，与不要当成已经有的：
 
-- **三个平台的设备与系统改动都没有在真机上跑过**：Windows 的设备与那十个放开的函数在这台开发机上编译、`clippy` 过，**没有在任何地方运行过**（没有一条缺省的用例开设备，`RURGE_TEST_WINTUN_DLL` 不设，P19，M4d 记录第 70 行）；Linux 与 macOS 专有的代码 CI 还没有见过。
+- **三个平台的设备与系统改动都没有在真机上跑过**：Windows 的设备与那十二个放开的函数在这台开发机上编译、`clippy` 过，**没有在任何地方运行过**（没有一条缺省的用例开设备，`RURGE_TEST_WINTUN_DLL` 不设，P19，M4d 记录第 70 行）；Linux 与 macOS 专有的代码 CI 还没有见过。
 - **`a_real_wintun_dll_passes` 在本机没有真正跑过**（没有 `wintun.dll`）；真的 `wintun.dll` 的签名者是 `WireGuard LLC`、只读共享开着文件时 `LoadLibraryExW` 照样能载入，都要手工清单核（W36）。
 - **`the_wintun_dll_option_is_a_usage_error_elsewhere` 在本机只编译、不运行**，第一次运行是 Linux / macOS 的 CI（M4d 记录第 75、76 行）。
 - **L2 的用例没有运行过**：`tests/privileged` 写好、在这台机器上只编译到 `#![cfg(target_os = "linux")]` 之后是一个空文件；手工清单的 L32 是在一次性虚拟机上跑它。
