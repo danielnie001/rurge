@@ -289,6 +289,11 @@ impl System for MacSystem {
     /// service whose servers cannot be read is left alone (P8), and one whose
     /// servers the backup holds already is not read again — after a crash they
     /// are the responder's, not the service's.
+    ///
+    /// The file is read even when it holds nothing but the responder, and what
+    /// is left then is stored as it is: a list that is empty is no answer, and
+    /// `physical_dns` reads the service's own servers and DHCP then (the phase
+    /// 3 / M4c plan's execution record row 47).
     fn dns_saved(&self, _dev: &Adapter, saved: &[Saved]) -> Result<Vec<Saved>, String> {
         let enabled = self.list_services(false)?;
         if !saved.iter().any(|saved| mac_dns(saved).is_some()) {
@@ -459,6 +464,12 @@ impl System for MacSystem {
     /// the ones DHCP gave it, or none at all. Never the responder: a service the
     /// user pointed at `198.18.0.2` by hand would send rurge's own lookups to an
     /// address this machine cannot reach (R16).
+    ///
+    /// A list that is empty once rurge's space is out is no answer: configd
+    /// writes `/etc/resolv.conf` asynchronously, so a close followed straight by
+    /// an open — or a crash's recovery, then an open — may find only the
+    /// responder there. Unknown means the service's own servers and then DHCP
+    /// are read (the phase 3 / M4c plan's execution record row 47).
     fn physical_dns(
         &self,
         primary: Option<&str>,
@@ -470,7 +481,9 @@ impl System for MacSystem {
             if network_changed {
                 // it is only right until the network it was read on changes
                 state.before = None;
-            } else if let Some(before) = &state.before {
+            } else if let Some(before) = &state.before
+                && !before.is_empty()
+            {
                 return Some(before.clone());
             }
         }
@@ -1121,6 +1134,36 @@ mod tests {
         assert_eq!(
             system.physical_dns(Some("en0"), &backup, false),
             Some(Vec::new())
+        );
+    }
+
+    /// `/etc/resolv.conf` can hold nothing but the responder just after a close,
+    /// or just after a crash's recovery: configd writes it asynchronously. A
+    /// list that is empty once rurge's space is out is no answer, so the
+    /// service's own servers and then DHCP are read (the phase 3 / M4c plan's
+    /// execution record row 47).
+    #[test]
+    fn a_list_that_is_empty_after_rurges_space_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("resolv.conf"),
+            "nameserver 198.18.0.2\nnameserver fd00:6152::2\n",
+        )
+        .unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        runner.reply(LIST, TWO_SERVICES);
+        runner.reply(
+            "/usr/sbin/networksetup -listnetworkserviceorder",
+            SERVICE_ORDER,
+        );
+        runner.reply("/usr/sbin/ipconfig getpacket en0", PACKET);
+        let system = system_of(dir.path(), &runner);
+
+        let backup = system.dns_saved(&dev(), &[]).unwrap();
+        assert_eq!(
+            system.physical_dns(Some("en0"), &backup, false),
+            Some(vec![ip("192.168.4.1")]),
+            "the empty list is unknown, so DHCP's servers are read"
         );
     }
 }
