@@ -198,8 +198,14 @@ impl System for LinuxSystem {
         }
         if self.behind_the_stub() && resolvectl {
             let steps = translation::take_dns(self.tools()?, &dev.name, ipv6);
-            self.run(&steps)?;
+            // A takeover that fails partway is undone as if it had happened:
+            // the steps before the one that failed have set the link already,
+            // and `give_dns_back`'s `revert` leaves a link nothing was set on
+            // as it is (`Ignore`) — while leaving this false would keep the
+            // failed open's `198.18.0.2` and `~.` until the device goes (the
+            // phase 3 / M4c plan's execution record row 42).
             self.took_dns.store(true, Ordering::Relaxed);
+            self.run(&steps)?;
             return Ok(true);
         }
         // not a system whose DNS goes through resolved's stub, or too old a
@@ -565,6 +571,34 @@ mod tests {
             // the per-link settings go with the device: nothing to back up
             assert_eq!(system.dns_saved(&dev(), &[]), Ok(Vec::new()));
         }
+    }
+
+    /// A takeover that fails partway is undone as if it had happened: the
+    /// steps before the one that failed have set the link already, so
+    /// `give_dns_back` reverts it — a link nothing was set on is `Ignore`, and
+    /// `revert` leaves it that way (the phase 3 / M4c plan's execution record
+    /// row 42).
+    #[test]
+    fn a_takeover_that_fails_partway_is_given_back() {
+        let dir = tempfile::tempdir().unwrap();
+        with_tools(dir.path());
+        put(dir.path(), "/etc/resolv.conf", STUB_CONF);
+        let runner = Arc::new(Fake::default());
+        let system = system_of(dir.path(), &runner);
+        // `domain` fails: `llmnr` and the rest before it have set the link
+        runner.fail("resolvectl", "domain rurge", "the link is gone");
+
+        let error = system.take_dns(&dev(), false).unwrap_err();
+        assert!(error.contains("the link is gone"), "{error}");
+
+        system.give_dns_back(&dev()).unwrap();
+        let lines = runner.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with("resolvectl revert rurge")),
+            "the half-taken-over link was not reverted: {lines:?}"
+        );
     }
 
     /// Without the stub, the system's DNS is left alone and one open says why
