@@ -11,6 +11,8 @@
 //! This task's `system` answers [`Unsupported`] on every platform: M4c's tasks
 //! 6 and 7 put Linux's and macOS's in its `cfg`s, and M4d Window's.
 
+pub mod linux;
+
 use std::io;
 use std::net::IpAddr;
 use std::path::PathBuf;

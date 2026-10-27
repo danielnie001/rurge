@@ -36,6 +36,7 @@ nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 # The workspace lints, except `unsafe_code`: notifying WinINet that the proxy
 # settings changed (`sysproxy::windows`), putting an external program in a

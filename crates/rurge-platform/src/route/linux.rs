@@ -1,9 +1,10 @@
 //! Linux: what it takes to bring the adapter up, route into it and point the
 //! system resolver at the responder (design 5.2).
 //!
-//! A translation, and nothing more: the programs' paths are given (M4c looks
-//! them up; this file never looks anything up in `PATH`), and no program is
-//! run. Every platform compiles and tests this file.
+//! A translation, and nothing more: the programs' paths are given, and no
+//! program is run. [`LinuxTools::find`] is the one place a path is looked for:
+//! the system's directories, never `PATH`. Every platform compiles and tests
+//! this file.
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,40 @@ pub struct LinuxTools {
     /// systemd-resolved): the system DNS is not taken over, and the steps that
     /// would are empty (design 5.2).
     pub resolvectl: Option<PathBuf>,
+}
+
+impl LinuxTools {
+    /// `ip` and `resolvectl`, each the first of `/usr/sbin`, `/sbin`, `/usr/bin`,
+    /// `/bin` (under `root`) that has it. Without `ip` there is no enhanced mode.
+    pub fn find(root: &Path) -> Result<LinuxTools, String> {
+        let Some(ip) = find_program(root, "ip") else {
+            return Err(
+                "cannot find the ip program (iproute2) in /usr/sbin, /sbin, /usr/bin or /bin"
+                    .to_string(),
+            );
+        };
+        Ok(LinuxTools {
+            ip,
+            resolvectl: find_program(root, "resolvectl"),
+        })
+    }
+}
+
+/// Where the programs are looked for, in this order (design 5.1).
+const DIRECTORIES: [&str; 4] = ["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
+
+/// `name` in the first of [`DIRECTORIES`] that has it, as the absolute path it
+/// is on a real system: built from text, so that it is spelled `/sbin/ip`
+/// whichever host the tests run on. `root` says where to look (`/` in
+/// production) and is not part of the answer.
+fn find_program(root: &Path, name: &str) -> Option<PathBuf> {
+    for dir in DIRECTORIES {
+        let found = root.join(dir.trim_start_matches('/')).join(name);
+        if found.is_file() {
+            return Some(PathBuf::from(format!("{dir}/{name}")));
+        }
+    }
+    None
 }
 
 /// Bring the adapter up with its address and MTU (design 5.2, 9.3 step 2).

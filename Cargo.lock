@@ -3431,6 +3431,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "windows-registry",
  "windows-sys 0.61.2",
 ]

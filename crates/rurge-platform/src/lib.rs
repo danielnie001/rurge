@@ -5,6 +5,8 @@ pub mod dirs;
 pub mod dns;
 pub mod enhanced;
 pub mod icmp;
+#[cfg(test)]
+mod log_capture;
 pub mod netenv;
 pub mod process;
 pub mod procinfo;
