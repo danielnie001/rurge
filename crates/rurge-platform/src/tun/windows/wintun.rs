@@ -67,9 +67,9 @@ type Entry = unsafe extern "system" fn() -> isize;
 /// The pointers are [`Send`] and [`Sync`] like any function pointer, which is
 /// why the module handle is an integer: a pointer is neither (P4). Nothing is
 /// unloaded, so they are valid for as long as this is reachable.
-// The entry points are read from task 5 on (the phase 3 / M4d plan's
-// execution record row 55); until then no field but `module` has a reader.
-#[allow(dead_code)]
+// The eleven entry points and the module handle are read by the functions
+// below, one call each: nothing here is unused (the phase 3 / M4d plan's
+// execution record row 55).
 pub(super) struct Wintun {
     /// `LoadLibraryExW`'s handle as an integer (P4). Never freed.
     pub(super) module: usize,
@@ -109,8 +109,6 @@ pub(super) struct Wintun {
 /// system gave. The words `frame::explained` puts in front of a failed open
 /// stand for the adapter, not for these, so the caller passes these on as they
 /// are (the plan's execution record row 59). No message names the path (P16).
-// Read from task 5 on (the phase 3 / M4d plan's execution record row 55).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn loaded(path: &Path) -> io::Result<Arc<Wintun>> {
     {
         let loaded = LOADED.lock().unwrap_or_else(PoisonError::into_inner);
@@ -144,6 +142,12 @@ pub(super) fn loaded(path: &Path) -> io::Result<Arc<Wintun>> {
         Err(text) => return Err(not_ours(text)),
     }
     let wintun = Arc::new(load(path)?);
+    // which module the entry points came from, and that it is loaded at all:
+    // DEBUG, and the only reader the module handle has outside the tests
+    tracing::debug!(
+        module = %format!("0x{:X}", wintun.module),
+        "wintun.dll is loaded"
+    );
     *LOADED.lock().unwrap_or_else(PoisonError::into_inner) =
         Some((path.to_path_buf(), Arc::clone(&wintun)));
     Ok(wintun)
@@ -381,6 +385,200 @@ fn load(path: &Path) -> io::Result<Wintun> {
             unsafe extern "system" fn(SessionHandle, *const u8)
         ),
     })
+}
+
+/// Makes an adapter called `name`, of the tunnel type `tunnel_type`, with
+/// `guid`: its handle as an integer (plan P4). Its failure is Windows's own
+/// error (`GetLastError`), and a malformed GUID is not one of them: ours is a
+/// constant `wintun.h` takes.
+#[allow(unsafe_code)]
+pub(super) fn create_adapter(
+    wintun: &Wintun,
+    name: &str,
+    tunnel_type: &str,
+    guid: &GUID,
+) -> io::Result<usize> {
+    let name = terminated(name);
+    let tunnel_type = terminated(tunnel_type);
+    // SAFETY: both names are NUL-terminated UTF-16 that outlive the call, and
+    // `guid` is a live GUID whose address the call reads; the answer is the
+    // adapter's handle, or null with the error in `GetLastError`.
+    let adapter = unsafe { (wintun.create_adapter)(name.as_ptr(), tunnel_type.as_ptr(), guid) };
+    if adapter.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(adapter as usize)
+}
+
+/// The handle of the adapter called `name` that some process has open, if
+/// there is one: the probe of the name (M4d plan P8). `None` otherwise, and
+/// then what Windows said is DEBUG only: a name nobody holds open is the
+/// usual answer, not a failure.
+#[allow(unsafe_code)]
+pub(super) fn open_adapter(wintun: &Wintun, name: &str) -> Option<usize> {
+    let name = terminated(name);
+    // SAFETY: the name is NUL-terminated UTF-16 that outlives the call; the
+    // answer is that adapter's handle, or null.
+    let adapter = unsafe { (wintun.open_adapter)(name.as_ptr()) };
+    if adapter.is_null() {
+        let error = io::Error::last_os_error();
+        tracing::debug!(%error, "no adapter of that name is open");
+        return None;
+    }
+    Some(adapter as usize)
+}
+
+/// Releases the adapter `adapter`; one this module made is removed with it
+/// (`wintun.h`).
+#[allow(unsafe_code)]
+pub(super) fn close_adapter(wintun: &Wintun, adapter: usize) {
+    // SAFETY: `adapter` is a handle `create_adapter` or `open_adapter` gave,
+    // and this is the one call that closes it.
+    unsafe { (wintun.close_adapter)(adapter as AdapterHandle) }
+}
+
+/// The index of the interface that belongs to `adapter`: `WintunGetAdapterLUID`
+/// and then `ConvertInterfaceLuidToIndex`. It is the number the steps name the
+/// adapter by, and another interface of the same name is never mistaken for
+/// this one.
+#[allow(unsafe_code)]
+pub(super) fn adapter_index(wintun: &Wintun, adapter: usize) -> io::Result<u32> {
+    use windows_sys::Win32::Foundation::NO_ERROR;
+    use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex;
+
+    let mut luid = NET_LUID_LH::default();
+    // SAFETY: `adapter` is a live adapter handle, and `luid` is a live
+    // `NET_LUID_LH` the call fills in.
+    unsafe { (wintun.adapter_luid)(adapter as AdapterHandle, &mut luid) };
+    let mut index = 0u32;
+    // SAFETY: `luid` is the LUID that call just filled in, and `index` is a
+    // live `u32` this call fills in; its answer is an error code, not an
+    // interface index.
+    let result = unsafe { ConvertInterfaceLuidToIndex(&luid, &mut index) };
+    if result != NO_ERROR {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
+    Ok(index)
+}
+
+/// Starts a session on `adapter` with a ring of `capacity` bytes (a power of
+/// two, within `wintun.h`'s bounds): its handle as an integer.
+#[allow(unsafe_code)]
+pub(super) fn start_session(wintun: &Wintun, adapter: usize, capacity: u32) -> io::Result<usize> {
+    // SAFETY: `adapter` is a live adapter handle, and `capacity` is one of the
+    // sizes `wintun.h` allows; the answer is the session's handle, or null
+    // with the error in `GetLastError`.
+    let session = unsafe { (wintun.start_session)(adapter as AdapterHandle, capacity) };
+    if session.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(session as usize)
+}
+
+/// Ends the session `session`, after the thread that read it has ended.
+#[allow(unsafe_code)]
+pub(super) fn end_session(wintun: &Wintun, session: usize) {
+    // SAFETY: `session` is a handle `start_session` gave that has not been
+    // ended yet, and this is the one call that ends it.
+    unsafe { (wintun.end_session)(session as SessionHandle) }
+}
+
+/// The event a session's reader waits on: `WintunGetReadWaitEvent`. The event
+/// is the session's, not ours: it is never closed here (`wintun.h`).
+#[allow(unsafe_code)]
+pub(super) fn read_event(wintun: &Wintun, session: usize) -> io::Result<usize> {
+    // SAFETY: `session` is a live session handle; the answer is that session's
+    // read event, which stays valid as long as the session does.
+    let event = unsafe { (wintun.read_event)(session as SessionHandle) };
+    if event.is_null() {
+        return Err(io::Error::other("the adapter's session has no read event"));
+    }
+    Ok(event as usize)
+}
+
+/// Waits at most `milliseconds` for `event`, a session's read event. Which way
+/// the wait ended is not read: a reader that wakes up asks the session for a
+/// packet again, and a timeout only brings it back to the stop flag.
+#[allow(unsafe_code)]
+pub(super) fn wait_readable(event: usize, milliseconds: u32) {
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    // SAFETY: `event` is the read event of a session that is not ended while
+    // its reader runs, and waiting on an event does not take it; the answer
+    // (the event, the timeout, or a failure) is not used.
+    unsafe { WaitForSingleObject(event as HANDLE, milliseconds) };
+}
+
+/// The packet that is waiting in `session`, copied out: `Ok(None)` when none is
+/// there (`ERROR_NO_MORE_ITEMS`). Any other answer that is not a packet is the
+/// device gone or broken — `ERROR_HANDLE_EOF` too (the phase 3 / M4c plan's
+/// execution record row 27) — and ends the reader.
+#[allow(unsafe_code)]
+pub(super) fn receive(wintun: &Wintun, session: usize) -> io::Result<Option<Vec<u8>>> {
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+
+    let mut size = 0u32;
+    // SAFETY: `session` is a live session handle, and `size` is a live `u32`
+    // the call writes the packet's length into; the answer is the packet in the
+    // session's ring, which stays there until it is released, or null.
+    let packet = unsafe { (wintun.receive)(session as SessionHandle, &mut size) };
+    if packet.is_null() {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_NO_MORE_ITEMS as i32) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let mut copy = vec![0u8; size as usize];
+    // SAFETY: the call answered a packet of `size` bytes in the session's
+    // ring, and `copy` has room for exactly that many; copying out of the ring
+    // does not move it.
+    unsafe { std::ptr::copy_nonoverlapping(packet, copy.as_mut_ptr(), size as usize) };
+    // SAFETY: the packet the call above answered, released once and only after
+    // it was copied out, so that the ring can be read again.
+    unsafe { (wintun.release_receive)(session as SessionHandle, packet) };
+    Ok(Some(copy))
+}
+
+/// Writes `packet` into the session's ring: `Ok(true)` when it went out, and
+/// `Ok(false)` when the ring is full (`ERROR_BUFFER_OVERFLOW`) — the packet is
+/// the caller's to drop and count (M4c plan P14).
+#[allow(unsafe_code)]
+pub(super) fn send(wintun: &Wintun, session: usize, packet: &[u8]) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+
+    let size = u32::try_from(packet.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a packet for the virtual adapter is longer than 4 GiB",
+        )
+    })?;
+    // SAFETY: `session` is a live session handle, and `size` is the packet's
+    // length, which `wintun.h` takes as a `u32`; the answer is room for that
+    // many bytes in the ring, or null.
+    let room = unsafe { (wintun.allocate_send)(session as SessionHandle, size) };
+    if room.is_null() {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_BUFFER_OVERFLOW as i32) {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    // SAFETY: the call above answered room for exactly `size` bytes in the
+    // session's ring, and `packet` is `size` bytes long.
+    unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), room, size as usize) };
+    // SAFETY: the room the allocation answered, with the packet written into
+    // it, sent once: nothing writes into it after this.
+    unsafe { (wintun.send)(session as SessionHandle, room) };
+    Ok(true)
+}
+
+/// `text` as Windows takes a name: UTF-16 with a NUL at the end. The names are
+/// rurge's own constants, which have no NUL in them.
+fn terminated(text: &str) -> Vec<u16> {
+    let mut units: Vec<u16> = OsStr::new(text).encode_wide().collect();
+    units.push(0);
+    units
 }
 
 /// `text` as Windows takes a path: UTF-16 with a NUL at the end. A NUL that is

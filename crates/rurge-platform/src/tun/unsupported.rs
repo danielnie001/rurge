@@ -1,5 +1,6 @@
-//! The adapter on a platform that has none in this version: Windows takes
-//! Wintun in M4d, and this is what is left.
+//! The adapter on a platform that has none in this version: Linux's,
+//! macOS's and Windows's are their own modules, and this is what is left for
+//! any other platform (none this version is built for).
 //!
 //! There is no device to have, so [`Device`] has no values at all: every
 //! method is reached only through a `TunDevice`, and no `TunDevice` is ever

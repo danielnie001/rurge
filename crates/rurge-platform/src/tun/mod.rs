@@ -26,7 +26,8 @@
 //! ```
 //!
 //! There is one platform's module at a time, chosen by the `cfg`s below; a
-//! platform that has none in this version gets `unsupported`.
+//! platform that has none in this version gets `unsupported` (nothing this
+//! version is built for).
 //!
 //! Deciding when a packet has no room, counting the dropped ones and the two
 //! log lines are [`write_all`]'s here, without a platform in them. Reading a
@@ -49,6 +50,8 @@ pub mod reader;
 
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+use windows::{Device as Imp, no_room};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -60,9 +63,9 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos::{Device as Imp, no_room};
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 use unsupported::{Device as Imp, no_room};
 
 /// The buffer a read goes into (M4c plan P14): larger than any MTU, so that a

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// Adding a function that opts out of the lint means changing this list, and
 /// saying so in the commit message and in the `unsafe_code` paragraph of
 /// CLAUDE.md.
-const LISTED: [(&str, &str); 13] = [
+const LISTED: [(&str, &str); 23] = [
     ("src/process.rs", "in_job"),
     ("src/process.rs", "job_for"),
     ("src/procinfo/macos.rs", "pcblist"),
@@ -27,8 +27,18 @@ const LISTED: [(&str, &str); 13] = [
     ("src/sysproxy/windows.rs", "notify_wininet"),
     ("src/tun/linux.rs", "set_iff"),
     ("src/tun/macos.rs", "utun_connect"),
+    ("src/tun/windows/wintun.rs", "adapter_index"),
+    ("src/tun/windows/wintun.rs", "close_adapter"),
+    ("src/tun/windows/wintun.rs", "create_adapter"),
+    ("src/tun/windows/wintun.rs", "end_session"),
     ("src/tun/windows/wintun.rs", "load"),
+    ("src/tun/windows/wintun.rs", "open_adapter"),
+    ("src/tun/windows/wintun.rs", "read_event"),
+    ("src/tun/windows/wintun.rs", "receive"),
+    ("src/tun/windows/wintun.rs", "send"),
+    ("src/tun/windows/wintun.rs", "start_session"),
     ("src/tun/windows/wintun.rs", "verify_signer"),
+    ("src/tun/windows/wintun.rs", "wait_readable"),
 ];
 
 #[test]

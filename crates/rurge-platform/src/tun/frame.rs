@@ -108,6 +108,7 @@ pub fn utun_to_front(buf: &mut [u8], read: usize) -> Option<usize> {
 pub enum Os {
     Linux,
     MacOs,
+    Windows,
 }
 
 /// What an error of opening the adapter means to the user (M4 design 8.5):
@@ -120,6 +121,14 @@ pub enum Os {
 /// the address — while in a container root may be the one `CAP_NET_ADMIN` was
 /// taken from. The design's "or `CAP_NET_ADMIN`" is corrected by the phase 3 /
 /// M4c plan's execution record row 46.
+///
+/// The Windows lines are the two the device can meet before the adapter is
+/// made: Wintun answers a permission error when the process may not make an
+/// adapter, and the probe of the name (`WintunOpenAdapter`) finds it when
+/// another rurge has it open (M4d plan P8). A missing or refused
+/// `wintun.dll` is not explained here: it happens before the adapter, and
+/// `wintun::loaded`'s own words say it (the phase 3 / M4d plan's execution
+/// record row 59).
 ///
 /// A platform is named rather than chosen by `cfg`, so that either platform's
 /// words can be tested wherever this crate is built (M4c plan P2, P16).
@@ -136,6 +145,12 @@ pub fn explained(err: io::Error, os: Os) -> io::Error {
             "the virtual adapter is in use: is another rurge running with the enhanced mode on?"
         }
         (Os::MacOs, io::ErrorKind::PermissionDenied) => "the enhanced mode needs root",
+        (Os::Windows, io::ErrorKind::PermissionDenied) => {
+            "the enhanced mode needs to run as Administrator"
+        }
+        (Os::Windows, io::ErrorKind::ResourceBusy) => {
+            "the virtual adapter is in use: is another rurge running with the enhanced mode on?"
+        }
         _ => return io::Error::new(kind, format!("cannot open the virtual adapter: {err}")),
     };
     io::Error::new(kind, text)
@@ -297,6 +312,16 @@ mod tests {
                 ErrorKind::PermissionDenied,
                 "the enhanced mode needs root",
             ),
+            (
+                Os::Windows,
+                ErrorKind::PermissionDenied,
+                "the enhanced mode needs to run as Administrator",
+            ),
+            (
+                Os::Windows,
+                ErrorKind::ResourceBusy,
+                "the virtual adapter is in use: is another rurge running with the enhanced mode on?",
+            ),
         ] {
             let error = explained(io::Error::from(kind), os);
             assert_eq!(error.kind(), kind, "{os:?}");
@@ -304,7 +329,7 @@ mod tests {
         }
 
         // anything else keeps the kind and says what the system said
-        for os in [Os::Linux, Os::MacOs] {
+        for os in [Os::Linux, Os::MacOs, Os::Windows] {
             let error = explained(
                 io::Error::new(ErrorKind::InvalidData, "the system's own words"),
                 os,
