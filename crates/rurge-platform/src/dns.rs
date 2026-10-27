@@ -100,23 +100,30 @@ pub fn is_global_v6(ip: &Ipv6Addr) -> bool {
 }
 
 /// `resolv.conf` text → (nameservers, search domains). Usable on every platform (tests).
+///
+/// Best effort, as glibc reads the file: a line it does not understand — an
+/// option or a directive it does not know — is ignored, and the rest is used.
+/// `Config::parse` instead fails on the first such line and gives nothing, which
+/// would empty the servers of a system whose only fault is one word
+/// `resolv.conf` may hold. The lines it did not take are a DEBUG line, never the
+/// file's content (M4c plan R13).
 pub fn parse_resolv_conf(text: &str) -> (Vec<IpAddr>, Vec<String>) {
-    match resolv_conf::Config::parse(text) {
-        Ok(cfg) => {
-            let servers = cfg.nameservers.iter().map(IpAddr::from).collect();
-            let mut search: Vec<String> = cfg.get_search().cloned().unwrap_or_default();
-            if search.is_empty()
-                && let Some(d) = cfg.get_domain()
-            {
-                search.push(d.clone());
-            }
-            (servers, search)
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "cannot parse resolv.conf");
-            (Vec::new(), Vec::new())
-        }
+    let (cfg, errors) = resolv_conf::Config::parse_with_errors(text.as_bytes());
+    if !errors.is_empty() {
+        let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        tracing::debug!(
+            errors = %errors.join("; "),
+            "some lines of resolv.conf were not understood; the rest is used"
+        );
     }
+    let servers = cfg.nameservers.iter().map(IpAddr::from).collect();
+    let mut search: Vec<String> = cfg.get_search().cloned().unwrap_or_default();
+    if search.is_empty()
+        && let Some(d) = cfg.get_domain()
+    {
+        search.push(d.clone());
+    }
+    (servers, search)
 }
 
 #[cfg(windows)]
@@ -194,6 +201,16 @@ mod tests {
         let (_, only_domain) = parse_resolv_conf("nameserver 1.1.1.1\ndomain home.arpa\n");
         assert_eq!(only_domain, vec!["home.arpa".to_string()]);
         assert_eq!(parse_resolv_conf("").0.len(), 0);
+    }
+
+    /// A line the parser does not know — an option, a directive — does not
+    /// cost the servers: `resolv.conf` is read as glibc reads it, which
+    /// ignores what it does not understand (M4c plan R13).
+    #[test]
+    fn an_unknown_option_does_not_empty_the_servers() {
+        let (servers, _) =
+            parse_resolv_conf("nameserver 192.0.2.1\noptions edns0 trust-ad frobnicate\n");
+        assert_eq!(servers, vec!["192.0.2.1".parse::<IpAddr>().unwrap()]);
     }
 
     #[test]
