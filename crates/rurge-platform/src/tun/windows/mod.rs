@@ -142,7 +142,8 @@ impl Device {
         let adapter = wintun::create_adapter(&wintun, NAME, TUNNEL_TYPE, &GUID)
             .map_err(|error| frame::explained(error, Os::Windows))?;
         // 4. to 7. the index, the session, its read event, and the reader
-        let opened = match Self::start(&wintun, adapter) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let opened = match Self::start(&wintun, adapter, &stop) {
             Ok(opened) => opened,
             Err(error) => {
                 // nothing of the session is left: `start` ends it
@@ -155,7 +156,7 @@ impl Device {
                 wintun,
                 adapter,
                 session: opened.session,
-                stop: Arc::new(AtomicBool::new(false)),
+                stop,
                 reader: Some(opened.reader),
                 packets: Mutex::new(opened.packets),
             },
@@ -168,8 +169,10 @@ impl Device {
 
     /// The steps after the adapter was made: the index, the session, its read
     /// event, and the reader thread. A session this started is ended here when
-    /// a later step fails; the adapter is the caller's to close.
-    fn start(wintun: &Arc<Wintun>, adapter: usize) -> io::Result<Started> {
+    /// a later step fails; the adapter is the caller's to close. `stop` is the
+    /// device's own flag, which the thread it starts watches: the device sets
+    /// it on a close, and the thread reads it.
+    fn start(wintun: &Arc<Wintun>, adapter: usize, stop: &Arc<AtomicBool>) -> io::Result<Started> {
         let index = index(wintun, adapter).map_err(|error| frame::explained(error, Os::Windows))?;
         let session = wintun::start_session(wintun, adapter, RING)
             .map_err(|error| frame::explained(error, Os::Windows))?;
@@ -181,13 +184,12 @@ impl Device {
             }
         };
         let (tx, rx) = mpsc::channel(PACKETS);
-        let stop = Arc::new(AtomicBool::new(false));
         let ring = ReadRing {
             wintun: Arc::clone(wintun),
             session,
             event,
         };
-        let thread_stop = Arc::clone(&stop);
+        let thread_stop = Arc::clone(stop);
         let reader = std::thread::Builder::new()
             .name("rurge-wintun-reader".to_string())
             .spawn(move || reader::read_loop(&ring, &tx, &thread_stop, reader::READ_WAIT));
