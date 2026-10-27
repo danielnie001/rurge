@@ -557,7 +557,9 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 
 第 3 条在第 4 条之前：`tun-included-routes` 把一段局域网送进虚拟网卡时，rurge 自己到局域网的连接仍走局域网的网卡。绑上出口的网卡失败时这次连接失败、不退回不绑（退回就会进虚拟网卡），错误是 `cannot bind to the network outside the enhanced mode: <错误种类>`。
 
-问出口的地方：`open_socket`；`DirectPacket` 的每个数据报（套接字按（地址族，出口）各一个，用到才建）；QUIC 直连的套接字（按服务端的地址）；`rurge-dns` 的纯 UDP 上游（经 `ResolverDeps::direct`，见下）；流水线回退的连接器；资源下载与 Profile 来源（`resource_client_with`）；ICMP 的回显套接字。建套接字的地方查得住的证据是 `crates/rurge/tests/sockets.rs` 的 `every_outbound_socket_is_made_in_one_place`：它读 `crates/*/src` 的生产代码，把建套接字、问系统解析库、建不带钩子的连接器的写法与一张 17 行的名单比对，多一处少一处都变红（名单与改法见 `docs/testing.md`）。
+问出口的地方：`open_socket`；`DirectPacket` 的每个数据报（套接字按（地址族，出口）各一个，用到才建）；QUIC 直连的套接字（按服务端的地址）；`rurge-dns` 的纯 UDP 上游（经 `ResolverDeps::direct`，见下）；流水线回退的连接器；资源下载与 Profile 来源（`resource_client_with`）；ICMP 的回显套接字。建套接字的地方查得住的证据是 `crates/rurge/tests/sockets.rs` 的 `every_outbound_socket_is_made_in_one_place`：它读 `crates/*/src` 的生产代码，把建套接字、问系统解析库、建不带钩子的连接器的写法与一张 24 行的名单逐处比对，同一个文件里同一种写法的第二处也要一行，多一处少一处都变红（名单与改法见 `docs/testing.md`）。
+
+目的地址先规范化成 `IpAddr::to_canonical`：`::ffff:a.b.c.d` 是 IPv4，按 IPv4 判第 3、4 条（双栈的 IPv6 套接字连它时发出去的是 IPv4 包）。只改判定，`DirectConnector` 拨号仍用按地址族选的那个套接字（“拨号前先规范化、改用 IPv4 套接字”这一种更彻底的做法没有采用，M4b 记录第 71 行）。
 
 日志（网卡名与地址只在 DEBUG；两种错误文本不带网卡名）：
 
@@ -567,6 +569,17 @@ rurge 在对应有变化时重写它，至多每 10 秒一次，TUN 停下时再
 | DEBUG | `rurge's own connection cannot leave through the egress interface` | `dst`、`interface`、`error` | 绑不上；系统的原话与网卡名只在这一行 |
 | WARN | `cannot read the subnets of the physical interfaces; rurge's own connections to them follow the primary interface` | `error` | 打开或跟随时读不到直连子网：表照写、子网是空的（第 3 条不起作用，第 4、5 条照旧） |
 | WARN | `interface unavailable; using the default one (allow-other-interface)` | `interface`、`error` | 策略的 `interface` 绑不上而 `allow-other-interface` 退回时（M4b 之前就有，不是新的）：退回之后才问出口、由出口决定绑哪块网卡。每个 `DirectConnector` 只报一次 |
+| INFO | `<协议名>: the egress of rurge's own sockets changed; a new connection is made` | `policy` | QUIC 策略（TUIC、Hysteria 2、MASQUE、TrustTunnel）发现自己的连接是按另一张出口表绑的：旧连接不再接新请求，下一个请求重拨（`rurge-proto-quic` 的 `on_route`） |
+| INFO | `wireguard: the egress of rurge's own sockets changed; the peers are dialled anew` | `policy` | WireGuard 发现载体是按另一张出口表绑的：每个对端重拨，经它的连接照常（`rurge-proto-wireguard` 的 `Device::rerouted`，至多 250 毫秒一次） |
+
+#### 出口表变了之后
+
+直连的连接器（`DirectConnector`）的 `route()` 说出它的套接字是按哪一张出口表绑的（`SocketHook::egress_route` 答 `Some(Route::egress(&表))`，没有表时是 `None`）；`Route` 相等仍只比那个对象，所以同一张表是同一个 `Route`。活得比一次会话长的套接字靠它跟上表（M4b 记录第 68 行）：
+
+- QUIC 的每条连接一个不连接的 UDP 套接字（TUIC、Hysteria 2、MASQUE、TrustTunnel）：连接被取用时比一次（一个 UDP 会话至多一秒一次），不同则不再接新请求、下一个请求重拨，那一行 INFO 换成了上面表里的那一句。
+- WireGuard 的载体（连接了的 UDP，每个对端一个）：每个 `TICK`（250 毫秒）比一次，不同则每个对端重拨，那一行 INFO 同样换了。
+
+管理器只在**表的内容变了**时才往槽里写另一张表（`set_egress`：内容相同时留着同一个 `Arc`，返回 `false`），否则每一次重载都会让所有 WireGuard 隧道与 QUIC 连接重拨一次（M4b 记录第 69 行）。跟随（重载或网络变化）写了另一张表而这一次不重新接管 DNS 时，管理器仍调一次 `system_dns_changed`：解析器的上游是按旧表绑的，下一个查询按新表重建它们（`Resolver::reread_system_servers` 也清 `[Host]` 的 `server:` 上游，M4b 记录第 67 行）。网络变化时引擎先按旧表重建、跟随后写新表的那一次序不变（设计第 9.8 节）：写下新表之后 WireGuard 与 QUIC 照 `route()` 重拨，DNS 的重新接管让解析器按新表重建（M4b 记录第 70 行）。
 
 #### 非直连的 VPN 路由（登记的限制）
 
@@ -605,18 +618,25 @@ TUN 的 `Pinger` 现在是可执行文件的 `PlatformPinger`（`crates/rurge/sr
 | DEBUG | `icmp: no socket for an echo request` | `family`、`error` | 同上，第一条之后 |
 | DEBUG | `icmp: the echo socket could not be bound` | `interface`、`error` | 绑出口的网卡失败；进连接的错误文本照出口那一句 |
 | DEBUG | `icmp: echo requests leave through an interface` | `interface`、`family` | 绑上了出口的网卡 |
-| DEBUG | `icmp: reading a reply failed` | `error` | 收包出错（下一个之前退避 50 毫秒） |
+| DEBUG | `icmp: reading a reply failed` | `error` | 收包出错；接连第二次起，下一次读之前退避 50 毫秒（第一次不退避） |
 
 #### 外部程序一律 DIRECT
 
 `external` 策略拉起的程序（以及 Unix 上它起的子进程）的会话不看规则与出站模式，一律 `DIRECT`（设计第 11 节）：引擎的 `choose_policy` 在看出站模式之前先看“有没有外部程序在跑”（`ExternalPrograms::any_running`），有才等这个会话的进程（上限照旧 `PROCESS_WAIT`，200 毫秒），PID 在某个程序的进程树里（`ExternalOutbound::runs`，进程树是 `ProcessTree::contains`）就走 DIRECT；请求记录的 `notes` 写 `Requested by an external program: always DIRECT`，另有一行 DEBUG 带 `session` 与 `pid`。没有程序在跑时一个字也不多等；进程的槽已经等过时规则评估复用同一个，不等两次。
 
+日志：程序的生命周期三行 INFO（`external: the program started`、`external: the program exited`（带 `code`）、`external: the program stopped`）只带策略名；程序的 PID 在启动之后那一行 DEBUG `external: the program's process id` 里（进程的名字、路径、PID 只进 DEBUG，M4b 记录第 74 行）。
+
 登记的限制：
 
 - **预匹配先于它**：预匹配规则在 DNS 与 SYN 两层先判，外部程序自己发往被预匹配拒绝的名字或地址的查询与连接照旧被拒绝，会话不成为一条请求。
 - **`setsid` 的子进程不算**：Unix 上认的是“与程序同一个进程组”，自己 `setsid` 出去的子进程不在里面，它的会话照规则走。
-- **进程查找超时照规则走**：等进程超过 `PROCESS_WAIT` 时不把会话当外部程序的，照规则走，`notes` 里照旧是 `Process not known within 200 ms: PROCESS-NAME did not match`。
+- **进程查找超时**：等进程超过 `PROCESS_WAIT` 时不把会话当外部程序的。规则模式下照规则走，`notes` 里照旧是 `Process not known within 200 ms: PROCESS-NAME did not match`；直连与全局（`outbound-mode = direct` / 指定了 `global-policy`）模式下在等进程之前就定了去向，照出站模式走，不记这一句（`crates/rurge-engine/src/engine.rs` 的 `choose_policy`）。
 - **Windows 上 M4d 之前只认程序本身**：`ProcessTree::contains` 在 Windows 上恒答 `false`（`in_job` 是 M4d 的），所以 `runs(pid)` 只认程序自己的 PID；程序拉起的子进程的会话要等 M4d 的 `in_job` 才认得出来。
+
+#### 打开那一刻与之后出现的网卡（登记的限制）
+
+- **表变之前建的会话的套接字不重建**：每一个已经建立的会话的 TCP 连接（含 DoH、HTTP/2、SSH 的连接池）与 UDP 中继，以及旧 QUIC 连接上已经在走的流，都是按建它们时的那张表绑的。表变的那一刻（增强模式打开、或者换了网络）它们经虚拟网卡绕一次或断一次，之后新建的照新表。WireGuard 的包最晚到下一个 `TICK`（至多 250 毫秒）才按新表发出，那之前进虚拟网卡（M4b 记录第 68 行、延后第 16 行）。
+- **直连子网只在打开与跟随时读**（设计第 7.1 节）：打开之后才出现的次网卡（`docker compose up` 建的网桥、后接的第二块网卡、USB 共享）的子网要到下一次跟随（重载或网络变化）才进表，在那之前 rurge 自己到那里的连接绑在主网卡上、到不了（M4b 延后第 14 行）。
 
 ### 没有覆盖的
 
@@ -625,7 +645,7 @@ TUN 的 `Pinger` 现在是可执行文件的 `PlatformPinger`（`crates/rurge/sr
 - **接管期间的去处只在单元用例里**：`server:system` 一类、单标签名字、`force-syslib`、`.local` 的四条路由 `crates/rurge-dns/src/resolver.rs` 的用例钉住；`physical` 今天没有人写（M4c），所以真机上接管期间拿到的是本机配置的那一份。
 - **`PlatformPinger` 的两种情形没有用例**：出口是 `Some(网卡)` 的 ICMP 套接字（要真的网卡与出口表）与收包出错后的退避（`RECV_ERROR_BACKOFF`）都没有用例走到。
 - **Windows 的 `ProcessTree::contains` 恒假**：外部程序拉起的子进程在 Windows 上要等 M4d 的 `in_job` 才认得出来。
-- **本机没有编译过的 Unix 代码**：`rurge-platform::icmp::open` 的 Linux / Android 一份、macOS 一份与“其余平台”一份，`ProcessTree::contains` 的 Unix 一段与它的用例 `a_process_tree_contains_its_leader_and_what_it_started_and_nothing_else`，`crates/rurge-proto/src/external.rs` 的测试助手 `long_runner` 的 Unix 一支，与端到端用例 `what_the_program_started_goes_direct_too`。第一次 CI 的 Linux / macOS 核对。
+- **本机没有编译过的 Unix 代码**：`rurge-platform::icmp::open` 的 Linux / Android 一份、macOS 一份与“其余平台恒失败”一份（那一份 CI 的三个平台也编不到，所以“第一次 CI 核对”对它不成立，M4b 延后第 17 行），`ProcessTree::contains` 的 Unix 一段与它的用例 `a_process_tree_contains_its_leader_and_what_it_started_and_nothing_else`，`crates/rurge-proto/src/external.rs` 的测试助手 `long_runner` 的 Unix 一支，与端到端用例 `what_the_program_started_goes_direct_too`。第一次 CI 的 Linux / macOS 核对。
 - **`pings_the_loopback` 只在本机的那一条路上跑过**：这台 Windows 上原始套接字开得起来，`127.0.0.1` 与 `::1` 都真的来回了一次；Linux / Android 的数据报套接字与它退到原始套接字的那一路、macOS 的数据报套接字、“开不了套接字所以跳过”那条路没有任何平台跑过，macOS 的数据报套接字按标识符与序号对号（M4b 记录第 46 行）也没有在 macOS 上观察过。
 - **Linux 与 macOS 的 `0600` 用例只在 CI 上编译运行**：池的文件 `fake-ip.txt` 在 Unix 上以 `0600` 建出（M4a 的任务 2），那条 `#[cfg(unix)]` 的用例在这台 Windows 开发机上没有编译过。
 - **三个平台的步骤没有在机器上跑过**：`netsh` 与 `ip` 的写法是按文档与手册页核对出来的（M4a 计划 P2 ～ P5），没有一条在真机上执行过；`rurge check` 的四个码只对着 Profile 的解析测过。

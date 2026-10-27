@@ -322,31 +322,36 @@ M4b 做完了（2026-10-27；计划 `docs/superpowers/plans/2026-10-26-phase3-m4
 - **可执行文件**：有状态的 `PlatformSockets`（读出口表的槽）与 `PlatformSystemDns`（增强模式的标志与 `physical`），`Runtime` 建一次、每一代克隆同一份 `Arc`；管理器的 `Links` 写出口表、标志与网络任务的排除名单，并在标志变了、接管、交还之后调 `system_dns_changed`；后端接口多了 `subnets`（文件后端从文件里读）。
 - **真实的 `Pinger`**：`rurge_platform::icmp`（建套接字、报文与应答的解读）与 `crates/rurge/src/cli/pinger.rs` 的 `PlatformPinger`（按出口绑、按序号分派）；M4a 的 `NoPinger` 与它的那一条用例删掉，换成 `pings_the_loopback`。
 - **外部程序一律 DIRECT**：`ProcessGroup::contains` / `ProcessTree::contains`（Unix 是进程组，Windows 在 M4d 之前恒假）、`ExternalOutbound::runs` / `running`、`ExternalPrograms::any_running` / `runs`，引擎的 `choose_policy` 在看出站模式之前先看外部程序。
-- **漏网的检查**：`crates/rurge/tests/sockets.rs` 的源码扫描（`LISTED` 17 行）与 `crates/rurge-engine/tests/egress.rs` 的四个运行时用例。
+- **漏网的检查**：`crates/rurge/tests/sockets.rs` 的源码扫描（`LISTED` 现在 24 行、逐处比对，见下面的修正一轮）与 `crates/rurge-engine/tests/egress.rs` 的五个运行时用例。
 
 **使用者仍然开不了增强模式**：平台后端照旧对每个动作答 `the enhanced mode is not available on this platform in this version`，上面这些只经单元用例、运行时用例、源码扫描与只供测试的文件后端看得见。细节在 `docs/api/phase3.md` 的「M4b」一节。
 
 门禁：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过，`cargo test -j 8 --workspace --no-fail-fast` **83 个结果行、4501 通过、0 失败、13 忽略**（一台 Windows 11 x86-64 的开发机上的一次运行，不是 CI；没有二进制以 `STATUS_HEAP_CORRUPTION` 退出、没有重跑；与任务 9 的基线相同，M4b 记录第 66 行）。
+
+**整分支终审之后的一轮修正**（2026-10-27，同一个做法；M4b 记录第 67 ～ 77 行与延后第 13 ～ 17 行）：`reread_system_servers` 也重建 `[Host]` 的上游；活得比一次会话长的套接字（WireGuard 的载体、QUIC 的连接）靠 `Connector::route()` 跟上出口表，`set_egress` 只在表的内容变了时才换 `Arc`，跟随写了另一张表而不重新接管 DNS 时解析器的上游按新表重建；`decide` 先把 IPv4 映射地址规范化；Profile 来源问出口的运行时用例；扫描改成逐处比对、多认几种写法（名单 24 行）；外部程序的 PID 只进 DEBUG。门禁：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过，`cargo test -j 8 --workspace --no-fail-fast` **83 个结果行、4513 通过、0 失败、13 忽略**（同一台开发机上的一次运行，不是 CI；没有二进制以 `STATUS_HEAP_CORRUPTION` 或 `STATUS_ACCESS_VIOLATION` 退出、没有重跑；比上一次多 12 条，就是这一轮新加的那十二条）。
 
 没做的，与不要当成已经有的：
 
 - **这一版 `rurge run --enhanced-mode` 在每个平台上仍然以 1 退出**（M4a 那一条照旧）；真的能开是 M4c（Linux 与 macOS）与 M4d（Windows）之后。
 - **`physical` 没有人写**：`PlatformSystemDns::servers()` 里“接管期间给物理网卡的服务器”那一半是 M4c 的（macOS 写备份里的原值与 `ipconfig getpacket` 的，Linux 写 resolved 的上游名单；Windows 不需要它），所以今天两边给出的是同一份名单。
 - **Windows 的 `ProcessTree::contains` 恒假**（P15）：`runs(pid)` 只认程序自己的 PID，程序拉起的子进程的会话要等 M4d 的 `in_job`；`crates/rurge-platform/src/process.rs` 的 `#[cfg(windows)] contains_is_false_until_m4d` 断言的就是“程序本身不在树里”，M4d 接上 `in_job` 时要换掉（M4b 延后第 3 行）。
-- **本机没有编译过的 Unix 代码**（这台 Windows 上编不到、也跑不到，第一次 CI 核对）：`rurge_platform::icmp::open` 的 Linux / Android 一份（先数据报、不行退原始）、macOS 一份（数据报）与“其余平台恒失败”一份；`ProcessTree::contains` 的 `#[cfg(unix)]` 一段（`nix::unistd::getpgid`）与它的用例 `a_process_tree_contains_its_leader_and_what_it_started_and_nothing_else`；`crates/rurge-proto/src/external.rs` 的测试助手 `long_runner` 的 `#[cfg(unix)]` 一支（起 `sleep`）；`tests/external/tests/engine.rs` 的用例 `what_the_program_started_goes_direct_too`。
+- **本机没有编译过的 Unix 代码**（这台 Windows 上编不到、也跑不到，第一次 CI 核对）：`rurge_platform::icmp::open` 的 Linux / Android 一份（先数据报、不行退原始）、macOS 一份（数据报）与“其余平台恒失败”一份（后一份 CI 的三个平台也编不到，所以“第一次 CI 核对”对它不成立，M4b 延后第 17 行）；`ProcessTree::contains` 的 `#[cfg(unix)]` 一段（`nix::unistd::getpgid`）与它的用例 `a_process_tree_contains_its_leader_and_what_it_started_and_nothing_else`；`crates/rurge-proto/src/external.rs` 的测试助手 `long_runner` 的 `#[cfg(unix)]` 一支（起 `sleep`）；`tests/external/tests/engine.rs` 的用例 `what_the_program_started_goes_direct_too`。
 - **`pings_the_loopback` 只在本机那一条路上跑过**：这台 Windows 上原始套接字开得起来，`127.0.0.1` 与 `::1` 都真的来回了一次、载荷相等（M4b 记录第 45 行）；Linux / Android 的数据报套接字与它退到原始套接字的那一路、macOS 的数据报套接字、“开不了套接字所以跳过”这条路没有任何平台跑过；macOS 的数据报套接字按标识符与序号对号（协调者的裁定 R22，M4b 记录第 46 行）也没有在 macOS 上观察过。
 - **防环没有在真机上验过**：`rurge_platform::socket::egress::subnets` 读本机网卡的那一步没有用例走到（要真的网卡与出口表，随 M4c 接上平台后端）；绑上网卡这一事只用“记下不真绑”的假钩子与数据用例测过；`PlatformPinger` 的 `Some(网卡)` 那一支与收包退避也没有用例。设计第 14 节的 L2 特权用例还没有写。
 - 手工验收一项也没有做（`docs/acceptance/phase3-manual.md` 里还没有 M4 一节，只有 M1、M2、M3；M4d 写它，要验的东西列在设计第 16 节），M4b 把 `ping`、防环、非直连的 VPN 路由三项加进了那张单子要看的东西里。
 - **M4b 的提交 CI 都没有见过**（最后一次被 CI 见过的运行是 `ac0a98a` 上的 40283632986，此后没有推送）。
+- **表变之前建的每个会话的套接字不重建**：已经建立的 TCP 连接（含 DoH、HTTP/2、SSH 的连接池）与 UDP 中继、旧 QUIC 连接上已经在走的流，在表变的那一刻（增强模式打开、或者换了网络）经虚拟网卡绕一次或断一次；WireGuard 的包最晚到下一个 `TICK`（至多 250 毫秒）才按新表发出。去向：手工验收与用户报告（M4b 延后第 16 行）。
+- **直连子网只在打开与跟随时读**（设计第 7.1 节）：打开之后才出现的次网卡（`docker compose up` 建的网桥、后接的第二块网卡、USB 共享）的子网要到下一次跟随（重载或网络变化）才进表，在那之前 rurge 自己到那里的连接绑在主网卡上、到不了（M4b 延后第 14 行）。
 
 以后的会话必须知道的事：
 
 - **出口判定的次序与两句话**（`crates/rurge-platform/src/socket/egress.rs`）：表是空的 -> 不绑；回环、未指定、组播、链路本地与广播 -> 不绑；直连子网（取最长前缀）-> 那块网卡；路由集（含 rurge 的空间）-> 主网卡，没有主网卡时这次连接失败；其余 -> 不绑。**直连子网那一条在路由集那一条之前**：`tun-included-routes` 把一段局域网送进虚拟网卡时，rurge 自己到局域网的连接仍走局域网的网卡。绑不上出口的网卡时连接失败、**不退回不绑**（退回就进虚拟网卡）；进请求记录与 API 的错误是 `cannot bind to the network outside the enhanced mode: <错误种类>`，网卡名与系统的原话只在 DEBUG（P3，M4b 记录第 16 行）。
+- **活得比一次会话长的套接字靠 `route()` 跟上出口表**（M4b 记录第 68、69 行）：直连的连接器的 `route()` 回 `SocketHook::egress_route()`，增强模式开着时它是 `Some(Route::egress(&表))`、没有表时是 `None`；WireGuard 的载体每个 `TICK`（250 毫秒）、QUIC 的连接每次取用都比一次，不同就重拨（INFO 换成“the egress of rurge’s own sockets changed”那一句）。管理器只在**表的内容变了**时才往槽里写另一张表（`set_egress` 内容相同时留着同一个 `Arc`、回 `false`），否则每一次重载都会让每个隧道与 QUIC 连接重拨；跟随写了另一张表而这一次不重新接管 DNS 时，仍调一次 `system_dns_changed` 让解析器的上游按新表重建。新加**活得长的套接字**时，要么同样跟着 `route()`、要么在表变时自己重建。
 - **`SocketHook::egress` 的缺省是 `Ok(None)`**：所以没有平台钩子的地方（`rurge-net` 的其余用例、`DirectConnector::new`）行为一字不变。改名或改签名时 `crates/rurge-net/src/connector.rs` 的 `open_socket` 的三个调用者（`connect_one`、`bind_udp`、`connect_udp`）与 `DirectPacket` 一起看。
 - **`ResolverDeps::direct` 不随出站模式**：纯 UDP 上游（配置的、系统的、引导的、`[Host]` 的 `server:`）一律经它——带平台钩子的直连连接器；`encrypted-dns-follow-outbound-mode` 只管加密上游，别把 `direct` 换成流水线的连接器。
 - **`OwnResolve`**：`enhanced_mode()` 且这一代的解析器已发布时问它，否则问系统解析库。守护进程的下载用 `resource_client_with`；`resource_client()` 留给不起引擎的命令（`rurge check` 一类）与用例（P10）——它不绑、走系统解析库，扫描用例的名单里写着它。
 - **`system_dns_changed` 与 `network_changed` 是两件事**：前者是接管 / 交还（重读系统的服务器、**不清缓存**，经接口的上游随之清掉），在标志变了、接管、交还之后各调一次；后者是网络真的变了（清缓存、读 IPv6、重读服务器、清 `[Host]` 的上游），照旧只在网络真的变了时调。
-- **扫描用例的名单**（`crates/rurge/tests/sockets.rs` 的 `LISTED`）：加一处建套接字、问系统解析库或建不带钩子的连接器（`Arc::new(NoopSocketHook)`）的地方，就加一行（文件、写法、理由）；M4c / M4d 加设备的套接字时同样（macOS 的 utun 控制套接字）。名单按（文件，写法）比对，所以同一个文件里同一种写法的第二处不单独变红；一行只读 `//` 之前的部分（`docs/testing.md` 的「阶段 3 / M4b 起」一段）。
+- **扫描用例的名单**（`crates/rurge/tests/sockets.rs` 的 `LISTED`）：加一处建套接字、问系统解析库或建不带钩子的连接器（`NoopSocketHook)`）的地方，就加一行（文件、写法、理由写它是哪一个函数）；M4c / M4d 加设备的套接字时同样（macOS 的 utun 控制套接字）。名单与找到的写法**逐处**比对（不按（文件，写法）去重），同一个文件里同一种写法的第二处也要一行；一行只读 `//` 之前的部分（`docs/testing.md` 的「阶段 3 / M4b 起」一段，M4b 记录第 73 行）。
 - **`DirectPacket` 一个数据报只问一次出口**：那次回答决定新套接字绑哪块网卡，也是它在列表里的键（M4b 记录第 17 行）；建它时不经 `open_socket`，所以不会问两次。
 - **外部程序的那一段在 `choose_policy` 的最前面**（在看出站模式之前）：所以程序在跑时，**直连与全局模式的会话也等一次进程**（上限 `PROCESS_WAIT`，P16、协调者的裁定 R17）；`notes` 的 `Requested by an external program: always DIRECT` 在 `crates/rurge-engine/src/owner.rs`，PID 只在 `choose_policy` 的那一行 DEBUG（M4b 记录第 50 行）。Windows 在 M4d 之前只认程序本身。
 - **ICMP 的两种对号规则**：`Kind::keeps_ident`（原始套接字恒真；数据报套接字只在 Linux / Android 上为假）；新增平台时看它的内核改不改 `icmp_id`。`PlatformPinger` 的 WARN 一个实例只报一次；载体（`Carrier`）按（地址族，出口）只增不减（M4b 延后第 4 行）。
