@@ -53,7 +53,8 @@ impl PlatformPinger {
 
     /// The socket an echo request to `family` goes out on, bound to `egress`
     /// like every other socket rurge makes: made on first use, and a failure
-    /// is not kept, so the next echo tries again.
+    /// is not kept, so the next echo tries again — neither a socket that could
+    /// not be made nor one whose send failed (`forget`).
     fn carrier(&self, family: Family, egress: Option<&str>) -> io::Result<Arc<UdpSocket>> {
         let mut carriers = self.carriers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(carrier) = carriers
@@ -87,6 +88,22 @@ impl PlatformPinger {
             task,
         });
         Ok(socket)
+    }
+
+    /// Drops the carrier `socket` and ends its receive task (M4b 终审 M2,
+    /// 协调者的裁定 R12). By pointer, not by (family, egress): a carrier made
+    /// again under the same key must not be taken by a late failure of the one
+    /// it replaced.
+    fn forget(&self, socket: &Arc<UdpSocket>) {
+        let mut carriers = self.carriers.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(at) = carriers
+            .iter()
+            .position(|carrier| Arc::ptr_eq(&carrier.socket, socket))
+        else {
+            return;
+        };
+        let carrier = carriers.remove(at);
+        carrier.task.abort();
     }
 
     /// A socket for echo requests of `family`, bound where rurge's own sockets
@@ -146,7 +163,17 @@ impl Pinger for PlatformPinger {
             let mut waiting = Waiting::new(&self.waiters)
                 .ok_or_else(|| io::Error::other("every ICMP sequence number waits for a reply"))?;
             let request = icmp::request(family, waiting.ident, waiting.seq, payload);
-            socket.send_to(&request, SocketAddr::new(dst, 0)).await?;
+            if let Err(error) = socket.send_to(&request, SocketAddr::new(dst, 0)).await {
+                // a socket that cannot send is not kept: an interface that
+                // changed its address or its index would otherwise leave ICMP
+                // broken until rurge restarted (M4b 终审 M2, R12)
+                self.forget(&socket);
+                tracing::debug!(
+                    %error,
+                    "icmp: an echo socket failed to send; the next echo makes a new one"
+                );
+                return Err(error);
+            }
             waiting.reply().await
         })
     }
@@ -431,5 +458,110 @@ mod tests {
                     .expect("the echo reply");
             assert_eq!(reply, payload, "the reply carries what went out");
         }
+    }
+
+    /// A pinger with no egress, as `pings_the_loopback` builds one.
+    fn pinger() -> PlatformPinger {
+        PlatformPinger::new(Arc::new(PlatformSockets::new(
+            super::super::enhanced::egress_slot(),
+        )))
+    }
+
+    /// A carrier nothing reads: a loopback socket of the test's own, and a task
+    /// that waits for ever. `AbortHandle` is how the test watches that task
+    /// afterwards — the carrier holds the `JoinHandle`.
+    async fn spare_carrier(family: Family) -> (Carrier, Arc<UdpSocket>, tokio::task::AbortHandle) {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let task = tokio::spawn(std::future::pending::<()>());
+        let watch = task.abort_handle();
+        (
+            Carrier {
+                family,
+                egress: None,
+                socket: socket.clone(),
+                task,
+            },
+            socket,
+            watch,
+        )
+    }
+
+    /// `forget` drops the carrier it is given, and only that one: the match is
+    /// by pointer, so a carrier made again under the same (family, egress) is
+    /// not taken by a late failure of the one it replaced (R12).
+    #[tokio::test]
+    async fn forget_drops_only_the_carrier_that_failed() {
+        let pinger = pinger();
+        let (first, first_socket, first_task) = spare_carrier(Family::V4).await;
+        let (second, second_socket, _second_task) = spare_carrier(Family::V4).await;
+        {
+            // the same key twice, on purpose: `Carrier` carries its own socket
+            let mut carriers = pinger.carriers.lock().unwrap();
+            carriers.push(first);
+            carriers.push(second);
+        }
+
+        pinger.forget(&first_socket);
+        {
+            let carriers = pinger.carriers.lock().unwrap();
+            assert_eq!(carriers.len(), 1, "only the one that failed is dropped");
+            assert!(
+                Arc::ptr_eq(&carriers[0].socket, &second_socket),
+                "the other one stays"
+            );
+        }
+        // the dropped carrier's receive task is not left running: it ends well
+        // within a second (the wait is on the clock, 10 ms at a time)
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline && !first_task.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            first_task.is_finished(),
+            "the dropped carrier's task still runs"
+        );
+
+        // one that is not in the list at all: nothing happens
+        let stranger = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        pinger.forget(&stranger);
+        assert_eq!(pinger.carriers.lock().unwrap().len(), 1);
+    }
+
+    /// A carrier whose send fails is dropped, so the next echo makes a new one:
+    /// an interface that changed its address or its index does not leave ICMP
+    /// broken until rurge restarts (M4b 终审 M2, R12). The 70,000-byte payload
+    /// is only one way to make `send_to` fail; every send error does this.
+    #[tokio::test]
+    async fn a_carrier_that_fails_to_send_is_made_again() {
+        let pinger = pinger();
+        let dst: IpAddr = "127.0.0.1".parse().unwrap();
+        if let Err(error) = icmp::open(Family::V4) {
+            eprintln!("icmp: no IPv4 socket for an echo request ({error}); skipped");
+            return;
+        }
+        // the carrier this echo uses, so the one made after it can be told apart
+        let first = pinger.carrier(Family::V4, None).expect("an IPv4 socket");
+        let too_big = vec![0u8; 70_000];
+        let failed = pinger.echo(dst, &too_big).await;
+        assert!(
+            failed.is_err(),
+            "a payload that big does not fit one datagram"
+        );
+        assert!(
+            pinger.carriers.lock().unwrap().is_empty(),
+            "the carrier that failed is not kept"
+        );
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), pinger.echo(dst, b"rurge"))
+            .await
+            .expect("the reply within five seconds")
+            .expect("an echo reply through a new carrier");
+        assert_eq!(reply, b"rurge");
+        let carriers = pinger.carriers.lock().unwrap();
+        assert_eq!(carriers.len(), 1, "one carrier, made again");
+        assert!(
+            !Arc::ptr_eq(&carriers[0].socket, &first),
+            "the one that failed is gone"
+        );
     }
 }
