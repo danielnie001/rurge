@@ -42,6 +42,16 @@ impl CommandRunner for SystemRunner {
     }
 }
 
+/// A [`CommandRunner`] that gives up on a program after the time it is given
+/// ([`run_with_timeout`]): a tool that hangs does not hold up its caller.
+pub struct TimedRunner(pub Duration);
+
+impl CommandRunner for TimedRunner {
+    fn run(&self, cmd: &[String]) -> io::Result<String> {
+        run_with_timeout(cmd, self.0)
+    }
+}
+
 /// What the error of a command that failed says: the command, how it ended
 /// and what the tool printed. The command is shown without the credentials
 /// an argument may carry: a proxy setting written back can be a URL with a

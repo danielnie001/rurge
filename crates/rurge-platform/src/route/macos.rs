@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use super::set::RouteSet;
 use super::steps::{OnFailure, Step};
-use super::{ADAPTER_V4, ADAPTER_V6, MTU, SPACE_V4, SPACE_V6};
+use super::{ADAPTER_V4, ADAPTER_V6, MTU, SPACE_V4};
 
 /// The programs at the paths design 5.1 gives them: never looked up in `PATH`.
 const IFCONFIG: &str = "/sbin/ifconfig";
@@ -20,8 +20,9 @@ const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
 const KILLALL: &str = "/usr/bin/killall";
 
 /// What `networksetup` is given when there is no server to write: its word for
-/// an empty list.
-const EMPTY: &str = "Empty";
+/// an empty list, in the case its manual page spells it — the page says to type
+/// "empty" in place of the DNS server names (M4c plan P6).
+const EMPTY: &str = "empty";
 
 /// Bring the utun up with its address and MTU (design 5.3, 9.3 step 2).
 pub fn configure(dev: &str) -> Step {
@@ -44,6 +45,11 @@ pub fn configure(dev: &str) -> Step {
 
 /// The utun's IPv6 address: a step of its own, so that IPv6 failing to come up
 /// leaves the rest of the open alone (M4-D17).
+///
+/// `128`: a shorter prefix would have the kernel put that prefix on the link
+/// and install a route for it, which the `fd00:6152::/64` this file adds would
+/// then collide with. `alias`: without it `ifconfig` takes the address as one
+/// replacing what is there, where rurge only adds its own (M4c plan P5).
 pub fn configure_ipv6(dev: &str) -> Step {
     step(
         IFCONFIG,
@@ -52,7 +58,8 @@ pub fn configure_ipv6(dev: &str) -> Step {
             "inet6".to_owned(),
             ADAPTER_V6.to_string(),
             "prefixlen".to_owned(),
-            SPACE_V6.prefix_len().to_string(),
+            "128".to_owned(),
+            "alias".to_owned(),
         ],
         OnFailure::Ipv6Off,
     )
@@ -231,7 +238,14 @@ mod tests {
             configure_ipv6("utun7"),
             plain(
                 "/sbin/ifconfig",
-                &["utun7", "inet6", "fd00:6152::1", "prefixlen", "64"],
+                &[
+                    "utun7",
+                    "inet6",
+                    "fd00:6152::1",
+                    "prefixlen",
+                    "128",
+                    "alias"
+                ],
                 OnFailure::Ipv6Off,
             )
         );
@@ -393,7 +407,7 @@ mod tests {
             set_dns("Wi-Fi", &[], OnFailure::Ignore),
             plain(
                 "/usr/sbin/networksetup",
-                &["-setdnsservers", "Wi-Fi", "Empty"],
+                &["-setdnsservers", "Wi-Fi", "empty"],
                 OnFailure::Ignore,
             )
         );

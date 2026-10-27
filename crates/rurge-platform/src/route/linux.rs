@@ -45,9 +45,11 @@ pub fn unconfigure_ipv6(t: &LinuxTools, dev: &str) -> Step {
     ip_step(t, true, &lines, OnFailure::Ignore)
 }
 
-/// The routes into the adapter, one batch for each family (design 5.2):
-/// `replace` rather than `add`, so that a prefix the kernel already has is no
-/// error.
+/// The routes into the adapter, one batch for each family (design 5.2): every
+/// line adds, so that a prefix another program installed — a full-tunnel VPN's
+/// half, say — is no route taken over without a word: `route add` of a prefix
+/// that is already there fails with `File exists`, and the open is undone
+/// (M4c plan P3).
 pub fn add_routes(t: &LinuxTools, dev: &str, set: &RouteSet) -> Vec<Step> {
     let mut steps = Vec::with_capacity(2);
     if !set.v4.is_empty() {
@@ -93,10 +95,13 @@ pub fn take_dns(t: &LinuxTools, dev: &str, ipv6: bool) -> Vec<Step> {
             vec!["domain".to_owned(), dev.to_owned(), "~.".to_owned()],
             OnFailure::Fail,
         ),
+        // `~.` above already sends names to this link, so this step only decides
+        // where a name that no link is for goes — there is no such name now, and
+        // its failing is no reason to leave the DNS alone (M4c plan P4).
         resolvectl_step(
             resolvectl,
             vec!["default-route".to_owned(), dev.to_owned(), "yes".to_owned()],
-            OnFailure::Fail,
+            OnFailure::Ignore,
         ),
         resolvectl_step(resolvectl, vec!["flush-caches".to_owned()], OnFailure::Fail),
     ]
@@ -143,9 +148,10 @@ fn ip_step(t: &LinuxTools, force: bool, lines: &[String], on_failure: OnFailure)
     }
 }
 
-/// One `ip -batch` run adding `nets`, a `route replace` line each. `ip` reads
-/// the address family of each prefix, so a batch of either family is the same
-/// shape.
+/// One `ip -batch` run adding `nets`, a `route add` line each: not a replacing
+/// one, which would take a prefix another program installed over without a word
+/// and leave that program without it (M4c plan P3). `ip` reads the address
+/// family of each prefix, so a batch of either family is the same shape.
 fn route_step<T: std::fmt::Display>(
     t: &LinuxTools,
     dev: &str,
@@ -154,7 +160,7 @@ fn route_step<T: std::fmt::Display>(
 ) -> Step {
     let lines: Vec<String> = nets
         .iter()
-        .map(|net| format!("route replace {net} dev {dev}"))
+        .map(|net| format!("route add {net} dev {dev}"))
         .collect();
     ip_step(t, false, &lines, on_failure)
 }
@@ -258,15 +264,15 @@ mod tests {
                     "/usr/sbin/ip",
                     &["-batch", "{script}"],
                     concat!(
-                        "route replace 1.0.0.0/8 dev rurge\n",
-                        "route replace 128.0.0.0/1 dev rurge\n",
+                        "route add 1.0.0.0/8 dev rurge\n",
+                        "route add 128.0.0.0/1 dev rurge\n",
                     ),
                     OnFailure::Fail,
                 ),
                 scripted(
                     "/usr/sbin/ip",
                     &["-batch", "{script}"],
-                    "route replace 100::/8 dev rurge\n",
+                    "route add 100::/8 dev rurge\n",
                     OnFailure::Ipv6Off,
                 ),
             ]
@@ -280,7 +286,7 @@ mod tests {
             [scripted(
                 "/usr/sbin/ip",
                 &["-batch", "{script}"],
-                "route replace 1.0.0.0/8 dev rurge\n",
+                "route add 1.0.0.0/8 dev rurge\n",
                 OnFailure::Fail,
             )]
         );
@@ -289,10 +295,32 @@ mod tests {
             [scripted(
                 "/usr/sbin/ip",
                 &["-batch", "{script}"],
-                "route replace 100::/8 dev rurge\n",
+                "route add 100::/8 dev rurge\n",
                 OnFailure::Ipv6Off,
             )]
         );
+    }
+
+    /// A prefix that is already there — one another program installed, a
+    /// full-tunnel VPN for one of the halves — makes `route add` fail with
+    /// `File exists`, and what was done is undone: rurge never quietly takes a
+    /// route over (M4c plan P3).
+    #[test]
+    fn linux_adds_routes_and_never_replaces_them() {
+        let steps = add_routes(
+            &tools(),
+            "rurge",
+            &set(&["0.0.0.0/1", "128.0.0.0/1"], &["100::/8"]),
+        );
+        let lines: Vec<&str> = steps
+            .iter()
+            .flat_map(|step| step.script.as_deref().unwrap_or_default().lines())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        for line in lines {
+            assert!(line.starts_with("route add "), "{line}");
+            assert!(!line.contains("replace"), "{line}");
+        }
     }
 
     #[test]
@@ -335,7 +363,7 @@ mod tests {
                 plain(
                     "/usr/sbin/resolvectl",
                     &["default-route", "rurge", "yes"],
-                    OnFailure::Fail,
+                    OnFailure::Ignore,
                 ),
                 plain("/usr/sbin/resolvectl", &["flush-caches"], OnFailure::Fail),
             ]

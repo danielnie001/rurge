@@ -2,11 +2,13 @@
 //! address space, the set computed from a profile's `tun-*` items, and — in the
 //! files this module grows for each platform — the steps that install them.
 //!
-//! Everything here is data. Nothing installs a route and no program is run: the
-//! set is a pure function of the profile's inputs, and the platform steps to
-//! come are pure translations, so all three platforms are compiled and tested
-//! on every host. Running them belongs to the platform layer (M4c / M4d).
+//! Everything here but `exec` is data: the set is a pure function of the
+//! profile's inputs, and the platform steps are pure translations, so all three
+//! platforms are compiled and tested on every host. `exec` runs a set of steps
+//! through the command runner it is given (M4c): nothing here installs a route
+//! by itself.
 
+pub mod exec;
 pub mod linux;
 pub mod macos;
 pub mod set;
