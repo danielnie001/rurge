@@ -255,6 +255,7 @@ impl System for MacSystem {
         TunDevice::open(&DeviceSpec {
             name: "utun".to_string(),
             mtu: usize::from(MTU),
+            wintun_dll: None,
         })
     }
 

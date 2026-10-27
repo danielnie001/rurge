@@ -72,6 +72,8 @@ pub struct DeviceSpec {
     /// Linux: the interface's name. macOS: unused (the kernel picks `utunN`).
     pub name: String,
     pub mtu: usize,
+    /// Windows: where `wintun.dll` is; unused elsewhere.
+    pub wintun_dll: Option<std::path::PathBuf>,
 }
 
 /// The virtual adapter (M4 design 8.1): packets in and out, without offloads.

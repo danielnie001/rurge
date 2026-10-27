@@ -147,6 +147,7 @@ impl System for LinuxSystem {
         TunDevice::open(&DeviceSpec {
             name: "rurge".to_string(),
             mtu: usize::from(MTU),
+            wintun_dll: None,
         })
     }
 
