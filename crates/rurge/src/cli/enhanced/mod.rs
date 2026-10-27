@@ -968,7 +968,11 @@ impl EnhancedMode {
     /// then it is left as it is.
     async fn close(&self, mut on: On, saved: &[Undo], rewrite: bool) -> Result<(), String> {
         let mut closing = Closing::default();
-        let Some(dev) = on.dev.clone() else {
+        // Taken, not cloned: the device goes before `rp_filter` is written back
+        // and the backup rewritten, so what `backend.close` gets is the
+        // manager's own reference and dropping it closes the descriptor (the
+        // phase 3 / M4c plan's execution record row 43, M4 design 9.4).
+        let Some(dev) = on.dev.take() else {
             // nothing was done
             self.shared.set_off();
             return Ok(());
@@ -1142,6 +1146,10 @@ mod tests {
         /// interface's effective value is not 1, or when there is no interface
         /// to read yet (the phase 3 / M4c plan's execution record row 40).
         no_adjust: Arc<AtomicBool>,
+        /// How many strong references the device had when `close` was given it:
+        /// one means the manager had already let go of it (the phase 3 / M4c
+        /// plan's execution record row 43).
+        close_strong: Arc<Mutex<Vec<usize>>>,
     }
 
     impl Mock {
@@ -1327,8 +1335,12 @@ mod tests {
             self.physical.lock().unwrap().clone()
         }
 
-        fn close(&self, _dev: Opened) {
+        fn close(&self, dev: Opened) {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            self.close_strong
+                .lock()
+                .unwrap()
+                .push(Arc::strong_count(&dev.device));
             self.calls.push("close");
         }
     }
@@ -2185,6 +2197,35 @@ mod tests {
             );
             assert!(!f.store.snapshot().await.features.enhanced_mode, "{fails}");
         }
+    }
+
+    /// The device goes before the system's own settings go back: the close
+    /// hands its last owner over, so the backend sees one strong reference to
+    /// it and the device is shut then — not after `rp_filter` was written back
+    /// and the backup rewritten (the phase 3 / M4c plan's execution record
+    /// row 43, M4 design 9.4).
+    #[tokio::test]
+    async fn a_close_hands_the_device_over_before_the_adjustments_go_back() {
+        let mut f = fixture(true).await;
+        f.mode.enable(wanted()).await.unwrap();
+
+        f.mode.disable().await.unwrap();
+
+        assert_eq!(
+            *f.backend.close_strong.lock().unwrap(),
+            [1],
+            "the manager had already let go of the device"
+        );
+        let calls = f.backend.calls.list();
+        let closed = calls
+            .iter()
+            .position(|call| call == "close")
+            .expect("the device is closed");
+        let adjusted = calls
+            .iter()
+            .position(|call| call == "undo adjust")
+            .expect("the adjustment goes back");
+        assert!(closed < adjusted, "the device goes first: {calls:?}");
     }
 
     #[tokio::test]

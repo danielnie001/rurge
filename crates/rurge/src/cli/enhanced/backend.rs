@@ -238,11 +238,12 @@ impl Backend for PlatformBackend {
     }
     fn close(&self, dev: Opened) {
         // The manager's close stops the TUN first and waits for it at most
-        // `JOIN_LIMIT` (`cli/enhanced`): when the TUN has ended, this is the
-        // last owner of the device, and dropping it closes the descriptor —
-        // the adapter goes with it. When it did not end within that limit, the
-        // TUN's tasks still hold an `Arc`, and the device closes when they let
-        // go.
+        // `JOIN_LIMIT` (`cli/enhanced`), and it takes the device out of what
+        // it held instead of cloning it (the phase 3 / M4c plan's execution
+        // record row 43): when the TUN has ended, this is the last owner of
+        // the device, and dropping it closes the descriptor — the adapter goes
+        // with it. When it did not end within that limit, the TUN's tasks
+        // still hold an `Arc`, and the device closes when they let go.
         drop(dev);
     }
 }
