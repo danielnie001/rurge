@@ -114,13 +114,20 @@ pub enum Os {
 /// the missing permission or the missing module, in the platform's words, or
 /// what the system said. The error's kind is the one the system gave.
 ///
+/// The Linux line says root, not `CAP_NET_ADMIN`: `ip` and `resolvectl` are
+/// programs of the machine's, and a file capability on rurge's own binary
+/// (`setcap`) never reaches them, so a machine set up that way fails later, at
+/// the address — while in a container root may be the one `CAP_NET_ADMIN` was
+/// taken from. The design's "or `CAP_NET_ADMIN`" is corrected by the phase 3 /
+/// M4c plan's execution record row 46.
+///
 /// A platform is named rather than chosen by `cfg`, so that either platform's
 /// words can be tested wherever this crate is built (M4c plan P2, P16).
 pub fn explained(err: io::Error, os: Os) -> io::Error {
     let kind = err.kind();
     let text = match (os, kind) {
         (Os::Linux, io::ErrorKind::PermissionDenied) => {
-            "the enhanced mode needs root or CAP_NET_ADMIN"
+            "the enhanced mode needs root (in a container, root with CAP_NET_ADMIN)"
         }
         (Os::Linux, io::ErrorKind::NotFound) => {
             "there is no /dev/net/tun: the kernel's tun module is not loaded"
@@ -273,7 +280,7 @@ mod tests {
             (
                 Os::Linux,
                 ErrorKind::PermissionDenied,
-                "the enhanced mode needs root or CAP_NET_ADMIN",
+                "the enhanced mode needs root (in a container, root with CAP_NET_ADMIN)",
             ),
             (
                 Os::Linux,
