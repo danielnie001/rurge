@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 /// Adding a function that opts out of the lint means changing this list, and
 /// saying so in the commit message and in the `unsafe_code` paragraph of
 /// CLAUDE.md.
-const LISTED: [(&str, &str); 10] = [
+const LISTED: [(&str, &str); 11] = [
+    ("src/process.rs", "in_job"),
     ("src/process.rs", "job_for"),
     ("src/procinfo/macos.rs", "pcblist"),
     ("src/procinfo/macos.rs", "pid_path"),

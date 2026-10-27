@@ -5,6 +5,8 @@
 //! closes it, and also when rurge dies.
 
 use std::io;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::process::Command;
 
 /// Called on the command before it is spawned: on Unix the program becomes
@@ -86,8 +88,8 @@ impl ProcessTree {
     }
 
     /// Whether process `pid` is the program or one it started that is still
-    /// in its tree (M4 design 11). `false` when the platform cannot tell, and
-    /// for a process that is not running.
+    /// in its tree (M4 design 11). `false` for a process that is not running,
+    /// and for a tree that has already been ended.
     pub fn contains(&self, pid: u32) -> bool {
         // the two that are never a program rurge started, and a group of 0
         // would be rurge's own (see `contain`)
@@ -105,9 +107,18 @@ impl ProcessTree {
         }
         #[cfg(windows)]
         {
-            // M4d takes the program's children in with `IsProcessInJob`;
-            // until then the platform cannot tell.
-            false
+            // every process the program started while the job was open is in
+            // the job; ours is not
+            let Some(job) = self.job.as_ref() else {
+                return false;
+            };
+            match windows::in_job(job.as_raw_handle(), pid) {
+                Ok(contained) => contained,
+                Err(e) => {
+                    tracing::debug!("whether {pid} is in the program's job is unknown: {e}");
+                    false
+                }
+            }
         }
     }
 
@@ -128,7 +139,7 @@ impl ProcessTree {
 #[cfg(windows)]
 mod windows {
     use std::io;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
     /// A Job Object that ends every process in it when its last handle
     /// closes, with process `pid` in it. One of the functions on the list in
@@ -181,6 +192,53 @@ mod windows {
             return Err(io::Error::last_os_error());
         }
         Ok(job)
+    }
+
+    /// Whether process `pid` is in `job` (M4 design 11): `OpenProcess` with
+    /// `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE`, a zero-wait
+    /// `WaitForSingleObject` (an exited process is not in it, whatever
+    /// `IsProcessInJob` would say of it), then `IsProcessInJob`. A process that
+    /// is gone is not in it.
+    #[allow(unsafe_code)]
+    pub(super) fn in_job(job: RawHandle, pid: u32) -> io::Result<bool> {
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            WaitForSingleObject,
+        };
+        // SAFETY: plain call; a non-null result is a new handle nobody else owns.
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if process.is_null() {
+            let error = io::Error::last_os_error();
+            // a process that is gone, rather than one we may not ask about
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        // SAFETY: `process` is a valid handle owned by nothing else.
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+        // SAFETY: a valid handle that outlives the call, and a zero timeout
+        // never waits.
+        let waited = unsafe { WaitForSingleObject(process.as_raw_handle(), 0) };
+        if waited == WAIT_OBJECT_0 {
+            return Ok(false);
+        }
+        let mut contained = 0;
+        // SAFETY: both handles are valid and outlive the call, and `contained`
+        // is a `BOOL` that lives across it.
+        let asked = unsafe { IsProcessInJob(process.as_raw_handle(), job, &mut contained) };
+        if asked == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(contained != 0)
     }
 }
 
@@ -283,21 +341,60 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// Windows cannot tell yet: the program's children are taken in with
-    /// `IsProcessInJob` in M4d; until then nothing is in the tree.
+    /// The program itself is in the job, and our own process is not (M4
+    /// design 11): a session of the program is DIRECT, ours follows the rules.
     #[cfg(windows)]
     #[test]
-    fn contains_is_false_until_m4d() {
+    fn a_child_in_the_job_is_contained_and_this_process_is_not() {
         let mut child = long_runner().spawn().unwrap();
-        let tree = ProcessTree::contain(child.id()).unwrap();
-        assert!(!tree.contains(child.id()));
-        assert!(!tree.contains(std::process::id()));
-        drop(tree);
+        let mut tree = ProcessTree::contain(child.id()).unwrap();
+        assert!(tree.contains(child.id()), "the program itself");
+        assert!(!tree.contains(std::process::id()), "our own process");
+        tree.kill().unwrap();
         let ended = ended_within(&mut child, Duration::from_secs(10));
         if !ended {
             let _ = child.kill();
         }
         assert!(ended, "the program is still running");
+    }
+
+    /// An ended process is in nothing, even while its process object lives
+    /// on: `Child` keeps the handle until it is dropped, so `OpenProcess`
+    /// still opens it and `IsProcessInJob` still answers. The zero-wait
+    /// `WaitForSingleObject` is what says it has ended.
+    #[cfg(windows)]
+    #[test]
+    fn an_exited_child_whose_handle_is_still_open_is_not_contained() {
+        let mut child = long_runner().spawn().unwrap();
+        let mut tree = ProcessTree::contain(child.id()).unwrap();
+        assert!(tree.contains(child.id()), "the program while it runs");
+        tree.kill().unwrap();
+        let ended = ended_within(&mut child, Duration::from_secs(10));
+        if !ended {
+            let _ = child.kill();
+        }
+        assert!(ended, "the program is still running");
+        child.wait().unwrap();
+        assert!(!tree.contains(child.id()), "an ended process is in nothing");
+    }
+
+    /// A process that is gone out of the system is in nothing either:
+    /// `OpenProcess` answers `ERROR_INVALID_PARAMETER` for its id.
+    #[cfg(windows)]
+    #[test]
+    fn a_process_that_is_gone_is_not_contained() {
+        let mut child = long_runner().spawn().unwrap();
+        let mut tree = ProcessTree::contain(child.id()).unwrap();
+        let pid = child.id();
+        tree.kill().unwrap();
+        let ended = ended_within(&mut child, Duration::from_secs(10));
+        if !ended {
+            let _ = child.kill();
+        }
+        assert!(ended, "the program is still running");
+        // the last handle to it: the process object goes with it
+        drop(child);
+        assert!(!tree.contains(pid), "a process that is gone is in nothing");
     }
 
     /// The job goes with its handle: a rurge that dies (or forgets the tree)

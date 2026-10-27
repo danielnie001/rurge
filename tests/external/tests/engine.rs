@@ -467,9 +467,8 @@ async fn in_the_global_mode_too() {
 }
 
 /// What the program started is its own too: the session of a child process is
-/// DIRECT (M4 design 11). Unix only: Windows cannot tell the children until
-/// M4d, so only CI's Linux and macOS run this.
-#[cfg(unix)]
+/// DIRECT (M4 design 11). On every platform: the child is recognised through
+/// the process tree of it (a process group on Unix, a Job Object on Windows).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn what_the_program_started_goes_direct_too() {
     let port = free_port();
