@@ -220,6 +220,10 @@ pub struct Engine {
     /// The rules waited for a process and gave up, and the engine said so
     /// (`SLOW`) — once.
     process_wait_warned: AtomicBool,
+    /// What the engine remembers of the hosts whose QUIC it blocked for a
+    /// `block-quic=adaptive` policy (phase 3 M5 design 6.3): it outlives a
+    /// reload, and a change of network does not clear it.
+    quic_adaptive: crate::quic_adaptive::QuicAdaptive,
 }
 
 impl Engine {
@@ -264,6 +268,7 @@ impl Engine {
             owner_permits: Arc::new(tokio::sync::Semaphore::new(LOOKUPS)),
             tun_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             process_wait_warned: AtomicBool::new(false),
+            quic_adaptive: crate::quic_adaptive::QuicAdaptive::new(),
         });
         let rt = engine.runtime();
         if let Some(pc) = rt.dns_pipeline() {
@@ -465,6 +470,12 @@ impl Engine {
     /// sessions, the connectivity tests.
     pub(crate) fn new_handle(&self, session: SessionInfo) -> Arc<SessionHandle> {
         self.new_handle_with(session, ProcessSlot::unknown())
+    }
+
+    /// The hosts whose QUIC this engine blocked for a `block-quic=adaptive`
+    /// policy, and whether they fell back to TCP (design 6.3).
+    pub(crate) fn quic_adaptive(&self) -> &crate::quic_adaptive::QuicAdaptive {
+        &self.quic_adaptive
     }
 
     /// Starts finding the process behind `session`, if it is one that can be
@@ -1600,6 +1611,13 @@ impl Dialer for Engine {
                 Turned::Name(lease) => handle.on_finish(move |_, _| drop(lease)),
                 Turned::Unknown => return fail(handle, FailKind::Other, FAKE_ADDRESS_NOT_KNOWN),
             }
+            // A client's TCP session to a host whose QUIC the engine blocked
+            // is that client falling back (phase 3 M5 design 6.3): the table
+            // of `block-quic=adaptive` hears of it. The engine's own sessions
+            // come through `dial_internal` instead, so they cannot pass for a
+            // client's.
+            self.quic_adaptive
+                .on_tcp(&handle.session().dst_host.to_string(), Instant::now());
             let trail = handle.trail().clone();
             trail
                 .follow(self.connect_session(rt, registry, handle))
@@ -1874,5 +1892,66 @@ mod tests {
             esc.record("h0.test", t0);
         }
         assert!(esc.should_drop("h0.test", t0));
+    }
+
+    /// A client's TCP session tells the table of `block-quic=adaptive` that
+    /// the client fell back (design 6.3). The entry is put an hour away from
+    /// the end of its window, so that the test depends on no clock of the
+    /// machine.
+    #[tokio::test]
+    async fn a_client_tcp_session_tells_the_table() {
+        use crate::quic_adaptive::Adaptive;
+        use crate::runtime::RuntimeOptions;
+        use crate::stack::StackOptions;
+        use rurge_dns::system::StaticSystemDns;
+        use rurge_net::socket::NoopSocketHook;
+        use rurge_rules::GeoUrls;
+
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = from_text(
+            "[General]\nipv6 = false\n[Proxy]\n[Rule]\nFINAL,REJECT\n",
+            &dir.path().join("t.conf"),
+            &LoadOptions::for_tests(),
+        );
+        assert!(!loaded.diagnostics.has_errors());
+        let runtime = Runtime::build(
+            loaded.config,
+            RuntimeOptions {
+                stack: StackOptions {
+                    data_dir: dir.path().to_path_buf(),
+                    no_network: true,
+                    geo_urls: GeoUrls::default(),
+                    dns_cache_size: 16,
+                    system: Arc::new(StaticSystemDns::default()),
+                    wait: Duration::ZERO,
+                    dns_connector: None,
+                    socket_hook: Arc::new(NoopSocketHook),
+                    resource_resolve: None,
+                    dns_override: Default::default(),
+                },
+                outbound_mode: OutboundMode::Rule,
+                idle_timeout: Duration::from_secs(60),
+                shared: EngineShared::default(),
+                request_log_size: 16,
+            },
+        )
+        .await
+        .unwrap();
+        let engine = Engine::new(runtime);
+        let trying = Instant::now() + Duration::from_secs(3600);
+        engine
+            .quic_adaptive()
+            .set("x.test", Adaptive::Trying(trying));
+        // a client's session, which the rules of the profile reject: the
+        // table hears of it on the way, whatever becomes of the session
+        let session = SessionInfo {
+            listener: ListenerKind::Socks5,
+            ..SessionInfo::tcp(HostName::parse("x.test"), 80)
+        };
+        assert!(engine.dial(session).await.is_err(), "FINAL,REJECT");
+        assert_eq!(
+            engine.quic_adaptive().state("x.test"),
+            Some(Adaptive::FellBack)
+        );
     }
 }

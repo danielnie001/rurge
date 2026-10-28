@@ -13,6 +13,7 @@ pub mod outbounds;
 pub mod owner;
 mod prematch;
 pub mod profile;
+mod quic_adaptive;
 pub mod relay;
 mod reload;
 pub mod runtime;

@@ -12,7 +12,9 @@ use crate::selections::SelectionTable;
 use crate::smart::{Candidate, Health, ROUND_INTERVAL, ROUND_SAMPLE, SiteMemory, rank, sample};
 use crate::testbook::{MAX_CONCURRENT_TESTS, TestCase, TestMode, TestResult};
 use rurge_config::rule::PolicyRef;
-use rurge_config::spec::{CommonOpts, GroupSpec, IpVersion, NotImplemented, PolicySpec, ProtoSpec};
+use rurge_config::spec::{
+    BlockQuic, CommonOpts, GroupSpec, IpVersion, NotImplemented, PolicySpec, ProtoSpec,
+};
 use rurge_config::wireguard::WireGuardSection;
 use rurge_config::{
     Builtin, Config, GroupKind, KeystoreType, NetworkCell, NetworkFacts, PolicyKind, Span,
@@ -324,11 +326,17 @@ fn alias_terminal(kind: PolicyKind) -> Option<Terminal> {
     }
 }
 
-/// Whether a `direct` alias needs a connector of its own.
+/// Whether a `direct` alias needs an outbound of its own: a socket's options,
+/// or a `block-quic` of its own, which the engine reads off the policy's spec
+/// (phase 3 M5 design 6.2: under `all-proxy` and `per-policy` a DIRECT-kind
+/// policy's own parameter is what counts).
 /// `allow_other_interface` is not part of the predicate: it only says what to
 /// do when `interface` is unavailable, so on its own it changes nothing.
-fn has_socket_opts(common: &CommonOpts) -> bool {
-    common.interface.is_some() || common.tos != 0 || common.ip_version != IpVersion::default()
+fn needs_an_outbound(common: &CommonOpts) -> bool {
+    common.interface.is_some()
+        || common.tos != 0
+        || common.ip_version != IpVersion::default()
+        || common.block_quic != BlockQuic::default()
 }
 
 /// Everything an outbound was built from. Two generations that agree on it
@@ -524,7 +532,7 @@ impl PolicyRegistry {
         let policy_entry =
             |kind: PolicyKind, spec: Option<&PolicySpec>, why: Option<&NotImplemented>| {
                 Ok::<Entry, BuildError>(match (alias_terminal(kind), spec) {
-                    (Some(Terminal::Direct), Some(spec)) if has_socket_opts(&spec.common) => {
+                    (Some(Terminal::Direct), Some(spec)) if needs_an_outbound(&spec.common) => {
                         outbound_entry(spec, false)?
                     }
                     (Some(terminal), _) => Entry::Alias(terminal),

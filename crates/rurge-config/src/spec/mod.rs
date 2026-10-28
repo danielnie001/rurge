@@ -25,7 +25,7 @@ pub mod wireguard;
 pub mod ws;
 
 pub use anytls::AnyTlsSpec;
-pub use common::{Applies, CommonOpts, IpVersion, Tristate};
+pub use common::{Applies, BlockQuic, CommonOpts, IpVersion, Tristate};
 pub use external::ExternalSpec;
 pub use group::{
     GroupOutcome, GroupSpec, ImportOpts, PolicyPath, Priority, SubnetSpec, TestOpts, to_group_spec,

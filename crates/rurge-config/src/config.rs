@@ -3719,7 +3719,11 @@ H = trust-tunnel, h.test, 443, username=u, password=pw, h3=maybe, ecn=on\n{}[Rul
             on(
                 "P = http, p.test, 80, underlying-proxy=Q, interface=en0, block-quic=maybe",
                 vec![
-                    bad_value("block-quic", "maybe", "auto / on / off / true / false"),
+                    bad_value(
+                        "block-quic",
+                        "maybe",
+                        "auto / on / off / adaptive / true / false",
+                    ),
                     not_applicable(
                         "`interface` has no effect on a policy with `underlying-proxy`; ignored",
                     ),

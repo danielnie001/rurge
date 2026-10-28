@@ -24,6 +24,18 @@ pub enum Tristate {
     Off,
 }
 
+/// `block-quic` of a policy (manual: Policies › Parameters, 6.11): whether
+/// QUIC is blocked for the flows that use it, or left to a table that watches
+/// whether a blocked client falls back to TCP (phase 3 M5 design 6.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BlockQuic {
+    #[default]
+    Auto,
+    On,
+    Off,
+    Adaptive,
+}
+
 /// Which kind of policy the parameters are written on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applies {
@@ -79,7 +91,7 @@ pub struct CommonOpts {
     pub tfo: bool,
     pub tos: u8,
     pub ecn: Tristate,
-    pub block_quic: Tristate,
+    pub block_quic: BlockQuic,
     pub test_url: Option<String>,
     pub test_timeout: Option<Duration>,
     pub test_udp: Option<UdpTest>,
@@ -109,6 +121,16 @@ const TRISTATES: [(&str, Tristate); 5] = [
     ("off", Tristate::Off),
     ("true", Tristate::On),
     ("false", Tristate::Off),
+];
+
+/// `block-quic` has one value of its own, `adaptive` (6.11).
+const BLOCK_QUIC: [(&str, BlockQuic); 6] = [
+    ("auto", BlockQuic::Auto),
+    ("on", BlockQuic::On),
+    ("off", BlockQuic::Off),
+    ("adaptive", BlockQuic::Adaptive),
+    ("true", BlockQuic::On),
+    ("false", BlockQuic::Off),
 ];
 
 /// Parameters the manual marks "proxy policies only".
@@ -178,7 +200,7 @@ pub(crate) fn read_common(
     // is then all there is to say about it
     let ecn_read = r.choice("ecn", &TRISTATES);
     let mut ecn = ecn_read.unwrap_or_default();
-    let block_quic = r.choice("block-quic", &TRISTATES).unwrap_or_default();
+    let block_quic = r.choice("block-quic", &BLOCK_QUIC).unwrap_or_default();
     let mut test_url = None;
     if let Some(v) = r.str("test-url") {
         let lower = v.trim().to_ascii_lowercase();
@@ -299,7 +321,7 @@ mod tests {
                 tfo: true,
                 tos: 0x28,
                 ecn: Tristate::On,
-                block_quic: Tristate::Off,
+                block_quic: BlockQuic::Off,
                 test_url: Some("http://t.example/".into()),
                 test_timeout: Some(Duration::from_secs(3)),
                 test_udp: Some(crate::general::UdpTest {
@@ -311,6 +333,49 @@ mod tests {
         );
         assert_eq!(notes.inert, ["tfo", "ecn"]);
         assert_eq!(notes.ios_only, ["hybrid"]);
+    }
+
+    /// `block-quic` takes four values, and `true` / `false` stand for `on` /
+    /// `off` as they do for `ecn` (manual, Policies › Parameters, 6.11;
+    /// phase 3 M5 design 6.2).
+    #[test]
+    fn block_quic_reads_four_values_and_two_spellings() {
+        for (written, expected) in [
+            ("auto", BlockQuic::Auto),
+            ("on", BlockQuic::On),
+            ("off", BlockQuic::Off),
+            ("adaptive", BlockQuic::Adaptive),
+            ("true", BlockQuic::On),
+            ("false", BlockQuic::Off),
+        ] {
+            let (c, _, diags) = read(&format!("http, h, 1, block-quic={written}"), Applies::Proxy);
+            assert!(diags.is_empty(), "{written}: {diags:?}");
+            assert_eq!(c.block_quic, expected, "{written}");
+        }
+        // written without it, it is `auto`
+        let (c, _, diags) = read("http, h, 1", Applies::Proxy);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(c.block_quic, BlockQuic::Auto);
+    }
+
+    /// An `auto` that is an error leaves the default in place, and the error
+    /// lists every spelling: the one thing said about the value.
+    #[test]
+    fn an_unknown_block_quic_value_is_e0018() {
+        let (c, _, diags) = read("http, h, 1, block-quic=maybe", Applies::Proxy);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, codes::E_INVALID_POLICY_PARAM);
+        assert!(
+            diags[0].message.contains("`block-quic`"),
+            "{}",
+            diags[0].message
+        );
+        assert!(
+            diags[0].message.contains("adaptive"),
+            "{}",
+            diags[0].message
+        );
+        assert_eq!(c.block_quic, BlockQuic::Auto);
     }
 
     /// `dns-follow-interface` follows the policy's `interface`: written

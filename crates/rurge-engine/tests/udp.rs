@@ -318,8 +318,9 @@ async fn block_quic_drops_quic_and_nothing_else() {
     assert_eq!(plain.protocol, Some(rurge_config::rule::ProtocolKind::Udp));
 }
 
-/// `per-policy`: a proxy's `auto` blocks, its `off` lets QUIC through;
-/// DIRECT's `auto` lets it through.
+/// `per-policy` (the default): a proxy's `auto` is 6.11's — it carries UDP,
+/// so QUIC is left to the table and the first flow to a host is blocked; `off`
+/// lets QUIC through; DIRECT's `auto` lets it through.
 #[tokio::test]
 async fn per_policy_block_quic_follows_the_terminal_policy() {
     let up = FakeSocks5::spawn(Socks5Script::default()).await;
@@ -354,6 +355,46 @@ DOMAIN,off.test,Off",
     assert!(blocked("auto.test:443"));
     assert!(!blocked("off.test:443"));
     assert!(!blocked("direct.test:443"));
+}
+
+/// 6.11's `auto`: a proxy that carries no UDP is blocked, and the record says
+/// why the flow was — QUIC, not the missing UDP.
+#[tokio::test]
+async fn auto_blocks_quic_through_a_proxy_that_carries_no_udp() {
+    let up = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!("NoUdp = socks5, 127.0.0.1, {}", up.addr().port());
+    let h = harness(Profile {
+        proxies: &proxies,
+        rules: "DOMAIN,noudp.test,NoUdp",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("noudp.test", 443, &quic_initial()).await;
+    routed(&h, 1).await;
+    drop(association);
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Rejected("REJECT".into()));
+    assert_eq!(records[0].error.as_deref(), Some("QUIC blocked"));
+}
+
+/// `block-quic=adaptive` written on a `direct` alias goes through the table
+/// too (design 6.2, 6.3): the first QUIC flow to a name is blocked.
+#[tokio::test]
+async fn adaptive_on_a_direct_alias_blocks_the_first_quic_flow() {
+    let h = harness(Profile {
+        proxies: "D = direct, block-quic=adaptive",
+        rules: "DOMAIN,d.test,D",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("d.test", 443, &quic_initial()).await;
+    routed(&h, 1).await;
+    drop(association);
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Rejected("REJECT".into()));
+    assert_eq!(records[0].error.as_deref(), Some("QUIC blocked"));
 }
 
 /// `PROTOCOL,UDP` matches every UDP flow; `PROTOCOL,QUIC` the QUIC ones.

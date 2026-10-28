@@ -11,7 +11,7 @@ use rurge_config::general::{BlockQuicGlobal, UdpFallback};
 use rurge_config::policy::Builtin;
 use rurge_config::rule::{PolicyRef, ProtocolKind};
 use rurge_config::session::SessionInfo;
-use rurge_config::spec::Tristate;
+use rurge_config::spec::BlockQuic;
 use rurge_inbound::{ProcessSlot, SessionHandle, SessionOutcome, UdpClient};
 use rurge_net::connector::{ConnectOpts, PacketSocket, Target, lost_alone};
 use rurge_policy::TerminalKind;
@@ -53,21 +53,52 @@ const SEND_TIMEOUT: Duration = CONNECT_TIMEOUT.saturating_add(Duration::from_sec
 /// Room for the largest datagram.
 const DATAGRAM: usize = 65536;
 
-/// Whether a QUIC flow is blocked. The global setting overrides the terminal
-/// policy's own `block-quic`: `all` blocks every flow, `always-allow` none, and
-/// `all-proxy` every flow through a proxy — the manual has it override the
-/// proxy policies' parameter, so a DIRECT-kind policy (`DIRECT`, a `direct`
-/// alias) keeps its own. `per-policy` asks the policy for every flow; its
-/// `auto` blocks proxies and lets DIRECT through.
-pub(crate) fn quic_blocked(global: BlockQuicGlobal, policy: Tristate, direct: bool) -> bool {
+/// What `block-quic` says of one QUIC flow (phase 3 M5 design 6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuicVerdict {
+    Allow,
+    Block,
+    /// Blocked or let through by the table of the engine (design 6.3).
+    Adaptive,
+}
+
+/// Whether a QUIC flow is blocked, going through or left to the table of the
+/// engine. The global setting comes first: `all` blocks every flow,
+/// `always-allow` none (`DIRECT` and its aliases included), and `all-proxy`
+/// every flow through a proxy — the manual has it override the proxy
+/// policies' own parameter, so a DIRECT-kind policy keeps its own.
+/// `per-policy` asks the policy of every flow, where `on` blocks, `off` lets
+/// through, `adaptive` leaves the answer to the table, and `auto` (6.11) lets
+/// DIRECT through, blocks a proxy that carries no UDP, and leaves the rest to
+/// the table.
+///
+/// `direct` is a terminal policy of the DIRECT kind, which looks at no
+/// `carries_udp`; `carries_udp` is the terminal outbound's `udp()`.
+pub(crate) fn quic_verdict(
+    global: BlockQuicGlobal,
+    policy: BlockQuic,
+    direct: bool,
+    carries_udp: bool,
+) -> QuicVerdict {
+    use BlockQuic::{Adaptive, Auto, Off, On};
+    use QuicVerdict::{Allow, Block};
     match global {
-        BlockQuicGlobal::AlwaysAllow => false,
-        BlockQuicGlobal::All => true,
-        BlockQuicGlobal::AllProxy => !direct || policy == Tristate::On,
+        BlockQuicGlobal::AlwaysAllow => Allow,
+        BlockQuicGlobal::All => Block,
+        BlockQuicGlobal::AllProxy => match (direct, policy) {
+            (false, _) => Block,
+            (true, Auto) => Allow,
+            (true, On) => Block,
+            (true, Off) => Allow,
+            (true, Adaptive) => QuicVerdict::Adaptive,
+        },
         BlockQuicGlobal::PerPolicy => match policy {
-            Tristate::On => true,
-            Tristate::Off => false,
-            Tristate::Auto => !direct,
+            On => Block,
+            Off => Allow,
+            Adaptive => QuicVerdict::Adaptive,
+            Auto if direct => Allow,
+            Auto if !carries_udp => Block,
+            Auto => QuicVerdict::Adaptive,
         },
     }
 }
@@ -604,18 +635,34 @@ async fn open(
         return Err(SessionOutcome::Rejected(reject_kind(&resolution.chain)));
     }
     let direct = resolution.terminal == TerminalKind::Direct;
+    // what the terminal outbound can carry, before
+    // `udp-policy-not-supported-behaviour` puts DIRECT in its place
+    let carries_udp = resolution.outbound.udp() != UdpSupport::Unsupported;
     let setting = resolution
         .chain
-        .last()
-        .and_then(|name| registry.spec(name))
+        .iter()
+        .rev()
+        // the last policy of the chain that has a spec: a `direct` alias is
+        // followed by the builtin `DIRECT` it stands for, with no spec of its
+        // own, and it is the alias's parameters that say (`block-quic=on` on
+        // one is a DIRECT-kind policy's own parameter, design 6.2)
+        .find_map(|name| registry.spec(name))
         .map(|spec| spec.common.block_quic)
         .unwrap_or_default();
-    if handle.session().protocol == Some(ProtocolKind::Quic)
-        && quic_blocked(rt.config.general.block_quic, setting, direct)
-    {
-        // the browser falls back to TCP
-        handle.set_error("QUIC blocked");
-        return Err(SessionOutcome::Rejected(RejectKind::Reject));
+    if handle.session().protocol == Some(ProtocolKind::Quic) {
+        let blocked = match quic_verdict(rt.config.general.block_quic, setting, direct, carries_udp)
+        {
+            QuicVerdict::Allow => false,
+            QuicVerdict::Block => true,
+            QuicVerdict::Adaptive => engine
+                .quic_adaptive()
+                .on_quic(&destination.host.to_string(), Instant::now()),
+        };
+        if blocked {
+            // the browser falls back to TCP
+            handle.set_error("QUIC blocked");
+            return Err(SessionOutcome::Rejected(RejectKind::Reject));
+        }
     }
     let mut outbound = resolution.outbound.clone();
     // a `smart` group's member tells the book how it did (phase 2 M5
@@ -812,28 +859,66 @@ mod tests {
     }
 
     #[test]
-    fn which_quic_flows_are_blocked() {
-        use BlockQuicGlobal::*;
-        use Tristate::*;
-        // (global, policy's block-quic, terminal is DIRECT) → blocked
-        for (global, policy, direct, blocked) in [
-            (PerPolicy, Auto, false, true),
-            (PerPolicy, Auto, true, false),
-            (PerPolicy, On, true, true),
-            (PerPolicy, Off, false, false),
-            (AllProxy, Off, false, true),
-            (AllProxy, On, true, true),
-            (AllProxy, Auto, true, false),
-            (AllProxy, Off, true, false),
-            (All, Off, true, true),
-            (AlwaysAllow, On, false, false),
-        ] {
-            assert_eq!(
-                quic_blocked(global, policy, direct),
-                blocked,
-                "{global:?} {policy:?} direct={direct}"
-            );
+    fn every_cell_of_the_quic_verdict() {
+        /// The verdict of one cell, written out again from the table of the
+        /// design (6.2, P7) so that the function is checked against it rather
+        /// than against itself.
+        fn expected(
+            global: BlockQuicGlobal,
+            policy: BlockQuic,
+            direct: bool,
+            carries_udp: bool,
+        ) -> QuicVerdict {
+            use BlockQuic::{Adaptive, Auto, Off, On};
+            use QuicVerdict::{Adaptive as Table, Allow, Block};
+            match global {
+                BlockQuicGlobal::AlwaysAllow => Allow,
+                BlockQuicGlobal::All => Block,
+                // a proxy flow is settled by the global mode alone
+                BlockQuicGlobal::AllProxy if !direct => Block,
+                // and a DIRECT one by the parameter the mode leaves it:
+                // `all-proxy` takes only the proxy flows, `per-policy` every
+                // flow
+                BlockQuicGlobal::AllProxy | BlockQuicGlobal::PerPolicy => match policy {
+                    On => Block,
+                    Off => Allow,
+                    Adaptive => Table,
+                    // 6.11: DIRECT through, a proxy that carries no UDP
+                    // blocked, the rest to the table
+                    Auto if global == BlockQuicGlobal::AllProxy => Allow,
+                    Auto if direct => Allow,
+                    Auto if !carries_udp => Block,
+                    Auto => Table,
+                },
+            }
         }
+
+        let mut cells = 0;
+        for global in [
+            BlockQuicGlobal::PerPolicy,
+            BlockQuicGlobal::AllProxy,
+            BlockQuicGlobal::All,
+            BlockQuicGlobal::AlwaysAllow,
+        ] {
+            for policy in [
+                BlockQuic::Auto,
+                BlockQuic::On,
+                BlockQuic::Off,
+                BlockQuic::Adaptive,
+            ] {
+                for direct in [false, true] {
+                    for carries_udp in [false, true] {
+                        cells += 1;
+                        assert_eq!(
+                            quic_verdict(global, policy, direct, carries_udp),
+                            expected(global, policy, direct, carries_udp),
+                            "{global:?} {policy:?} direct={direct} carries_udp={carries_udp}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 64, "four globals × four policies × two × two");
     }
 
     /// A flow lives `FLOW_IDLE` past its last datagram; a DNS flow no longer
