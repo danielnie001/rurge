@@ -1546,6 +1546,28 @@ async fn select_on_a_subnet_group_overrides_it_until_cleared() {
     );
 }
 
+/// The members of a `subnet` group are listed as the group is written: the
+/// policies of its conditions in that order, then `default`, each once — the
+/// shape every group's members have (phase 3 M1 design 6.1, 6.3; the whole
+/// list is in `docs/api/phase3.md`).
+#[tokio::test]
+async fn the_api_lists_the_members_of_a_subnet_group_in_the_order_written() {
+    let api = api_in(
+        "DOMAIN,target.test,Net",
+        "Net = subnet, SSID:Home = DIRECT, TYPE:WIRED = HK, SSID:Cafe = DIRECT, default = HK",
+    )
+    .await;
+    let (status, body) = get(&api, "/v1/policy_groups").await;
+    assert_eq!(status, 200, "{body}");
+    let members: Vec<&str> = body["Net"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no `Net` in {body}"))
+        .iter()
+        .map(|member| member["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(members, ["DIRECT", "HK"]);
+}
+
 #[tokio::test]
 async fn profile_check_includes_the_dry_build() {
     let api = api().await;
