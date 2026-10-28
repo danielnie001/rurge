@@ -484,10 +484,13 @@ async fn run_flow(
     // 13): the rules see the name, and the flow goes to it.
     let turned = engine.turn_back(&mut session);
     let destination = Target::new(session.dst_host.clone(), session.dst_port);
-    // the rules see what the first datagram is (`PROTOCOL,QUIC`)
+    // the rules see what the first datagram is (`PROTOCOL,QUIC`,
+    // `PROTOCOL,STUN`), on any port
     session.protocol = Some(
-        if asked.port == 443 && crate::sniff::is_quic_initial(&first.datagram) {
+        if rurge_net::quic::initial::is_client_initial(&first.datagram) {
             ProtocolKind::Quic
+        } else if crate::sniff::is_stun(&first.datagram) {
+            ProtocolKind::Stun
         } else {
             ProtocolKind::Udp
         },

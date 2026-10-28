@@ -571,8 +571,15 @@ impl UdpAssociation {
     }
 }
 
-/// A QUIC Initial-looking datagram (padded to 1200 bytes).
+/// A QUIC client Initial: one that opens with the Initial keys of QUIC v1
+/// and the connection ID below (RFC 9001 §5).
 pub fn quic_initial() -> Vec<u8> {
+    rurge_net::quic::testing::client_initial(1, &[0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08])
+}
+
+/// A datagram that looks like an Initial to a glance at its header; no key
+/// opens it.
+pub fn lookalike_quic_initial() -> Vec<u8> {
     let mut out = vec![0xc3, 0, 0, 0, 1];
     out.resize(1200, 0);
     out

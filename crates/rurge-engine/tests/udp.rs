@@ -389,6 +389,102 @@ PROTOCOL,UDP,REJECT-NO-DROP",
     );
 }
 
+/// A STUN Binding request (RFC 8489 §5): type 0x0001, no attributes, the
+/// magic cookie, and a transaction ID.
+fn stun_binding_request() -> Vec<u8> {
+    let mut out = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42];
+    out.extend_from_slice(&[0x0f; 12]);
+    out
+}
+
+/// QUIC is recognised on any port, not only 443 (M5 design 4.4).
+#[tokio::test]
+async fn quic_on_any_port_is_quic() {
+    let h = harness(Profile {
+        rules: "PROTOCOL,QUIC,REJECT",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("quic.test", 8443, &quic_initial()).await;
+    routed(&h, 1).await;
+    drop(association);
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Rejected("REJECT".into()));
+    assert_eq!(
+        records[0].protocol,
+        Some(rurge_config::rule::ProtocolKind::Quic)
+    );
+}
+
+/// `block-quic` blocks QUIC on any port too.
+#[tokio::test]
+async fn block_quic_blocks_quic_on_any_port() {
+    let h = harness(Profile {
+        general: "block-quic = all",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("quic.test", 8443, &quic_initial()).await;
+    routed(&h, 1).await;
+    drop(association);
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Rejected("REJECT".into()));
+    assert_eq!(records[0].error.as_deref(), Some("QUIC blocked"));
+}
+
+/// A datagram whose header looks like an Initial but that no key opens is
+/// plain UDP (M5 design 4.5): `block-quic` leaves it alone.
+#[tokio::test]
+async fn a_lookalike_of_a_quic_initial_is_plain_udp() {
+    let h = harness(Profile {
+        general: "block-quic = all",
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("alt.test", 443, &lookalike_quic_initial())
+        .await;
+    routed(&h, 1).await;
+    drop(association);
+    let records = finished(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Completed, "{records:?}");
+    assert_eq!(
+        records[0].protocol,
+        Some(rurge_config::rule::ProtocolKind::Udp)
+    );
+}
+
+/// STUN is labelled on any port too, and `PROTOCOL,UDP` matches it as well
+/// (M5 design 5).
+#[tokio::test]
+async fn stun_flows_are_labelled_stun() {
+    for (rule, status) in [
+        ("PROTOCOL,STUN,REJECT", "REJECT"),
+        ("PROTOCOL,UDP,REJECT-NO-DROP", "REJECT-NO-DROP"),
+    ] {
+        let h = harness(Profile {
+            rules: rule,
+            ..Profile::default()
+        })
+        .await;
+        let association = udp_associate(h.socks()).await;
+        association
+            .send("stun.test", 9000, &stun_binding_request())
+            .await;
+        routed(&h, 1).await;
+        drop(association);
+        let records = finished(&h, 1).await;
+        assert_eq!(records[0].status, RecordStatus::Rejected(status.into()));
+        assert_eq!(
+            records[0].protocol,
+            Some(rurge_config::rule::ProtocolKind::Stun)
+        );
+    }
+}
+
 /// `udp-policy-not-supported-behaviour = DIRECT`: a policy without UDP
 /// sends through DIRECT instead, and the record says so.
 #[tokio::test]

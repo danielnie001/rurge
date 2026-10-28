@@ -1,30 +1,28 @@
 //! TLS ClientHello SNI parsing (M3b, observability only). Best-effort: any
-//! malformed, truncated, or non-TLS input returns `None`. And QUIC Initial
-//! recognition for UDP flows (phase 2 M5 design 6.1).
+//! malformed, truncated, or non-TLS input returns `None`. And STUN
+//! recognition for UDP flows (phase 3 M5 design 5); QUIC's recognition lives
+//! in `rurge_net::quic::initial`, since it opens the Initial packet.
 
-/// QUIC v2's version number (RFC 9369), whose Initial packets carry type 1.
-const QUIC_V2: u32 = 0x6b33_43cf;
-
-/// Whether `datagram` is a QUIC Initial packet: a long header with the
-/// fixed bit, a version other than 0 (version negotiation), the Initial
-/// type — 0 in v1 and the drafts, 1 in v2 — and the 1200 bytes a client's
-/// Initial is padded to (RFC 9000 §14.1, §17.2.2; RFC 9369 §3.2).
-pub fn is_quic_initial(datagram: &[u8]) -> bool {
-    let Some(&first) = datagram.first() else {
+/// Whether `datagram` is a STUN message (RFC 5389 / 8489 §5, §6): at
+/// least the 20 bytes of the header, the two top bits of the first byte
+/// clear, the magic cookie 0x2112A442 in bytes 4–7, and a message length
+/// (bytes 2–3) that is a multiple of 4 and is exactly what follows the
+/// header — over UDP one datagram is one message. Classic STUN (RFC 3489,
+/// no cookie) and TURN ChannelData are not recognised.
+pub fn is_stun(datagram: &[u8]) -> bool {
+    let Some(header) = datagram.get(..20) else {
         return false;
     };
-    let Some(version) = datagram.get(1..5) else {
+    // the two top bits are zero in every STUN message: set, the first is RTP
+    // (0x80) and the second TURN's ChannelData (0x40)
+    if header[0] & 0xc0 != 0 {
         return false;
-    };
-    let version = u32::from_be_bytes([version[0], version[1], version[2], version[3]]);
-    let kind = (first >> 4) & 0b11;
-    datagram.len() >= 1200
-        && first & 0xc0 == 0xc0
-        && match version {
-            0 => false,
-            QUIC_V2 => kind == 0b01,
-            _ => kind == 0b00,
-        }
+    }
+    if header[4..8] != [0x21, 0x12, 0xa4, 0x42] {
+        return false;
+    }
+    let length = u16::from_be_bytes([header[2], header[3]]) as usize;
+    length % 4 == 0 && 20 + length == datagram.len()
 }
 
 /// Extracts the SNI host_name from a single TLS ClientHello record, if present.
@@ -83,44 +81,6 @@ pub fn parse_sni(record: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod quic_tests {
-    use super::*;
-
-    fn initial(first: u8, version: u32, len: usize) -> Vec<u8> {
-        let mut out = vec![first];
-        out.extend_from_slice(&version.to_be_bytes());
-        out.resize(len, 0);
-        out
-    }
-
-    #[test]
-    fn a_quic_initial_is_recognised() {
-        assert!(is_quic_initial(&initial(0xc3, 1, 1200)), "v1");
-        assert!(is_quic_initial(&initial(0xd3, QUIC_V2, 1250)), "v2");
-        assert!(
-            is_quic_initial(&initial(0xc0, 0xff00_001d, 1200)),
-            "draft 29"
-        );
-        assert!(!is_quic_initial(&initial(0xc3, 1, 1199)), "unpadded");
-        assert!(
-            !is_quic_initial(&initial(0xe3, 1, 1200)),
-            "a handshake packet"
-        );
-        assert!(
-            !is_quic_initial(&initial(0xc3, QUIC_V2, 1200)),
-            "v2 type 0 is 0-RTT"
-        );
-        assert!(
-            !is_quic_initial(&initial(0xc3, 0, 1200)),
-            "version negotiation"
-        );
-        assert!(!is_quic_initial(&initial(0x43, 1, 1200)), "a short header");
-        assert!(!is_quic_initial(&[0xc3, 0, 0]));
-        assert!(!is_quic_initial(&[]));
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -176,5 +136,55 @@ mod tests {
         assert_eq!(parse_sni(&full[..20]), None); // truncated
         assert_eq!(parse_sni(&[]), None);
         assert_eq!(parse_sni(&[0x16, 0x03, 0x01]), None);
+    }
+}
+
+#[cfg(test)]
+mod stun_tests {
+    use super::*;
+
+    /// A Binding request (RFC 8489 §6): type 0x0001, no attributes, the
+    /// magic cookie, and a transaction ID.
+    fn binding() -> Vec<u8> {
+        let mut out = vec![0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42];
+        out.extend_from_slice(&[0x0f; 12]);
+        out
+    }
+
+    #[test]
+    fn stun_messages_are_recognised() {
+        assert!(is_stun(&binding()), "a Binding request");
+        let mut with_attribute = binding();
+        // SOFTWARE (0x8022), four bytes of value
+        with_attribute[2..4].copy_from_slice(&8u16.to_be_bytes());
+        with_attribute.extend_from_slice(&[0x80, 0x22, 0x00, 0x04]);
+        with_attribute.extend_from_slice(b"rurg");
+        assert!(is_stun(&with_attribute), "a request with one attribute");
+    }
+
+    #[test]
+    fn what_is_not_stun_is_not() {
+        let mut wrong_cookie = binding();
+        wrong_cookie[7] ^= 0x01;
+        assert!(!is_stun(&wrong_cookie), "the magic cookie off by a bit");
+        let mut not_multiple = binding();
+        not_multiple[2..4].copy_from_slice(&6u16.to_be_bytes());
+        not_multiple.extend_from_slice(&[0u8; 6]);
+        assert!(
+            !is_stun(&not_multiple),
+            "a length that is not a multiple of four"
+        );
+        let mut short = binding();
+        short[2..4].copy_from_slice(&8u16.to_be_bytes());
+        short.extend_from_slice(&[0u8; 4]);
+        assert!(!is_stun(&short), "a length the datagram does not fill");
+        let mut rtp = binding();
+        rtp[0] = 0x80;
+        assert!(!is_stun(&rtp), "RTP");
+        let mut channel_data = binding();
+        channel_data[0] = 0x40;
+        assert!(!is_stun(&channel_data), "TURN ChannelData");
+        assert!(!is_stun(&binding()[..19]), "19 bytes");
+        assert!(!is_stun(&[]), "an empty datagram");
     }
 }
