@@ -8,6 +8,7 @@ use common::*;
 use rurge_config::HostName;
 use rurge_config::session::SessionInfo;
 use rurge_inbound::{DialError, Dialer};
+use rurge_proto_wireguard::testing::hex;
 
 /// A peer, and the section of policy `WG = wireguard, section-name=w` that
 /// reaches it.
@@ -457,4 +458,47 @@ H = http, 127.0.0.1, 9",
     assert_eq!(outcome("H"), None, "an http proxy carries no UDP");
     assert_eq!(outcome("DIRECT"), None, "no proxy-test-udp");
     assert_eq!(peer.core().dns_questions, ["echo.test A"]);
+}
+
+/// The manual's server form of a `[WireGuard …]` section loads, but a policy
+/// on it has no peer to dial: the connection fails at once, saying why, and
+/// nothing is looked up or dialled (phase 3 / M5 design 10.2).
+#[tokio::test]
+async fn a_policy_on_a_section_without_peers_fails_at_once() {
+    let (private, public) = keypair();
+    let section = format!(
+        "[WireGuard home]\nprivate-key = {}\nself-ip = 10.8.0.1\nlisten-port = 51820\n\
+peer = (public-key = {}, allowed-ips = 10.8.0.2/32)\n\
+peer = (public-key = {}, allowed-ips = 10.8.0.3/32)\n",
+        hex(&private),
+        hex(&public),
+        hex(&public)
+    );
+    let h = harness(Profile {
+        proxies: "WG = wireguard, section-name = home",
+        rules: "DOMAIN,target.test,WG",
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(b"CONNECT target.test:7 HTTP/1.1\r\nHost: target.test:7\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut answer)).await;
+    assert!(
+        !answer.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+    let log = h.engine.request_log();
+    wait_until("the session to finish", || !log.recent(10).is_empty()).await;
+    let record = log.recent(10)[0].clone();
+    assert_eq!(record.status, RecordStatus::Rejected("REJECT".into()));
+    assert_eq!(
+        record.error.as_deref(),
+        Some("policy protocol not implemented: wireguard (no peer to dial)")
+    );
+    assert!(h.dns.queries().is_empty(), "the name is not looked up");
 }

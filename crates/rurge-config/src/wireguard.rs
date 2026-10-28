@@ -107,6 +107,17 @@ impl Report<'_> {
             .at(span.clone()),
         );
     }
+
+    /// What is read and has no effect in this version: `W0029`.
+    fn inert(&mut self, span: &Span, message: impl fmt::Display) {
+        self.diags.push(
+            Diagnostic::warning(
+                codes::W_PARAM_NOT_EFFECTIVE,
+                format!("[WireGuard {}]: {message}", self.name),
+            )
+            .at(span.clone()),
+        );
+    }
 }
 
 /// Whether an unknown key or field, lowercased, may be quoted: only what
@@ -252,7 +263,16 @@ fn allowed_ips(value: &str) -> Result<Vec<IpNet>, String> {
 }
 
 /// One `( … )` of a `peer` line; `n` counts the section's peers from 1.
-fn peer(report: &mut Report<'_>, span: &Span, item: &str, n: usize) -> Option<WireGuardPeer> {
+/// `listening` is whether the section has a `listen-port`: a peer without an
+/// `endpoint` then asks for an incoming tunnel, which this version does not
+/// accept, so it is left out instead of being an error.
+fn peer(
+    report: &mut Report<'_>,
+    span: &Span,
+    item: &str,
+    n: usize,
+    listening: bool,
+) -> Option<WireGuardPeer> {
     let Some(inner) = item
         .trim()
         .strip_prefix('(')
@@ -334,10 +354,22 @@ fn peer(report: &mut Report<'_>, span: &Span, item: &str, n: usize) -> Option<Wi
             _ => report.warn(span, format!("peer {n}: an unknown field ignored")),
         }
     }
-    for field in ["public-key", "allowed-ips", "endpoint"] {
+    for field in ["public-key", "allowed-ips"] {
         if !given.iter().any(|g| g == field) {
             report.error(span, format!("peer {n}: `{field}` is required"));
         }
+    }
+    if !given.iter().any(|g| g == "endpoint") {
+        if listening {
+            report.inert(
+                span,
+                format!(
+                    "peer {n}: no `endpoint`; this version accepts no incoming WireGuard peers, so the peer is left out"
+                ),
+            );
+            return None;
+        }
+        report.error(span, format!("peer {n}: `endpoint` is required"));
     }
     if report.failed != failed_before {
         return None;
@@ -372,6 +404,11 @@ pub fn parse_section(section: &Section, diags: &mut Diagnostics) -> Option<WireG
     let mut peers = Vec::new();
     // peers are numbered as written, broken ones included
     let mut written = 0;
+    // `listen-port` makes the section a server's: it decides what a peer
+    // without an `endpoint` means, whether it is written before or after.
+    let listening = section.active_entries().any(|entry| {
+        split_definition(&entry.raw).is_some_and(|(key, _)| key.eq_ignore_ascii_case("listen-port"))
+    });
     // what was written, valid or not: only a key left out is "required"
     let mut given: Vec<String> = Vec::new();
     for entry in section.active_entries() {
@@ -437,10 +474,22 @@ pub fn parse_section(section: &Section, diags: &mut Diagnostics) -> Option<WireG
                     ),
                 ),
             },
+            "listen-port" => report.inert(
+                span,
+                "`listen-port` has no effect: this version accepts no incoming WireGuard peers",
+            ),
+            "accept-incoming" => {
+                if parse_bool(value) != Some(false) {
+                    report.inert(
+                        span,
+                        "`accept-incoming` has no effect: this version accepts no incoming WireGuard peers",
+                    );
+                }
+            }
             "peer" => {
                 for item in split_list(value) {
                     written += 1;
-                    peers.extend(peer(&mut report, span, &item, written));
+                    peers.extend(peer(&mut report, span, &item, written, listening));
                 }
             }
             other if quotable(other) => report.warn(span, format!("unknown key `{other}` ignored")),
@@ -546,6 +595,118 @@ peer = (public-key = {PUBLIC}, allowed-ips = \"0.0.0.0/0, ::/0\", endpoint = eng
         assert_eq!(p.endpoint.to_string(), "engage.cloudflareclient.com:2408");
         assert_eq!(p.client_id, Some([83, 12, 235]));
         assert_eq!((p.keepalive, &p.preshared_key), (None, &None));
+    }
+
+    /// The manual's server example (Policies › WireGuard): a port to listen
+    /// on and two peers that connect to it. rurge accepts no incoming peers,
+    /// so the section loads and leaves them out (phase 3 / M5 design 10.2).
+    #[test]
+    fn the_manuals_server_example_loads() {
+        let (section, diags) = parse(&format!(
+            "[WireGuard home]\nprivate-key = {PRIVATE}\nself-ip = 10.8.0.1\nlisten-port = 51820\n\
+peer = (public-key = {PUBLIC}, allowed-ips = 10.8.0.2/32)\n\
+peer = (public-key = {PRIVATE}, allowed-ips = 10.8.0.3/32)\n"
+        ));
+        let section = section.expect("the section loads");
+        assert!(section.peers.is_empty(), "{:?}", section.peers);
+        assert_eq!(section.name, "home");
+        let found: Vec<(&str, &str)> = diags.iter().map(|d| (d.code, d.message.as_str())).collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "[WireGuard home]: `listen-port` has no effect: this version accepts no incoming WireGuard peers"
+                ),
+                (
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "[WireGuard home]: peer 1: no `endpoint`; this version accepts no incoming WireGuard peers, so the peer is left out"
+                ),
+                (
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "[WireGuard home]: peer 2: no `endpoint`; this version accepts no incoming WireGuard peers, so the peer is left out"
+                ),
+            ]
+        );
+        assert!(
+            diags.iter().all(|d| d.severity == Severity::Warning),
+            "{diags:?}"
+        );
+        for shown in diags.iter().map(|d| d.to_string().to_ascii_lowercase()) {
+            for key in [PRIVATE, PUBLIC] {
+                assert!(!shown.contains(&key[..20].to_ascii_lowercase()), "{shown}");
+            }
+        }
+    }
+
+    /// With a port to listen on, a peer that names an endpoint is dialled as
+    /// before and one that does not is left out with a warning.
+    #[test]
+    fn peers_with_and_without_an_endpoint_mix_when_listening() {
+        let (section, diags) = parse(&format!(
+            "[WireGuard m]\nprivate-key = {PRIVATE}\nself-ip = 10.8.0.1\nlisten-port = 51820\n\
+peer = (public-key = {PUBLIC}, allowed-ips = 10.8.0.2/32, endpoint = a.test:51820)\n\
+peer = (public-key = {PRIVATE}, allowed-ips = 10.8.0.3/32)\n"
+        ));
+        let section = section.expect("the section loads");
+        assert_eq!(section.peers.len(), 1);
+        assert_eq!(section.peers[0].endpoint.to_string(), "a.test:51820");
+        let found: Vec<(&str, &str)> = diags.iter().map(|d| (d.code, d.message.as_str())).collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "[WireGuard m]: `listen-port` has no effect: this version accepts no incoming WireGuard peers"
+                ),
+                (
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "[WireGuard m]: peer 2: no `endpoint`; this version accepts no incoming WireGuard peers, so the peer is left out"
+                ),
+            ]
+        );
+    }
+
+    /// Without a port to listen on, a peer with no endpoint is still an
+    /// error: nothing says it was meant to connect to this side.
+    #[test]
+    fn a_peer_without_an_endpoint_is_an_error_without_listen_port() {
+        assert_eq!(
+            errors(&format!(
+                "[WireGuard m]\nprivate-key = {PRIVATE}\nself-ip = 10.8.0.1\n\
+peer = (public-key = {PUBLIC}, allowed-ips = 10.8.0.2/32)\n"
+            )),
+            ["[WireGuard m]: peer 1: `endpoint` is required"]
+        );
+    }
+
+    /// `accept-incoming = false` asks for what rurge does anyway; anything
+    /// else asks for incoming peers, which rurge does not accept.
+    #[test]
+    fn accept_incoming_false_says_nothing_and_anything_else_is_w0029() {
+        let text = |value: &str| {
+            format!(
+                "[WireGuard a]\nprivate-key = {PRIVATE}\nself-ip = 10.8.0.1\naccept-incoming = {value}\n\
+peer = (public-key = {PUBLIC}, allowed-ips = 10.8.0.2/32, endpoint = a.test:51820)\n"
+            )
+        };
+        let (section, diags) = parse(&text("false"));
+        assert!(section.is_some());
+        assert!(diags.is_empty(), "{diags:?}");
+        for value in ["true", "maybe"] {
+            let (section, diags) = parse(&text(value));
+            assert!(section.is_some(), "{value}");
+            let found: Vec<(&str, &str)> =
+                diags.iter().map(|d| (d.code, d.message.as_str())).collect();
+            assert_eq!(
+                found,
+                [(
+                    codes::W_PARAM_NOT_EFFECTIVE,
+                    "[WireGuard a]: `accept-incoming` has no effect: this version accepts no incoming WireGuard peers"
+                )],
+                "{value}"
+            );
+        }
     }
 
     #[test]
@@ -827,7 +988,7 @@ peer = (public-key = {PUBLIC}, allowed-ips = 10.0.0.0/8, endpoint = a.test:1, pr
     #[test]
     fn unknown_keys_and_fields_are_warnings() {
         let (section, diags) = parse(&format!(
-            "[WireGuard u]\nprivate-key = {PRIVATE}\nself-ip = 10.0.0.2\nlisten-port = 51820\n\
+            "[WireGuard u]\nprivate-key = {PRIVATE}\nself-ip = 10.0.0.2\nfwmark = 51820\n\
 peer = (public-key = {PUBLIC}, allowed-ips = 10.0.0.0/8, endpoint = a.test:1, persistent = 1)\n"
         ));
         assert!(section.is_some());
@@ -837,7 +998,7 @@ peer = (public-key = {PUBLIC}, allowed-ips = 10.0.0.0/8, endpoint = a.test:1, pe
             [
                 (
                     codes::W_UNKNOWN_KEY,
-                    "[WireGuard u]: unknown key `listen-port` ignored"
+                    "[WireGuard u]: unknown key `fwmark` ignored"
                 ),
                 (
                     codes::W_UNKNOWN_KEY,

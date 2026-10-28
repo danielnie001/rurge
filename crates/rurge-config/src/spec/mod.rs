@@ -195,6 +195,10 @@ pub enum NotImplemented {
     SsCipher(&'static str),
     /// A `snell` version rurge does not speak: 6 (phase 2 M8 design 4.4).
     SnellVersion(u8),
+    /// A `wireguard` policy whose section lists no peer to dial: this version
+    /// accepts no incoming peers, so there is nothing to connect to (phase 3
+    /// / M5 design 10.2).
+    WireGuardNoPeers,
     /// An `external` policy written in downloaded text: it would start a
     /// program on this machine that nobody here wrote, so it is not started.
     DownloadedExternal,
@@ -225,6 +229,7 @@ impl NotImplemented {
             NotImplemented::SnellVersion(n) => format!(
                 "`snell` version {n} is not supported: it is a beta protocol without a public specification; such policies behave as REJECT"
             ),
+            NotImplemented::WireGuardNoPeers => "`wireguard` policies whose section has no peer to dial are not supported in this version (it only lists peers that connect to it); such policies behave as REJECT".to_string(),
             NotImplemented::DownloadedExternal => "`external` policies written in downloaded text are not started; they behave as REJECT".to_string(),
             NotImplemented::ManagedExternal => "`external` policies in the downloaded copy of a managed profile are not started; they behave as REJECT".to_string(),
         }
@@ -243,10 +248,9 @@ impl NotImplemented {
                     "to use an `external` policy, load a profile without `#!MANAGED-CONFIG` that takes the downloaded parts in by `#!include`",
                 )
             }
-            NotImplemented::SsCipher(_) | NotImplemented::SnellVersion(_) => {
+            NotImplemented::SsCipher(_) | NotImplemented::SnellVersion(_) | NotImplemented::WireGuardNoPeers => {
                 Diagnostic::warning(codes::W_PROTOCOL_NOT_IMPLEMENTED, self.warning())
-            }
-        }
+            }        }
     }
 
     /// What the session log says after "policy protocol not implemented: ".
@@ -254,6 +258,7 @@ impl NotImplemented {
         match self {
             NotImplemented::SsCipher(method) => format!("ss ({method})"),
             NotImplemented::SnellVersion(n) => format!("snell v{n}"),
+            NotImplemented::WireGuardNoPeers => "wireguard (no peer to dial)".to_string(),
             NotImplemented::DownloadedExternal => "external (downloaded text)".to_string(),
             NotImplemented::ManagedExternal => "external (managed profile)".to_string(),
         }
@@ -264,6 +269,9 @@ impl NotImplemented {
         match self {
             NotImplemented::SsCipher(method) => format!("`ss` with the cipher `{method}`"),
             NotImplemented::SnellVersion(n) => format!("`snell` version {n}"),
+            NotImplemented::WireGuardNoPeers => {
+                "`wireguard` on a section with no peer to dial".to_string()
+            }
             NotImplemented::DownloadedExternal => "`external` in downloaded text".to_string(),
             NotImplemented::ManagedExternal => "`external` in a managed profile".to_string(),
         }
@@ -587,6 +595,11 @@ pub fn to_spec(policy: &ProxyPolicy, env: &SpecEnv<'_>) -> SpecOutcome {
         PolicyKind::WireGuard => {
             let mut common = read_common(&mut r, Applies::Proxy, &mut notes);
             let wireguard = wireguard::read_wireguard(&mut r, &mut common, env.wireguard);
+            // a section left with no peer to dial is the manual's server form:
+            // nothing this version can connect to (phase 3 / M5 design 10.2)
+            if wireguard.section.peers.is_empty() && !r.has_errors() {
+                not_implemented = Some(NotImplemented::WireGuardNoPeers);
+            }
             // `tfo` does not apply at all (`W0028`): no second word on it;
             // `ecn` is left its "no effect yet" below
             notes.inert.retain(|name| *name != "tfo");
@@ -703,7 +716,7 @@ mod tests {
     use crate::policy::{Builtin, PolicyKind, parse_policy};
     use crate::span::Span;
     use crate::types::HostName;
-    use crate::wireguard::WireGuardSection;
+    use crate::wireguard::{PeerEndpoint, WireGuardPeer, WireGuardSection};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -716,6 +729,33 @@ mod tests {
     }
 
     fn outcome_of(p: &ProxyPolicy) -> SpecOutcome {
+        outcome_on(&[dialable_section()], p)
+    }
+
+    /// A section with one peer to dial: what the lines in these tests name
+    /// unless a test says otherwise.
+    fn dialable_section() -> WireGuardSection {
+        WireGuardSection {
+            name: "home".into(),
+            mtu: 1280,
+            peers: vec![WireGuardPeer {
+                public_key: [1; 32],
+                allowed_ips: vec!["10.8.0.0/24".parse().unwrap()],
+                endpoint: PeerEndpoint {
+                    host: HostName::parse("127.0.0.1"),
+                    port: 51820,
+                },
+                preshared_key: None,
+                keepalive: None,
+                client_id: None,
+            }],
+            ..WireGuardSection::default()
+        }
+    }
+
+    /// As `outcome_of`, with the `[WireGuard <name>]` sections `section-name`
+    /// may name given here.
+    fn outcome_on(wireguard: &[WireGuardSection], p: &ProxyPolicy) -> SpecOutcome {
         let keystore = vec![KeystoreItem {
             name: "cert1".into(),
             kind: KeystoreType::P12,
@@ -731,16 +771,11 @@ mod tests {
             "REJECT" => Some(NameKind::Builtin(Builtin::Reject)),
             _ => None,
         };
-        let wireguard = [WireGuardSection {
-            name: "home".into(),
-            mtu: 1280,
-            ..WireGuardSection::default()
-        }];
         to_spec(
             p,
             &SpecEnv {
                 keystore: &keystore,
-                wireguard: &wireguard,
+                wireguard,
                 lookup: &lookup,
             },
         )
@@ -987,6 +1022,33 @@ mod tests {
         assert_eq!(
             o.diagnostics[0].message,
             "policy `W`: Shadow TLS cannot be combined with a `wireguard` policy"
+        );
+    }
+
+    /// A `wireguard` line whose section lists no peer to dial: the manual's
+    /// server form, which this version accepts no incoming peer for.
+    #[test]
+    fn a_policy_on_a_section_without_peers_is_not_implemented() {
+        let p = parse_policy("W", "wireguard, section-name=home", &span()).unwrap();
+        let wireguard = [WireGuardSection {
+            name: "home".into(),
+            mtu: 1280,
+            ..WireGuardSection::default()
+        }];
+        let o = outcome_on(&wireguard, &p);
+        assert!(o.spec.is_none());
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let why = o.not_implemented.expect("a section with no peer to dial");
+        assert_eq!(why, NotImplemented::WireGuardNoPeers);
+        assert_eq!(why.diagnostic().code, codes::W_PROTOCOL_NOT_IMPLEMENTED);
+        assert_eq!(
+            why.warning(),
+            "`wireguard` policies whose section has no peer to dial are not supported in this version (it only lists peers that connect to it); such policies behave as REJECT"
+        );
+        assert_eq!(why.note(), "wireguard (no peer to dial)");
+        assert_eq!(
+            why.imported(),
+            "`wireguard` on a section with no peer to dial"
         );
     }
 
