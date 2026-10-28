@@ -830,6 +830,11 @@
 | 19 | 2 | 执行者的裁定：#127（FR-HTTP-10 的「…来源（…进程 / 设备）」之设备）记 `不属于阶段 3（…）`：需求行的阶段栏列了几个阶段（「1 基础 / 4 完整」），设备登记在阶段 7（`DEVICE-NAME` / `MAC-ADDRESS`），与计划「切法」表的预期一致，不另记 | 本提交 |
 | 20 | 2 | 执行者的裁定：拿真实的输入试过之后（见报告），`rurge rule match --platform windows` / `--platform macos` / `--platform linux` 对 `PROCESS-NAME` 给的结果完全一样（`rule-match.txt` 的 11 组、`rule-match-paths.txt` 的 9 组与 `rule-match-slash.txt` 的 2 组，结果都一样）；进程的比较是编译期按 rurge 运行的系统定的（`crates/rurge-rules/src/matcher.rs` 的 `cfg!(windows)`），`--platform` 不改变它（与 M2-D17 对内部集 `SYSTEM` 的说明一致）。所以「用例」一格里“各平台的读法”由纯函数用例 `process_comparison_follows_the_platform` 与各平台的 CI 运行证明，真实输入只能证明本机（Windows）的读法 | 本提交 |
 | 21 | 2 | 执行者的裁定：#17、#18 没有做改坏验证，也没有改那两个文件：它们读的是 `crates/rurge-platform/src/procinfo/linux.rs` 与 `macos.rs`，派工的规矩是“只读，不改”；它们能红的用例（Linux / macOS 的真读用例，与 `walk` / `parse_proc_net` 对夹具的用例）写在「用例」一格，断言逐条读过 | 本提交 |
+| 22 | 3a | 协调者的裁定（派工「本任务的提示」第 1 条）：指向别的行的六行（#69、#93、#112、#113、#114、#119）的结论与「真机上」照被指的那一行，「用例」写「同上」，「代码」不动；#69 指三行（#82 ～ #84），结论取三行里对这一句整体成立的那一个、三行不同时取最弱的（这一片三行都是 `做了`），「真机上」写三行的并集（P25 的 (a)(c)(e)） | 本提交 |
+| 23 | 3a | 执行者的裁定：#57、#58、#60、#61、#63、#66、#67 的「真机上」写「缺」：M3 一节的 19 项里没有能证这一句的项——没有一项直接问 `fd00:6152::2`、也没有问 `.3` ～ `.9` 的，没有看跨重启的映射、`always-real-ip` 与 `[Host]` 权威应答的；W18、M16、L17 往 IPv4 的 `198.18.0.2` 问 AAAA 的期望（拿到 `fd00:6152::` 的地址）与「地址族一致」相反。由任务 6b 补 | 本提交 |
+| 24 | 3a | 执行者的裁定：拿真实的输入试过（报告里列了片段与读数），`rurge check` 对规则集文件里的 `pre-matching` 与 `FINAL` 行一条诊断也不给（它不建注册表）；同一份 Profile 在 `rurge rule match` 里给 `W0023`：`2 line(s) skipped (first: line 2: pre-matching is only allowed on top-level rules)`，`FINAL` 那一行也在被跳过的两行里 | 本提交 |
+| 25 | 3a | 执行者的裁定：改坏验证 12 次（`task-3a-mut-1` ～ `task-3a-mut-12`），盖住 #57、#58、#61、#62、#63、#65、#68、#70、#80、#81、#82、#83、#84；#56、#59、#60、#64、#66、#67 与指向它们的行没有做：用例的断言里写的就是这一句说的地址、范围、常量与应答码，读断言就能看出会红（#56 与 #57、#58 在同一个函数 `space::place` 上，改那两处时它跟着变） | 本提交 |
+| 26 | 3a | 执行者的裁定：#61 按「一句覆盖几个平台、取最弱的」判 `做了`——持久化本身在本机有会红的用例（`the_file_round_trips`、`a_stop_writes_clean`、`the_engine_reopens_the_pool` 等），只给所有者读写的权限那一段是 `cfg(unix)`、本机编译不到，所以在「代码」一格注明它的 `cfg` 与它只管 Windows 以外 | 本提交 |
 
 ## 延后事项
 
