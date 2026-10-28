@@ -623,9 +623,10 @@ async fn features_collections_stop_and_unknown_paths() {
     wait_until(async || api.control.stops.load(Ordering::SeqCst) == 1).await;
 }
 
-/// `GET /v1/features/enhanced_mode`: the two switches it has, the ten reasons a
-/// packet is dropped, and the panics of the TCP stacks (M3-D22, P12's names).
-/// A mode that is off says zero for all of them.
+/// `GET /v1/features/enhanced_mode`: the two switches it has, the eleven reasons
+/// a packet is dropped, the packets `[IP Rewrite]` sent back, and the panics of
+/// the TCP stacks (M3-D22, P12's names). A mode that is off says zero for all
+/// of them.
 #[tokio::test]
 async fn enhanced_mode_get_has_the_counters_and_the_shape() {
     let api = api().await;
@@ -642,8 +643,10 @@ async fn enhanced_mode_get_has_the_counters_and_the_shape() {
             "beyondWindow": 0,
             "rstLimited": 0,
             "icmpLimited": 0,
+            "ipRewrite": 0,
         },
         "stackPanics": 0,
+        "reflected": 0,
     });
     assert_eq!(get(&api, "/v1/features/enhanced_mode").await, (200, off));
     {
@@ -660,6 +663,8 @@ async fn enhanced_mode_get_has_the_counters_and_the_shape() {
             beyond_window: 8,
             rst_limited: 9,
             icmp_limited: 10,
+            ip_rewrite: 12,
+            reflected: 13,
             stack_panics: 11,
         };
     }
@@ -680,8 +685,10 @@ async fn enhanced_mode_get_has_the_counters_and_the_shape() {
                     "beyondWindow": 8,
                     "rstLimited": 9,
                     "icmpLimited": 10,
+                    "ipRewrite": 12,
                 },
                 "stackPanics": 11,
+                "reflected": 13,
             })
         )
     );

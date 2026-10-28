@@ -28,8 +28,8 @@ fn known(name: &str) -> ApiResult<()> {
 }
 
 /// The enhanced mode as the API gives it (M3-D22, P12's key names): whether it
-/// is on, what its TUN has dropped for each reason, and the panics of the TCP
-/// stacks. All zero while it is off.
+/// is on, what its TUN has dropped for each reason, the packets `[IP Rewrite]`
+/// sent back, and the panics of the TCP stacks. All zero while it is off.
 fn enhanced_json(status: EnhancedStatus) -> Value {
     let c = status.counters;
     json!({
@@ -45,8 +45,10 @@ fn enhanced_json(status: EnhancedStatus) -> Value {
             "beyondWindow": c.beyond_window,
             "rstLimited": c.rst_limited,
             "icmpLimited": c.icmp_limited,
+            "ipRewrite": c.ip_rewrite,
         },
         "stackPanics": c.stack_panics,
+        "reflected": c.reflected,
     })
 }
 

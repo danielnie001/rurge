@@ -472,11 +472,12 @@ fn turning_it_on_and_off_through_the_api() {
     let body = parsed(&api_call(api, "GET", "/v1/features/enhanced_mode", "k", None).1);
     assert_eq!(body["enabled"], false);
     let dropped = body["dropped"].as_object().unwrap();
-    assert_eq!(dropped.len(), 10, "ten reasons: {body}");
+    assert_eq!(dropped.len(), 11, "eleven reasons: {body}");
     for (name, count) in dropped {
         assert_eq!(count, 0, "{name}: {body}");
     }
     assert_eq!(body["stackPanics"], 0, "{body}");
+    assert_eq!(body["reflected"], 0, "{body}");
 
     assert_eq!(
         api_call(
