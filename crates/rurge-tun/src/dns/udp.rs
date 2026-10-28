@@ -17,6 +17,7 @@ use super::Ask;
 use crate::context::Context;
 use crate::packet::{Reason, udp_packets};
 use crate::stats::Stats;
+use crate::writer::Class;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -97,7 +98,7 @@ fn write(ctx: &Context, ask: &Ask, reply: &[u8]) {
         debug_assert!(false, "a reply over UDP is too long to be a datagram");
         return;
     };
-    match ctx.writer.try_send(packets) {
+    match ctx.try_send(Class::Udp, packets) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             Stats::drop(

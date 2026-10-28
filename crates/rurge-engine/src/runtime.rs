@@ -105,6 +105,7 @@ impl Runtime {
             allow_dns_svcb: config.general.allow_dns_svcb,
             hijack_dns: config.general.hijack_dns.clone(),
             ip_rewrite: Arc::new(config.ip_rewrite.clone()),
+            udp_priority: config.general.udp_priority,
         });
         // the engine's cell, not one of this generation's: the network is
         // the machine's, and outlives the profile it is read against

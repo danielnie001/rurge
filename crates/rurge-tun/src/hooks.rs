@@ -51,6 +51,9 @@ pub struct TunSettings {
     /// packet whose IP header passed its own checks and that is no martian
     /// (design 8.3). The receive task reads it once for each batch.
     pub ip_rewrite: Arc<IpRewrite>,
+    /// `udp-priority`: the UDP datagrams the TUN writes back go ahead of the
+    /// rest at the writer (design 7.2); nothing else is reordered.
+    pub udp_priority: bool,
 }
 
 /// What the responder asks of this generation's resolver.

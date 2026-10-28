@@ -128,6 +128,9 @@ impl Tun {
         // TUN runs, and two TUNs do not choose alike
         let shard_key = RandomState::new();
         let writer_queue = options.writer_queue;
+        // two queues, of the same size: the UDP datagrams the TUN writes back
+        // go to the priority one (see `writer`)
+        let (to_priority, from_priority) = mpsc::channel(writer_queue);
         let (to_writer, from_shards) = mpsc::channel(writer_queue);
         #[cfg(test)]
         let mut shards = Vec::new();
@@ -174,7 +177,10 @@ impl Tun {
             pool: pool.clone(),
             hooks,
             pinger,
-            writer: to_writer.clone(),
+            writer: writer::Outlet {
+                priority: to_priority,
+                normal: to_writer.clone(),
+            },
             stats: stats.clone(),
             life: life.clone(),
             options,
@@ -189,11 +195,12 @@ impl Tun {
             dns_queue: to_responder,
             udp_bytes: udp_bytes.clone(),
         });
-        // the shards and the context hold the writer's queue: it ends once they
-        // all have
+        // the shards and the context hold the writer's two queues: it ends
+        // once they all have
         drop(to_writer);
         tasks.spawn(writer::run(
             device.clone(),
+            from_priority,
             from_shards,
             writer_queue,
             life.clone(),

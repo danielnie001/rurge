@@ -8,6 +8,7 @@ use crate::context::Context;
 use crate::icmp;
 use crate::packet::{Reason, udp_packets};
 use crate::stats::Stats;
+use crate::writer::Class;
 use rurge_config::HostName;
 use rurge_inbound::UdpClient;
 use rurge_net::BoxFuture;
@@ -125,8 +126,7 @@ impl UdpClient for TunUdpClient {
             // what comes back keeps the session as what goes out does
             self.session.state().last = Instant::now();
             self.ctx
-                .writer
-                .send(packets)
+                .send(Class::Udp, packets)
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the TUN has ended"))
         })

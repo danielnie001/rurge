@@ -81,6 +81,7 @@ pub(crate) fn settings(resolver: Arc<dyn Resolve>, icmp_forwarding: bool) -> Tun
         allow_dns_svcb: false,
         hijack_dns: Vec::new(),
         ip_rewrite: Arc::default(),
+        udp_priority: true,
     }
 }
 

@@ -3,11 +3,14 @@
 //! the stop.
 
 use super::{APP4, FAR4, Lab, NOTHING, taking, target_of};
-use crate::testing::UdpScript;
 use crate::testing::packets;
-use crate::tests::support::{GatedDevice, WITHIN, addr, eventually, in_five_seconds, rig_with};
+use crate::testing::{AppStack, FakeDialer, FakeResolve, UdpScript};
+use crate::tests::support::{
+    Extras, GatedDevice, Rig, WITHIN, addr, eventually, in_five_seconds, rig_with, settings,
+    tun_dialing,
+};
 use crate::writer::STOP_GRACE;
-use crate::{Counters, Ending, TunOptions};
+use crate::{Counters, Ending, TunOptions, TunSettings};
 use rurge_proto::RejectKind;
 use std::io;
 use std::sync::Arc;
@@ -28,13 +31,42 @@ fn gated() -> (Lab, Arc<GatedDevice>) {
     (taking(rig), gate)
 }
 
+/// The same with `udp-priority` off: one queue, as before the writer had two.
+/// The test below reads the ICMP messages it writes against where the UDP reply
+/// it marks them with came, which is the order they came in only while the
+/// reply is in the same queue (the phase 3 / M5 plan's execution record row 36).
+fn gated_without_priority() -> (Lab, Arc<GatedDevice>) {
+    let (gate, end) = GatedDevice::pair();
+    let extras = Extras::default();
+    extras.hooks.set(TunSettings {
+        udp_priority: false,
+        ..settings(FakeResolve::new(), true)
+    });
+    let dialer = FakeDialer::new();
+    let tun = tun_dialing(
+        gate.clone(),
+        dialer.clone(),
+        &extras,
+        TunOptions {
+            writer_queue: 1,
+            ..TunOptions::default()
+        },
+    );
+    let rig = Rig {
+        tun,
+        app: AppStack::start(end),
+        dialer,
+    };
+    (taking(rig), gate)
+}
+
 /// The receive task, and the dialer's client when it refuses a flow, hand the
 /// writer an ICMP message without waiting: when its queue is full the message is
 /// dropped and counted, and nothing else stops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_writer_queue_drops_the_icmp_and_counts_it() {
     for from_the_client in [false, true] {
-        let (mut lab, gate) = gated();
+        let (mut lab, gate) = gated_without_priority();
         let (app, marker) = (addr(APP4), addr(FAR4));
         lab.dialer()
             .script_udp(target_of(marker), UdpScript::Reply(b"marker".to_vec()));

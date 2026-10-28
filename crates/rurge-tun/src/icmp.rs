@@ -14,6 +14,7 @@ use crate::limit::Limiter;
 use crate::packet::{Parsed, Reason};
 use crate::space::{self, Place};
 use crate::stats::Stats;
+use crate::writer::Class;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     Icmpv4DstUnreachable, Icmpv4Message, Icmpv4Packet, Icmpv4Repr, Icmpv6DstUnreachable,
@@ -83,7 +84,7 @@ pub(crate) fn refuse(ctx: &Context, src: IpAddr, dst: IpAddr, quoted: &[u8]) {
 /// one) from `src` to `dst`, without waiting for room: if its queue is full
 /// they are dropped and counted.
 fn offer(ctx: &Context, packets: Vec<Vec<u8>>, src: IpAddr, dst: IpAddr) {
-    match ctx.writer.try_send(packets) {
+    match ctx.try_send(Class::Other, packets) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             // not `ctx.stats.drop(..)`: on an `Arc` that is `Drop::drop`
@@ -312,7 +313,7 @@ async fn forward(
     tokio::select! {
         biased;
         _ = ctx.life.stopped() => {}
-        _ = ctx.writer.send(packets) => {}
+        _ = ctx.send(Class::Other, packets) => {}
     }
 }
 

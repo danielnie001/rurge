@@ -11,6 +11,7 @@ use crate::limit::Limiter;
 use crate::stats::Stats;
 use crate::tcp::Admission;
 use crate::udp::Sessions;
+use crate::writer::{Class, Outlet};
 use crate::{Hooks, Life, Pinger, TunOptions};
 use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::Dialer;
@@ -32,9 +33,10 @@ pub(crate) struct Context {
     pub(crate) hooks: Arc<dyn Hooks>,
     /// Sends the echo requests that go out.
     pub(crate) pinger: Arc<dyn Pinger>,
-    /// The writer's queue, for what the TUN makes itself: replies to the apps'
-    /// datagrams and to their echo requests, and ICMP messages.
-    pub(crate) writer: mpsc::Sender<Vec<Vec<u8>>>,
+    /// The writer's two queues, for what the TUN makes itself: the replies to
+    /// the apps' datagrams and to their echo requests, the responder's answers
+    /// and the ICMP messages. Which one a batch goes to is `send`'s to choose.
+    pub(crate) writer: Outlet,
     pub(crate) stats: Arc<Stats>,
     pub(crate) life: Arc<Life>,
     pub(crate) options: TunOptions,
@@ -64,4 +66,38 @@ pub(crate) struct Context {
     /// The bytes of the datagrams that wait in the UDP sessions' queues (see
     /// `crate::bytes`, which holds the budget of the shards' queues too).
     pub(crate) udp_bytes: Arc<QueuedBytes>,
+}
+
+impl Context {
+    /// Sends `batch` to the writer's queue for `class` in this generation,
+    /// waiting for room: the priority queue for `Class::Udp` while
+    /// `udp_priority` is on, the normal one otherwise.
+    pub(crate) async fn send(
+        &self,
+        class: Class,
+        batch: Vec<Vec<u8>>,
+    ) -> Result<(), mpsc::error::SendError<Vec<Vec<u8>>>> {
+        self.queue(class).send(batch).await
+    }
+
+    /// The same without waiting.
+    pub(crate) fn try_send(
+        &self,
+        class: Class,
+        batch: Vec<Vec<u8>>,
+    ) -> Result<(), mpsc::error::TrySendError<Vec<Vec<u8>>>> {
+        self.queue(class).try_send(batch)
+    }
+
+    /// The queue `class` goes to in this generation. The setting is read on
+    /// every batch, so a reload applies to the next: the datagrams of one UDP
+    /// flow may change queues as it is reloaded, and UDP promises no order
+    /// between them anyway (design 7.2).
+    fn queue(&self, class: Class) -> &mpsc::Sender<Vec<Vec<u8>>> {
+        if class == Class::Udp && self.hooks.settings().udp_priority {
+            &self.writer.priority
+        } else {
+            &self.writer.normal
+        }
+    }
 }

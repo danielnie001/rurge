@@ -127,8 +127,7 @@ async fn reflect_sends_a_syn_back_with_the_addresses_swapped() {
             ..Counters::default()
         }
     );
-    assert!(lab.dialer().udp_sent().is_empty(), "nothing was dialed");
-    assert_eq!(lab.dialer().associations_open(), 0);
+    assert!(lab.dialer().dialed().is_empty(), "nothing was dialed");
 }
 
 /// Every kind of packet goes back: a UDP datagram, an echo request, an IPv6

@@ -10,6 +10,7 @@ use crate::context::Context;
 use crate::icmp;
 use crate::packet::{Hit, Reason, Refusal, refusal, rst_for};
 use crate::stats::Stats;
+use crate::writer::Class;
 use rurge_config::IpRewriteAction;
 use std::net::IpAddr;
 use std::sync::PoisonError;
@@ -94,7 +95,7 @@ fn reject(ctx: &Context, hit: &Hit, packet: Vec<u8>) {
 /// for room: `true` if it took them, `false` if its queue was full (counted
 /// `queue_full`) or it has ended (the TUN is ending, and nothing is counted).
 fn offer(ctx: &Context, packets: Vec<Vec<u8>>, src: IpAddr, dst: IpAddr) -> bool {
-    match ctx.writer.try_send(packets) {
+    match ctx.try_send(Class::Other, packets) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
             // not `ctx.stats.drop(..)`: on an `Arc` that is `Drop::drop`
