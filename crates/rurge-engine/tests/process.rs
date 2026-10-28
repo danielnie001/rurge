@@ -481,7 +481,7 @@ async fn an_internal_session_is_not_looked_up() {
     let fallback: Arc<dyn Connector> = Arc::new(DirectConnector::new(h.engine.resolver()));
     let mut stream = h
         .engine
-        .dial_internal(session, &fallback)
+        .dial_internal(session, None, &fallback)
         .await
         .expect("an internal session is not refused for a process it has not got");
     stream.write_all(b"internal").await.unwrap();

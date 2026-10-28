@@ -1739,6 +1739,122 @@ fn internal_sessions(engine: &Engine) -> Vec<RequestRecord> {
     all
 }
 
+/// The profile of the two tests below: `boot` is the plain `dns-server`, which
+/// resolves the DNS server's own name; `up` is the `tcp://` upstream written
+/// as that name, whose connection the pipeline carries. `rules` are the
+/// profile's rules.
+fn dns_following_profile(boot: &MockDns, up: &MockDns, rules: &str) -> String {
+    format!(
+        "[General]\nhttp-listen = 127.0.0.1:0\nsocks5-listen = 127.0.0.1:0\n\
+encrypted-dns-follow-outbound-mode = true\ndns-server = 127.0.0.1:{}\n\
+encrypted-dns-server = tcp://dns-up.test:{}\nipv6 = false\n\
+[Proxy]\nNamed = direct\n[Proxy Group]\n[Rule]\n{}",
+        boot.addr().port(),
+        up.addr().port(),
+        rules
+    )
+}
+
+/// Looks `target.test` up through the pipeline within the 5-second bound, and
+/// gives back the `Internal` sessions the engine recorded.
+async fn lookup_target_test(engine: &Engine) -> Vec<RequestRecord> {
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine
+            .runtime()
+            .stack
+            .resolver
+            .lookup("target.test", rurge_dns::resolver::LookupOpts::default()),
+    )
+    .await
+    .expect("the lookup ends within the bound");
+    assert!(res.is_ok(), "resolution through the pipeline: {res:?}");
+    internal_sessions(engine)
+}
+
+/// A DNS server's connection carries its name through the pipeline (phase 3 /
+/// M5 design 9.2–9.4): the rule written for the server's host name matches
+/// it — with an IP rule in front, which is what makes the rules ask for an
+/// address —, and the address they match by is the one the bootstrap
+/// resolved, never a lookup of the engine's own: that one would come back to
+/// this very session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_session_matches_rules_by_the_servers_name() {
+    let boot = MockDns::spawn().await;
+    boot.set("dns-up.test", &["127.0.0.1"], &[], 60);
+    let up = MockDns::spawn().await;
+    up.set("target.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dns_following_profile(
+        &boot,
+        &up,
+        "IP-CIDR,10.0.0.0/8,REJECT\nDOMAIN,dns-up.test,Named\nPROTOCOL,DNS,REJECT\nFINAL,DIRECT\n",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let internal = lookup_target_test(&engine).await;
+    let dst = format!("dns-up.test:{}", up.addr().port());
+    let session = internal
+        .iter()
+        .find(|r| r.dst == dst)
+        .unwrap_or_else(|| panic!("the DNS server's own session, named: {internal:?}"));
+    assert_eq!(
+        session.rule.as_deref(),
+        Some("DOMAIN,dns-up.test,Named"),
+        "{session:?}"
+    );
+    assert_eq!(
+        session.policy.first().map(String::as_str),
+        Some("Named"),
+        "{session:?}"
+    );
+    assert_eq!(session.remote_addr, Some(up.addr()), "{session:?}");
+    assert_eq!(session.dns_ms, None, "{session:?}");
+    assert_eq!(
+        up.query_count("dns-up.test", rurge_dns::message::Qtype::A),
+        0,
+        "the engine's resolver never asks the upstream for its own name"
+    );
+    assert_eq!(
+        boot.query_count("dns-up.test", rurge_dns::message::Qtype::A),
+        1,
+        "the bootstrap resolved the name, and only it"
+    );
+}
+
+/// `IP-CIDR` keeps matching a DNS session by the address the bootstrap gave
+/// the server's name (phase 3 / M5 design 9.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ip_cidr_rule_still_matches_a_dns_session_by_its_address() {
+    let boot = MockDns::spawn().await;
+    boot.set("dns-up.test", &["127.0.0.1"], &[], 60);
+    let up = MockDns::spawn().await;
+    up.set("target.test", &["127.0.0.1"], &[], 60);
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dns_following_profile(
+        &boot,
+        &up,
+        "IP-CIDR,127.0.0.1/32,Named\nDOMAIN,dns-up.test,REJECT\nFINAL,DIRECT\n",
+    );
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let internal = lookup_target_test(&engine).await;
+    let dst = format!("dns-up.test:{}", up.addr().port());
+    let session = internal
+        .iter()
+        .find(|r| r.dst == dst)
+        .unwrap_or_else(|| panic!("the DNS server's own session, named: {internal:?}"));
+    assert_eq!(
+        session.rule.as_deref(),
+        Some("IP-CIDR,127.0.0.1/32,Named"),
+        "{session:?}"
+    );
+    assert_eq!(
+        session.policy.first().map(String::as_str),
+        Some("Named"),
+        "{session:?}"
+    );
+    assert_eq!(session.remote_addr, Some(up.addr()), "{session:?}");
+}
+
 /// The anti-loop fallback of `encrypted-dns-follow-outbound-mode` (M3 design
 /// §7.4): reaching a proxy configured by HOST NAME would need the very lookup
 /// the DNS session is carrying, so the engine warns and connects directly.

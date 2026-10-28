@@ -28,8 +28,9 @@ use rurge_net::packet_datagram::packet_datagram;
 use rurge_policy::auto::SelectCtx;
 use rurge_policy::{Note, PolicyRegistry, Resolution, TerminalKind};
 use rurge_proto::{OutboundError, OutboundRef, UdpSupport};
-use rurge_rules::matcher::SubRuleHit;
-use rurge_rules::{LazyProcess, OutboundMode, Outcome};
+use rurge_rules::engine::FixedResolve;
+use rurge_rules::matcher::{ResolvedAddrs, SubRuleHit};
+use rurge_rules::{LazyProcess, LazyResolver, OutboundMode, Outcome};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
@@ -795,12 +796,26 @@ impl Engine {
 
     /// Mode / rule → policy, shared by `dial`, `dial_internal` and the UDP
     /// flows (M4 §4.1). When a line of a set decided the rule, the session's
-    /// log line and its notes say which.
+    /// log line and its notes say which. The IP rules ask `resolver`: the
+    /// engine's own, but an internal DNS session comes with the address its
+    /// server was resolved to (phase 3 / M5 design 9.3).
     pub(crate) async fn choose_policy(
         &self,
         rt: &Runtime,
         registry: &PolicyRegistry,
         handle: &SessionHandle,
+    ) -> Chosen {
+        self.choose_policy_with(rt, registry, handle, rt.stack.resolver.as_ref())
+            .await
+    }
+
+    /// `choose_policy` with the IP rules asking `resolver`.
+    pub(crate) async fn choose_policy_with(
+        &self,
+        rt: &Runtime,
+        registry: &PolicyRegistry,
+        handle: &SessionHandle,
+        resolver: &dyn LazyResolver,
     ) -> Chosen {
         // the process of the session, waited for only while an `external`
         // program runs (M4 design 11, M4b plan P16): the same `SlotProcess`
@@ -836,12 +851,7 @@ impl Engine {
         }
         let decision = rt
             .rules
-            .evaluate_with_process(
-                handle.session(),
-                OutboundMode::Rule,
-                rt.stack.resolver.as_ref(),
-                &process,
-            )
+            .evaluate_with_process(handle.session(), OutboundMode::Rule, resolver, &process)
             .await;
         if let Some(i) = decision.matched {
             handle.set_rule(rule_raw(&rt.rules, i));
@@ -996,6 +1006,36 @@ enum InternalRoute {
     Bypass(&'static str),
 }
 
+/// The one address a named internal DNS session comes with, in the shape the
+/// IP rules ask their resolver for: its own family, the other empty (phase 3
+/// / M5 design 9.3).
+fn resolved_addrs(address: IpAddr) -> ResolvedAddrs {
+    match address {
+        IpAddr::V4(v4) => ResolvedAddrs {
+            v4: vec![v4],
+            v6: Vec::new(),
+        },
+        IpAddr::V6(v6) => ResolvedAddrs {
+            v4: Vec::new(),
+            v6: vec![v6],
+        },
+    }
+}
+
+/// What an internal DNS session dials: the address its server was resolved to
+/// when it came with one (a server written as a name), the session's own
+/// destination otherwise. Everything dials that address — DIRECT, a proxy, a
+/// bypass — so a named session never needs a lookup of the engine's own
+/// (phase 3 / M5 design 9.4).
+fn internal_target(handle: &SessionHandle, address: Option<IpAddr>) -> Target {
+    let session = handle.session();
+    let host = match address {
+        Some(address) => HostName::Ip(address),
+        None => session.dst_host.clone(),
+    };
+    Target::new(host, session.dst_port)
+}
+
 /// What an internal DNS session tells a `smart` group of the member it went
 /// through (M3c design 4.3): that it could not connect, or — once its
 /// outbound is ready — its first byte back, or three seconds without one;
@@ -1029,19 +1069,33 @@ fn report_internal(
 impl Engine {
     /// Mode / rule → policy for an internal DNS session (`dial_internal`,
     /// `dial_internal_udp`), and the bypasses decided before anything is
-    /// dialled, each warned about.
+    /// dialled, each warned about. `address` is the address the session's
+    /// server was resolved to, when the session was named: the IP rules then
+    /// match by it, never by a lookup of the engine's, which would come back
+    /// to this very session (phase 3 / M5 design 9.3).
     async fn route_internal(
         &self,
         rt: &Runtime,
         registry: &PolicyRegistry,
         handle: &SessionHandle,
+        address: Option<IpAddr>,
     ) -> InternalRoute {
-        let policy = match self.choose_policy(rt, registry, handle).await {
+        let chosen = match address {
+            Some(address) => {
+                let fixed = FixedResolve(resolved_addrs(address));
+                self.choose_policy_with(rt, registry, handle, &fixed).await
+            }
+            None => self.choose_policy(rt, registry, handle).await,
+        };
+        let policy = match chosen {
             Chosen::Policy(p) => p,
             // An IP-literal DNS session never needs resolution; a DnsFailed here
             // would only come from a misconfigured rule → direct.
             Chosen::DnsFailed => PolicyRef::Builtin(Builtin::Direct),
         };
+        // the session's own destination, not what is dialled: a `smart` group
+        // knows the server by its name when it was written as one (phase 3 /
+        // M5 design 9.3)
         let ctx = SelectCtx {
             host: Some(handle.session().dst_host.to_string()),
         };
@@ -1086,16 +1140,22 @@ impl Engine {
     /// Dials a DNS upstream connection through the pipeline (Internal session).
     /// Never lets the routing break DNS: a REJECT, and a proxy that would have
     /// to be resolved first, each warn and connect directly instead.
+    ///
+    /// `address` is the address the session's server was resolved to, when
+    /// the server was written as a name (`rurge-dns`'s bootstrap): the IP
+    /// rules match by it, and what is dialled is that address, whatever the
+    /// rules pick (phase 3 / M5 design 9.3, 9.4).
     pub async fn dial_internal(
         &self,
         session: SessionInfo,
+        address: Option<IpAddr>,
         fallback: &Arc<dyn Connector>,
     ) -> io::Result<BoxedStream> {
         let (rt, registry) = self.snapshot();
         let handle = self.new_handle(session);
         let trail = handle.trail().clone();
         trail
-            .follow(self.connect_internal(rt, registry, handle, fallback))
+            .follow(self.connect_internal(rt, registry, handle, address, fallback))
             .await
     }
 
@@ -1106,16 +1166,17 @@ impl Engine {
         rt: Arc<Runtime>,
         registry: Arc<PolicyRegistry>,
         handle: Arc<SessionHandle>,
+        address: Option<IpAddr>,
         fallback: &Arc<dyn Connector>,
     ) -> io::Result<BoxedStream> {
         if self.is_suspended() {
             return Err(refused_internal(&handle));
         }
-        let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
+        let target = internal_target(&handle, address);
         let opts = ConnectOpts {
             timeout: CONNECT_TIMEOUT,
         };
-        let resolution = match self.route_internal(&rt, &registry, &handle).await {
+        let resolution = match self.route_internal(&rt, &registry, &handle, address).await {
             InternalRoute::Policy(resolution) => resolution,
             InternalRoute::Bypass(why) => {
                 return bypass_to_direct(handle, fallback, &target, &opts, why).await;
@@ -1132,7 +1193,7 @@ impl Engine {
             Ok(stream) => Ok(crate::dns_pipeline::wrap_internal(stream, handle)),
             Err(OutboundError::Reject(_)) | Err(OutboundError::Unsupported(_)) => {
                 tracing::warn!(
-                    dst = %target.host,
+                    dst = %handle.session().dst_host,
                     "DNS session routed to a reject/unsupported policy; connecting directly to keep DNS working"
                 );
                 bypass_to_direct(handle, fallback, &target, &opts, REJECT_BYPASSED).await
@@ -1175,13 +1236,14 @@ impl Engine {
     pub async fn dial_internal_udp(
         &self,
         session: SessionInfo,
+        address: Option<IpAddr>,
         fallback: &Arc<dyn Connector>,
     ) -> io::Result<BoxedDatagram> {
         let (rt, registry) = self.snapshot();
         let handle = self.new_handle(session);
         let trail = handle.trail().clone();
         trail
-            .follow(self.open_internal_udp(rt, registry, handle, fallback))
+            .follow(self.open_internal_udp(rt, registry, handle, address, fallback))
             .await
     }
 
@@ -1192,16 +1254,17 @@ impl Engine {
         rt: Arc<Runtime>,
         registry: Arc<PolicyRegistry>,
         handle: Arc<SessionHandle>,
+        address: Option<IpAddr>,
         fallback: &Arc<dyn Connector>,
     ) -> io::Result<BoxedDatagram> {
         if self.is_suspended() {
             return Err(refused_internal(&handle));
         }
-        let target = Target::new(handle.session().dst_host.clone(), handle.session().dst_port);
+        let target = internal_target(&handle, address);
         let opts = ConnectOpts {
             timeout: CONNECT_TIMEOUT,
         };
-        let resolution = match self.route_internal(&rt, &registry, &handle).await {
+        let resolution = match self.route_internal(&rt, &registry, &handle, address).await {
             InternalRoute::Policy(resolution) => resolution,
             InternalRoute::Bypass(why) => {
                 return bypass_udp_to_direct(handle, fallback, &target, &opts, why).await;
@@ -1211,7 +1274,7 @@ impl Engine {
         // says of it only what it says of any outbound without UDP
         if resolution.terminal == TerminalKind::Reject {
             tracing::warn!(
-                dst = %target.host,
+                dst = %handle.session().dst_host,
                 "DNS session routed to a reject/unsupported policy; connecting directly to keep DNS working"
             );
             return bypass_udp_to_direct(handle, fallback, &target, &opts, REJECT_BYPASSED).await;
@@ -1240,7 +1303,7 @@ impl Engine {
                 UdpFallback::Direct => {
                     handle.set_error("policy does not support UDP; sent through DIRECT");
                     let ctx = SelectCtx {
-                        host: Some(target.host.to_string()),
+                        host: Some(handle.session().dst_host.to_string()),
                     };
                     let direct = PolicyRef::Builtin(Builtin::Direct);
                     outbound = registry.resolve_with(&direct, &ctx).outbound;

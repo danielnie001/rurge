@@ -8,8 +8,11 @@
 //! `BootstrapConnector`, which resolves a domain-configured upstream name via
 //! plain-UDP bootstrap first and hands this connector an IP target — so the
 //! pipeline never needs to resolve anything itself and cannot re-enter the
-//! resolver. The `Domain` arms below are only a defensive fallback. Plain UDP
-//! upstreams never use a connector.
+//! resolver. The name the server was written as comes along
+//! (`Connector::connect_resolved`, phase 3 / M5 design 9.2): the session is
+//! called by it, and the IP rules match by the address that came with it. The
+//! `Domain` targets below are only a defensive fallback. Plain UDP upstreams
+//! never use a connector.
 
 use crate::engine::Engine;
 use rurge_config::HostName;
@@ -65,11 +68,14 @@ impl PipelineConnector {
         }
     }
 
-    /// A DNS upstream's TCP connection, routed as an `Internal` session
-    /// called `protocol`.
-    async fn connect_as(
+    /// A DNS upstream's TCP connection, as an `Internal` session called by
+    /// what its kind of server speaks: `name` is the server's own, when it was
+    /// written as one, and `target` the address the bootstrap resolved it to
+    /// (phase 3 / M5 design 9.2).
+    async fn connect_with(
         &self,
         protocol: ProtocolKind,
+        name: Option<&str>,
         target: &Target,
         opts: &ConnectOpts,
     ) -> io::Result<BoxedStream> {
@@ -78,42 +84,80 @@ impl PipelineConnector {
             // Defensive only: the resolver's BootstrapConnector resolves
             // upstream names itself and hands us IP targets. Anything else
             // must not enter the pipeline (it could recurse), so go direct.
-            HostName::Domain(_) => return self.fallback.connect(target, opts).await,
+            HostName::Domain(_) => {
+                return match name {
+                    Some(name) => self.fallback.connect_resolved(name, target, opts).await,
+                    None => self.fallback.connect(target, opts).await,
+                };
+            }
         };
+        let host = match name {
+            Some(name) => HostName::Domain(name.to_string()),
+            None => HostName::Ip(ip),
+        };
+        // an address to dial, when the session is called by a name
+        let address = name.map(|_| ip);
+        let port = target.port;
         let engine = self.engine.get().and_then(Weak::upgrade);
         let Some(engine) = engine else {
             // Not attached yet (bootstrap phase) → direct.
-            return self.fallback.connect(target, opts).await;
+            let target = Target::new(host, port);
+            return match name {
+                Some(name) => self.fallback.connect_resolved(name, &target, opts).await,
+                None => self.fallback.connect(&target, opts).await,
+            };
         };
-        let mut session = SessionInfo::tcp(HostName::Ip(ip), target.port);
+        let mut session = SessionInfo::tcp(host, port);
         session.listener = ListenerKind::Internal;
         session.transport = Transport::Tcp;
         session.protocol = Some(protocol);
-        engine.dial_internal(session, &self.fallback).await
+        engine.dial_internal(session, address, &self.fallback).await
     }
 
-    /// The QUIC carrier of a DoQ / DoH3 upstream, routed as `connect_as`
+    /// The QUIC carrier of a DoQ / DoH3 upstream, routed as `connect_with`
     /// routes a TCP connection: an `Internal` UDP session called `protocol`.
-    async fn connect_udp_as(
+    async fn connect_udp_with(
         &self,
         protocol: ProtocolKind,
+        name: Option<&str>,
         target: &Target,
         opts: &ConnectOpts,
     ) -> io::Result<BoxedDatagram> {
         let ip = match &target.host {
             HostName::Ip(ip) => *ip,
-            // Defensive only, as for `connect_as`.
-            HostName::Domain(_) => return self.fallback.connect_udp(target, opts).await,
+            // Defensive only, as for `connect_with`.
+            HostName::Domain(_) => {
+                return match name {
+                    Some(name) => self.fallback.connect_udp_resolved(name, target, opts).await,
+                    None => self.fallback.connect_udp(target, opts).await,
+                };
+            }
         };
+        let host = match name {
+            Some(name) => HostName::Domain(name.to_string()),
+            None => HostName::Ip(ip),
+        };
+        let address = name.map(|_| ip);
+        let port = target.port;
         let engine = self.engine.get().and_then(Weak::upgrade);
         let Some(engine) = engine else {
             // Not attached yet (bootstrap phase) → direct.
-            return self.fallback.connect_udp(target, opts).await;
+            let target = Target::new(host, port);
+            return match name {
+                Some(name) => {
+                    self.fallback
+                        .connect_udp_resolved(name, &target, opts)
+                        .await
+                }
+                None => self.fallback.connect_udp(&target, opts).await,
+            };
         };
-        let mut session = SessionInfo::udp(HostName::Ip(ip), target.port);
+        let mut session = SessionInfo::udp(host, port);
         session.listener = ListenerKind::Internal;
         session.protocol = Some(protocol);
-        engine.dial_internal_udp(session, &self.fallback).await
+        engine
+            .dial_internal_udp(session, address, &self.fallback)
+            .await
     }
 }
 
@@ -130,7 +174,24 @@ impl Connector for Face {
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedStream>> {
-        Box::pin(self.pipeline.connect_as(self.protocol, target, opts))
+        Box::pin(
+            self.pipeline
+                .connect_with(self.protocol, None, target, opts),
+        )
+    }
+
+    /// The server was written as `name`, which the bootstrap resolved to
+    /// `target`: the session is called by that name (phase 3 / M5 design 9.2).
+    fn connect_resolved<'a>(
+        &'a self,
+        name: &'a str,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+        Box::pin(
+            self.pipeline
+                .connect_with(self.protocol, Some(name), target, opts),
+        )
     }
 
     /// `as_direct` stays `None`, so the QUIC path always takes its carrier
@@ -140,7 +201,23 @@ impl Connector for Face {
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
-        Box::pin(self.pipeline.connect_udp_as(self.protocol, target, opts))
+        Box::pin(
+            self.pipeline
+                .connect_udp_with(self.protocol, None, target, opts),
+        )
+    }
+
+    /// `connect_resolved` for the carrier of a DoQ / DoH3 server.
+    fn connect_udp_resolved<'a>(
+        &'a self,
+        name: &'a str,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+        Box::pin(
+            self.pipeline
+                .connect_udp_with(self.protocol, Some(name), target, opts),
+        )
     }
 }
 
