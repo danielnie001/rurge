@@ -108,7 +108,7 @@
 
 设计 `docs/superpowers/specs/2026-10-17-phase3-m2-process-design.md`，计划 `docs/superpowers/plans/2026-10-17-phase3-m2-process-plan.md`（末尾「延后事项」第 1、2、4、5 行是这一节的来由），API 与日志行见 `docs/api/phase3.md` 的「M2　进程识别」，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 3.1 节 `PROCESS-NAME`、3.5 节内部集 `SYSTEM` 与 10.4 节请求记录。
 
-自动化里真的读系统的表的，主要是每个平台一条读自己回环连接的用例（`this_process_owns_its_loopback_sockets`）和一条起真实二进制的端到端用例（`a_process_rule_matches_the_test_process`）；其中 Windows 的真读用例和端到端用例只在一台 Windows 11 x86-64 的开发机上编译、跑过，Linux 与 macOS 的真读用例从没有编译过；Linux 与 macOS 的真实读取（`/proc` 的内容与权限、`pcblist_n` 的真实布局、`proc_pidpath`）只对着按公开格式写的夹具测过，第一次 CI 运行时核对。下面是 CI 与回环验不了的：真实的浏览器与命令行工具会显示成哪个进程、别的用户的进程、虚拟机与容器的客户端、macOS 上代建的连接取哪个 PID、几百条并发连接时查找在不在 200 毫秒里结束。**一项也没有做过。**编号接着 M1 往下排（W11、M9、L10、P11），整份清单里的编号不重复。
+自动化里真的读系统的表的，主要是每个平台一条读自己回环连接的用例（`this_process_owns_its_loopback_sockets`）和一条起真实二进制的端到端用例（`a_process_rule_matches_the_test_process`）；这几条用例在 CI 上编译、运行并通过（运行 40283632986 起，各在它所属的平台上；任务日志要登录才能读，逐条的结果没有读到），其中 Linux 与 macOS 的真读用例在这台 Windows 开发机上编译不到；Linux 与 macOS 的真实读取（`/proc` 的内容与权限、`pcblist_n` 的真实布局、`proc_pidpath`）在开发机上只对着按公开格式写的夹具测过。下面是 CI 与回环验不了的：真实的浏览器与命令行工具会显示成哪个进程、别的用户的进程、虚拟机与容器的客户端、macOS 上代建的连接取哪个 PID、几百条并发连接时查找在不在 200 毫秒里结束。**一项也没有做过。**编号接着 M1 往下排（W11、M9、L10、P11），整份清单里的编号不重复。
 
 ### 前置条件
 
