@@ -3,7 +3,7 @@
 //!
 //! The header alone cannot tell an Initial from some other encrypted UDP
 //! protocol that happens to start with the same shape: a random first byte
-//! is in `0xc0`–`0xcf` about one time in sixteen. So the check is two
+//! has the long header bit set about one time in two. So the check is two
 //! parts. The cheap part reads the header — the version, its Initial type,
 //! the lengths of the connection IDs, the token and the Length field — and
 //! turns away, without allocating and without deriving a key, anything that
@@ -31,11 +31,11 @@ const MIN_LENGTH: usize = 4 + SAMPLE;
 
 /// Whether `datagram` begins with a client's QUIC Initial packet (design
 /// 4.2): the first packet in it, as far as its Length reaches, has a long
-/// header with the fixed bit, a version this recognises (v1, v2, drafts
-/// 29–32), the Initial type of that version, connection IDs of lengths
-/// QUIC allows, and opens with the client Initial keys of its own
-/// Destination Connection ID. A datagram the header checks turn away costs
-/// no allocation and no key.
+/// header (the QUIC bit may be clear, RFC 9287 §3.1), a version this
+/// recognises (v1, v2, drafts 29–32), the Initial type of that version,
+/// connection IDs of lengths QUIC allows, and opens with the client Initial
+/// keys of its own Destination Connection ID. A datagram the header checks
+/// turn away costs no allocation and no key.
 pub fn is_client_initial(datagram: &[u8]) -> bool {
     let Some(header) = header(datagram) else {
         return false;
@@ -109,8 +109,10 @@ fn header(datagram: &[u8]) -> Option<Header<'_>> {
         return None;
     }
     let first = *datagram.first()?;
-    // a long header with the fixed bit (RFC 9000 §17.2)
-    if first & 0xc0 != 0xc0 {
+    // a long header; the QUIC bit (RFC 9000 §17.2's fixed bit) may be clear,
+    // as RFC 9287 §3.1 lets a client clear it, so only the long header bit is
+    // required here
+    if first & 0x80 == 0 {
         return None;
     }
     let version = quic_version(u32::from_be_bytes(datagram.get(1..5)?.try_into().ok()?))?;
@@ -191,7 +193,7 @@ fn opens(datagram: &[u8], header: &Header<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quic::testing::{TestCert, client_initial};
+    use crate::quic::testing::{TestCert, client_initial, client_initial_with_quic_bit};
     use crate::quic::{Transport, client_config};
     use std::time::Duration;
 
@@ -244,6 +246,24 @@ mod tests {
                     dcid.len()
                 );
             }
+        }
+    }
+
+    /// RFC 9287 §3.1 lets a client clear the QUIC bit (RFC 9000 §17.2's
+    /// fixed bit) in its Initial packets, so one with a clear bit is still an
+    /// Initial; setting the bit afterwards changes the header the tag covers.
+    #[test]
+    fn a_cleared_quic_bit_is_still_one() {
+        for version in [1, 0x6b33_43cf, 0xff00_001d] {
+            let datagram = client_initial_with_quic_bit(version, DCID, false);
+            assert_eq!(datagram[0] & 0x40, 0, "{version:#x}: the QUIC bit clear");
+            assert!(is_client_initial(&datagram), "{version:#x}");
+            let mut set = datagram;
+            set[0] |= 0x40;
+            assert!(
+                !is_client_initial(&set),
+                "{version:#x}: the header the tag covers changed"
+            );
         }
     }
 
@@ -325,10 +345,6 @@ mod tests {
         let mut short = v1.clone();
         short[0] &= !0x80;
         cases.push(("a short header", short));
-
-        let mut unfixed = v1.clone();
-        unfixed[0] &= !0x40;
-        cases.push(("the fixed bit clear", unfixed));
 
         let mut zero_version = v1.clone();
         zero_version[1..5].copy_from_slice(&0u32.to_be_bytes());

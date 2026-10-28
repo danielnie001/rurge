@@ -463,6 +463,13 @@ impl AsyncUdpSocket for Gate {
 /// protection applied (RFC 9001 §5), the datagram 1200 bytes long (plan
 /// P5). Panics on any other version.
 pub fn client_initial(version: u32, dcid: &[u8]) -> Vec<u8> {
+    client_initial_with_quic_bit(version, dcid, true)
+}
+
+/// The same, with the QUIC bit (RFC 9000 §17.2's fixed bit) set or clear in
+/// the first byte before the packet is sealed: RFC 9287 §3.1 lets a client
+/// clear it, and header protection does not cover it.
+pub fn client_initial_with_quic_bit(version: u32, dcid: &[u8], quic_bit: bool) -> Vec<u8> {
     let quic = crate::quic::initial::quic_version(version)
         .unwrap_or_else(|| panic!("not a version whose Initial keys we have: {version:#x}"));
     let kind: u8 = match quic {
@@ -470,10 +477,10 @@ pub fn client_initial(version: u32, dcid: &[u8]) -> Vec<u8> {
         _ => 0b00,
     };
     let dcid_len = u8::try_from(dcid.len()).expect("a connection ID of at most 255 bytes");
-    // a long header with the fixed bit, the version's Initial type, and a
-    // 4-byte packet number
+    // a long header, the version's Initial type, and a 4-byte packet number;
+    // the QUIC bit is the caller's
     let mut datagram = Vec::with_capacity(1200);
-    datagram.push(0xc0 | (kind << 4) | 0x03);
+    datagram.push(0x80 | if quic_bit { 0x40 } else { 0 } | (kind << 4) | 0x03);
     datagram.extend_from_slice(&version.to_be_bytes());
     datagram.push(dcid_len);
     datagram.extend_from_slice(dcid);
