@@ -1179,6 +1179,7 @@ TUN_BENCH_FAR=memory cargo test -p rurge-tun --release --lib -- --ignored --exac
 | 32 | 5 | 本任务逐条对照计划：`classify` 的次序、`refusal` 的判法、三种动作、`Context::admission`、`route`/`run`、`Counters` 的文档与日志、引擎与 API 都照写；除上面几行的出入与裁定外没有别的 | 953a566 |
 | 33 | 5 | 门禁（一台机器上的一次运行，不是 CI）：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过（0 个警告）；`cargo test -j 8 --workspace --no-fail-fast` 86 个结果行、4696 通过、0 失败、13 忽略，是基线 86 / 4676 / 0 / 13 净加 20（`src/tests/rewrite.rs` 19 条、引擎 `tests/tun.rs` 1 条），没有 `STATUS_*` 退出。日志 `task-5-gate.log` 在工作区（git 忽略） | 本提交 |
 | 34 | 5 | 计时用例循环：`cargo test -j 8 --workspace --lib -- tests::rewrite` 单独跑 20 次，每次 19 通过、0 失败；`cargo test -j 8 --workspace --test tun -- ip_rewrite_in_the_profile` 单独跑 20 次，每次 1 通过、0 失败。日志 `task-5-loop-rewrite.log`、`task-5-loop-engine.log` 在工作区 | 本提交 |
+| 35 | 5 | 执行者的裁定：`refusal` 对读不到首部的 IPv6 分片（下一个首部是 44、载荷不足八个字节）答 `Nothing`。P11 只列了读得到的情形；这是“读不到的字节一律当读不到处理、不回”的一致读法（同一条对 ICMP 类型字节不在包里的规定）。没有单独用例覆盖这种截短的包 | 本提交 |
 
 ## 延后事项
 
