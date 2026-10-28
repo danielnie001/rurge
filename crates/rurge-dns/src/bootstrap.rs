@@ -5,7 +5,10 @@
 //! injected `Connector` so DoT / DoH connections dial the pre-resolved
 //! address while TLS still sees the hostname; the DoQ / DoH3 upstreams
 //! resolve their server through the bootstrap themselves and open their
-//! QUIC paths on it to an address.
+//! QUIC paths on it to an address. An inner connector is told the name the
+//! address was resolved from (`Connector::connect_resolved`), so that a
+//! pipeline connector can call the session by the server's name (phase 3 /
+//! M5 design 9.2).
 
 use crate::cache::{CacheHit, CachedAddrs, DnsCache};
 use crate::fanout::{FanoutOpts, resolve_name};
@@ -172,13 +175,19 @@ impl BootstrapConnector {
 
     /// `dial` to `target`: an address as it is, a name to each of its
     /// addresses through the bootstrap in turn, IPv4 first, until one
-    /// answers.
-    async fn each_address<T, F>(&self, target: &Target, dial: impl Fn(Target) -> F) -> io::Result<T>
+    /// answers. `dial` is told the name the address came from, when the
+    /// target had one: the inner connector is then asked by `connect_resolved`
+    /// / `connect_udp_resolved` and passes it on (phase 3 / M5 design 9.2).
+    async fn each_address<T, F>(
+        &self,
+        target: &Target,
+        dial: impl Fn(Target, Option<String>) -> F,
+    ) -> io::Result<T>
     where
         F: Future<Output = io::Result<T>>,
     {
         let host = match &target.host {
-            HostName::Ip(_) => return dial(target.clone()).await,
+            HostName::Ip(_) => return dial(target.clone(), None).await,
             HostName::Domain(d) => d,
         };
         let ips = self
@@ -188,7 +197,8 @@ impl BootstrapConnector {
             .map_err(|e| io::Error::other(e.to_string()))?;
         let mut last = io::Error::new(io::ErrorKind::NotFound, format!("no addresses for {host}"));
         for ip in interleave(ips, false) {
-            match dial(Target::new(HostName::Ip(ip), target.port)).await {
+            let at = Target::new(HostName::Ip(ip), target.port);
+            match dial(at, Some(host.clone())).await {
                 Ok(done) => return Ok(done),
                 Err(e) => last = e,
             }
@@ -203,8 +213,15 @@ impl Connector for BootstrapConnector {
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedStream>> {
-        Box::pin(self.each_address(target, move |target| async move {
-            self.inner.connect(&target, opts).await
+        Box::pin(self.each_address(target, move |target, name| async move {
+            match name {
+                Some(name) => {
+                    self.inner
+                        .connect_resolved(name.as_str(), &target, opts)
+                        .await
+                }
+                None => self.inner.connect(&target, opts).await,
+            }
         }))
     }
 
@@ -213,9 +230,37 @@ impl Connector for BootstrapConnector {
         target: &'a Target,
         opts: &'a ConnectOpts,
     ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
-        Box::pin(self.each_address(target, move |target| async move {
-            self.inner.connect_udp(&target, opts).await
+        Box::pin(self.each_address(target, move |target, name| async move {
+            match name {
+                Some(name) => {
+                    self.inner
+                        .connect_udp_resolved(name.as_str(), &target, opts)
+                        .await
+                }
+                None => self.inner.connect_udp(&target, opts).await,
+            }
         }))
+    }
+
+    /// The caller resolved the name already: the address and the name go on
+    /// to the inner connector as they are, and nothing is resolved here.
+    fn connect_resolved<'a>(
+        &'a self,
+        name: &'a str,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+        self.inner.connect_resolved(name, target, opts)
+    }
+
+    /// `connect_resolved` for a UDP flow.
+    fn connect_udp_resolved<'a>(
+        &'a self,
+        name: &'a str,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+        self.inner.connect_udp_resolved(name, target, opts)
     }
 
     /// The inner connector, when it dials directly: a QUIC path then sends
@@ -234,6 +279,7 @@ mod tests {
     use crate::upstream::udp::UdpUpstream;
     use rurge_net::connector::{DirectConnector, SystemResolve};
     use std::future::poll_fn;
+    use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
     use tokio::net::{TcpListener, UdpSocket};
 
@@ -476,6 +522,172 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.to_string().contains("nx.example"));
+    }
+
+    /// Records every call as `call`, the name it was given, and the target;
+    /// and dials what it was given with a direct connector, so that a test
+    /// has a stream to read from and a datagram a loopback echo answers.
+    struct Recording {
+        calls: Mutex<Vec<String>>,
+        inner: DirectConnector,
+    }
+
+    impl Recording {
+        fn new() -> Recording {
+            Recording {
+                calls: Mutex::new(Vec::new()),
+                inner: DirectConnector::new(Arc::new(SystemResolve)),
+            }
+        }
+
+        fn note(&self, call: &str, name: Option<&str>, target: &Target) {
+            let name = name.map(|name| format!("{name} ")).unwrap_or_default();
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{call} {name}{}:{}", target.host, target.port));
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Connector for Recording {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.note("connect", None, target);
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            self.note("connect_udp", None, target);
+            self.inner.connect_udp(target, opts)
+        }
+
+        fn connect_resolved<'a>(
+            &'a self,
+            name: &'a str,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            self.note("connect_resolved", Some(name), target);
+            self.inner.connect(target, opts)
+        }
+
+        fn connect_udp_resolved<'a>(
+            &'a self,
+            name: &'a str,
+            target: &'a Target,
+            opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            self.note("connect_udp_resolved", Some(name), target);
+            self.inner.connect_udp(target, opts)
+        }
+    }
+
+    /// A server written as a name reaches the inner connector as the address
+    /// the bootstrap gave it, and with the name it was written as: the
+    /// pipeline connector behind it matches rules by that name (phase 3 / M5
+    /// design 9.2). An address is dialled as it is, as ever.
+    #[tokio::test]
+    async fn connector_dials_the_resolved_address_and_names_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let _ = s.write_all(b"ok").await;
+                });
+            }
+        });
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+        let dns = MockDns::spawn().await;
+        dns.set("dot.example", &["127.0.0.1"], &[], 60);
+        let bootstrap = Bootstrap::new(
+            vec![Arc::new(UdpUpstream::new(dns.addr(), direct()))],
+            false,
+            once(),
+        );
+        let recording = Arc::new(Recording::new());
+        let connector = BootstrapConnector::new(recording.clone(), bootstrap);
+        let opts = ConnectOpts::default();
+
+        let mut stream = connector
+            .connect(&Target::new(HostName::parse("dot.example"), port), &opts)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ok");
+        assert_eq!(
+            recording.calls(),
+            [format!("connect_resolved dot.example 127.0.0.1:{port}")]
+        );
+
+        // an address is dialled as it is, with no name to carry
+        let mut stream = connector
+            .connect(&Target::new(HostName::parse("127.0.0.1"), port), &opts)
+            .await
+            .unwrap();
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ok");
+        assert_eq!(
+            recording.calls(),
+            [
+                format!("connect_resolved dot.example 127.0.0.1:{port}"),
+                format!("connect 127.0.0.1:{port}"),
+            ]
+        );
+
+        // UDP goes the same way
+        let datagram = connector
+            .connect_udp(
+                &Target::new(HostName::parse("dot.example"), udp_port),
+                &opts,
+            )
+            .await
+            .unwrap();
+        poll_fn(|cx| datagram.poll_send(cx, b"ping")).await.unwrap();
+        let mut storage = [0u8; 8];
+        let mut read = ReadBuf::new(&mut storage);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_fn(|cx| datagram.poll_recv(cx, &mut read)),
+        )
+        .await
+        .expect("the echo within the bound")
+        .unwrap();
+        assert_eq!(read.filled(), b"ping");
+        let datagram = connector
+            .connect_udp(&Target::new(HostName::parse("127.0.0.1"), udp_port), &opts)
+            .await
+            .unwrap();
+        poll_fn(|cx| datagram.poll_send(cx, b"pong")).await.unwrap();
+        assert_eq!(
+            recording.calls(),
+            [
+                format!("connect_resolved dot.example 127.0.0.1:{port}"),
+                format!("connect 127.0.0.1:{port}"),
+                format!("connect_udp_resolved dot.example 127.0.0.1:{udp_port}"),
+                format!("connect_udp 127.0.0.1:{udp_port}"),
+            ]
+        );
     }
 
     #[tokio::test]

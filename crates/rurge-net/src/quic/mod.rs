@@ -59,6 +59,34 @@ impl Path {
         ecn: Tristate,
         opts: &ConnectOpts,
     ) -> io::Result<Path> {
+        Path::open_over(connector, None, server, hopping, ecn, opts).await
+    }
+
+    /// `open` for a server whose address `server` the name `name` resolved
+    /// to (phase 3 / M5 design 9.2, the plan's P15): over a connector that is
+    /// not direct, the carrier is asked of `connect_udp_resolved`, so it
+    /// learns the name of the server it carries to. A direct connector
+    /// resolves `server` its own way whatever it is called, so the name is
+    /// not used.
+    pub async fn open_resolved(
+        connector: &dyn Connector,
+        name: &str,
+        server: &Target,
+        opts: &ConnectOpts,
+    ) -> io::Result<Path> {
+        Path::open_over(connector, Some(name), server, None, Tristate::Auto, opts).await
+    }
+
+    /// `open` and `open_resolved`: the one way a path is opened, `name` being
+    /// the name `server` was resolved from, when there was one.
+    async fn open_over(
+        connector: &dyn Connector,
+        name: Option<&str>,
+        server: &Target,
+        hopping: Option<&PortHopping>,
+        ecn: Tristate,
+        opts: &ConnectOpts,
+    ) -> io::Result<Path> {
         let path = match (connector.as_direct(), hopping) {
             (Some(direct), None) => {
                 let remote = direct.udp_peer(server).await?;
@@ -82,7 +110,10 @@ impl Path {
                 }
             }
             (None, None) => {
-                let carrier = connector.connect_udp(server, opts).await?;
+                let carrier = match name {
+                    Some(name) => connector.connect_udp_resolved(name, server, opts).await?,
+                    None => connector.connect_udp(server, opts).await?,
+                };
                 let carried = Arc::new(carrier::Carried::new(carrier));
                 Path {
                     socket: carried.clone(),

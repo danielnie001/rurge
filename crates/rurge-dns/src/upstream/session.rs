@@ -54,6 +54,7 @@ use rurge_net::connector::{ConnectOpts, Connector, Target, interleave};
 use rurge_net::http::quic_tls_client_config;
 use rurge_net::quic::{self, Path, Transport};
 use std::io;
+use std::net::IpAddr;
 use std::pin::pin;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -166,10 +167,17 @@ impl Dialer {
     }
 
     /// A connection to `server`; `budget` bounds the opening of the path
-    /// only.
+    /// only. Over a connector that is not direct the path is opened by
+    /// `Path::open_resolved` when the server was written as a name, so that
+    /// the carrier learns it (phase 3 / M5 design 9.2, plan P15).
     async fn connect_to(&self, server: &Target, budget: Duration) -> io::Result<Connection> {
         let opts = ConnectOpts { timeout: budget };
-        let path = Path::open(self.connector.as_ref(), server, None, Tristate::Auto, &opts).await?;
+        let named = self.host.parse::<IpAddr>().is_err();
+        let path = if named {
+            Path::open_resolved(self.connector.as_ref(), &self.host, server, &opts).await?
+        } else {
+            Path::open(self.connector.as_ref(), server, None, Tristate::Auto, &opts).await?
+        };
         quic::connect(path, &self.config, &self.host).await
     }
 }

@@ -141,6 +141,31 @@ pub trait Connector: Send + Sync {
         Box::pin(std::future::ready(Err(no_udp())))
     }
 
+    /// `connect` to `target`, which is an address `name` resolved to (phase 3
+    /// / M5 design 9.2). A connector that tells its sessions by name — the
+    /// engine's DNS pipeline — takes the name along; every other dials
+    /// `target` as `connect` would.
+    fn connect_resolved<'a>(
+        &'a self,
+        name: &'a str,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+        let _ = name;
+        self.connect(target, opts)
+    }
+
+    /// `connect_udp` to `target`, which is an address `name` resolved to.
+    fn connect_udp_resolved<'a>(
+        &'a self,
+        name: &'a str,
+        target: &'a Target,
+        opts: &'a ConnectOpts,
+    ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+        let _ = name;
+        self.connect_udp(target, opts)
+    }
+
     /// Where this connector's connections go now, when that can change
     /// under it (a policy group's member as the underlying proxy): a
     /// connection made before it changed goes elsewhere. `None`: always the
@@ -1058,6 +1083,78 @@ mod tests {
             .err()
             .expect("refused");
         assert!(!err.to_string().is_empty());
+    }
+
+    /// The two calls that take the name a connector's target was resolved
+    /// from (`Connector::connect_resolved`) are the plain ones for every
+    /// connector but the engine's DNS pipeline: the name is dropped, and the
+    /// target dialled as it is (phase 3 / M5 design 9.2).
+    #[tokio::test]
+    async fn the_resolved_calls_default_to_the_plain_ones() {
+        #[derive(Default)]
+        struct Plain(Mutex<Vec<String>>);
+
+        fn note(calls: &Mutex<Vec<String>>, call: &str, target: &Target) {
+            calls
+                .lock()
+                .unwrap()
+                .push(format!("{call} {}:{}", target.host, target.port));
+        }
+
+        fn refused() -> io::Error {
+            io::Error::new(io::ErrorKind::ConnectionRefused, "refused")
+        }
+
+        impl Connector for Plain {
+            fn connect<'a>(
+                &'a self,
+                target: &'a Target,
+                _opts: &'a ConnectOpts,
+            ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+                note(&self.0, "connect", target);
+                Box::pin(std::future::ready(Err(refused())))
+            }
+
+            fn connect_udp<'a>(
+                &'a self,
+                target: &'a Target,
+                _opts: &'a ConnectOpts,
+            ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+                note(&self.0, "connect_udp", target);
+                Box::pin(std::future::ready(Err(refused())))
+            }
+        }
+
+        let plain = Plain::default();
+        let opts = ConnectOpts::default();
+        let named = Target::new(HostName::parse("dns.test"), 853);
+        let at_ip = Target::new(HostName::Ip(ip("127.0.0.1")), 853);
+        assert!(
+            plain
+                .connect_resolved("dns.test", &named, &opts)
+                .await
+                .is_err()
+        );
+        assert!(
+            plain
+                .connect_resolved("dns.test", &at_ip, &opts)
+                .await
+                .is_err()
+        );
+        assert!(
+            plain
+                .connect_udp_resolved("dns.test", &at_ip, &opts)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *plain.0.lock().unwrap(),
+            [
+                "connect dns.test:853",
+                "connect 127.0.0.1:853",
+                "connect_udp 127.0.0.1:853",
+            ]
+        );
     }
 
     #[tokio::test]

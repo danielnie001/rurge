@@ -3921,6 +3921,106 @@ https://dns.example/dns-query"
         }
     }
 
+    /// A named QUIC server's connector was asked about one of its addresses,
+    /// under the name the server was written as.
+    #[derive(Debug, PartialEq)]
+    struct Named {
+        kind: &'static str,
+        call: &'static str,
+        name: String,
+        target: String,
+        port: u16,
+    }
+
+    /// A connector that dials nothing, and knows the calls that carry a name
+    /// (`Connector::connect_resolved`): it refuses, and notes what it was
+    /// asked in a list its fellows share.
+    struct Naming {
+        kind: &'static str,
+        asked: Arc<Mutex<Vec<Named>>>,
+    }
+
+    impl Naming {
+        fn refuse(&self, call: &'static str, name: Option<&str>, target: &Target) -> io::Error {
+            self.asked.lock().expect("asked").push(Named {
+                kind: self.kind,
+                call,
+                name: name.unwrap_or_default().to_string(),
+                target: target.host.to_string(),
+                port: target.port,
+            });
+            io::Error::new(io::ErrorKind::ConnectionRefused, "refused")
+        }
+    }
+
+    impl Connector for Naming {
+        fn connect<'a>(
+            &'a self,
+            target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            Box::pin(std::future::ready(
+                Err(self.refuse("connect", None, target)),
+            ))
+        }
+
+        fn connect_udp<'a>(
+            &'a self,
+            target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            Box::pin(std::future::ready(Err(self.refuse(
+                "connect_udp",
+                None,
+                target,
+            ))))
+        }
+
+        fn connect_resolved<'a>(
+            &'a self,
+            name: &'a str,
+            target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+            Box::pin(std::future::ready(Err(self.refuse(
+                "connect_resolved",
+                Some(name),
+                target,
+            ))))
+        }
+
+        fn connect_udp_resolved<'a>(
+            &'a self,
+            name: &'a str,
+            target: &'a Target,
+            _opts: &'a ConnectOpts,
+        ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+            Box::pin(std::future::ready(Err(self.refuse(
+                "connect_udp_resolved",
+                Some(name),
+                target,
+            ))))
+        }
+    }
+
+    /// One connector that knows the named calls of each kind, all noting what
+    /// they were asked in `asked`.
+    fn naming_connectors(asked: &Arc<Mutex<Vec<Named>>>) -> DnsConnectors {
+        let naming = |kind| -> Arc<dyn Connector> {
+            Arc::new(Naming {
+                kind,
+                asked: asked.clone(),
+            })
+        };
+        DnsConnectors {
+            tcp: naming("tcp"),
+            tls: naming("tls"),
+            https: naming("https"),
+            quic: naming("quic"),
+            h3: naming("h3"),
+        }
+    }
+
     /// Every kind of upstream is dialled through the connector of its kind,
     /// and through no other: a resolver of each kind of server is given five
     /// connectors that refuse, and the only one asked is its own, for the
@@ -4007,6 +4107,56 @@ https://dns.example/dns-query"
                     kind,
                     call: "connect",
                     host: "127.0.0.1".to_string(),
+                    port
+                }],
+                "{server}"
+            );
+            assert_eq!(
+                bootstrap.query_count("dns.example", Qtype::A),
+                1,
+                "{server}"
+            );
+        }
+    }
+
+    /// A QUIC server written as a name reaches its connector with the name as
+    /// well as the address the bootstrap gave: the pipeline connector behind
+    /// it (`encrypted-dns-follow-outbound-mode`) matches rules by that name.
+    /// The address is the one that was dialled, IPv4 first — the ports are
+    /// marks to tell the servers by, and nothing is dialled at them.
+    #[tokio::test(start_paused = true)]
+    async fn a_named_quic_server_reaches_its_connector_with_its_name() {
+        for (server, kind, port) in [
+            ("quic://dns.example:4", "quic", 4),
+            ("h3://dns.example:5/dns-query", "h3", 5),
+        ] {
+            let bootstrap = MockDns::spawn().await;
+            bootstrap.set("dns.example", &["127.0.0.1"], &[], 60);
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let e = env(&profile(&format!("encrypted-dns-server = {server}"), ""));
+            let mut cfg = ResolverConfig::from_config(&e.cfg);
+            cfg.fanout = once();
+            let (r, _) = Resolver::new(
+                cfg,
+                ResolverDeps {
+                    connectors: naming_connectors(&asked),
+                    direct: direct(),
+                    sets: e.sets.clone(),
+                    system: Arc::new(StaticSystemDns::default()),
+                    resources: e.resources.clone(),
+                },
+            );
+            r.bootstrap.set_upstreams(vec![bootstrap.upstream()]);
+            r.lookup("a.test", LookupOpts::default())
+                .await
+                .expect_err("every connector refuses");
+            assert_eq!(
+                *asked.lock().unwrap(),
+                [Named {
+                    kind,
+                    call: "connect_udp_resolved",
+                    name: "dns.example".to_string(),
+                    target: "127.0.0.1".to_string(),
                     port
                 }],
                 "{server}"
