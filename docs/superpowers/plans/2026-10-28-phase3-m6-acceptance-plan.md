@@ -842,6 +842,8 @@
 | 31 | 3b | 执行者的裁定：#21、#22 的「真机上」写 `看不出`：会话表本身与「会话什么时候结束」在 API 里没有出口（记录与活动列表只到流这一层） | 本提交 |
 | 32 | 3b | 执行者的裁定：改坏验证 13 次（`task-3b-mut-1` ～ `task-3b-mut-13`），盖住 #8、#10、#11、#12、#21、#22、#23、#77、#85、#86、#87、#92、#122、#125（#88 指的就是 #125 那一处代码）；#89 ～ #91 没有单独做：它们的断言里写的就是回哪一种 ICMP、限频到第几个、哪一种不回，读断言就能看出会红；#123 没有代码；#88、#111 是指向别的行的行，不单独验 | 本提交 |
 | 33 | 3b | 执行者的裁定：拿真实的输入试过（`inputs/task-3b/`）：`icmp-forwarding = false` 与 `= true` 各 0 error、0 warning、0 info；TCP 与 UDP 层特有的预匹配写法（`AND` 里带 `DEST-PORT`、只有 `DEST-PORT` 的规则、`IP-CIDR`、`RULE-SET`）都按 SYN 层的读法命中，`RULE-SET` 命中时打印 `sub-rule:` 那一行；`rurge rule match --udp` 在带 `pre-matching` 的规则上仍报 `reason: pre-matching`（解释器自己那一遍预匹配），所以它看不到「UDP 没有预匹配阶段」这一点 | 本提交 |
+| 34 | 3b | 协调者的裁定：#89 ～ #91 改记 `做了`，推翻第 28 行。派工第 4 条把兼容性清单 4.1 节 UDP 行为一行的「UDP 无预匹配阶段」当成了 rurge 的差异，那一格其实是 Surge 行为一栏（Surge 自己的 UDP 也没有预匹配阶段）；虚拟网卡上三句都照做了（`REJECT` 回 ICMP 并在限频之后丢、`REJECT-NO-DROP` 回 ICMP、`REJECT-DROP` 直接丢），限频的数是登记的读法，经 SOCKS5 回不了 ICMP 是已知限制；与 3a 的 #82、#84 的先例一致。「有意不同的」表删三行，只剩 `suspend`；三行各做了一次改坏验证（`task-3b-mut-14` 是 #91、`task-3b-mut-15` 是 #90、`task-3b-mut-16` 是 #89） | 本提交 | 本提交 |
+| 35 | 3b | 协调者的裁定：订正第 33 行的最后一句。`rurge rule match --udp` 报 `pre-matching` 与运行时一样：规则引擎的 `crates/rurge-rules/src/engine.rs` 的 `evaluate` 与 `evaluate_with_process` 不论传输都先走 `pre_pass`（带 `pre-matching` 的 REJECT 类规则排在写的次序之前，`reason` 是 `pre-matching`），UDP 流在运行时也走这一遍（`crates/rurge-engine/src/udp.rs` 的 `open` → `crates/rurge-engine/src/engine.rs` 的 `choose_policy` → `choose_policy_with` → `evaluate_with_process`）；「UDP 没有预匹配阶段」只是说没有 DNS 层、SYN 层那样在会话之前问规则的那一层 | 本提交 |
 
 ## 延后事项
 
