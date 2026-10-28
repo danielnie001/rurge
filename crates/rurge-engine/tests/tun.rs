@@ -351,6 +351,49 @@ async fn ip_rewrite_in_the_profile_acts_on_the_tun_and_a_reload_replaces_it() {
     assert!(udp_records(&rig.h).is_empty(), "no request record");
 }
 
+/// `[IP Rewrite]` takes only the packets that enter Surge VIF: the table acts
+/// on a datagram through the adapter, and the sessions of the proxy listeners
+/// are left alone even when a line names the echo server's own address — "This
+/// section only applies to traffic handled by Surge VIF", "Requests sent to
+/// Surge's proxy server are not affected." The line naming `127.0.0.1` would
+/// take the echo server's traffic were the listeners to ask the table.
+#[tokio::test]
+async fn ip_rewrite_leaves_requests_to_the_proxy_ports_alone() {
+    let echo = echo_server().await;
+    let rules = guarded("");
+    let sections = format!("[IP Rewrite]\n{} = drop\n203.0.113.9 = drop\n", echo.ip());
+    let rig = Rig::new(Profile {
+        sections: &sections,
+        ..profile(&rules)
+    })
+    .await;
+    // the table is in this generation: the datagram is dropped here, where the
+    // guards below would refuse it as a session of the adapter
+    rig.app.inject(packets::udp(
+        app_udp(),
+        "203.0.113.9:9000".parse().unwrap(),
+        b"dropped",
+    ));
+    wait_until("the datagram to be dropped", || {
+        rig.tun.counters().ip_rewrite == 1
+    })
+    .await;
+
+    let mut tunnel = connect_via_http(rig.h.http(), &echo.to_string()).await;
+    echo_through(&mut tunnel, b"through the HTTP listener").await;
+    drop(tunnel);
+
+    let mut tunnel = connect_via_socks5(rig.h.socks(), &echo.ip().to_string(), echo.port()).await;
+    echo_through(&mut tunnel, b"through the SOCKS5 listener").await;
+    drop(tunnel);
+
+    assert_eq!(
+        rig.tun.counters().ip_rewrite,
+        1,
+        "only the datagram through the adapter was taken"
+    );
+}
+
 // ---- the process behind a session
 
 /// Above 65535, so that no port number a log line carries can contain it.
