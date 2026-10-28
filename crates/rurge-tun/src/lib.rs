@@ -267,7 +267,7 @@ pub struct TunOptions {
     pub shard_queue: usize,
     /// The bytes of packets that can wait in all the shards' queues together, counted by the memory each packet holds (its capacity). A packet that does not fit is dropped and counted (`queue_full`). More than zero.
     pub queue_bytes: usize,
-    /// How many batches of packets (one for each turn of a shard) can wait for the writer. A shard whose batch finds the queue full waits for room. More than zero.
+    /// How many batches of packets can wait for the writer, for each of its two queues: one holds the UDP datagrams the TUN writes back while `udp-priority` is on, the other everything else, the shards' batches among it. A batch is a shard's turn output or something the TUN makes itself, and a shard whose batch finds its queue full waits for room. More than zero.
     pub writer_queue: usize,
     /// How long a UDP session, and each destination in it, can go without a packet either way before it ends. The default is the engine's own: its flows end after 60 seconds of quiet. At least 1 ms and at most 24 hours.
     pub udp_idle: Duration,

@@ -55,6 +55,14 @@ pub(crate) struct Outlet {
     pub(crate) normal: mpsc::Sender<Vec<Vec<u8>>>,
 }
 
+/// Which of the writer's two queues a batch was taken from. Not the class it is
+/// for: a batch for UDP waits in the normal queue while `udp-priority` is off.
+#[derive(Clone, Copy)]
+enum Queue {
+    Priority,
+    Normal,
+}
+
 pub(crate) async fn run(
     device: Arc<dyn Device>,
     mut priority: mpsc::Receiver<Vec<Vec<u8>>>,
@@ -82,17 +90,17 @@ pub(crate) async fn run(
             biased;
             _ = &mut patience => return,
             received = priority.recv_many(&mut from_priority, limit), if priority_open => {
-                (Class::Udp, received)
+                (Queue::Priority, received)
             }
             received = normal.recv_many(&mut from_normal, limit), if normal_open => {
-                (Class::Other, received)
+                (Queue::Normal, received)
             }
         };
         if received == 0 {
             // every sender of this queue has gone, and it is empty
             match from {
-                Class::Udp => priority_open = false,
-                Class::Other => normal_open = false,
+                Queue::Priority => priority_open = false,
+                Queue::Normal => normal_open = false,
             }
             if !priority_open && !normal_open {
                 return;
@@ -102,12 +110,12 @@ pub(crate) async fn run(
         // the other queue, if it is open, is taken from without waiting: a
         // round is one write, and the priority queue's packets go first in it
         match from {
-            Class::Udp => {
+            Queue::Priority => {
                 if normal_open {
                     normal_open = take_now(&mut normal, &mut from_normal, limit);
                 }
             }
-            Class::Other => {
+            Queue::Normal => {
                 if priority_open {
                     priority_open = take_now(&mut priority, &mut from_priority, limit);
                 }
