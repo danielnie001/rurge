@@ -277,7 +277,8 @@ pub(crate) fn segment(packet: &[u8]) -> Option<Segment> {
 }
 
 /// What a packet `reject` matched is answered with, the first rule that holds
-/// deciding (M5 design 8.5 and 21, plan P11 and its execution record row 70): a later fragment, an ICMP error or
+/// deciding (M5 design 8.5 and 21, plan P11 and its execution record
+/// row 70): a later fragment, an ICMP error or
 /// redirect, an extension header chain that is not walked, and a type that
 /// cannot be read answer nothing (RFC 1122 3.2.2, RFC 4443 2.4); an
 /// unfragmented TCP segment answers a reset only for a SYN without ACK, and

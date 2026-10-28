@@ -494,7 +494,8 @@ M5 做完了（2026-10-28；计划 `docs/superpowers/plans/2026-10-28-phase3-m5-
 - **任务 9**（`76ff44c`）：三个基准重跑，读数在 M5 记录第 61 ～ 63 行（下一段）。
 - **任务 10**（`6729fd8`）：文档收尾——兼容性清单、`docs/api/phase3.md` 的「M5」、`docs/testing.md`、手工清单的 M5 一节、两份 README、需求文档第 7 节的状态、`CLAUDE.md`、本节与计划的两张表。
 - **任务 10 的修正第 1 轮**（`698c958`、`335e692`、`337570a`、`e920e1d`）：终审的四条（扩展首部与 ICMPv6 重定向、IPv6 的引用、`accept-incoming` 的 `W0029`、QUIC 的 QUIC 位）与任务 10 文档的十四条；四次变异核对与二十次循环在 M5 记录第 81、82 行。
-- **任务 10 的修正第 2 轮**（这一个提交）：评审第 2 轮的文档与注释订正（C1 ～ C11），M5 记录第 83 行起；只改文档与注释，没有重跑全量。
+- **任务 10 的修正第 2 轮**（`ca46f58`）：评审第 2 轮的文档与注释订正（C1 ～ C11），M5 记录第 83 行起；只改文档与注释，没有重跑全量。
+- **任务 10 的修正第 3 轮**（这一个提交）：两段文档注释重排到 80 列，字不改（M5 记录第 90 行）。
 
 门禁（任务 8，一台 Windows 11 x86-64 开发机上的一次运行，**不是 CI**）：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过（0 个警告）；`cargo test -j 8 --workspace --no-fail-fast` **86 个结果行、4717 通过、0 失败、13 忽略**。任务 8 修正第 1 轮之后的第一次全量是 4716 通过、1 失败——`rurge-proto-quic` 的 `trust_tunnel::tests::the_last_tunnel_goes_on_beside_all_the_others_unread` 在它自己的时限上以 “the windows never filled” 失败（与本轮改动无关的计时用例），单独重跑通过，这个 4717 是第二次全量的数（M5 记录第 60 行）；任务 9 与任务 10 的第一部分不改代码，任务 10 的修正第 1 轮改了代码、全量重跑：**86 个结果行、4720 通过、0 失败、13 忽略**（4717 加本轮的 3 条：`refusal_reads_past_no_ipv6_extension_header`、`reject_quotes_an_ipv6_packet_up_to_the_minimum_mtu`、`a_cleared_quic_bit_is_still_one`），仍是同一台机器上的一次运行，不是 CI（M5 记录第 82 行）。
 

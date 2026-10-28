@@ -316,7 +316,8 @@ fn fragment(next: u8, offset: u16, more: bool) -> Vec<u8> {
 /// `[IP Rewrite]`'s `reject` does not walk a chain of IPv6 extension headers:
 /// what comes after one (beyond the one fragment header it reads) cannot be
 /// read, so nothing is answered, as with any type it cannot read (M5 design
-/// 8.5 and 21, plan P11 and its execution record row 70). An ICMPv6 redirect (type 137) is answered with nothing too
+/// 8.5 and 21, plan P11 and its execution record row 70). An ICMPv6
+/// redirect (type 137) is answered with nothing too
 /// (RFC 4443 2.4(e)). Pure function: no TUN, no network, no files.
 #[test]
 fn refusal_reads_past_no_ipv6_extension_header() {
