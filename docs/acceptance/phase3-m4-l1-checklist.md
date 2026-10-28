@@ -10,7 +10,7 @@
 
 **2026-10-29 的订正（阶段 3 / M6）**：下文有两处过时，不改原文，以这一段为准。
 
-- 路由集那一组（第 27 行的名字与第 72 行的“12 条”）当时列了 12 条用例，现在 `crates/rurge-platform/src/route/set.rs` 里有 14 条 `#[test]`（`3a76b80` 与 `HEAD` 上都是 14 条）：多的是 `an_included_class_e_route_stays_out_where_the_platform_blocks_it` 与 `windows_leaves_class_e_out`，由 `8538125`（2026-10-27，`fix(platform): Windows 的路由集不进 240.0.0.0/4`）加上；那一份写于 `8538125` 之前。两条都在 `3a76b80` 上，所以 CI 运行 40611702392 见过它们。
+- 「一、设计的 L1 四条」的「1. `rurge-platform`」表里「路由集（第 4.7 节）」一行列的名字，与「二」的 M4a 表里「4（路由集）」一行写的“见一、1 的 12 条”，当时是 12 条用例；现在 `crates/rurge-platform/src/route/set.rs` 里有 14 条 `#[test]`（`3a76b80` 与 `HEAD` 上都是 14 条）：多的是 `an_included_class_e_route_stays_out_where_the_platform_blocks_it` 与 `windows_leaves_class_e_out`，由 `8538125`（2026-10-27，`fix(platform): Windows 的路由集不进 240.0.0.0/4`）加上；那一份写于 `8538125` 之前。两条都在 `3a76b80` 上，所以 CI 运行 40611702392 见过它们。
 - `forget_drops_only_the_carrier_that_failed` 是旧名：`f49ee24`（2026-10-27，`fix(cli): 发送失败的 ICMP 载体退休，而不是立刻停掉`）起叫 `forget_retires_only_the_carrier_that_failed`（`crates/rurge/src/cli/pinger.rs`）。下文的旧名照当时的写法留着。
 
 **三种标记**（「编译与运行」一栏）：

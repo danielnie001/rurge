@@ -2,11 +2,11 @@
 
 ## 怎么读
 
-这份文档把 `docs/requirements.md` 里属于阶段 3 的句子一句一行地对着手册、代码和用例读了一遍：第 4 节阶段栏含 3 的 12 行需求、写「各阶段」「逐阶段补齐」「各键随所属功能阶段生效」的 3 行里在阶段 3 生效的部分、第 7 节阶段 3 的范围里没有编号的两件（预匹配在 DNS 与 SYN 层、`[IP Rewrite]`）、阶段 1 与阶段 2 的对照推到阶段 3 的句子，以及第 5 节四条与阶段 3 相关的非功能需求。切成 141 句，分在十张表里；第一部分的次序是：入站、出站、策略组、规则、DNS、配置与观测、第 7 节的两张、阶段 1 与阶段 2 推过来的、非功能需求。第一部分末尾是四张登记表（没有做完的、需求文字的问题、有意不同的、本机没有能红的用例的），每行用 `#` 指回第一部分的那一句。
+这份文档把 `docs/requirements.md` 里属于阶段 3 的句子一句一行地对着手册、代码和用例读了一遍：第 4 节阶段栏含 3 的 12 行需求、写「各阶段」「逐阶段补齐」「各键随所属功能阶段生效」的 3 行里在阶段 3 生效的部分、第 7 节阶段 3 的范围里没有编号的两件（预匹配在 DNS 与 SYN 层、`[IP Rewrite]`）、阶段 1 与阶段 2 的对照推到阶段 3 的句子，以及第 5 节四条与阶段 3 相关的非功能需求。切成 141 句，分在十张表里；第一部分的次序是：入站、出站、策略组、规则、DNS、配置与观测、第 7 节的两张、阶段 1 与阶段 2 推过来的、非功能需求。第一部分末尾是四张登记表（没有做完的、需求文字的问题、有意不同的、本机没有能红的用例的），每行用 `#` 指回第一部分的那一句。`#N` 是第一部分十张表按次序连着数的第 N 行（与 M6 计划「Task 0：骨架」一节的「切法」表同一套编号）。
 
-读的是一个助手：它读代码、读用例的断言、补用例、修小处的缺口；每个任务由协调者随机抽五行，照同样的三样东西（手册原句、代码、用例的断言）重读一遍。读的代码是 `7c5753e`（阶段 3 / M5 的最后一个提交）；读的过程中补的用例与代码在其后的提交里，表里逐行写明提交（`5e00564`、`fcf9464`、`37616a0` 三个）。
+读的是一个助手：它读代码、读用例的断言、补用例；每个任务由协调者随机抽五行，照同样的三样东西（手册原句、代码、用例的断言）重读一遍。读的代码是 `7c5753e`（阶段 3 / M5 的最后一个提交）；读的过程中补的三条用例在其后的三个提交里，表里逐行写明提交（`5e00564`、`fcf9464`、`37616a0`）。
 
-CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑过；M5 与 M6 加的用例（上面三个提交与 M5 自己的用例）CI 没有见过。
+CI：`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），CI 运行 40611702392 在它们编译得到的平台上都跑过并通过；M5 与 M6 加的用例（上面三个提交与 M5 自己的用例）CI 没有见过。
 
 没有覆盖什么：手工验收一项也没有做——第 14 节八条要真机与 CI，本文只写现有的证据；L2 特权用例（`tests/privileged/tests/linux_netns.rs` 的三条与 `crates/rurge-platform/src/tun/windows/wintun.rs` 的 `a_real_wintun_dll_passes`）写好没有运行过；M5 与 M6 的提交 CI 没有见过。判为「做了」的句子指到一条断言了这一句的用例，这不等于别处没有缺口。
 
@@ -59,20 +59,20 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
 | 有意不同（已登记） | 3 | 2 | 1 | 0 |
 | 做了，本机没有能红的用例（第四个数） | 3 | 3 | 0 | 0 |
 
-**阶段 3 的功能需求不齐备**（M6 设计第 11 节：表里有任何一句 P0 或 P1 的「没有做完（已登记）」，「齐备」一词就不出现）：有一句 P1——#37（FR-IN-10 的 `tfo-behaviour`，缺的是 TCP Fast Open 本身）；非功能需求另有 4 句没有做完（#132 与 #133 的 NFR-01、#139 的 NFR-07、#141 的 NFR-11），与这一句写在一起，不藏进表里。此外还有 4 句「需求文字有问题」（#20、#32、#99、#104）与 3 句「有意不同（已登记）」（#35、#101、#120）：它们不是没有做，改的是需求或登记的字面，逐句见四张表。
+阶段 3 的功能需求有一句没有做完：P1 的 #37（FR-IN-10 的 `tfo-behaviour`，缺的是 TCP Fast Open 本身；M6 设计第 11 节）；非功能需求另有 4 句没有做完（#132 与 #133 的 NFR-01、#139 的 NFR-07、#141 的 NFR-11），写在同一句里。此外还有 4 句「需求文字有问题」（#20、#32、#99、#104）与 3 句「有意不同（已登记）」（#35、#101、#120）：它们不是没有做，改的是需求或登记的字面，逐句见四张表。
 
-**齐备不等于验收通过**，两件事分开写：第 14 节八条验收标准要真机与 CI，第二部分逐条写现有的证据与还缺什么，八条里没有一条能因为 L1 全绿就写成「通过」。
+需求逐句对过代码不等于验收通过：第 14 节八条验收标准要真机与 CI，第二部分逐条写现有的证据与还缺什么，八条里没有一条能因为 L1 全绿就写成「通过」。
 
 第 14 节八条各一句：
 
-1. 浏览器、命令行工具与不支持代理的应用的流量出现在请求记录里并按规则分流：L1 是经内存设备与引擎的端到端用例（`crates/rurge-engine/tests/tun.rs` 的 `tcp_to_a_documentation_address_follows_the_rules` 记录里是规则的原文 `DOMAIN,target.test,DIRECT` 与策略 `DIRECT`、`crates/rurge-engine/tests/tun_dns.rs` 的 `a_name_asked_through_the_responder_connects_to_its_upstream` 记录里是名字与同一条规则；UDP 是 `udp_to_a_fake_address_reaches_its_name_and_answers_from_it` 与 `a_rejected_udp_flow_answers_with_icmp`），CI 运行 40611702392 见过它们；L3 是 W48、W18、W27（Windows）、M37、M16、M25（macOS）、L39、L17、L27（Linux）与 P25、P31，一项也没有做。还缺真机上的验收。
+1. 浏览器、命令行工具与不支持代理的应用的流量出现在请求记录里并按规则分流：L1 是经内存设备与引擎的端到端用例——`crates/rurge-engine/tests/tun.rs` 的 `tcp_to_a_fake_address_reaches_its_name`（两条连接连到 fake 地址，记录里 `dst` 是名字与端口、`listener` 是 `Tun`、`rule` 是 `DOMAIN,target.test,DIRECT` 的原文、`policy` 是 `DIRECT`、状态是完成）、`tcp_to_a_documentation_address_follows_the_rules`（真实地址按 `IP-CIDR` 规则走 `socks5` 策略，SOCKS5 上游收到 `192.0.2.10:80`，记录里 `rule` 是那条 `IP-CIDR` 规则、`policy` 是 `Proxy`）、`a_rejected_udp_flow_answers_with_icmp`（被拒绝的 UDP 流拿到 ICMP“管理上禁止”，记录里 `listener` 是 `Tun`、`dst` 是名字与端口、状态是拒绝）、`udp_to_a_fake_address_reaches_its_name_and_answers_from_it`（数据报按名字到达、回包的源是 fake 地址）；`crates/rurge-engine/tests/tun_dns.rs` 的 `a_name_asked_through_the_responder_connects_to_its_upstream`（问应答器拿到 fake 地址，连上去的记录里 `dst` 是名字与端口、`rule` 是 `DOMAIN,target.test,DIRECT`、状态是完成）；CI 运行 40611702392 见过它们；L3 是 W48、W18、W27（Windows）、M37、M16、M25（macOS）、L39、L17、L27（Linux）与 P25、P31，一项也没有做。还缺真机上的验收。
 2. `ping` 正常：L1 是虚拟网卡内核的假 pinger 与引擎经内存设备发的一次回显——`crates/rurge-tun/src/tests/icmp/echo.rs` 的 `a_ping_to_a_real_address_goes_through_the_pinger_v4`、`the_reply_carries_the_payload_the_pinger_gave` 与 `crates/rurge-engine/tests/tun.rs` 的 `a_ping_to_a_fake_address_goes_to_the_names_address`，CI 见过；L3 是 W26、W41、M24、L26 与 P31，没有做。
 3. fake-IP 映射与真实连接一致：L1 是应答器给出的地址、连接到来时反查的名字、规则看到的目标（`a_name_asked_through_the_responder_connects_to_its_upstream`、`tcp_to_a_fake_address_reaches_its_name`、`the_fake_addresses_are_turned_back_while_the_tun_runs_and_not_after`），CI 见过；L3 是 W18、M16、L17 与 P33 ～ P35、P26，没有做。
 4. 网络切换后 30 秒内恢复：L1 是假探测器上的去抖与下游时序（`crates/rurge/src/cli/network.rs` 的 `a_burst_of_changes_is_told_at_its_first_and_at_its_end` 与 `a_change_after_a_quiet_second_is_told_at_once`，虚拟时钟）与引擎换网络之后清缓存、重算子网组（`crates/rurge-engine/tests/network.rs` 的 `a_network_change_flushes_the_resolver` 与 `a_network_change_moves_the_subnet_group`），CI 见过；30 秒本身是墙钟上的事，L3 是 W24、M22、L24 与 P31，没有做。
-5. `PROCESS-NAME` 在三个平台命中：L1 与 CI 是三个平台上查测试进程自己的用例（`crates/rurge-platform/src/procinfo/` 下 Windows / Linux / macOS 各一条 `this_process_owns_its_loopback_sockets`，Windows 的 `the_system_process_has_no_path`，macOS 的 `a_process_that_does_not_exist_is_not_described`）与起真实二进制的 `crates/rurge/tests/cli.rs` 的 `a_process_rule_matches_the_test_process`，CI 运行 40611702392 在三个平台上都跑过；L3 是 W11、W12、W15、M9、M11、M13、L10、L11、L13 与 P17，没有做。
+5. `PROCESS-NAME` 在三个平台命中：L1 与 CI 是三个平台上查测试进程自己的用例（`crates/rurge-platform/src/procinfo/` 下 Windows / Linux / macOS 各一条 `this_process_owns_its_loopback_sockets`；Windows 另有 `the_system_process_has_no_path`（`describe(4)` 是 `("System", None)`）、`a_process_that_does_not_exist_is_not_described`（`describe(u32::MAX)` 是 `None`）与 `the_addresses_of_the_machine_include_its_loopback_address`；macOS 另有 `a_process_that_does_not_exist_is_not_described`（`u32::MAX` 与 `i32::MAX` 都是 `None`））与起真实二进制的 `crates/rurge/tests/cli.rs` 的 `a_process_rule_matches_the_test_process`（文件名、完整路径与目录前缀三种写法各命中一次，记录里的 `pid` 是本进程、`processPath` 是本二进制），CI 运行 40611702392 在三个平台上都跑过；L3 是 W11、W12、W15、M9、M11、M13、L10、L11、L13 与 P17，没有做。
 6. 性能基准达到 NFR-01 目标的 70% 以上：阶段 3 / M5 重跑的 B1、B2、b3（内存设备，一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；数字照 M5 计划「执行期修正记录」第 61 ～ 63 行）：B1 八个量出来的行都过 0.7 Gbit/s 的线，最低 4.065 Gbit/s；B2 门槛读数 403.7 MB 在 429 MB 的线内、保守读数 445.3 MB 超线 16.3 MB（归项目所有者）；b3 中位数 0.9 µs、p99 2.9 µs 在 200 µs 的线内，最大 4542.2 µs 是线的 22.7 倍。真实设备上的数没有量（总设计 Q7）。
-7. 需求逐句对照过代码、三个数照实写：就是本文第一部分（141 行、十张表），三个数与第四个数见上面的表；功能需求不齐备这一句照实写，不写成齐备。
-8. 三平台 CI 绿：最近一次被 CI 见过的运行是 40611702392（`3a76b80`，2026-10-28，三个平台的 `check` 与 `bench` 都通过）；之后 M5 与 M6 的提交 CI 没有见过，所以这一条要等那一次推送之后的运行。
+7. 需求逐句对照过代码、三个数照实写：就是本文第一部分（141 行、十张表），三个数与第四个数见上面的表；没有做完的五句照实写。
+8. 三平台 CI 绿：最近一次被 CI 见过的运行是 40611702392（`3a76b80`，2026-10-28，三个平台的 `check` 与 `bench` 都通过）；`3a76b80` 之后的提交（含 M5 与 M6）CI 没有见过，所以这一条要等那一次推送之后的运行。
 
 ## 第一部分：需求逐句对照代码
 
@@ -116,7 +116,7 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
 | FR-IN-10 | 「`[SSID Setting]`」：行的读法与按当前网络选中的那一行 | 做了 | `crates/rurge-config/src/ssid_setting.rs::parse`（`parse_line` 里的 `parameters_start`：表达式写到第一个"前面是空白、写成 `<认识的键>=`"的地方为止，所以 SSID 里可以有空格；列表的下一项与下一个参数照兼容性清单 9.4 节分）与 `crates/rurge-config/src/config.rs::effective_ssid_setting`（按书写顺序第一行命中的，整行取用、不与后面的行合并）；已知限制：表达式后面直接跟逗号（`SSID:Home, suspend=true`）时逗号成了表达式的一部分，这一行永不命中，也没有诊断（兼容性清单 9.4 节第一行的"已知限制"、M1 计划「延后事项」第 9 行；拿 `rurge check` 试过，没有诊断） | `crates/rurge-config/src/ssid_setting.rs`：`ssid_setting_lines_are_read`、`the_expression_ends_in_front_of_the_first_known_key`、`lines_keep_their_order_and_their_places`、`the_dns_servers_of_a_line_are_read_as_those_of_general_are`、`an_unknown_parameter_is_said_and_never_quoted`；`crates/rurge-config/src/config.rs`：`the_first_matching_ssid_setting_line_is_in_effect`（三行，命中第一行，第二行的 `suspend` 不被合进来）、`an_ssid_setting_follows_subnet_exp_wifi_always_match` | — |
 | FR-IN-10 | 「`suspend`」 | 有意不同（已登记） | `crates/rurge-config/src/ssid_setting.rs` 的 `SsidSetting` 里的 `suspend`（不写是 false）→ `crates/rurge/src/cli/run.rs::takeover_paused_here`；桌面上的 `suspend` 是"接管暂停"（总设计第 9.7 节、P3-D15）：撤掉系统代理与虚拟网卡，监听器与 API 照常。手册只写了 iOS 的"隧道不断、只是不处理"，差异登记在兼容性清单 9.4 节 `suspend` 一行（🟡）；需求的字面改不改是总设计第 16 节的 Q8，归项目所有者 | `crates/rurge-config/src/ssid_setting.rs`：`suspend_takes_the_booleans_of_general`（`true` / `TRUE` / `1` / `yes` 与 `false` / `0` / `no`）；`crates/rurge/tests/cli.rs`：`the_network::the_system_proxy_pauses_on_a_suspend_network`、`the_network::the_last_state_asked_for_during_a_pause_is_the_one_that_stands_after_it`、`the_network::a_pause_that_ends_switches_the_system_proxy_off_if_it_is_still_on_and_was_asked_off`、`the_network::a_reload_that_changes_the_ssid_setting_ends_or_begins_the_pause` | W7、W8、M5、L6 |
 | FR-IN-10 | 「`dns-server` / `encrypted-dns-server` 覆盖」 | 做了 | `crates/rurge-config/src/ssid_setting.rs` 的 `add_dns_server` 与 `add_encrypted_dns_server`（`off` 是空表）；建一代时 `crates/rurge-engine/src/stack.rs` 的 `DnsOverride::for_network` 与 `apply` 把写了的列表整张替换，没写的那一项保持全局的，`[Host]` 里 `server:` 写明的服务器不受影响；网络变化让覆盖变了，`crates/rurge/src/cli/run.rs` 用内存里的配置重建一代 | `crates/rurge-config/src/ssid_setting.rs`：`the_dns_servers_of_a_line_are_read_as_those_of_general_are`、`a_list_nothing_was_read_into_is_not_the_lines`；`crates/rurge-engine/tests/network.rs`：`the_ssid_setting_of_the_network_sets_the_dns_servers`（解析器真的问覆盖后的服务器、`encrypted-dns-server=off` 去掉加密 DNS）、`the_dns_override_of_a_generation_is_known`；`crates/rurge/tests/cli.rs`：`the_network::the_ssid_setting_dns_servers_follow_the_network`（`GET /v1/dns` 的 `upstreams` 跟着网络变）、`the_network::a_rebuild_for_the_dns_of_a_network_neither_reads_the_profile_nor_forgets_a_choice`、`the_network::a_rebuild_for_the_dns_of_a_network_prints_what_the_new_generation_says` | W6、M5、L6、P4 |
-| FR-IN-10 | 「`tfo-behaviour`」 | 没有做完（已登记） | `crates/rurge-config/src/ssid_setting.rs` 的 `TfoBehaviour` 与 `read_parameters`：三个值照读（不分大小写），读到就一条 `W0029`，值写错是 `W0028`。缺的是 TCP Fast Open 本身：`socket2` 0.6 没有安全封装、工作区禁 `unsafe`（兼容性清单 4.3 节 `tfo`，"有安全封装后再评估"），登记在兼容性清单 9.4 节 `tfo-behaviour` 一行（🟡）；使用者看到的是连接不受这一行影响、`rurge check` 一条 `W0029` | `crates/rurge-config/src/ssid_setting.rs`：`tfo_behaviour_takes_three_values`（三个值都读，每个一条 `W0029`；`always` 是 `W0028` 且不被引用） | — |
+| FR-IN-10 | 「`tfo-behaviour`」 | 没有做完（已登记） | `crates/rurge-config/src/ssid_setting.rs` 的 `TfoBehaviour` 与 `read_parameters`：三个值照读（不分大小写），读到就一条 `W0029`，值写错是 `W0028`。缺的是 TCP Fast Open 本身：`socket2` 0.6 没有安全封装、工作区禁 `unsafe`（兼容性清单 4.3 节 `tfo`，"有安全封装后再评估"），登记在兼容性清单 9.4 节 `tfo-behaviour` 一行（🔁，那一行的备注指回本文「没有做完的」）；使用者看到的是连接不受这一行影响、`rurge check` 一条 `W0029` | `crates/rurge-config/src/ssid_setting.rs`：`tfo_behaviour_takes_three_values`（三个值都读，每个一条 `W0029`；`always` 是 `W0028` 且不被引用） | — |
 | FR-IN-10 | 「`suspend` 时停止接管并释放系统代理…」 | 做了 | `crates/rurge/src/cli/run.rs` 的 `Takeover`（`begin` 与 `follow`）与 `takeover_paused_here`：暂停时把开着的系统代理恢复成使用者原来的设置（同关闭系统代理），离开时想开着的重新指向 rurge；暂停只在内存里，不进 `state.json`；增强模式的那一半是本表「…与 TUN」一行，归任务 4 | `crates/rurge/tests/cli.rs`：`the_network::the_system_proxy_pauses_on_a_suspend_network`（系统代理的文件后端：暂停时文件回到原值、`GET` 说 `false`、`state.json` 里没有暂停的痕迹）、`the_network::the_last_state_asked_for_during_a_pause_is_the_one_that_stands_after_it`、`the_network::a_pause_that_ends_switches_the_system_proxy_off_if_it_is_still_on_and_was_asked_off` | W7、W8、M5、L6 |
 | FR-IN-10 | 「…与 TUN」 | 做了 | `crates/rurge/src/cli/run.rs::Takeover::begin`（启动时判这个网络要不要暂停、一行 INFO `takeover paused on this network`；想要的是 `Takeover::new` 从 `--enhanced-mode` 记下的，暂停时调用方不打开、也不清掉它）、同文件的 `Takeover::follow`（进入暂停：开着的增强模式按关闭的次序关掉、`enhanced_wanted = true`，失败一行 ERROR、模式仍是关的；离开暂停：`enhanced_wanted` 且关着才开，失败一行 ERROR `cannot turn the enhanced mode on when the pause ends; it stays off`、不重试；两个方向都是增强模式先于系统代理）、同文件的 `Takeover::switch_enhanced`（每一次得到成功应答的 `POST` 都把它记成要的那个，暂停与否都一样；关闭回 500 时也记成关——M4a 计划「执行期修正记录」第 97 行）；想要的状态起于 `--enhanced-mode`，之后有两处改它，最后一次生效：进入暂停时模式开着（`Takeover::follow` 只在模式开着时把 `enhanced_wanted` 记成真，模式关着时不改它——重新打开失败之后、或设备自己坏了之后，模式是关着的而 `enhanced_wanted` 仍是真，所以下一次离开暂停会再试着打开一次）、每一次得到成功应答的 `POST`。登记的读法：桌面上的 `suspend` 是接管暂停——撤掉系统代理与虚拟网卡，监听器与 API 照常（兼容性清单 9.4 节 `suspend` 一行、P3-D15、M4-D18）。已知限制：暂停结束时重新打开失败只记一条 ERROR、不重试，直到下一次进出暂停或下一次 `POST`（`docs/api/phase3.md`「接管暂停：增强模式的那一半」一节、M4 设计第 9.9 节与 M4-D18）；掉线不算离开——读不到任何网络的那一瞬（睡眠唤醒、Wi-Fi 重连、拔插扩展坞）不算换了网络，暂停不结束（兼容性清单 9.4 节 `suspend` 一行） | `crates/rurge/tests/run/enhanced_mode.rs`：`the_enhanced_mode_waits_on_a_suspend_network_and_opens_when_it_is_left`（暂停网络上启动时后端一个动作也没有、`GET` 是假；离开时打开一次、装进去的是 `routes_of(false)`；回去时关一次；再离开时打开是第二次）、`a_post_during_the_pause_is_noted_and_done_when_it_ends`（暂停期间 `POST true` 回 200 而后端文件是 `null`；离开时开一次；暂停期间 `POST false` 之后离开仍关着，打开只有一次） | W25、M23、L25 |
 | FR-IN-10 | 「API 保持可用」 | 做了 | 暂停只改系统代理：API 服务器（`crates/rurge/src/cli/run.rs` 里的 API 任务）不经过暂停的判断，暂停期间 `crates/rurge-api/src/routes/features.rs::get_feature` 与 `set_feature` 照常答；经代理端口来的请求也照旧 | `crates/rurge/tests/cli.rs`：`the_network::the_system_proxy_pauses_on_a_suspend_network`（暂停期间 `GET` 与 `POST /v1/features/system_proxy` 都答 200）、`the_network::the_last_state_asked_for_during_a_pause_is_the_one_that_stands_after_it`（暂停期间两次 `POST` 都 200，且什么也不设） | — |
@@ -312,7 +312,7 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
 
 | # | 需求（优先级） | 这一句 | 缺什么、使用者今天看到什么 | 去向 |
 | --- | --- | --- | --- | --- |
-| 37 | FR-IN-10（P1） | 「`tfo-behaviour`」 | 缺的是 TCP Fast Open 本身：`socket2` 0.6 没有安全封装、工作区禁 `unsafe`（兼容性清单 4.3 节 `tfo`，"有安全封装后再评估"），登记在兼容性清单 9.4 节 `tfo-behaviour` 一行（🟡）。三个值照读，每个一条 `W0029`；连接不受这一行影响 | 项目所有者（M6 设计第 13 节第 4 条：放进哪个阶段） |
+| 37 | FR-IN-10（P1） | 「`tfo-behaviour`」 | 缺的是 TCP Fast Open 本身：`socket2` 0.6 没有安全封装、工作区禁 `unsafe`（兼容性清单 4.3 节 `tfo`，"有安全封装后再评估"），登记在兼容性清单 9.4 节 `tfo-behaviour` 一行（🔁，那一行的备注指回本文「没有做完的」）。三个值照读，每个一条 `W0029`；连接不受这一行影响 | 项目所有者（M6 设计第 13 节第 4 条：放进哪个阶段） |
 | 132 | NFR-01 | 「目标值（阶段 1 与阶段 3 建立基准后校准）」 | 缺的是“校准”：目标值没有对着基准读数改过，也没有真实设备上的数（三个基准都是内存设备上的量：`crates/rurge-tun/src/tests/bench/mod.rs` 三条带 `#[ignore]` 的用例、`docs/testing.md` 的基准三行、阶段 3 / M5 计划「执行期修正记录」第 61 ～ 63 行）。另一件是阶段 3 / M3b 计划「延后事项」第 29 行的引擎一侧：TUN 里排队的 UDP 由 `TunOptions.udp_bytes`（缺省 64 MiB）管，引擎每个 UDP 关联今天的上限是 `crates/rurge-engine/src/udp.rs` 的 `QUEUED_BYTES`（1 MiB，超出的数据报丢掉，WARN 至多每 60 秒一条，与关联数、流数两个上限共用一个计时），UDP 洪水下的验收没有做。使用者今天看到的：没有区别——这两件都是目标值与验收的事，不是行为 | 项目所有者（总设计第 16 节 Q7：真实设备上的数字由谁、在哪台机器上量；M6 设计第 3.4 节；M3b 计划「延后事项」第 29 行） |
 | 133 | NFR-01 | 「fake-IP 应答 < 0.2 ms」 | 中位数 0.9 µs、p99 2.9 µs 在 0.2 ms 的线内，**最大 4542.2 µs 是线的 22.7 倍**（阶段 3 / M5 计划「执行期修正记录」第 63 行；内存设备上的一次运行，不是 CI）；真实设备上没有量，所以不写成“达到”。使用者今天看到的：没有区别——这是目标值有没有达到的事，不是行为 | 项目所有者（总设计第 16 节 Q7；最大值算不算没达到、70% 的线怎么用，由所有者定；最大值的那个解释由 M3c 计划「延后事项」第 12 行登记——读代码得出、没有改池验证，M4 没有在真实设备上量过） |
 | 139 | NFR-07 | 「平台特定代码隔离在 `rurge-platform` 与 `rurge-tun`」 | 缺的是 `crates/rurge-config/src/config.rs::Platform::current`（第 49、51 行的 `cfg!`）在库 crate 的生产代码里，没有设计登记它（M6 设计第 86 行、M6-D20、P7 的名单）。使用者今天看到的：没有差别——这是代码放在哪个 crate 里的问题，不是行为的问题 | 项目所有者（M6-D20：挪进可执行文件或平台层并在设计里登记，还是改 AR-02 / NFR-07 的字面） |
@@ -349,7 +349,7 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
 
 ### 第 1 条：浏览器、命令行工具与不支持代理的应用的流量出现在请求记录里，并按规则分流
 
-- **L1**：`crates/rurge-engine/tests/tun.rs`：`tcp_to_a_documentation_address_follows_the_rules`（经内存设备的 TCP 会话，记录里 `dst` 是目标与端口、`listener` 是 `Tun`、`rule` 是 `DOMAIN,target.test,DIRECT` 的原文、`policy` 是 `DIRECT`、状态是完成）、`udp_to_a_fake_address_reaches_its_name_and_answers_from_it`（UDP 数据报按名字到达、回包的源是 fake 地址）、`a_rejected_udp_flow_answers_with_icmp`（被规则拒绝的 UDP 流拿到 ICMP“管理上禁止”）、`tun_traffic_is_counted_under_its_listener`（从虚拟网卡进来的流量计在 `listener.tun` 名下）；`crates/rurge-engine/tests/tun_dns.rs`：`a_name_asked_through_the_responder_connects_to_its_upstream`（问应答器拿到 fake 地址、连上去的记录里是名字与同一条规则）。全量门禁：86 个结果行、4723 通过、0 失败、13 忽略（一台机器上的一次运行，不是 CI）。
+- **L1**：`crates/rurge-engine/tests/tun.rs`：`tcp_to_a_fake_address_reaches_its_name`（经内存设备的 TCP 会话连到 fake 地址，记录里 `dst` 是名字与端口、`listener` 是 `Tun`、`listen_port` 是 0、`transport` 是 TCP、`src` 是应用的端点、`rule` 是 `DOMAIN,target.test,DIRECT` 的原文、`policy` 是 `DIRECT`、状态是完成）、`tcp_to_a_documentation_address_follows_the_rules`（真实地址 `192.0.2.10:80` 按 `IP-CIDR,192.0.2.0/24,Proxy` 走 `socks5` 策略：SOCKS5 上游收到一条 CONNECT `(1, "192.0.2.10", 80)`，记录里 `dst` 是 `192.0.2.10:80`、`rule` 是那条 `IP-CIDR` 规则、`policy` 是 `Proxy`）、`udp_to_a_fake_address_reaches_its_name_and_answers_from_it`（UDP 数据报按名字到达、回包的源是 fake 地址）、`a_rejected_udp_flow_answers_with_icmp`（被规则拒绝的 UDP 流拿到 ICMP“管理上禁止”，记录里 `listener` 是 `Tun`、`dst` 是名字与端口、状态是拒绝）、`tun_traffic_is_counted_under_its_listener`（经虚拟网卡的会话之后，`crates/rurge-engine/src/observe.rs` 的 `TrafficStats::by_listener` 里 `Tun` 那一格的上行与下行都大于 0，`Http` 与 `Socks5` 两格不动）；`crates/rurge-engine/tests/tun_dns.rs`：`a_name_asked_through_the_responder_connects_to_its_upstream`（问应答器拿到 fake 地址，连上去之后的记录里 `dst` 是名字与端口、`listener` 是 `Tun`、`rule` 是 `DOMAIN,target.test,DIRECT`、状态是完成、`notes` 是空的）。全量门禁：86 个结果行、4723 通过、0 失败、13 忽略（一台机器上的一次运行，不是 CI）。
 - **L2**：`tests/privileged/tests/linux_netns.rs`：`a_tcp_round_trip_and_a_ping_go_through_the_adapter_and_out_direct`（没有运行过）。
 - **L3**：Windows W48、W18、W27；macOS M37、M16、M25；Linux L39、L17、L27；与平台无关 P25、P31（清单开头「第 14 节八条各由哪几项证明」的索引表）。一项也没有做过。
 - **CI**：上面引的 L1 用例都在 `3a76b80` 上，CI 运行 40611702392 在三个平台上跑过并通过。
@@ -376,12 +376,12 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
 - **L1**：`crates/rurge/src/cli/network.rs`：`a_burst_of_changes_is_told_at_its_first_and_at_its_end`（一阵变化在第一次与最后一次各报一次）、`a_change_after_a_quiet_second_is_told_at_once`（静默一秒之后的变化立即报）、`a_change_that_is_undone_inside_the_second_is_not_told_again`（一秒之内变回原样不重报），三条都用虚拟时钟（`#[tokio::test(start_paused = true)]`）；`crates/rurge-platform/src/netenv/watch.rs`：`a_burst_of_messages_is_one_hint_after_it_has_gone_quiet`、`a_burst_that_does_not_end_is_a_hint_after_a_second`（去抖本身：一阵路由消息合成一个提示，不结束的一阵一秒后也给一个）；下游：`crates/rurge-engine/tests/network.rs` 的 `a_network_change_flushes_the_resolver`（换网络清 DNS 缓存）、`a_network_change_moves_the_subnet_group`（`subnet` 组重选）。全量门禁的数同第 1 条。
 - **L2**：`tests/privileged/tests/linux_netns.rs`：`a_killed_run_is_undone_by_the_next_start`（被杀掉的 rurge 留下的网卡、路由、`rp_filter` 由下一次启动还回去——恢复的那一半，不是 30 秒本身；没有运行过）。
 - **L3**：Windows W24；macOS M22；Linux L24；与平台无关 P31（三个平台各做一次，记从换网络到第一次成功的秒数）。一项也没有做过。30 秒是墙钟上的数，L1 的计时是虚拟时钟，量不了它。
-- **CI**：上面引的 L1 用例都在 `3a76b80` 上，那次运行在三个平台跑过并通过；`netenv` 的平台读取器在三个平台都编译（`each_platform_is_read_by_its_own_reader`）、Linux 与 macOS 的读取只在 CI 上对着假命令与文件跑过。
+- **CI**：上面引的 L1 用例都在 `3a76b80` 上，那次运行在它们编译得到的平台上跑过并通过；`crates/rurge-platform/src/netenv` 的 `linux.rs` 与 `macos.rs` 不带平台的 `cfg`（`mod.rs` 里 `mod linux;`、`mod macos;` 不带条件），它们对着假命令与文件的单元用例在这台开发机与 CI 的三个平台上都跑；真正读 Linux 与 macOS 本机的那一条是 `mod.rs` 的 `reading_this_machine_does_not_panic`（`Backend::Platform`，只断言不变式），它在 CI 的 Linux 与 macOS 上跑过。
 - **还缺什么**：真机上真的换网络（Wi-Fi 互换、插拔网线）与睡眠唤醒之后的 30 秒（P31、W24、M22、L24）；真实 Wi-Fi 的事件与路由套接字的反应在 L1 里是假的。
 
 ### 第 5 条：`PROCESS-NAME` 在三个平台命中
 
-- **L1 与 CI**：三个平台上查测试进程自己的用例——`crates/rurge-platform/src/procinfo/windows.rs`、`linux.rs`、`macos.rs` 各一条 `this_process_owns_its_loopback_sockets`（本进程的一条回环 TCP 连接与一个回环 UDP 套接字，PID 是本进程、名字与路径是 `current_exe()` 解开的路径；只在各自平台上编译），Windows 另有 `the_system_process_has_no_path`（PID 4 走一遍映像路径），macOS 另有 `a_process_that_does_not_exist_is_not_described`（问一次 `proc_pidpath`）；`crates/rurge/tests/cli.rs` 的 `a_process_rule_matches_the_test_process`（三个平台都编译；起真实的二进制，按文件名、完整路径与目录前缀三种写法各命中一次，并断言记录里的 `pid` 与 `processPath`）。这几条都在 `3a76b80` 上，CI 运行 40611702392 在三个平台上跑过并通过——这是阶段 3 里少数由 CI 在三个平台直接证明的行为。全量门禁的数同第 1 条。已知限制：规则走到 `PROCESS-NAME` 而进程还没查到时至多等 200 毫秒（`PROCESS_WAIT`），到期按“不知道”判（兼容性清单 3.1 节 `PROCESS-NAME` 一行、M2-D3）。
+- **L1 与 CI**：三个平台上查测试进程自己的用例——`crates/rurge-platform/src/procinfo/windows.rs`、`linux.rs`、`macos.rs` 各一条 `this_process_owns_its_loopback_sockets`（本进程的一条回环 TCP 连接与一个回环 UDP 套接字，PID 是本进程、名字与路径是 `current_exe()` 解开的路径；只在各自平台上编译）；Windows 另有 `the_system_process_has_no_path`（`describe(4)` 是 `("System", None)`：PID 4 问得出名字、问不出路径）、`a_process_that_does_not_exist_is_not_described`（`describe(u32::MAX)` 是 `None`）与 `the_addresses_of_the_machine_include_its_loopback_address`（本机地址里有 `127.0.0.1`）；macOS 另有 `a_process_that_does_not_exist_is_not_described`（`u32::MAX` 不问系统、`i32::MAX` 问了系统，两个都是 `None`）；`crates/rurge/tests/cli.rs` 的 `a_process_rule_matches_the_test_process`（三个平台都编译；起真实的二进制，按文件名、完整路径与目录前缀三种写法各命中一次，并断言记录里的 `pid` 是本进程、`processPath` 是本二进制）。这几条都在 `3a76b80` 上，CI 运行 40611702392 在它们编译得到的平台上跑过并通过——这是阶段 3 里少数由 CI 在三个平台直接证明的行为。全量门禁的数同第 1 条。已知限制：规则走到 `PROCESS-NAME` 而进程还没查到时至多等 200 毫秒（`PROCESS_WAIT`），到期按“不知道”判（兼容性清单 3.1 节 `PROCESS-NAME` 一行、M2-D3）。
 - **L2**：没有（进程识别的系统读法各有自己的用例，不靠特权用例）。
 - **L3**：Windows W11、W12、W15；macOS M9、M11、M13；Linux L10、L11、L13；与平台无关 P17。一项也没有做过。
 - **还缺什么**：真机上用真实的程序验证（浏览器、命令行工具、别的设备与虚拟机来的连接）；W13 的 SMB 与目录联接、M10 的 `sysctl` 情形、L12 的 `hidepid` 这些只在清单里写着的环境。
@@ -391,7 +391,7 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
 - **L1**：三个基准是 `crates/rurge-tun/src/tests/bench/mod.rs` 里带 `#[ignore]` 的三条用例（B1、B2、b3），只手动跑；缺省门禁与 CI 都不跑它们。阶段 3 / M5 重跑的读数（一台 Windows 11 x86-64 开发机、release、`TUN_BENCH_FAR=memory`，不是 CI；阶段 3 / M5 计划「执行期修正记录」第 61 ～ 63 行）：B1 八个量出来的行都过 0.7 Gbit/s 的线，最低 4.065 Gbit/s；B2 门槛读数 403.7 MB 在 429 MB 的线内，保守读数 445.3 MB 超线 16.3 MB（归项目所有者，M5 延后第 4 行）；b3 中位数 0.9 µs、p99 2.9 µs 在 200 µs 的线内，最大 4542.2 µs 是线的 22.7 倍。
 - **L2**：没有（基准不是特权用例；它们在内存设备上跑）。
 - **L3**：P19（B1，真实设备上的单流吐吞）、P20（B2）、P21（fake 应答的延迟与转发的往返），三个平台各做一次——清单开头索引表的第 6 条。一项也没有做过。
-- **CI**：`bench` 一步只在 Linux 上 `cargo bench --no-run` 编 `rurge-rules` 与 `rurge-dns` 的基准，这三条用例不在其中；`3a76b80` 上那次运行的 `bench` 一步通过，但证明的是它们编得起来。
+- **CI**：三条基准是 `rurge-tun` 的单元用例（`#[test]` 加 `#[ignore]`），CI 的测试一步（`.github/workflows/ci.yml` 的 `cargo test --workspace --no-fail-fast`，三个平台）编译它们、不跑；`bench` 是另一个任务，只在 `ubuntu-latest` 上跑 `cargo bench -p rurge-rules --no-run` 与 `cargo bench -p rurge-dns --no-run`，与这三条无关。
 - **还缺什么**：真实设备上的三项基准（P19 ～ P21，三个平台各一次），以及目标值照着基准校准（总设计 Q7）；B2 的保守读数超线要不要调预算，归项目所有者。
 
 ### 第 7 条：需求逐句对照过代码，三个数照实写
@@ -400,7 +400,7 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
 - **L2**：不适用。
 - **L3**：不适用（清单里这一行写的就是本文第一部分）。
 - **CI**：不适用。
-- **还缺什么**：需求已逐句对过（这一条本身做完了），但**功能需求不齐备**：P1 的 #37（`tfo-behaviour`）没有做完（已登记），非功能需求另有 4 句没有做完；这五句放进哪个阶段要项目所有者定。
+- **还缺什么**：需求已逐句对过（这一条本身做完了），但有一句功能需求没有做完：P1 的 #37（`tfo-behaviour`，缺的是 TCP Fast Open 本身）；非功能需求另有 4 句没有做完（#132、#133、#139、#141）。这五句放进哪个阶段要项目所有者定。
 
 ### 第 8 条：三平台 CI 绿
 
@@ -412,7 +412,7 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
 
 ## 靠手工验收的
 
-「真机上」一列点到的项，按平台数（同一项被几行点到只算一次；清单里写着“三个平台各做一次”的 P 项每个平台各算一次——P19、P20、P21 与 P33 ～ P41 共 12 项）：
+「真机上」一列点到的项，按平台数（同一项被几行点到只算一次）。「真机上」一列点到的 P 项里，要三个平台各做一次的 12 项每个平台各算一次：P19 ～ P21（清单开头索引表第 6 条按平台分开列它们）与 P33 ～ P41（各自的一行写着“三个平台各做一次”）。P31、P32 的一行也这样写，但没有哪一行点到它们，在下面的 39 项里：
 
 | 平台 | 只有这个平台的项 | “三个平台各做一次”的 P 项 | 合计 |
 | --- | ---: | ---: | ---: |
@@ -423,7 +423,7 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
 
 141 行共点到 133 个不同的项（W 39、M 32、L 30、P 32）；清单里共 172 项（W 50、M 39、L 42、P 41），另 39 项没有任何一行点到。另有两行点到 L2 的用例名（`a_real_wintun_dll_passes`、`a_tcp_round_trip_and_a_ping_go_through_the_adapter_and_out_direct`），它们不是清单里的项。**一项也没有做过。**
 
-没有任何一行点到的 39 项：L3、L7、L8、L9、L21、L23、L24、L30、L31、L32、L37、L39、M7、M8、M21、M22、M28、M35、M37、P9、P15、P16、P18、P22、P26、P29、P31、P32、W9、W10、W23、W24、W31、W32、W38、W39、W40、W46、W48。其中 8 项由清单开头「第 14 节八条各由哪几项证明」的索引表点到——W48、M37、L39（第 1 条）、W24、M22、L24（第 4 条）、P31（第 1、2、4 条）、P26（第 3 条）；其余 31 项是各节的例外情形（没有 resolved 的 Linux、严格 `rp_filter`、中文系统、Hyper-V / WSL、与全隧道 VPN 共存一类的环境）、NFR-02 的空闲开销与冷启动，以及与其他手工项互为备份的项（清单里写着“同 W23”“照 W46 做”的），不是这 141 句里哪一句的唯一证据。验收文档的 141 行里没有一句要它们，手工验收时按清单的次序照做就行。
+没有任何一行点到的 39 项：L3、L7、L8、L9、L21、L23、L24、L30、L31、L32、L37、L39、M7、M8、M21、M22、M28、M35、M37、P9、P15、P16、P18、P22、P26、P29、P31、P32、W9、W10、W23、W24、W31、W32、W38、W39、W40、W46、W48。其中 8 项由清单开头「第 14 节八条各由哪几项证明」的索引表点到——W48、M37、L39（第 1 条）、W24、M22、L24（第 4 条）、P31（第 1、2、4 条）、P26（第 3 条）。其余 31 项自己在做的事是：NFR-02 的空闲开销与冷启动（W9、W10、M7、M8、L8、L9；NFR-02 不在本文对照的四条非功能需求里）；防环，即 rurge 自己的连接不进虚拟网卡（W23，与写着“同 W23”的 M21、L23）；`block-quic=adaptive` 与 `auto`（W46，与写着“照 W46 做”的 M35、L37）；`reflect` 送回的包在真实系统上的去向与终止（P32）；压力与大流量（W39 的大流量下载、P22 的一阵上千个查询、P29 的 `dns_tcp_max`）；特定的环境（L21 没有 systemd-resolved、L31 严格的 `rp_filter`、W32 中文系统、W38 开着 Hyper-V / WSL / ICS、M28 与 L30 与全隧道 VPN 共存——两项都写“同 W30”）；L2 特权用例在一次性的虚拟机里跑一遍（L32）；长时间与日常使用（P9 的 IPv6 临时地址轮换 24 小时、P18 的日常使用一天、L7 的睡眠与唤醒、L3 的“不引发 Wi-Fi 扫描”）；设计细节的核对（W31 的 `metric=1` 被接受、W40 网络快照里没有虚拟网卡、P15 的 IPv6 回环与双栈客户端、P16 的进程不进 INFO）。验收文档的 141 行里没有一句要它们，手工验收时按清单的次序照做就行。
 
 ## 靠 CI 的
 
@@ -431,20 +431,20 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
 
 - `crates/rurge-platform/src/procinfo/linux.rs`：`this_process_owns_its_loopback_sockets`（只在 Linux 上编译；CI 运行 40611702392 通过）。
 - `crates/rurge-platform/src/procinfo/macos.rs`：`this_process_owns_its_loopback_sockets`、`a_process_that_does_not_exist_is_not_described`（只在 macOS 上编译；同上通过）。
-- 反过来看：`crates/rurge-platform/src/procinfo/windows.rs` 的 `this_process_owns_its_loopback_sockets` 与 `the_system_process_has_no_path` 只在 Windows 上编译（那次运行在 Windows 的任务里通过）；`crates/rurge/tests/cli.rs` 的 `sighup_reloads_the_profile` 带 `#[cfg(unix)]`（Linux 与 macOS 上编译，那次运行通过）。
+- 反过来看：`crates/rurge-platform/src/procinfo/windows.rs` 里只在 Windows 上编译的是 `this_process_owns_its_loopback_sockets`、`the_system_process_has_no_path`、`a_process_that_does_not_exist_is_not_described` 与 `the_addresses_of_the_machine_include_its_loopback_address`（那次运行在 Windows 的任务里通过）；`crates/rurge/tests/cli.rs` 的 `sighup_reloads_the_profile` 带 `#[cfg(unix)]`（Linux 与 macOS 上编译，那次运行通过）。
 - 没有缺省用例、第一次被编译就是 CI 的是 `crates/rurge-platform/src/tun/linux.rs` 与 `tun/macos.rs` 的 `Device`（含 `set_iff`、`utun_connect`）与 `tun/windows/wintun.rs` 的 FFI 那一层：`3a76b80` 上那次运行把它们编过了，但缺省的用例一条也不建网卡，它们的证据在 L2 与手工项里（见上二节与「本机没有能红的用例的」）。
-- `crates/rurge-platform/src/netenv` 的三个平台读取器在每个宿主上都编译、运行时按 `Os` 选（用例 `each_platform_is_read_by_its_own_reader`），不是“只在某个平台编译”；Linux 与 macOS 的读取在开发机上只对着假命令与文件测过，那次运行见过它们。
+- `crates/rurge-platform/src/netenv` 的三个平台读取器在每个宿主上都编译、运行时按 `Os` 选（用例 `each_platform_is_read_by_its_own_reader`），不是“只在某个平台编译”；Linux 与 macOS 的读取对着假命令与文件的单元用例在开发机与 CI 的三平台都跑过，真读本机的那一条（`reading_this_machine_does_not_panic`，只断言不变式）在 CI 的 Linux 与 macOS 上跑过。
 
 **L2 特权用例**（写好、没有运行过；要不要在 CI 上启用是总设计 Q4，归项目所有者）：`tests/privileged/tests/linux_netns.rs` 的 `a_tcp_round_trip_and_a_ping_go_through_the_adapter_and_out_direct`、`rurges_own_dns_queries_do_not_enter_the_adapter`、`a_killed_run_is_undone_by_the_next_start`，与 `crates/rurge-platform/src/tun/windows/wintun.rs` 的 `a_real_wintun_dll_passes`（要 `RURGE_TEST_WINTUN_DLL` 与一份 WireGuard LLC 签名的 `wintun.dll`）。
 
-**CI 见过的与没有见过的**：最近一次被 CI 见过的运行是 40611702392（`3a76b80`，2026-10-28，三个平台的 `check` 与 `bench` 都通过）。`3a76b80` 上就在的用例，那一次运行在三个平台上跑过；`origin/main` 仍是 `3a76b80`，所以 **M5（`e6666c1` 之后）与 M6（`e17e45b` 之后）的提交 CI 没有见过**，这两个时期加的用例——包括本文补的三条（`5e00564`、`fcf9464`、`37616a0`）与 M5 自己的用例——也都没有被它跑过。CI 的测试一步是 `cargo test --workspace --no-fail-fast`（三个平台），带 `#[ignore]` 的用例（三条基准与 Windows 的 `a_lookup_with_many_connections_open`）不跑；`bench` 一步只在 Linux 上 `cargo bench --no-run` 编 `rurge-rules` 与 `rurge-dns` 的基准，三条基准用例不在其中。
+**CI 见过的与没有见过的**：最近一次被 CI 见过的运行是 40611702392（`3a76b80`，2026-10-28，三个平台的 `check` 与 `bench` 都通过）。`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），那一次运行在它们编译得到的平台上都跑过并通过；`origin/main` 仍是 `3a76b80`，所以 **`3a76b80` 之后的提交都在本地、CI 没有见过**——读 M4 的 CI 的两个文档提交、M5 与 M6 的全部；这两个时期加的用例（含本文补的三条 `5e00564`、`fcf9464`、`37616a0` 与 M5 自己的用例）也没有被它跑过。CI 的测试一步是 `cargo test --workspace --no-fail-fast`（三个平台），带 `#[ignore]` 的用例不跑（全工作区 13 条，与阶段 3 有关的是三条基准与 Windows 的 `a_lookup_with_many_connections_open`）；`bench` 任务只在 Linux 上 `cargo bench --no-run` 编 `rurge-rules` 与 `rurge-dns` 的基准，三条基准用例不在其中。
 
 ## 留给项目所有者的
 
 下面各事的去向都是项目所有者；后来的会话不要自己定。
 
 1. **手工验收**：阶段 1（`docs/acceptance/phase1-manual.md`）、阶段 2（`docs/acceptance/phase2-manual.md`）、阶段 3（`docs/acceptance/phase3-manual.md`，172 项：W 50、M 39、L 42、P 41，按节 M1 37、M2 23、M3 19、M4 55、M5 19、M6 19）三份清单，一项也没有做过。阶段 3 的清单里被本文“真机上”一列点到 133 项（见「靠手工验收的」），L2 的四条特权用例也没有运行过。
-2. **推送与读回 CI**：M5（`e6666c1` 之后）与 M6（`e17e45b` 之后）的提交都在本地，`origin/main` 仍是 `3a76b80`。推送之后要读那次运行的注解与任务摘要，把本文、「靠 CI 的」与 `docs/status.md` 里写着“CI 没有见过”的每一处改成读到的结果。
+2. **推送与读回 CI**：`3a76b80` 之后的提交（读 M4 的 CI 的两个文档提交、M5 与 M6 的全部）都在本地，`origin/main` 仍是 `3a76b80`。推送之后要读那次运行的注解与任务摘要，把本文、「靠 CI 的」与 `docs/status.md` 里写着“CI 没有见过”的每一处改成读到的结果。
 3. **总设计 Q1 ～ Q8**，尤其：Q3（Wintun 的再分发要不要先向 WireGuard LLC 书面确认、发行包附不附带官方签名的 `wintun.dll`——NFR-11 的“确认”就是 #141）、Q4（L2 特权用例要不要在 CI 上启用、macOS 与 Windows 的冒烟）、Q7（NFR-01 在真实设备上怎样量、由谁量——#132、#133）、Q8（需求文档要不要为 `[IP Rewrite]` 另立一行；FR-IN-10 的 `suspend` 与 FR-OUT-11 的“UDP 443”改不改字面——#99、#104 与「有意不同的」里 `suspend` 那一行）。
 4. **对照查出的**：
    - 「需求文字的问题」4 句（#20、#32、#99、#104）：各句的需求文字或阶段栏怎么改。
@@ -452,7 +452,7 @@ CI：`3a76b80` 上就在的用例，CI 运行 40611702392 在三个平台上跑�
    - 阶段 1 推过来、阶段 3 有了结论、而需求行的阶段栏仍写 1（或列了几个阶段）的六句：#120（TUN 设备名，记「有意不同（已登记）」）、#121（`SUBNET`）、#123（`Host` 那一半，记「不属于阶段 3」）、#124（网络切换清空）、#125（RST 保护）、#126（FR-HTTP-10 的来源之进程）。要定的是这几句的阶段栏改不改、怎么改（出处是 `docs/acceptance/phase1-acceptance.md`「需求文字的问题」第一张表的第 11、12、20、27、29 行；#126 的出处是同一份文档第 410 行 FR-HTTP-10 那一句，它的阶段栏写「1 基础 / 4 完整」）。
    - 兼容性清单 5.2 节的 `MCCMNC:` 一行与同节的旧键 `cellular` 一行：阶段栏含 3、状态标 🔁（图例里是“记录一条日志”），而代码与清单自己的备注都写着不记日志，与 `CLAUDE.md` 兼容性原则“解析并忽略 + 记录日志”不一致；要不要加日志由所有者定（相对照，同类的 `vif-mode` 与 `cellular-fallback` 在阶段栏含 3 的那四行 🔁 里是记日志的）。
    - INFO 里的规则文字带着 `PROCESS-NAME` 的值（阶段 3 / M2 计划「延后事项」第 20 行；`CLAUDE.md`「日志的分级」已列为已知例外）。
-   - 阶段 3 / M3b 计划「延后事项」第 29 行的引擎一侧（UDP 的字节上限）：那里写的去曑是“阶段 3 / M6”，M6 不写代码；#132 照实记着它，新的去向由所有者定。
+   - 阶段 3 / M3b 计划「延后事项」第 29 行的引擎一侧（UDP 的字节上限）：那里写的去向是“阶段 3 / M6”，M6 不写代码；#132 照实记着它，新的去向由所有者定。
    - B2 的保守读数超线（M5 延后第 4 行）与 b3 的最大值算不算没达到（M3c 延后第 12 行）：预算要不要调、70% 的线怎么用。
    - 「本机没有能红的用例的」3 句（#1、#2、#3）：Windows、Linux、macOS 的设备与系统一侧要 L2 或真机才能证；要补的用例（含 L2 的那几条）列在那一张表里。
 5. **M1 ～ M5 归所有者的延后项**：照 `docs/status.md` 各节「去向写着项目所有者的」汇总，不在 M6 里改——包括总设计 Q2（改用现成的包，或开 `nix` 的 `socket` / `net` 特性）、Q5（Windows 防 DNS 泄漏的严格模式，WFP）；`queue_bytes` 要不要把每个包的 16 字节算进预算（M4a 延后第 9 行）；`state.json` 的写不 `fsync`（M4a 延后第 13 行）；`rurge-proto-wireguard` 的 `stack.rs` 里 `TCP_BUFFER` 那个读源码得出、没有观察过的 panic 风险（M3a 延后第 1 行，修法归所有者选）；`the_copy_takes_over_from_a_local_file_once_a_check_has_succeeded` 偶发 `ConnectionRefused`（M4b 延后第 1 行）；错误文本里 rurge 自己的网卡名、地址与前缀要不要照 P7 改成固定的一句（M4c 延后第 10 行）；仓库里 26 份旧文件写着这台开发机带 Windows 账户名的本机路径，改不改（M4d 一节）；`TunDevice::dropped()` 要不要发给 API；启动时第一次下载与增强模式打开的次序（M4b 延后第 10 行）。
