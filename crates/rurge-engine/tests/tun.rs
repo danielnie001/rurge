@@ -39,7 +39,7 @@ use rurge_tun::testing::{FakePinger, PingScript};
 use rurge_tun::{Ending, Hooks, TunOptions};
 use std::collections::VecDeque;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -307,6 +307,48 @@ async fn a_ping_to_a_fake_address_goes_to_the_names_address() {
         "a reply to a ping nobody forwards"
     );
     assert_eq!(rig.pinger.pinged().len(), 1, "the pinger was asked once");
+}
+
+// ---- `[IP Rewrite]`
+
+/// `[IP Rewrite]` of the profile acts on the packets through the adapter before
+/// any rule or policy sees them, and the next generation's table replaces it:
+/// a `drop` and then a `reject`, the second answered with ICMP, neither of them
+/// a request.
+#[tokio::test]
+async fn ip_rewrite_in_the_profile_acts_on_the_tun_and_a_reload_replaces_it() {
+    let rules = guarded("");
+    let rig = Rig::new(Profile {
+        sections: "[IP Rewrite]\n203.0.113.9 = drop\n",
+        ..profile(&rules)
+    })
+    .await;
+    let mut icmp = rig.app.divert_icmp();
+    let to: SocketAddr = "203.0.113.9:9000".parse().unwrap();
+    rig.app.inject(packets::udp(app_udp(), to, b"dropped"));
+    wait_until("the datagram to be dropped", || {
+        rig.tun.counters().ip_rewrite == 1
+    })
+    .await;
+    assert!(udp_records(&rig.h).is_empty(), "no request record");
+
+    // the next generation rejects the same address: the packet is answered
+    // with ICMP and still is no request
+    let text = Profile {
+        sections: "[IP Rewrite]\n203.0.113.9 = reject\n",
+        ..profile(&rules)
+    }
+    .text(rig.h.dns.addr());
+    rig.h
+        .engine
+        .swap_runtime(runtime(rig.data_dir(), &text, rig.h.engine.shared()).await);
+    rig.app.inject(packets::udp(app_udp(), to, b"rejected"));
+    prohibited_from(&mut icmp, to.ip()).await;
+    wait_until("the second datagram to be counted", || {
+        rig.tun.counters().ip_rewrite == 2
+    })
+    .await;
+    assert!(udp_records(&rig.h).is_empty(), "no request record");
 }
 
 // ---- the process behind a session
@@ -915,4 +957,5 @@ async fn the_tuns_settings_carry_the_dns_settings_of_the_profile() {
     assert!(!settings.allow_dns_svcb);
     assert!(settings.hijack_dns.is_empty());
     assert!(settings.always_real_ip.is_empty());
+    assert!(settings.ip_rewrite.is_empty());
 }

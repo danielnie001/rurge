@@ -95,7 +95,8 @@ impl Runtime {
         // this generation's resolver, and are forwarded as its profile says;
         // its DNS responder asks the same resolver for the names `[Host]`
         // maps and for the queries it forwards, and answers as the profile
-        // says of `always-real-ip`, `allow-dns-svcb` and `hijack-dns`
+        // says of `always-real-ip`, `allow-dns-svcb` and `hijack-dns`; and its
+        // `[IP Rewrite]` is this generation's table
         let tun = Arc::new(TunSettings {
             resolver: stack.resolver.clone(),
             icmp_forwarding: config.general.icmp_forwarding,
@@ -103,6 +104,7 @@ impl Runtime {
             always_real_ip: config.general.always_real_ip.clone(),
             allow_dns_svcb: config.general.allow_dns_svcb,
             hijack_dns: config.general.hijack_dns.clone(),
+            ip_rewrite: Arc::new(config.ip_rewrite.clone()),
         });
         // the engine's cell, not one of this generation's: the network is
         // the machine's, and outlives the profile it is read against
