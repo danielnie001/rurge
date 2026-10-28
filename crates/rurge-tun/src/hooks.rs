@@ -4,7 +4,7 @@
 //! into the world. The engine implements the first two; the third is a
 //! platform's (M4), and a test's until then.
 
-use rurge_config::{HijackTarget, HostList, PreMatchLayer, SessionInfo};
+use rurge_config::{HijackTarget, HostList, IpRewrite, PreMatchLayer, SessionInfo};
 use rurge_dns::hosts::HostAction;
 use rurge_net::BoxFuture;
 use rurge_net::connector::Resolve;
@@ -47,6 +47,10 @@ pub struct TunSettings {
     /// `hijack-dns`: the DNS servers whose queries the responder answers
     /// (UDP over IPv4 only).
     pub hijack_dns: Vec<HijackTarget>,
+    /// `[IP Rewrite]` of this generation: asked with the destination of each
+    /// packet whose IP header passed its own checks and that is no martian
+    /// (design 8.3). The receive task reads it once for each batch.
+    pub ip_rewrite: Arc<IpRewrite>,
 }
 
 /// What the responder asks of this generation's resolver.

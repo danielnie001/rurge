@@ -10,6 +10,7 @@ use crate::dispatch::{route, shard_of};
 use crate::stats::Stats;
 use crate::tcp::Tuple;
 use crate::{Counters, TunOptions};
+use rurge_config::IpRewrite;
 use std::hash::RandomState;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -45,6 +46,7 @@ fn a_shard_queue_beyond_queue_bytes_drops_and_counts_queue_full() {
         let routed = route(
             packet,
             true,
+            &IpRewrite::default(),
             std::slice::from_ref(&to_shard),
             &stats,
             &queue_bytes,

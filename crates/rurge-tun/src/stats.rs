@@ -19,6 +19,8 @@ pub(crate) struct Stats {
     pub(crate) beyond_window: AtomicU64,
     pub(crate) rst_limited: AtomicU64,
     pub(crate) icmp_limited: AtomicU64,
+    pub(crate) ip_rewrite: AtomicU64,
+    pub(crate) reflected: AtomicU64,
     pub(crate) stack_panics: AtomicU64,
     warnings: Warnings,
 }
@@ -45,15 +47,17 @@ impl Stats {
     }
 
     /// Counts a packet dropped for `reason` and says so: at WARN the first
-    /// time the TUN drops one for the reason, without an address, at DEBUG
-    /// after that with the ends of the packet where they were read, and not
-    /// at all for a martian. Every drop goes through here.
+    /// time the TUN drops one for a reason that is not wanted, without an
+    /// address, at DEBUG after that with the ends of the packet where they
+    /// were read, and not at all for a martian. A drop that is wanted (the
+    /// profile's `[IP Rewrite]` asked for it) is never said at WARN and is
+    /// said at DEBUG every time. Every drop goes through here.
     pub(crate) fn drop(&self, reason: Reason, src: Option<IpAddr>, dst: Option<IpAddr>) {
         Stats::count(self.counter(reason));
         if reason.is_silent() {
             return;
         }
-        if self.warnings.first_time(reason) {
+        if !reason.is_wanted() && self.warnings.first_time(reason) {
             tracing::warn!(
                 "tun: a packet was dropped (reason: {reason}); later drops for this reason are logged at debug level"
             );
@@ -65,6 +69,12 @@ impl Stats {
                 "tun: packet dropped"
             );
         }
+    }
+
+    /// Counts a packet `[IP Rewrite]` sent back: the writer's queue took it.
+    /// It is no drop, and nothing is said of it.
+    pub(crate) fn reflected(&self) {
+        Stats::count(&self.reflected);
     }
 
     fn counter(&self, reason: Reason) -> &AtomicU64 {
@@ -79,6 +89,7 @@ impl Stats {
             Reason::BeyondWindow => &self.beyond_window,
             Reason::RstLimited => &self.rst_limited,
             Reason::IcmpLimited => &self.icmp_limited,
+            Reason::IpRewrite => &self.ip_rewrite,
         }
     }
 
@@ -95,6 +106,8 @@ impl Stats {
             beyond_window: read(&self.beyond_window),
             rst_limited: read(&self.rst_limited),
             icmp_limited: read(&self.icmp_limited),
+            ip_rewrite: read(&self.ip_rewrite),
+            reflected: read(&self.reflected),
             stack_panics: read(&self.stack_panics),
         }
     }

@@ -15,6 +15,7 @@ mod options;
 mod outcomes;
 mod prematch;
 mod rebuild;
+mod rewrite;
 pub(crate) mod support;
 mod syn;
 mod tcp;

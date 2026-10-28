@@ -10,10 +10,12 @@ use crate::bytes::{QueuedBytes, Reserved};
 use crate::context::Context;
 use crate::device::Device;
 use crate::icmp;
-use crate::packet::{self, Parsed, Reason, Transport};
+use crate::packet::{self, Classified, Hit, Parsed, Reason, Transport};
+use crate::rewrite;
 use crate::stats::Stats;
 use crate::tcp::Tuple;
 use crate::udp;
+use rurge_config::IpRewrite;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -40,10 +42,14 @@ pub(crate) async fn run(
             ctx.life.device_failed(&error);
             return;
         }
+        // the table of the generation in use is read once for the batch, so
+        // every packet of it is handled as the same profile asked
+        let settings = ctx.hooks.settings();
         for packet in batch.drain(..) {
-            let Some((parsed, packet)) = route(
+            let Some(routed) = route(
                 packet,
                 ctx.options.ipv6,
+                &settings.ip_rewrite,
                 &shards,
                 &ctx.stats,
                 &queue_bytes,
@@ -51,13 +57,19 @@ pub(crate) async fn run(
             ) else {
                 continue;
             };
-            match parsed.transport {
-                Transport::Udp { .. } => udp::receive(&ctx, &parsed, &packet),
-                Transport::Icmp { .. } => icmp::receive(&ctx, &parsed, &packet),
-                // `route` gives a TCP segment to its shard and hands none back.
-                // Debug builds assert, so that a test notices; release builds do
-                // nothing, for a panic here would stop all reception.
-                Transport::Tcp(_) => debug_assert!(false, "route gives a TCP segment to a shard"),
+            match routed {
+                Routed::Local(parsed, packet) => match parsed.transport {
+                    Transport::Udp { .. } => udp::receive(&ctx, &parsed, &packet),
+                    Transport::Icmp { .. } => icmp::receive(&ctx, &parsed, &packet),
+                    // `route` gives a TCP segment to its shard and hands none
+                    // back. Debug builds assert, so that a test notices;
+                    // release builds do nothing, for a panic here would stop
+                    // all reception.
+                    Transport::Tcp(_) => {
+                        debug_assert!(false, "route gives a TCP segment to a shard")
+                    }
+                },
+                Routed::Rewrite(hit, packet) => rewrite::handle(&ctx, &hit, packet),
             }
         }
     }
@@ -83,28 +95,48 @@ impl Ingress {
     }
 }
 
+/// Where a packet the device gave goes.
+pub(crate) enum Routed {
+    /// A UDP datagram or an echo request, with what [`packet::classify`] read
+    /// of it and the packet cut to its length: for a session or the TUN's own
+    /// echo requests.
+    Local(Parsed, Vec<u8>),
+    /// A packet `[IP Rewrite]` matched, with what the table asked of it and the
+    /// packet cut to its length: for [`rewrite::handle`], and no stack.
+    Rewrite(Hit, Vec<u8>),
+}
+
 /// Sends `packet` where it is handled once it has passed the checks of
 /// [`packet::classify`], or drops it and says why. What follows the IP packet
-/// is cut off, so a shard is given the packet and no more. A TCP segment goes
-/// to its shard, holding the bytes it takes up out of `queue_bytes` until the
-/// shard has it; a segment that those bytes have no room for, or that finds
-/// the shard's queue full, is counted `queue_full`. A UDP datagram and an echo
-/// request, which are not for a shard, are given back with what `classify`
-/// read of them (and nothing is counted for them here).
+/// is cut off, so a shard is given the packet and no more. A packet `[IP
+/// Rewrite]` matched comes back whole for its action, cut to its length. A TCP
+/// segment goes to its shard, holding the bytes it takes up out of
+/// `queue_bytes` until the shard has it; a segment that those bytes have no
+/// room for, or that finds the shard's queue full, is counted `queue_full`. A
+/// UDP datagram and an echo request, which are not for a shard, are given back
+/// with what `classify` read of them (and nothing is counted for them here).
 pub(crate) fn route(
     mut packet: Vec<u8>,
     ipv6: bool,
+    rewrite: &IpRewrite,
     shards: &[mpsc::Sender<Ingress>],
     stats: &Stats,
     queue_bytes: &Arc<QueuedBytes>,
     shard_key: &RandomState,
-) -> Option<(Parsed, Vec<u8>)> {
-    let parsed = match packet::classify(&packet, ipv6) {
-        Ok(parsed) => parsed,
+) -> Option<Routed> {
+    let classified = match packet::classify(&packet, ipv6, rewrite) {
+        Ok(classified) => classified,
         Err(dropped) => {
             let (src, dst) = dropped.ends.unzip();
             stats.drop(dropped.reason, src, dst);
             return None;
+        }
+    };
+    let parsed = match classified {
+        Classified::Passed(parsed) => parsed,
+        Classified::Rewrite(hit) => {
+            packet.truncate(hit.len);
+            return Some(Routed::Rewrite(hit, packet));
         }
     };
     packet.truncate(parsed.len);
@@ -132,7 +164,7 @@ pub(crate) fn route(
             }
             None
         }
-        Transport::Udp { .. } | Transport::Icmp { .. } => Some((parsed, packet)),
+        Transport::Udp { .. } | Transport::Icmp { .. } => Some(Routed::Local(parsed, packet)),
     }
 }
 

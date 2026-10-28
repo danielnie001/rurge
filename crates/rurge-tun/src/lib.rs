@@ -23,6 +23,7 @@ mod hooks;
 mod icmp;
 mod limit;
 mod packet;
+mod rewrite;
 mod session;
 mod space;
 mod stats;
@@ -181,6 +182,7 @@ impl Tun {
             mtu,
             sessions: udp::Sessions::default(),
             ids: fragment::Ids::new(),
+            admission: admission.clone(),
             icmp_limit: Mutex::new(icmp::limiter()),
             echoes: AtomicUsize::new(0),
             responder,
@@ -663,8 +665,8 @@ pub enum Ending {
 }
 
 /// What the TUN has counted of the packets it dropped, one count for each
-/// reason (the logs call a reason by the name of its field), and of the panics
-/// of the TCP stack.
+/// reason (the logs call a reason by the name of its field), of the panics
+/// of the TCP stack, and of the packets `[IP Rewrite]` sent back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
     /// Packets that cannot be read: a version other than 4 and 6, lengths that do not fit, an IPv4 header checksum that does not hold, a transport header that is cut short or has port 0, the checksum of a UDP datagram or of an ICMP echo request that does not hold (or that a UDP datagram over IPv6 does not have).
@@ -675,7 +677,7 @@ pub struct Counters {
     pub martian: u64,
     /// Packets nothing handles: IPv6 while it is off, extension headers, protocols other than TCP, UDP and ICMP, an ICMP that is no echo request, and echo requests while `icmp-forwarding` is off; UDP datagrams when the dialer carries no UDP; replies from an address of the other family than the app's.
     pub unsupported: u64,
-    /// Packets for a shard whose queue was full, or that did not fit the bytes the shards' queues may hold (`queue_bytes`); datagrams for a UDP session whose queue was full, or that did not fit the bytes the sessions' queues may hold (`udp_bytes`); DNS queries that found the responder's queue full; the messages that the writer's queue had no room for and that are made without waiting: ICMP messages for refused UDP flows, ICMP messages for datagrams to rurge's own addresses, the local replies to echo requests to those addresses, and the answers of the DNS responder.
+    /// Packets for a shard whose queue was full, or that did not fit the bytes the shards' queues may hold (`queue_bytes`); datagrams for a UDP session whose queue was full, or that did not fit the bytes the sessions' queues may hold (`udp_bytes`); DNS queries that found the responder's queue full; the messages and reflected packets that the writer's queue had no room for and that are made without waiting: ICMP messages for refused UDP flows and for packets `[IP Rewrite]` rejected, ICMP messages for datagrams to rurge's own addresses, the local replies to echo requests to those addresses, the answers of the DNS responder, and the packets `[IP Rewrite]` sent back.
     pub queue_full: u64,
     /// SYNs, UDP datagrams and echo requests to an address of rurge's own space that names nothing; replies from a name that has no address.
     pub unknown_fake: u64,
@@ -683,10 +685,14 @@ pub struct Counters {
     pub busy: u64,
     /// Segments with data past the window the TUN last told of, dropped because the receive buffer had room.
     pub beyond_window: u64,
-    /// Resets not sent because of the limit on resets.
+    /// Resets not sent because of the limit on resets, which the TUN's own resets and those `[IP Rewrite]` answers a SYN with share.
     pub rst_limited: u64,
-    /// ICMP messages for refused UDP flows that the limit on ICMP held back (100 in 3 seconds).
+    /// ICMP messages for refused UDP flows and for packets `[IP Rewrite]` rejected that the limit on ICMP held back (100 in 3 seconds).
     pub icmp_limited: u64,
+    /// Packets that `[IP Rewrite]` rejected or dropped: what the profile asked for, so never warned about.
+    pub ip_rewrite: u64,
+    /// Packets that `[IP Rewrite]` sent back with their two addresses swapped. No drop, and not logged.
+    pub reflected: u64,
     /// Times the TCP stack of a shard panicked and the shard was started over, its connections reset.
     pub stack_panics: u64,
 }

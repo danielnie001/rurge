@@ -3,7 +3,7 @@
 //! `divert_udp` and `divert_icmp` take every packet of their kind.
 
 use super::stacks;
-use crate::packet::{Transport, classify};
+use crate::packet::{Transport, checks};
 use crate::testing::packets::{self, IcmpSeen, UdpSeen};
 use crate::tests::support::{WITHIN, addr, eventually, ip_around, syn_v4, within};
 use smoltcp::phy::ChecksumCapabilities;
@@ -34,7 +34,7 @@ fn the_packets_a_test_makes_are_read_back_and_a_damaged_one_is_not() {
                 payload: b"hello".to_vec()
             })
         );
-        let parsed = classify(&packet, true).expect("the TUN lets it through");
+        let parsed = checks(&packet, true).expect("the TUN lets it through");
         assert_eq!(
             parsed.transport,
             Transport::Udp {
@@ -103,7 +103,7 @@ fn the_icmp_a_test_makes_and_reads_is_checked_both_ways() {
     for (src, dst) in app_and_far_ends() {
         let (src, dst) = (src.ip(), dst.ip());
         let request = packets::echo_request(src, dst, 0x1234, 7, b"data");
-        let parsed = classify(&request, true).expect("the TUN lets it through");
+        let parsed = checks(&request, true).expect("the TUN lets it through");
         assert_eq!(
             parsed.transport,
             Transport::Icmp {

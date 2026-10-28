@@ -9,6 +9,7 @@
 
 use crate::fragment::{Ids, ip_packets};
 use crate::tcp::Tuple;
+use rurge_config::{IpRewrite, IpRewriteAction};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     IPV4_HEADER_LEN, Icmpv4Packet, Icmpv6Packet, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr,
@@ -21,6 +22,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 /// ICMP's type, code and checksum, and the identifier and sequence number an
 /// echo has after them: the shortest header of a message whose type is read.
 const ICMP_HEADER: usize = 8;
+/// The length of IPv6's fixed header: where its payload begins, and the length
+/// of the IP header of an IPv6 packet.
+const IPV6_HEADER_LEN: usize = 40;
 const ICMPV4_ECHO_REQUEST: u8 = 8;
 const ICMPV6_ECHO_REQUEST: u8 = 128;
 
@@ -78,6 +82,9 @@ pub(crate) enum Reason {
     RstLimited,
     /// An ICMP message for a refused UDP flow held back by the limit on ICMP.
     IcmpLimited,
+    /// A packet `[IP Rewrite]` rejected or dropped: what the profile asked
+    /// for, so it is counted and said at DEBUG, never at WARN.
+    IpRewrite,
 }
 
 impl Reason {
@@ -85,6 +92,14 @@ impl Reason {
     /// broadcast all the time (design 14).
     pub(crate) fn is_silent(self) -> bool {
         self == Reason::Martian
+    }
+
+    /// A packet dropped because `[IP Rewrite]` asked for it: counted and said
+    /// at DEBUG every time, and never at WARN, because it is what the profile
+    /// asked for rather than a packet that something could not handle (M5
+    /// design 8.7).
+    pub(crate) fn is_wanted(self) -> bool {
+        self == Reason::IpRewrite
     }
 }
 
@@ -101,6 +116,7 @@ impl fmt::Display for Reason {
             Reason::BeyondWindow => "beyond_window",
             Reason::RstLimited => "rst_limited",
             Reason::IcmpLimited => "icmp_limited",
+            Reason::IpRewrite => "ip_rewrite",
         })
     }
 }
@@ -177,38 +193,180 @@ pub(crate) struct Segment {
     pub(crate) payload_len: usize,
 }
 
+/// What [`classify`] makes of a packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Classified {
+    /// Every check passed, as before: the transport header is read.
+    Passed(Parsed),
+    /// `[IP Rewrite]` has a line for the destination: what is past the IP
+    /// header was not read.
+    Rewrite(Hit),
+}
+
+/// A packet `[IP Rewrite]` matched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Hit {
+    pub(crate) action: IpRewriteAction,
+    pub(crate) src: IpAddr,
+    pub(crate) dst: IpAddr,
+    /// Where the IP packet ends, as [`Parsed::len`].
+    pub(crate) len: usize,
+    /// The IP header's length: IPv4's IHL × 4, IPv6's 40.
+    pub(crate) header_len: usize,
+}
+
+/// What a packet `reject` matched is answered with (M5 design 8.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    Nothing,
+    Reset,
+    Prohibited,
+}
+
 /// Runs the checks on `packet`, in this order, the first that holds deciding:
-/// a packet that cannot be read; IPv6 while `ipv6` is off (an IPv6 packet is
-/// turned away on its version nibble, however damaged, so that check is
-/// really the first); a fragment; an address no packet has; a protocol that
-/// is not TCP, UDP or ICMP; a transport header that is cut short or names
-/// port 0; the checksum of a UDP datagram, which does not hold or, over IPv6,
-/// is left out; an ICMP message that is no echo request; the checksum of an
-/// echo request, which does not hold. The checksum of TCP is not looked at
-/// (design 4.4), and nor is that of an ICMP message that is no echo request,
-/// which is dropped as it is. Whatever is after the end of the IP packet is
-/// left out of [`Parsed::len`]. A packet turned away comes back with the
-/// reason and, once its IP header passed its own checks, its two addresses
-/// ([`Dropped`]).
-pub(crate) fn classify(packet: &[u8], ipv6: bool) -> Result<Parsed, Dropped> {
+/// IPv6 while `ipv6` is off (an IPv6 packet is turned away on its version
+/// nibble, however damaged, so that check is really the first); a packet that
+/// cannot be read; an address no packet has; a line of `[IP Rewrite]` for the
+/// destination, which answers what the profile asks and stops there; a
+/// fragment; a protocol that is not TCP, UDP or ICMP; a transport header that
+/// is cut short or names port 0; the checksum of a UDP datagram, which does
+/// not hold or, over IPv6, is left out; an ICMP message that is no echo
+/// request; the checksum of an echo request, which does not hold. The checksum
+/// of TCP is not looked at (M3 design 4.4), and nor is that of an ICMP message
+/// that is no echo request, which is dropped as it is. Whatever is after the
+/// end of the IP packet is left out of [`Parsed::len`]. A packet turned away
+/// comes back with the reason and, once its IP header passed its own checks,
+/// its two addresses ([`Dropped`]).
+pub(crate) fn classify(
+    packet: &[u8],
+    ipv6: bool,
+    rewrite: &IpRewrite,
+) -> Result<Classified, Dropped> {
     // IPv6 is dropped before any of its header is read, however damaged
     if !ipv6 && packet.first().is_some_and(|byte| byte >> 4 == 6) {
         return Err(Dropped::unread(Reason::Unsupported));
     }
-    parse(packet)
+    parse(packet, rewrite)
+}
+
+/// [`classify`] with an empty `[IP Rewrite]`: every check a packet passes on
+/// its way to a stack, with none of the lines that would take it instead. For
+/// the tests of the checks themselves.
+#[cfg(test)]
+pub(crate) fn checks(packet: &[u8], ipv6: bool) -> Result<Parsed, Dropped> {
+    match classify(packet, ipv6, &IpRewrite::default()) {
+        Ok(Classified::Passed(parsed)) => Ok(parsed),
+        Ok(Classified::Rewrite(_)) => unreachable!("an empty [IP Rewrite] has no line"),
+        Err(dropped) => Err(dropped),
+    }
 }
 
 /// The TCP segment of a packet that [`classify`] let through, read once more
 /// for the shard it was sent to: the shard's queue and turns take plain
 /// packets. `None` for a packet that is no TCP segment, which no shard is
-/// sent; nothing is counted here.
+/// sent; nothing is counted here, and `[IP Rewrite]` is not asked: a segment
+/// that is asked of this is not one the table takes.
 pub(crate) fn segment(packet: &[u8]) -> Option<Segment> {
-    match parse(packet) {
-        Ok(Parsed {
+    match parse(packet, &IpRewrite::default()) {
+        Ok(Classified::Passed(Parsed {
             transport: Transport::Tcp(segment),
             ..
-        }) => Some(segment),
+        })) => Some(segment),
         _ => None,
+    }
+}
+
+/// What a packet `reject` matched is answered with, the first rule that holds
+/// deciding (M5 design 8.5, plan P11): a later fragment, an ICMP error and a
+/// type that cannot be read answer nothing (RFC 1122 3.2.2, RFC 4443 2.4); an
+/// unfragmented TCP segment answers a reset only for a SYN without ACK, and
+/// nothing for a reset or a header that cannot be read; everything else
+/// answers with "administratively prohibited". The two addresses were read by
+/// [`classify`], and `packet` is cut to its length: what cannot be read there
+/// answers nothing rather than failing.
+pub(crate) fn refusal(packet: &[u8]) -> Refusal {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => refusal_v4(packet),
+        Some(6) => refusal_v6(packet),
+        _ => Refusal::Nothing,
+    }
+}
+
+fn refusal_v4(packet: &[u8]) -> Refusal {
+    let Ok(ip) = Ipv4Packet::new_checked(packet) else {
+        return Refusal::Nothing;
+    };
+    // a later fragment has no transport header to read: only the first answers
+    if ip.frag_offset() != 0 {
+        return Refusal::Nothing;
+    }
+    // ICMPv4's errors are 3, 4, 5, 11 and 12; a first fragment is looked at too
+    if ip.next_header() == IpProtocol::Icmp {
+        let Some(&kind) = ip.payload().first() else {
+            return Refusal::Nothing;
+        };
+        if matches!(kind, 3 | 4 | 5 | 11 | 12) {
+            return Refusal::Nothing;
+        }
+    }
+    // only an unfragmented TCP segment is read for a reset
+    if !ip.more_frags() && ip.next_header() == IpProtocol::Tcp {
+        return refusal_tcp(packet);
+    }
+    Refusal::Prohibited
+}
+
+fn refusal_v6(packet: &[u8]) -> Refusal {
+    let Ok(ip) = Ipv6Packet::new_checked(packet) else {
+        return Refusal::Nothing;
+    };
+    let payload = ip.payload();
+    let mut fragmented = false;
+    let mut next_header = ip.next_header();
+    if next_header == IpProtocol::Ipv6Frag {
+        // next header, reserved, the offset in units of 8 bytes and the more
+        // fragments bit, and the identification
+        if payload.len() < 8 {
+            return Refusal::Nothing;
+        }
+        if u16::from_be_bytes([payload[2], payload[3]]) >> 3 != 0 {
+            return Refusal::Nothing;
+        }
+        fragmented = true;
+        next_header = IpProtocol::from(payload[0]);
+        // a first fragment of ICMPv6 still says its type, after its header;
+        // types below 128 are the errors (RFC 4443 2.4)
+        if next_header == IpProtocol::Icmpv6 {
+            let Some(&kind) = payload.get(8) else {
+                return Refusal::Nothing;
+            };
+            if kind < 128 {
+                return Refusal::Nothing;
+            }
+        }
+    } else if next_header == IpProtocol::Icmpv6 {
+        let Some(&kind) = payload.first() else {
+            return Refusal::Nothing;
+        };
+        if kind < 128 {
+            return Refusal::Nothing;
+        }
+    }
+    // only an unfragmented TCP segment is read for a reset
+    if !fragmented && next_header == IpProtocol::Tcp {
+        return refusal_tcp(packet);
+    }
+    Refusal::Prohibited
+}
+
+fn refusal_tcp(packet: &[u8]) -> Refusal {
+    match segment(packet) {
+        // a header that cannot be read, or port 0
+        None => Refusal::Nothing,
+        // never a reset for a reset
+        Some(segment) if segment.rst => Refusal::Nothing,
+        Some(segment) if segment.syn && !segment.ack => Refusal::Reset,
+        Some(_) => Refusal::Prohibited,
     }
 }
 
@@ -413,15 +571,15 @@ fn option_at(options: &[u8], at: usize) -> Option<(u8, usize)> {
 }
 
 /// Every check of [`classify`] but the one of the `ipv6` option.
-fn parse(packet: &[u8]) -> Result<Parsed, Dropped> {
+fn parse(packet: &[u8], rewrite: &IpRewrite) -> Result<Classified, Dropped> {
     match packet.first().map(|byte| byte >> 4) {
-        Some(4) => read_ipv4(packet),
-        Some(6) => read_ipv6(packet),
+        Some(4) => read_ipv4(packet, rewrite),
+        Some(6) => read_ipv6(packet, rewrite),
         _ => Err(Dropped::unread(Reason::Malformed)),
     }
 }
 
-fn read_ipv4(packet: &[u8]) -> Result<Parsed, Dropped> {
+fn read_ipv4(packet: &[u8], rewrite: &IpRewrite) -> Result<Classified, Dropped> {
     let ip = Ipv4Packet::new_checked(packet).map_err(|_| Dropped::unread(Reason::Malformed))?;
     // smoltcp takes a header of fewer than five words, and then reads the
     // TCP header from inside the IP header (design 5.3, H4)
@@ -430,38 +588,48 @@ fn read_ipv4(packet: &[u8]) -> Result<Parsed, Dropped> {
     }
     // the header is sound: the addresses are the packet's to give from here on
     let (src, dst) = (ip.src_addr(), ip.dst_addr());
-    if ip.more_frags() || ip.frag_offset() != 0 {
-        return Err(Dropped::between(Reason::Fragment, src.into(), dst.into()));
-    }
     if martian_v4(src, dst) {
         return Err(Dropped::between(Reason::Martian, src.into(), dst.into()));
     }
-    transport(
-        src.into(),
-        dst.into(),
-        ip.next_header(),
-        ip.payload(),
-        usize::from(ip.total_len()),
-    )
+    let (src, dst) = (IpAddr::from(src), IpAddr::from(dst));
+    let (len, header_len) = (usize::from(ip.total_len()), usize::from(ip.header_len()));
+    if let Some(action) = rewrite.action(dst) {
+        return Ok(Classified::Rewrite(Hit {
+            action,
+            src,
+            dst,
+            len,
+            header_len,
+        }));
+    }
+    if ip.more_frags() || ip.frag_offset() != 0 {
+        return Err(Dropped::between(Reason::Fragment, src, dst));
+    }
+    transport(src, dst, ip.next_header(), ip.payload(), len).map(Classified::Passed)
 }
 
-fn read_ipv6(packet: &[u8]) -> Result<Parsed, Dropped> {
+fn read_ipv6(packet: &[u8], rewrite: &IpRewrite) -> Result<Classified, Dropped> {
     let ip = Ipv6Packet::new_checked(packet).map_err(|_| Dropped::unread(Reason::Malformed))?;
     // the header is sound: the addresses are the packet's to give from here on
     let (src, dst) = (ip.src_addr(), ip.dst_addr());
-    if ip.next_header() == IpProtocol::Ipv6Frag {
-        return Err(Dropped::between(Reason::Fragment, src.into(), dst.into()));
-    }
     if martian_v6(src, dst) {
         return Err(Dropped::between(Reason::Martian, src.into(), dst.into()));
     }
-    transport(
-        src.into(),
-        dst.into(),
-        ip.next_header(),
-        ip.payload(),
-        ip.total_len(),
-    )
+    let (src, dst) = (IpAddr::from(src), IpAddr::from(dst));
+    let len = ip.total_len();
+    if let Some(action) = rewrite.action(dst) {
+        return Ok(Classified::Rewrite(Hit {
+            action,
+            src,
+            dst,
+            len,
+            header_len: IPV6_HEADER_LEN,
+        }));
+    }
+    if ip.next_header() == IpProtocol::Ipv6Frag {
+        return Err(Dropped::between(Reason::Fragment, src, dst));
+    }
+    transport(src, dst, ip.next_header(), ip.payload(), len).map(Classified::Passed)
 }
 
 /// An address of the unspecified, loopback or multicast kinds on either end,

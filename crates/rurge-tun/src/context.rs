@@ -9,6 +9,7 @@ use crate::dns::udp::Query;
 use crate::fragment::Ids;
 use crate::limit::Limiter;
 use crate::stats::Stats;
+use crate::tcp::Admission;
 use crate::udp::Sessions;
 use crate::{Hooks, Life, Pinger, TunOptions};
 use rurge_dns::fakeip::FakeIpPool;
@@ -45,6 +46,10 @@ pub(crate) struct Context {
     pub(crate) sessions: Sessions,
     /// The identifications of the fragments the TUN writes.
     pub(crate) ids: Ids,
+    /// The TUN's admission to new sockets and to its own resets, the one every
+    /// shard holds: the limit on resets is the TUN's, so a reset `[IP Rewrite]`
+    /// answers a SYN with comes out of the same limit.
+    pub(crate) admission: Arc<Admission>,
     /// The limit on the ICMP messages for the UDP flows that were refused.
     pub(crate) icmp_limit: Mutex<Limiter>,
     /// How many echo requests wait for their replies: the places taken out of

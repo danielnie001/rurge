@@ -11,11 +11,12 @@ use super::support::{
 };
 use crate::bytes::QueuedBytes;
 use crate::dispatch::route;
-use crate::packet::{Parsed, Reason, Segment, Transport, classify, segment};
+use crate::packet::{Parsed, Reason, Segment, Transport, checks, segment};
 use crate::stats::{Stats, Warnings};
 use crate::tcp::Tuple;
 use crate::testing::{Script, Upstream};
 use crate::{Counters, TunOptions};
+use rurge_config::IpRewrite;
 use smoltcp::wire::{TcpControl, TcpRepr, TcpSeqNumber};
 use std::hash::RandomState;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -37,7 +38,7 @@ const SERVICE: u16 = 80;
 const MORE_FRAGMENTS: u16 = 0x2000;
 const DONT_FRAGMENT: u16 = 0x4000;
 
-const ALL_REASONS: [Reason; 10] = [
+const ALL_REASONS: [Reason; 11] = [
     Reason::Malformed,
     Reason::Fragment,
     Reason::Martian,
@@ -48,6 +49,7 @@ const ALL_REASONS: [Reason; 10] = [
     Reason::BeyondWindow,
     Reason::RstLimited,
     Reason::IcmpLimited,
+    Reason::IpRewrite,
 ];
 
 /// The bytes the shards' queues may hold together, and the key that chooses a
@@ -101,27 +103,27 @@ fn short_header_syn() -> Vec<u8> {
 
 /// Why `classify` drops `packet`, with IPv6 handled.
 fn dropped(packet: &[u8]) -> Reason {
-    classify(packet, true)
+    checks(packet, true)
         .expect_err("the packet is dropped")
         .reason
 }
 
 /// What `classify` makes of `packet`, with its drop as the reason alone.
 fn classified(packet: &[u8], ipv6: bool) -> Result<Parsed, Reason> {
-    classify(packet, ipv6).map_err(|dropped| dropped.reason)
+    checks(packet, ipv6).map_err(|dropped| dropped.reason)
 }
 
 /// The two addresses a drop of `packet` carries, if it does, with IPv6
 /// handled.
 fn ends_of(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
-    classify(packet, true)
+    checks(packet, true)
         .expect_err("the packet is dropped")
         .ends
 }
 
 /// What `classify` reads of `packet`, which it lets through.
 fn passes(packet: &[u8]) -> Parsed {
-    classify(packet, true).expect("the packet passes")
+    checks(packet, true).expect("the packet passes")
 }
 
 #[test]
@@ -187,14 +189,14 @@ fn a_bad_version_or_header_is_malformed() {
 fn ipv6_off_is_unsupported() {
     let packet = good6();
     assert_eq!(classified(&packet, false), Err(Reason::Unsupported));
-    assert!(classify(&packet, true).is_ok());
+    assert!(checks(&packet, true).is_ok());
     // IPv6 goes before its header is read: a packet too short to be read is
     // no different
     assert_eq!(classified(&packet[..12], false), Err(Reason::Unsupported));
     assert_eq!(classified(&packet[..12], true), Err(Reason::Malformed));
     // IPv4 is as it was
-    assert_eq!(classify(&good4(), false), classify(&good4(), true));
-    assert!(classify(&good4(), false).is_ok());
+    assert_eq!(checks(&good4(), false), checks(&good4(), true));
+    assert!(checks(&good4(), false).is_ok());
 }
 
 #[test]
@@ -542,7 +544,18 @@ fn bad_udp_and_icmp_checksums_are_malformed() {
         let mut damaged = packet.clone();
         damaged[field_at] ^= 0x01;
         let (queue_bytes, key) = queues();
-        assert!(route(damaged, true, &[], &stats, &queue_bytes, &key).is_none());
+        assert!(
+            route(
+                damaged,
+                true,
+                &IpRewrite::default(),
+                &[],
+                &stats,
+                &queue_bytes,
+                &key
+            )
+            .is_none()
+        );
         assert_eq!(
             stats.counters(),
             Counters {
@@ -686,10 +699,11 @@ fn the_checks_run_in_order() {
     v6_fragment[6] = 44;
     assert_eq!(classified(&v6_fragment, false), Err(Reason::Unsupported));
     assert_eq!(classified(&v6_fragment, true), Err(Reason::Fragment));
-    // a fragment to a multicast address is a fragment: that check is first
+    // a martian comes before the fragment check (the phase 3 / M5 design 8.3
+    // swapped the two): a fragment to a multicast address is a martian
     let to_multicast =
         with_fragment_field(syn4(APP4, Ipv4Addr::new(224, 0, 0, 251)), MORE_FRAGMENTS);
-    assert_eq!(dropped(&to_multicast), Reason::Fragment);
+    assert_eq!(dropped(&to_multicast), Reason::Martian);
     // a martian comes before the protocol being looked at
     assert_eq!(
         dropped(&ipv4_packet(47, APP4, Ipv4Addr::new(224, 0, 0, 1), &[0; 8])),
@@ -741,7 +755,7 @@ fn a_drop_carries_the_addresses_once_the_header_was_read() {
     }
     // IPv6 while it is off is decided on the version alone, however good
     // the packet is
-    assert_eq!(classify(&good6(), false).unwrap_err().ends, None);
+    assert_eq!(checks(&good6(), false).unwrap_err().ends, None);
     // decided after: the packet's own two addresses
     let mut fragment6 = good6();
     fragment6[6] = 44;
@@ -825,7 +839,7 @@ fn trailing_bytes_after_the_ip_packet_are_ignored() {
         padded.extend([0xaa; 7]);
         let parsed = passes(packet);
         assert_eq!(parsed.len, packet.len(), "the packet ends where it says");
-        assert_eq!(classify(&padded, true), classify(packet, true));
+        assert_eq!(checks(&padded, true), checks(packet, true));
     }
 }
 
@@ -1002,9 +1016,9 @@ fn damaged_packets_are_dropped_without_a_panic() {
         let ipv4 = base[0] >> 4 == 4;
         for ipv6 in [true, false] {
             let check = |packet: &[u8]| {
-                if let Ok(parsed) = classify(packet, ipv6) {
+                if let Ok(parsed) = checks(packet, ipv6) {
                     assert!(parsed.len <= packet.len());
-                    assert_eq!(classify(&packet[..parsed.len], ipv6), Ok(parsed));
+                    assert_eq!(checks(&packet[..parsed.len], ipv6), Ok(parsed));
                 }
             };
             for len in 0..=base.len() {
@@ -1035,7 +1049,18 @@ fn the_bytes_after_the_ip_packet_do_not_reach_the_shard() {
         let (queue_bytes, key) = queues();
         let mut padded = packet.clone();
         padded.extend([0xaa; 9]);
-        assert!(route(padded, true, &[to_shard], &stats, &queue_bytes, &key).is_none());
+        assert!(
+            route(
+                padded,
+                true,
+                &IpRewrite::default(),
+                &[to_shard],
+                &stats,
+                &queue_bytes,
+                &key
+            )
+            .is_none()
+        );
         assert_eq!(
             shard.try_recv().expect("the shard is given it").packet,
             packet
@@ -1311,6 +1336,7 @@ fn a_debug_line_has_the_addresses_that_were_read() {
             route(
                 packet,
                 ipv6,
+                &IpRewrite::default(),
                 std::slice::from_ref(&to_shard),
                 &stats,
                 &queue_bytes,
@@ -1349,6 +1375,7 @@ fn a_full_shard_queue_drops_and_says_so() {
             route(
                 packet.clone(),
                 true,
+                &IpRewrite::default(),
                 std::slice::from_ref(&to_shard),
                 &stats,
                 &queue_bytes,
