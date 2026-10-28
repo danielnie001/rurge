@@ -43,7 +43,7 @@
 
 ## M1　网络环境与子网
 
-阶段 3 / M6 订正了 M1、L2（M1 的 `./networksetup` 改成 `networksetup`；L2 补了停掉 NetworkManager 之后的恢复命令）。会改系统设置的项（W4、W7、W8、M5、M6、L2、L6、L7、L12）按上面「改系统设置的项与恢复」做。
+阶段 3 / M6 订正了 M1、L2（M1 的 `networksetup` 前面多余的 `./` 去掉了；L2 补了停掉 NetworkManager 之后的恢复命令）。会改系统设置的项（W4、W7、W8、M5、M6、L2、L6、L7、L12）按上面「改系统设置的项与恢复」做。
 
 ### 前置条件
 
