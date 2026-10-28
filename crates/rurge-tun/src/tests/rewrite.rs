@@ -6,14 +6,14 @@
 //! that quietly matches nothing.
 
 use super::udp::{APP4, APP6, NOTHING, lab_and_extras};
-use crate::packet::segment;
+use crate::packet::{Refusal, refusal, segment};
 use crate::space::ADAPTER_V4;
 use crate::testing::packets;
 use crate::testing::{FakeResolve, UdpScript};
 use crate::tests::log_capture::LogCapture;
 use crate::tests::support::{
     Extras, WITHIN, addr, eventually, ipv4_packet, ipv6_packet, segment_v4, settings, sock, syn_v4,
-    with_fragment_field, within,
+    syn_v6, with_fragment_field, within,
 };
 use crate::{Counters, TunOptions, TunSettings};
 use rurge_config::text::{Origin, Section, parse_str};
@@ -228,9 +228,10 @@ async fn reject_answers_a_syn_with_a_reset() {
 }
 
 /// Everything else is answered with "administratively prohibited", from where
-/// the packet was going, quoting the IP header and the eight bytes after it:
-/// a UDP datagram, a TCP segment with ACK, an echo request, a TCP first
-/// fragment and an IPv6 datagram.
+/// the packet was going, quoting the IPv4 header and the eight bytes after it
+/// (RFC 1122 3.2.2) or, over IPv6, as much of the packet as fits in the
+/// smallest MTU (RFC 4443 2.4(c)): a UDP datagram, a TCP segment with ACK, an
+/// echo request, a TCP first fragment and an IPv6 datagram.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reject_answers_the_rest_with_prohibited() {
     let mut lab = lab_with_table("203.0.113.0/24 = reject\n2001:db8::/32 = reject\n");
@@ -274,19 +275,211 @@ async fn reject_answers_the_rest_with_prohibited() {
             packets::udp(app6, addr("[2001:db8::5]:9000"), b"hello"),
             IpAddr::V6(APP6_IP),
             IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5)),
-            48,
+            53,
         ),
     ];
     for (packet, dst, src, quoted) in cases {
+        let whole = packet.len();
         lab.rig.app.inject(packet.clone());
         let (from, to, quote) = lab.prohibited().await;
         assert_eq!((from, to), (src, dst), "the message's ends");
-        assert_eq!(quote, packet[..quoted], "the header and eight bytes");
+        assert_eq!(
+            quote,
+            packet[..quoted],
+            "the quote of a {whole}-byte packet"
+        );
     }
     assert_eq!(
         lab.counters(),
         Counters {
             ip_rewrite: 5,
+            ..Counters::default()
+        }
+    );
+}
+
+/// An eight-byte IPv6 extension header whose next header is `next`, its length
+/// field zero (one eight-byte unit) and the rest padding.
+fn extension(next: u8) -> Vec<u8> {
+    vec![next, 0, 0, 0, 0, 0, 0, 0]
+}
+
+/// An eight-byte IPv6 fragment header: `next`, the offset in units of eight
+/// bytes with the more-fragments bit, and a fixed identification.
+fn fragment(next: u8, offset: u16, more: bool) -> Vec<u8> {
+    let mut header = vec![next, 0];
+    header.extend((offset << 3 | u16::from(more)).to_be_bytes());
+    header.extend([0, 0, 0, 1]);
+    header
+}
+
+/// `[IP Rewrite]`'s `reject` does not walk a chain of IPv6 extension headers:
+/// what comes after one (beyond the one fragment header it reads) cannot be
+/// read, so nothing is answered, as with any type it cannot read (M5 design
+/// 8.5, plan P11). An ICMPv6 redirect (type 137) is answered with nothing too
+/// (RFC 4443 2.4(e)). Pure function: no TUN, no network, no files.
+#[test]
+fn refusal_reads_past_no_ipv6_extension_header() {
+    let src = APP6_IP;
+    let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 20);
+    let udp = [0x13, 0x88, 0x23, 0x28, 0, 9, 0, 0];
+    let icmp = |kind: u8| vec![kind, 0, 0, 0, 0, 0, 0, 0];
+    let tcp: Vec<u8> = {
+        let syn = syn_v6(addr("[fd00:6152::1]:5000"), addr("[2001:db8::23]:80"));
+        syn[40..].to_vec()
+    };
+    let mut hop = extension(58);
+    hop.extend(icmp(1));
+    let mut options = extension(17);
+    options.extend(udp);
+    let mut routing = extension(6);
+    routing.extend(tcp);
+    let mut first_then_options = fragment(60, 0, true);
+    first_then_options.extend(extension(17));
+    first_then_options.extend(udp);
+    let mut experimental = extension(58);
+    experimental.extend(icmp(128));
+    let mut first_then_redirect = fragment(58, 0, true);
+    first_then_redirect.extend(icmp(137));
+    let mut first_then_udp = fragment(17, 0, true);
+    first_then_udp.extend(udp);
+    let cases = [
+        (
+            "Hop-by-Hop, then an ICMPv6 error",
+            ipv6_packet(0, src, dst, &hop),
+            Refusal::Nothing,
+        ),
+        (
+            "Destination Options, then UDP",
+            ipv6_packet(60, src, dst, &options),
+            Refusal::Nothing,
+        ),
+        (
+            "Routing, then a TCP SYN",
+            ipv6_packet(43, src, dst, &routing),
+            Refusal::Nothing,
+        ),
+        (
+            "a first fragment, then Destination Options",
+            ipv6_packet(44, src, dst, &first_then_options),
+            Refusal::Nothing,
+        ),
+        (
+            "next header 253",
+            ipv6_packet(253, src, dst, &experimental),
+            Refusal::Nothing,
+        ),
+        (
+            "an ICMPv6 redirect",
+            ipv6_packet(58, src, dst, &icmp(137)),
+            Refusal::Nothing,
+        ),
+        (
+            "a first fragment, then an ICMPv6 redirect",
+            ipv6_packet(44, src, dst, &first_then_redirect),
+            Refusal::Nothing,
+        ),
+        (
+            "a fragment header cut short",
+            ipv6_packet(44, src, dst, &[0u8; 4]),
+            Refusal::Nothing,
+        ),
+        (
+            "an ICMPv6 echo request",
+            ipv6_packet(58, src, dst, &icmp(128)),
+            Refusal::Prohibited,
+        ),
+        (
+            "an ICMPv6 error",
+            ipv6_packet(58, src, dst, &icmp(1)),
+            Refusal::Nothing,
+        ),
+        (
+            "a first fragment, then UDP",
+            ipv6_packet(44, src, dst, &first_then_udp),
+            Refusal::Prohibited,
+        ),
+        (
+            "an unfragmented UDP datagram",
+            ipv6_packet(17, src, dst, &udp),
+            Refusal::Prohibited,
+        ),
+        (
+            "No Next Header",
+            ipv6_packet(59, src, dst, &[0u8; 8]),
+            Refusal::Prohibited,
+        ),
+    ];
+    for (what, packet, expected) in cases {
+        assert_eq!(refusal(&packet), expected, "{what}");
+    }
+}
+
+/// An IPv6 packet is quoted up to what fits in the smallest MTU every IPv6
+/// link has, 1280 bytes, less the IPv6 and ICMPv6 headers: 1232 bytes (RFC
+/// 4443 2.4(c)). A fragment header can sit before the transport header, so the
+/// quote cannot stop at the IP header and eight bytes as IPv4's does (plan
+/// P11, which this test corrects).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reject_quotes_an_ipv6_packet_up_to_the_minimum_mtu() {
+    let mut lab = lab_with_table("203.0.113.0/24 = reject\n2001:db8::/32 = reject\n");
+    // a first fragment: fragment header (UDP, offset 0, more fragments), then
+    // the UDP header's ports at bytes 48 to 52 of the packet, then a payload
+    let mut first = vec![17, 0, 0, 1, 0, 0, 0, 1];
+    first.extend([0x13, 0x88, 0x23, 0x28, 0, 9, 0, 0]);
+    first.extend(b"hello");
+    let fragmented = ipv6_packet(
+        44,
+        APP6_IP,
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 20),
+        &first,
+    );
+    // an unfragmented IPv6 datagram longer than the quote
+    let mut long6 = vec![0u8; 8];
+    long6.extend([0x55u8; 1400]);
+    let long = ipv6_packet(
+        17,
+        APP6_IP,
+        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 21),
+        &long6,
+    );
+    // the same length over IPv4: its quote is still the header and eight bytes
+    let mut long4 = vec![0u8; 8];
+    long4.extend([0x55u8; 1400]);
+    let v4 = ipv4_packet(17, APP4_IP, Ipv4Addr::new(203, 0, 113, 22), &long4);
+
+    lab.rig.app.inject(fragmented.clone());
+    let (from, to, quote) = lab.prohibited().await;
+    assert_eq!(
+        (from, to),
+        (
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 20)),
+            IpAddr::V6(APP6_IP),
+        ),
+        "the fragment's ends"
+    );
+    assert_eq!(quote, fragmented, "a first fragment is quoted whole");
+    assert_eq!(
+        quote[48..52],
+        [0x13, 0x88, 0x23, 0x28],
+        "the UDP header's ports are in the quote"
+    );
+
+    lab.rig.app.inject(long.clone());
+    let (_, _, quote) = lab.prohibited().await;
+    assert_eq!(quote.len(), 1232, "the quote of a long IPv6 packet");
+    assert_eq!(quote, long[..1232], "the first 1232 bytes of the packet");
+
+    lab.rig.app.inject(v4.clone());
+    let (_, _, quote) = lab.prohibited().await;
+    assert_eq!(quote, v4[..28], "IPv4's header and eight bytes");
+
+    tokio::time::sleep(NOTHING).await;
+    assert!(lab.quiet(), "another answer");
+    assert_eq!(
+        lab.counters(),
+        Counters {
+            ip_rewrite: 3,
             ..Counters::default()
         }
     );

@@ -277,8 +277,9 @@ pub(crate) fn segment(packet: &[u8]) -> Option<Segment> {
 }
 
 /// What a packet `reject` matched is answered with, the first rule that holds
-/// deciding (M5 design 8.5, plan P11): a later fragment, an ICMP error and a
-/// type that cannot be read answer nothing (RFC 1122 3.2.2, RFC 4443 2.4); an
+/// deciding (M5 design 8.5, plan P11): a later fragment, an ICMP error or
+/// redirect, an extension header chain that is not walked, and a type that
+/// cannot be read answer nothing (RFC 1122 3.2.2, RFC 4443 2.4); an
 /// unfragmented TCP segment answers a reset only for a SYN without ACK, and
 /// nothing for a reset or a header that cannot be read; everything else
 /// answers with "administratively prohibited". The two addresses were read by
@@ -334,29 +335,53 @@ fn refusal_v6(packet: &[u8]) -> Refusal {
         }
         fragmented = true;
         next_header = IpProtocol::from(payload[0]);
-        // a first fragment of ICMPv6 still says its type, after its header;
-        // types below 128 are the errors (RFC 4443 2.4)
-        if next_header == IpProtocol::Icmpv6 {
-            let Some(&kind) = payload.get(8) else {
-                return Refusal::Nothing;
-            };
-            if kind < 128 {
-                return Refusal::Nothing;
-            }
+    }
+    // a chain of extension headers — anything beyond the one fragment header
+    // read above — is not walked: the message after it cannot be read, so
+    // nothing is answered
+    if is_ipv6_extension_header(next_header) {
+        return Refusal::Nothing;
+    }
+    // ICMPv6's errors are types below 128, and its redirects (137) are not
+    // answered either (RFC 4443 2.4(e)); a first fragment says its type after
+    // its fragment header
+    let kind = if next_header == IpProtocol::Icmpv6 {
+        let at = if fragmented { 8 } else { 0 };
+        match payload.get(at) {
+            Some(kind) => Some(*kind),
+            None => return Refusal::Nothing,
         }
-    } else if next_header == IpProtocol::Icmpv6 {
-        let Some(&kind) = payload.first() else {
-            return Refusal::Nothing;
-        };
-        if kind < 128 {
-            return Refusal::Nothing;
-        }
+    } else {
+        None
+    };
+    if kind.is_some_and(is_icmpv6_error) {
+        return Refusal::Nothing;
     }
     // only an unfragmented TCP segment is read for a reset
     if !fragmented && next_header == IpProtocol::Tcp {
         return refusal_tcp(packet);
     }
     Refusal::Prohibited
+}
+
+/// Whether `kind` is an ICMPv6 error or redirect: an error (below 128) or a
+/// redirect (137), for either of which no error is answered (RFC 4443 2.4(e),
+/// M5 design 8.5).
+fn is_icmpv6_error(kind: u8) -> bool {
+    kind < 128 || kind == 137
+}
+
+/// Whether `protocol` names an IPv6 extension header (IANA's "IPv6 Extension
+/// Header Types": Hop-by-Hop, Routing, Fragment, ESP, AH, Destination
+/// Options, Mobility, HIP, Shim6 and the two experimental ones). [`refusal_v6`]
+/// reads one fragment header and does not walk a chain of the rest, so what
+/// comes after an extension header cannot be read and is answered with
+/// nothing (M5 design 8.5, plan P11).
+fn is_ipv6_extension_header(protocol: IpProtocol) -> bool {
+    matches!(
+        u8::from(protocol),
+        0 | 43 | 44 | 50 | 51 | 60 | 135 | 139 | 140 | 253 | 254
+    )
 }
 
 fn refusal_tcp(packet: &[u8]) -> Refusal {

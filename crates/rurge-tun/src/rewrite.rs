@@ -17,6 +17,14 @@ use std::sync::PoisonError;
 use std::time::Instant;
 use tokio::sync::mpsc::error::TrySendError;
 
+/// The most of an IPv6 packet an ICMPv6 error quotes: the smallest MTU every
+/// IPv6 link has, less the IPv6 header and the ICMPv6 header, so that the
+/// answer stays within an MTU the virtual interface accepts (RFC 4443 2.4(c);
+/// Linux's `icmp6_send` uses the same limit). An IPv6 packet can carry a
+/// fragment header before its transport header, so the quote cannot assume
+/// the transport header follows the IP header, as IPv4's eight bytes do.
+const V6_QUOTE_MAX: usize = 1280 - 40 - 8;
+
 /// Does what `[IP Rewrite]` asks with `packet` (design 8.4 – 8.6). Never
 /// waits: what it writes is offered to the writer's queue, and what finds the
 /// queue full is dropped and counted `queue_full`.
@@ -75,9 +83,13 @@ fn reject(ctx: &Context, hit: &Hit, packet: Vec<u8>) {
                 .unwrap_or_else(PoisonError::into_inner)
                 .allow(Instant::now());
             if allowed {
-                // the IP header and what follows it, up to eight bytes, as a
-                // refusal of a UDP flow quotes its datagram
-                let quote = hit.len.min(hit.header_len + 8);
+                // IPv4's quote is its header and what follows it, up to eight
+                // bytes (RFC 1122 3.2.2); IPv6's is as much of the packet as
+                // fits in the smallest MTU (RFC 4443 2.4(c))
+                let quote = match hit.dst {
+                    IpAddr::V4(_) => hit.len.min(hit.header_len + 8),
+                    IpAddr::V6(_) => hit.len.min(V6_QUOTE_MAX),
+                };
                 icmp::refuse(ctx, hit.dst, hit.src, &packet[..quote]);
             } else {
                 Stats::drop(
