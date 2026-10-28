@@ -916,6 +916,9 @@
 | 105 | 7 修正 1 | 第 1 条：“齐备”一词按 M6 设计第 11 节在任务 7 写的文字里不再出现（验收文档「结论」两段与第 14 节第 7 条、第二部分第 7 条、`CLAUDE.md`、两份 README 各三处、`docs/README.md`、`docs/requirements.md` 的 2026-10-29 那一句、`docs/status.md` 的「结果」段），改成先写缺哪几句、再写“需求逐句对过代码不等于验收通过”；历史段落里的不动 | 本提交 |
 | 106 | 7 修正 1 | 第 2 条：第 14 节第 1、5 条的 L1 与第二部分第 1、5 条的括号照用例的断言重读、重写（`tcp_to_a_fake_address_reaches_its_name` 与 `tcp_to_a_documentation_address_follows_the_rules` 两条的断言原来写混了；`tun_traffic_is_counted_under_its_listener` 照 `by_listener` 的三格写；Windows 的 `the_system_process_has_no_path`、`a_process_that_does_not_exist_is_not_described` 与 `the_addresses_of_the_machine_include_its_loopback_address` 补全）；「结论」第 1 ～ 8 条与第二部分第 1 ～ 8 条的用例名逐个重读，`CI` 里“在哪几个平台跑过”按 `cfg` 与 `#[ignore]` 改；第 12 条的几处 CI 说法一并改 | 本提交 |
 | 107 | 7 修正 1 | 第 5 ～ 7、10、12 ～ 15 条合一行：L1 核对的订正段改成按内容指（不再写行号）；#37 的两格照清单写 🔁、备注指回本文「没有做完的」；错字“去曑”改“去向”；「怎么读」补 `#N` 是什么；两份 README 的 M6 一段挪到 M5 之后、M1 ～ M3 段的“（见下面两段）”改成“（见下面 M4 那一段）”；`CLAUDE.md` 的下一步改成先做任务 8、“`3a76b80` 之后的提交都在本地”；`docs/status.md` 的任务 0、任务 7、`Takeover`、任务 8 与“第 88 ～ 99 行”那几条照改 | 本提交 |
+| 108 | 7 修正 2 | 补充第 104 行（第 1 条）：`docs/api/phase3.md` 的订正段里“打开失败”指的是暂停结束时那一次——补上“离开暂停时，‘想要’开着而模式关着，就打开一次，失败记 ERROR `cannot turn the enhanced mode on when the pause ends; it stays off`，不重试，‘想要’不变”，“所以”那一句改成“所以暂停结束时那一次打开失败之后……”；`docs/status.md` 那一条跟着改（使用者的 `POST` 打开失败不改“想要”），括号里的行号写成第 94、104、108 行 | 本提交 |
+| 109 | 7 修正 2 | 补充第 105 行（第 2 条）：删掉进了正文的“写在同一句里”与 #37 括号里的“M6 设计第 11 节”（后者读起来像那一节讲的是 TCP Fast Open） | 本提交 |
+| 110 | 7 修正 2 | 补充第 106 行（第 3 条）：只在某些平台编译的用例照 `platform_tests.py` 列全——`crates/rurge-rules/src/engine.rs` 的 `a_system_rule_set_never_asks_for_the_process` 的 macOS 那一份与 `crates/rurge-dns/src/fakeip/file.rs` 的 `the_pool_file_is_its_owners_alone` 补进「靠 CI 的」单子；不属于阶段 3 的四条（`cli.rs` 的两条信号用例、`process.rs` 的 `a_process_tree_contains_its_leader_and_what_it_started_and_nothing_else`、`tests/interop/tests/sshd.rs`）另列一项；`procinfo/windows.rs` 的九条照写，“反过来看”改列全，读连接表的四条补进第二部分第 5 条与「结论」第 5 条 | 本提交 |
 
 ## 延后事项
 
