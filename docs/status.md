@@ -535,6 +535,55 @@ M5 做完了（2026-10-28；计划 `docs/superpowers/plans/2026-10-28-phase3-m5-
 
 协调者在 M5 代项目所有者作的裁定（所有者可以改，记在 M5 记录的行里）：第 8 行（`rurge-tun` 的用例从文字造 `[IP Rewrite]` 的表，不为用例加公开的构造函数）；第 9 行（`QuicAdaptive` 用递增的序号记“最近用到”，不比较时刻，淘汰序号最小的）；第 18、19 行（执行者的裁定，协调者评审时认可：`udp.rs` 的 `open()` 取链上最后一个有 spec 的名字的 `block-quic`；`has_socket_opts` 改名 `needs_an_outbound`，写了 `block-quic` 的 `direct` 别名建自己的出站）；第 20 行（执行者记下、协调者认可：`E0018` 的消息随取值表多出 `adaptive`，`config.rs` 里那条既有用例的期望随之改）；第 27 行（`reflect` 的包遇到写任务队列满时，`queue_full` 记要写出去的包的两个地址，不计 `reflected`）；第 28 行（两条“共用限频”的用例先用掉虚拟网卡自己的配额、再发往 `reject` 的地址，真的证明是共用的）；第 36 行（`a_full_writer_queue_drops_the_icmp_and_counts_it` 改用关着 `udp-priority` 的 `gated_without_priority()`）；第 37 行（`reflect_sends_a_syn_back_with_the_addresses_swapped` 查“什么也没拨”改看 `dialed()`）；第 41 ～ 44 行（写任务的用例在起写任务之前放好几批；`reply_to_the_app` 自带五秒的时限；`TunOptions.writer_queue` 写成两条队列各自的容量；`writer::run` 用私有的 `Queue` 标记一批取自哪条队列）；第 46 行（补 P15 的缺口：DoQ / DoH3 也经 `BootstrapConnector`，所以它另实现 `connect_resolved` / `connect_udp_resolved`）；第 50 ～ 52 行（引擎还没接上时也拨引导给的地址；`boot` 被问的次数改成“被问过”；四处文档注释照实改）；第 55 行（`unknown_keys_and_fields_are_warnings` 里“不认识的键”的例子从 `listen-port` 换成 `fwmark`）；第 59 行（`NotImplemented::diagnostic()` 的一支手工排版）；第 70 ～ 73 行（终审的四条）；第 74 ～ 80 行（评审第 1 轮的 B1 ～ B14，含 B2 对第 66 行那一组数的订正）；第 83 ～ 88 行（评审第 2 轮的 C1 ～ C11）。
 
+### M6（收尾与验收）
+
+M6 做完了（2026-10-29；计划 `docs/superpowers/plans/2026-10-28-phase3-m6-acceptance-plan.md`，下面写“M6 记录第 N 行”与“M6 延后第 N 行”指它末尾的两张表，写“P N”指它的「计划期决定」）。M6 由协调的会话逐个任务调 Pi 做、逐个任务评审（做法同 M4d、M5）。**M5 与 M6 的提交都在本地，CI 没有见过**：`origin/main` 仍是 `3a76b80`，最近一次被 CI 见过的运行是 40611702392。
+
+做了什么：阶段 3 的需求逐句对照过代码（新文件 `docs/acceptance/phase3-acceptance.md`：141 句、十张表、四张登记表、第 14 节八条的证据、靠手工验收的、靠 CI 的、留给项目所有者的）；两份清单对着现在的代码核了一遍（手工清单 172 项、兼容性清单阶段栏含 3 的 81 行）；对外的文档对齐（两份 README、需求文档第 7 节的状态、`CLAUDE.md`「现在在哪里」、本节、`docs/README.md`、阶段 1 与阶段 2 的验收文档各一句）。逐任务（提交是短哈希）：
+
+- **任务 0**（`e17e45b`、`269c738`、`c72b00f`）：验收文档的骨架（141 句切成句子）、两份清单的编号表、工作区的脚本。
+- **任务 1**（`5e00564`、`ead834e`、`c91e5cd`、`54a47ee`、`9f07c4d`、`433cd2b`）：M1 那一片（网络环境与子网、`[SSID Setting]`、NFR-05）；补了一条用例（`5e00564`：`rurge-api` 的 `subnet` 组在 `/v1/policy_groups` 里的成员表）。
+- **任务 2**（`257945a`、`a2b91fd`、`e21d0af`、`a778b57`）：M2 那一片（进程识别与 `PROCESS-NAME`）。
+- **任务 3**（`6ace5e1`、`31326e1`、`50683bd`、`39f7a41`、`a38ce30`、`99640f2`）：M3 那一片（虚拟网卡的内核、DNS 应答器、预匹配）。
+- **任务 4**（`35d4551`、`d4fec84`、`8582636`）：M4 那一片（平台接入、NFR-07、NFR-11）。
+- **任务 5**（`04ccf2d`、`0ca460d`、`35a8883`、`fcf9464`、`37616a0`、`f97f420`、`3306945`）：M5 那一片（识别、阻断、`[IP Rewrite]`、基准）；补了两条用例（`fcf9464` 的 `ip_rewrite_leaves_requests_to_the_proxy_ports_alone`、`37616a0` 的 `quic_and_stun_flows_are_named_quic_and_stun`）。
+- **任务 6a**（`2b0b76d`、`25277c3`、`bf108ff`）：兼容性清单阶段栏含 3 的行逐行核（核对时把 2.1 节 `block-quic` 的阶段栏改成 `2 / 3`，所以从开工时的 80 行变成 81 行），附录的统计重数（577 行，✅ 395、🟡 131、🔁 32、⛔ 14、❓ 5）。
+- **任务 6b**（`47eed2c`、`a1858aa`、`fcca7b6`、`befce97`、`b3ac83e`、`39d5ab4`、`f050653`）：手工清单核一遍、就地订正、M6 一节补齐（新加 19 项，从 153 项到 172 项：M1 37、M2 23、M3 19、M4 55、M5 19、M6 19），文件开头加「怎么用」与第 14 节八条的索引表。
+- **任务 7**（`ea92912` 与随后的文档收尾提交）：验收文档的结论、数字、四张登记表的编号与排序、第 14 节八条的证据、靠手工验收的、靠 CI 的、留给项目所有者的；对外的文档收尾。
+
+门禁（任务 7，一台 Windows 11 x86-64 开发机上的一次运行，**不是 CI**）：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过（0 个警告）；`cargo test -j 8 --workspace --no-fail-fast` **86 个结果行、4723 通过、0 失败、13 忽略**。第一次跑时 `rurge-engine` 的 `outbounds_tuic` 二进制以 `STATUS_HEAP_CORRUPTION` 退出（`CLAUDE.md`「这台开发机」里那种，与本轮改动无关），单独重跑 10 条全过；4723 与 `f97f420` 上的基线相同，任务 1a 与任务 5 补的三条在那条基线里已经算进去了（M6 记录第 92 行）。
+
+**结果（三个数与第四个数，要一起说）**：没有做完（已登记）5 句（P0 没有，P1 一句——#37 的 `tfo-behaviour`；非功能需求 4 句：#132、#133 的 NFR-01、#139 的 NFR-07、#141 的 NFR-11）；需求文字有问题 4 句（P0：#20、#32、#99、#104）；有意不同（已登记）3 句（#35、#101、#120）；本机没有能红的用例 3 句（#1、#2、#3，三个平台的 TUN 设备那一层）。**阶段 3 的功能需求不齐备**（那一句 P1 没有做完），验收文档里不写「齐备」；齐备也不等于验收通过。
+
+没做的，与不要当成已经有的：
+
+- **手工验收一项也没有做**：阶段 1、2、3 三份清单；阶段 3 那份 172 项（W 50、M 39、L 42、P 41），验收文档「真机上」一列点到 133 项，另 39 项没有任何一行点到（其中 8 项由清单开头的索引表点到）。L2 的四条特权用例（`tests/privileged/tests/linux_netns.rs` 的三条与 `a_real_wintun_dll_passes`）写好没有运行过。
+- **三个平台的设备与系统改动没有在真机上验证**：照代码会建网卡、配地址与路由、接管系统 DNS、还回去，但没有一次真的在 Windows / Linux / macOS 上跑过。
+- **第 14 节八条没有一条能写成「通过」**：L1 全绿不等于验收通过；第 3、4、6 条与真机有关的部分只有内存设备上的证据。
+- **M5 与 M6 的提交 CI 没有见过**：连 `3a76b80` 之后加的用例（`5e00564`、`fcf9464`、`37616a0` 三条与 M5 自己的用例）都没跑过；任务 8 在推送之后读回 CI，改掉写着“CI 没有见过”的每一处。
+- **`[IP Rewrite]` 只在内存设备上证明过**、`udp-priority` 的效果没有观察过（M5 一节就写着）。
+- **`tfo-behaviour` 没有实现**（#37）：`socket2` 0.6 没有安全封装，登记在兼容性清单 9.4 节。
+- **兼容性清单 5.2 节的 `MCCMNC:` 与旧键 `cellular` 两行不记日志**：阶段栏含 3、标 🔁，与 `CLAUDE.md` 兼容性原则“解析并忽略 + 记录日志”不一致；要不要加日志归项目所有者（M6 记录第 54、55 行）。
+
+以后的会话必须知道的事（改那一块之前读对应的一条、`docs/acceptance/phase3-acceptance.md` 与 M6 计划的两张表）：
+
+- **`rurge dns lookup` 是另一个进程，永远不在增强模式里**：`PlatformSystemDns` 的 `enhanced` 标志只有 `rurge run` 的增强模式管理器设。要证明增强模式下 rurge 的 DNS 行为，看运行中的 `rurge run`（M6 记录第 81 行）。
+- **增强模式下向应答器问 A / AAAA 拿到 fake 地址、不问上游**；要让 rurge 向上游问一次，用 TXT，应答器把它转发出去（`crates/rurge-tun/src/dns/mod.rs` 的 `forward`）。
+- **手工验收时局域网里的 `<服务器>` 在直连网段里**，要写进 `tun-included-routes` 才进虚拟网卡（M4 设计「执行期的订正」第 31 条；M6 记录第 83 行）。
+- **验收文档的数**：141 行、十张表；数的是行，指向别的行的行也算（M6-D18）。四张登记表的 `#` 是这一句在第一部分的序号，四张表都按它升序排；「有意不同的」与「本机没有能红的用例的」两张表的 `#` 一栏是 M6 才补上的（M6 记录第 88 行）。
+- **兼容性清单阶段栏含 3 的行是 81 行**（开工时 80，第 64 行把 2.1 节 `block-quic` 改成 `2 / 3`）；附录 577 行，✅ 395、🟡 131、🔁 32、⛔ 14、❓ 5（第 65 行）。
+- **手工清单 172 项**（W 50、M 39、L 42、P 41；按节 M1 37、M2 23、M3 19、M4 55、M5 19、M6 19），编号整份不重复，文件开头有「怎么用」（建议次序、前置条件、恢复命令、第 14 节八条的索引表）。
+- **`docs/api/phase3.md` 的 `Takeover::follow` 订正**（2026-10-29 那一段）：进入暂停时只在增强模式开着时把“想要”记成开着，关着时不改；打开失败之后与设备坏了之后都是“模式关着而想要仍是开着”（M6 记录第 94 行）。
+- **`docs/acceptance/phase3-m4-l1-checklist.md` 的两处过时**（同一行）：路由集那一组是 14 条用例（`8538125` 加的 `an_included_class_e_route_stays_out_where_the_platform_blocks_it` 与 `windows_leaves_class_e_out`）；`forget_drops_only_the_carrier_that_failed` 从 `f49ee24` 起叫 `forget_retires_only_the_carrier_that_failed`。
+- **M6 改的代码只有三条用例**（`5e00564`、`fcf9464`、`37616a0` 里的那三条）：没有改生产代码、没有加依赖、没有加放开的函数（`LISTED` 仍是 23 项）。
+
+去向写着项目所有者的（后来的会话不要自己定；验收文档的「留给项目所有者的」一节是汇总）：
+
+- **手工验收**（三份清单）、**推送与读回 CI**（M5 与 M6 的提交）。
+- 总设计 Q3（Wintun 再分发的书面确认，#141）、Q4（L2 在 CI 上启用）、Q7（NFR-01 在真实设备上怎样量、由谁量，#132、#133）、Q8（`[IP Rewrite]` 要不要另立需求行；`suspend` 与“UDP 443”的字面，#99、#104 与「有意不同的」里 `suspend` 那一行）。
+- 「需求文字的问题」4 句怎么改；「没有做完的」5 句放进哪个阶段；阶段 1 推过来、阶段栏仍写 1 的六句（#120、#121、#123、#124、#125、#126）；`MCCMNC:` 与 `cellular` 两行要不要加日志；INFO 里的规则文字带着 `PROCESS-NAME` 的值（M2 延后第 20 行）；M3b 计划「延后事项」第 29 行的引擎一侧（UDP 的字节上限，原来写“阶段 3 / M6”）；B2 的保守读数超线（M5 延后第 4 行）与基准最大值算不算没达到（M3c 延后第 12 行）；「本机没有能红的用例的」3 句要补的用例与手工项；M1 ～ M5 各节「去向写着项目所有者的」那些。
+- 与计划对不上的地方照 M6 计划的「执行期修正记录」；任务 7 自己定的事在第 88 ～ 99 行（四张表的编号与排序、手工 39 项的数法、一句总的 CI 的话、门禁的重跑、两处订正段的写法、README 的改法、81 行与 172 项、阶段 1 与 2 文档的那一句、六条阶段栏交给所有者）。
+
 ## 附：依赖方向一条的原文（原在 `CLAUDE.md`「计划中的架构」）
 
 - 依赖方向（M2 设计文档确认）：`rurge-dns → rurge-rules → rurge-net → rurge-config`；`[Host]` 集合键与 `LazyResolver` 都由 `rurge-dns` 依赖 `rurge-rules` 提供，而非并列关系；`rurge (bin) → rurge-engine → { rurge-inbound → rurge-proto, rurge-policy → rurge-proto, rurge-dns }`。M4 设计文档确认：`rurge (bin) → rurge-api → rurge-engine`；`rurge-api` 依赖 `rurge-engine` / `rurge-config`（`rurge-dns` 的类型经 `rurge-engine` 间接可达，不需要直接依赖），不依赖 `rurge-platform`，也不认识 bin。`tests/interop`（`rurge-interop`，`publish = false`）与 `tests/external`（`rurge-external-tests`，`publish = false`，M4c）是仅测试用的工作区成员。阶段 1 / M5a 的 dev-dependencies 多两条边——`rurge-engine` 的 `tracing-subscriber`（抓会话日志的 `LogCapture`）与 `rurge` 在 Unix 上的 `nix`（`signal` 特性，`SIGHUP` 用例）——，都是工作区已有的依赖，`Cargo.lock` 里没有新的包，生产代码的依赖方向没有变。M7 设计文档确认（M7-D8）：`rurge-engine → rurge-proto-quic → { rurge-proto, rurge-net, rurge-config }`；QUIC 的共用部分（UDP 层、拨号与 TLS、自写的 HTTP/3 客户端）在 `rurge-net::quic`，M7c 的 DoQ / DoH3 经它（`rurge-dns → rurge-rules → rurge-net`），`rurge-dns` 不依赖协议 crate。阶段 1 补遗（M5b）：Profile 的远程来源在 `rurge-engine` 的 `profile` 模块（`ProfileSources`，随进程存续），`rurge-api` 经 `ApiContext.sources` 够到它；加载器（`rurge-config`）自己从不联网，下载到的文本经调用方给的 `RemoteSource` 取，被 include 的文本能做什么由 `Reach` 定；Basic 认证的 `take_basic_authorization` 在 `rurge_net::http`（DoH 经它），`percent-encoding` 与 `base64` 两条依赖边因此从 `rurge-dns` 挪到 `rurge-net`，`Cargo.lock` 仍是 517 个包。阶段 2 / M8a 的任务 6：`rurge-proto` 多一条到 `socket2` 的可选依赖边（作 `testing` 特性带进来，另加进 `[dev-dependencies]`），给要发大于 9216 字节数据报的测试 socket 调高发送缓冲，`Cargo.lock` 仍是 517 个包。阶段 3 / M3a 与 M3b（M3 设计 M3-D2）：新 crate `rurge-tun → { rurge-inbound, rurge-proto, rurge-net, rurge-config, rurge-dns }`（`rurge-dns` 是 M3b 加的边：`FakeIpPool`；dev-dependencies 另开它的 `testing` 特性），再加 `smoltcp`、`getrandom`、`tokio`、`tokio-util`、`tracing` 这些工作区已有的依赖，不依赖 `rurge-engine`、`rurge-platform`；`rurge-engine → rurge-tun`（M3b 加的边：`Engine::start_tun`、`impl Hooks for Engine`；根 `Cargo.toml` 的 `[workspace.dependencies]` 有了 `rurge-tun`，dev-dependencies 另开它的 `testing` 特性），可执行文件（`rurge`）与 `rurge-api` 照旧不依赖它，M3 里可执行文件不起 TUN（只多了 `platform_query` 把 `remote` 交给平台层这一处接线）；`Cargo.lock` 在 M3a 多了 `rurge-tun` 这一项，现在是 518 个包，M3b 只多了这两条依赖边，没有新的包，也没有新的外部包。`rurge-tun` 的 `testing` 特性（应用端夹具、假 `Dialer`、假 `Hooks` 与 `Pinger`、假的转发 `FakeDns`、造包与读包的 `packets`、回环上的服务器）由依赖它的 crate 的 dev-dependencies 打开：`rurge-engine` 的端到端用例（`crates/rurge-engine/tests/tun.rs`、`tun_dns.rs`）用它，`rurge-tun` 自己的用例走 `cfg(test)`。阶段 3 / M3c 没有加依赖边：`rurge-tun` 要的报文辅助、池和转发本来就在它依赖的 `rurge-dns` 里，`PreMatchLayer` 放在 `rurge-config`（所以 `rurge-tun` 不直接依赖 `rurge-rules`），引擎的预匹配钩子读 `rurge-rules`、引擎本来就依赖它；`Cargo.lock` 仍是 518 个包。阶段 3 / M4a 加了两条依赖边：`rurge-platform → ipnet`（外部包，工作区已有，`route::set` 的路由集计算用）与 `rurge`（可执行文件）`→ rurge-tun`（`cli/enhanced` 用它的 `Device`、`Ending`、`TunOptions`、`Pinger`）；计划里设想过的 `rurge → ipnet` 没有加，`ipv6_usable` 直接比地址的首段、为这个布尔值不值得（M4a 记录第 73 行）；`rurge-api` 照旧只依赖 `rurge-engine` 与 `rurge-config`，`rurge-platform` 照旧不依赖任何工作区 crate；`Cargo.lock` 仍是 518 个包（数法：`Cargo.lock` 里以 `name = ` 开头的行数）。阶段 3 / M4b 加了两条依赖边，都是工作区已有的包、都由可执行文件（`rurge`）加：`rurge → ipnet`（管理器的 `Backend::subnets` 签名写 `ipnet::IpNet`，M4b 记录第 36 行）与 `rurge → getrandom`（`PlatformPinger` 的标识符，第 44 行）；M4a 那一句里写的“计划里设想过的 `rurge → ipnet` 没有加”在 M4b 加了；`rurge-platform` 照旧不依赖任何工作区 crate，`rurge-net` 照旧不认识平台（出口经 `SocketHook` 问），`rurge-dns` 照旧不依赖协议 crate；`Cargo.lock` 仍是 518 个包（同一种数法）。阶段 3 / M4c 加了三条边的账：生产依赖 `rurge-platform → tokio`（`AsyncFd`，工作区已有的包，M4c 记录第 16 行）；`rurge-platform` 的 dev-dependencies 多 `tracing-subscriber`（`LogCapture`，`enhanced` 的用例抓日志用，协调者的裁定 R5，第 20 行）；新的仅测试用的工作区成员 `tests/privileged`（`rurge-privileged-tests`，`publish = false`，不是任何 crate 的依赖，第 36 行）。`Cargo.lock` 的包数按 `[[package]]` 的个数数：M4b 收尾时 518，任务 9 之后 519——多的是 `rurge-privileged-tests` 自己，没有新的第三方包（`1eb68db` 的提交说明写的“包数不变”由 M4c 记录第 37 行订正）。

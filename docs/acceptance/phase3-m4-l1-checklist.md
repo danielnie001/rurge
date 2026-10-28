@@ -8,6 +8,11 @@
 
 **2026-10-28 的订正**（M4 推送之后的 CI）：运行 40611702392（提交 `3a76b80`）三个平台的 `check` 都绿。下文的“M4 的提交 CI 还没有见过”“CI 还没有见过”以这一段为准：标「三平台」的用例在 CI 的三个平台上、标「只在 Windows」的在 CI 的 Windows 上编译并通过；标「只在非 Windows」的那 1 条（`the_wintun_dll_option_is_a_usage_error_elsewhere`）在 Linux 与 macOS 上运行并通过；L2 的 3 条在 Linux 上编译了，CI 没设 `RURGE_TEST_PRIVILEGED`，它们打印原因就返回，仍是任何地方都没有运行过。文末两条限制里，`a_real_wintun_dll_passes` 在 CI 上同样只是返回（`RURGE_TEST_WINTUN_DLL` 不设），`pings_the_loopback` 在 CI 的各平台上真的收发了还是跳过了，没有读到。这些都由测试一步的成功推出：任务日志要登录才能读，各平台逐条的结果没有读到。「本机跑过」的意思不变。
 
+**2026-10-29 的订正（阶段 3 / M6）**：下文有两处过时，不改原文，以这一段为准。
+
+- 路由集那一组（第 27 行的名字与第 72 行的“12 条”）当时列了 12 条用例，现在 `crates/rurge-platform/src/route/set.rs` 里有 14 条 `#[test]`（`3a76b80` 与 `HEAD` 上都是 14 条）：多的是 `an_included_class_e_route_stays_out_where_the_platform_blocks_it` 与 `windows_leaves_class_e_out`，由 `8538125`（2026-10-27，`fix(platform): Windows 的路由集不进 240.0.0.0/4`）加上；那一份写于 `8538125` 之前。两条都在 `3a76b80` 上，所以 CI 运行 40611702392 见过它们。
+- `forget_drops_only_the_carrier_that_failed` 是旧名：`f49ee24`（2026-10-27，`fix(cli): 发送失败的 ICMP 载体退休，而不是立刻停掉`）起叫 `forget_retires_only_the_carrier_that_failed`（`crates/rurge/src/cli/pinger.rs`）。下文的旧名照当时的写法留着。
+
 **三种标记**（「编译与运行」一栏）：
 
 - **三平台（本机跑过）**：文件不带 `cfg`（或只带 `#[cfg(test)]`），三个平台都编译、都跑；这台 Windows 11 x86-64 开发机上跑过。CI 的三个平台任务会编译、运行它们；M4 的提交 CI 还没有见过。
