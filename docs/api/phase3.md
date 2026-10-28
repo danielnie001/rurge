@@ -869,7 +869,7 @@ M5 之后 `GET` 的形状（`dropped` 多第十一个键 `ipRewrite`，顶层多
 {"enabled":true,"dropped":{"malformed":0,"fragment":0,"martian":0,"unsupported":0,"queueFull":0,"unknownFake":0,"busy":0,"beyondWindow":0,"rstLimited":0,"icmpLimited":0,"ipRewrite":0},"stackPanics":0,"reflected":0}
 ```
 
-本节的例子**替代上面「M4」一节那个**（`GET /v1/features/enhanced_mode` 的旧例子，任务原文把它说成 M3 一节）；旧例子没有改，是这一段订正它。`POST` 的体、成功与失败的应答、接管暂停期间的行为都不变。
+本节的例子**替代上面「M4」一节那个**（`GET /v1/features/enhanced_mode` 的旧例子）；旧例子没有改，是这一段订正它。`POST` 的体、成功与失败的应答、接管暂停期间的行为都不变。
 
 - `dropped.ipRewrite`：`[IP Rewrite]` 的 `reject` 与 `drop` 命中的包各计一次（`rurge-tun` 的 `Reason::IpRewrite`）。它是“profile 要的”，所以**从不进 WARN**（`Reason::is_wanted`），每次一行 DEBUG；`reject` 又被 RST 或 ICMP 的限频挡下的那一个包仍计一次 `ipRewrite`，只是没有回包，限频各自计 `rstLimited` / `icmpLimited`。
 - `reflected`：`[IP Rewrite]` 的 `reflect` 送回、并且被写任务的队列收下的包。队列满的那一个计 `queueFull`（两个地址是那个要发出去的包的），不计 `reflected`。它不写日志。两个数在增强模式关着时都是 0；`Counters` 的字段名是 `ip_rewrite` 与 `reflected`，`GET /v1/traffic` 不涉及它们。
@@ -877,7 +877,7 @@ M5 之后 `GET` 的形状（`dropped` 多第十一个键 `ipRewrite`，顶层多
 
 ### `protocol` 的 `quic` 与 `stun` 不再限端口
 
-请求记录里的 `protocol` 由引擎的嗅探定（`crates/rurge-engine/src/udp.rs`）：一个 UDP 流的第一个数据报，先试 QUIC（`rurge_net::quic::initial::is_client_initial`：长首部、v1 / v2 / 草案 29 ～ 32、该版本的 Initial 类型、至少 1200 字节，再用自己的 Destination Connection ID 的 Initial 密钥解密确认），再试 STUN（`crates/rurge-engine/src/sniff.rs::is_stun`：RFC 8489 的魔数、首两位、长度恰好等于数据报），都不是就是 `UDP`。**端口是多少都一样**（M5a 之前只有 UDP 443）；`PROTOCOL,QUIC` / `PROTOCOL,STUN` / `block-quic` 都跟着它走。识别不写日志。仿一个 Initial 的普通 UDP 照样标 `UDP`（用例 `a_lookalike_of_a_quic_initial_is_plain_udp`）。
+请求记录里的 `protocol` 由引擎的嗅探定（`crates/rurge-engine/src/udp.rs`）：一个 UDP 流的第一个数据报，先试 QUIC（`rurge_net::quic::initial::is_client_initial`：长首部（QUIC 位可以是 0，RFC 9287 §3.1）、v1 / v2 / 草案 29 ～ 32、该版本的 Initial 类型、至少 1200 字节，再用自己的 Destination Connection ID 的 Initial 密钥解密确认），再试 STUN（`crates/rurge-engine/src/sniff.rs::is_stun`：RFC 8489 的魔数、首两位、长度恰好等于数据报），都不是就是 `UDP`。**端口是多少都一样**（阶段 3 / M5 之前，阶段 2 / M5a 起只认 UDP 443）；`PROTOCOL,QUIC` / `PROTOCOL,STUN` / `block-quic` 都跟着它走。识别不写日志。仿一个 Initial 的普通 UDP 照样标 `UDP`（用例 `a_lookalike_of_a_quic_initial_is_plain_udp`）。
 
 ### 内部 DNS 会话的目标是名字
 
@@ -903,7 +903,7 @@ M5 之后 `GET` 的形状（`dropped` 多第十一个键 `ipRewrite`，顶层多
 
 ### 与 `[IP Rewrite]` 共用的两个限频
 
-`reject` 回的 RST 走虚拟网卡自己的“3 秒 100 个”限频（超出计 `rstLimited`），回的 ICMP“管理上禁止”走虚拟网卡自己的 ICMP 限频（超出计 `icmpLimited`）——与预匹配拒绝、被拒的 UDP 流**同一份**，不是各一份（M5 记录第 28 行）。这两种被限频挡下的包仍计一次 `ipRewrite`（`reject` 命中了），只是没有回包；`src` / `dst` 照被拒的那个包的两端记。
+`reject` 回的 RST 走虚拟网卡自己的“3 秒 100 个”限频（超出计 `rstLimited`），回的 ICMP“管理上禁止”走虚拟网卡自己的 ICMP 限频（另一份，同样每 3 秒 100 个，超出计 `icmpLimited`）：**RST 与 ICMP 是两份限频**，`reject` 的 RST 与预匹配拒绝的 RST 共用一份，`reject` 的 ICMP 与被拒 UDP 流的 ICMP 共用另一份（M5 记录第 28 行）。这两种被限频挡下的包仍计一次 `ipRewrite`（`reject` 命中了），只是没有回包；`src` / `dst` 照被拒的那个包的两端记。
 
 ### 没有覆盖的
 
