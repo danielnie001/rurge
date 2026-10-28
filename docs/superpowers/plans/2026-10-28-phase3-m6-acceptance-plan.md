@@ -874,6 +874,7 @@
 | 63 | 6a | 「任务 5 留给 6a 的」#103、#106：9.10 节「作用的范围与时机」一行的备注末尾补用例 `ip_rewrite_leaves_requests_to_the_proxy_ports_alone`（任务 5 修正第 1 轮补的那条）。标记不动 | 本提交 |
 | 64 | 6a | 协调者的裁定（提示 15）：2.1 节 `block-quic` 的阶段栏从 `2` 改成 `2 / 3`，开头那句照 4.3 节写成“经 SOCKS5 与经虚拟网卡的 UDP 都生效”（任务 5 给 #41 下的结论是 `做了`）。它现在是阶段栏含 3 的第 81 行：`tools/stage3_rows.py` 的输出从 `total 80 {1: 2, 2: 11, …}` 变成 `total 81 {1: 2, 2: 12, …}`；标记不动，`lists/matrix-rows.md` 表末加了一行记它 | 本提交 |
 | 65 | 6a | 状态标记变了三行（第 57、62 行），附录按 `python -I tools/count_matrix.py . HEAD` 整张重数：577 行，✅ 395、🟡 131、🔁 32、⛔ 14、❓ 5（此前 ✅ 396、🟡 132、🔁 30）。附录那一段写了改动的三行与改了文字的各行 | 本提交 |
+| 66 | 6a | 协调者的裁定，订正第 56 行的一处出处（第 56 行不改写）：`read_subnet` 是 `a6a9ff1` 才加的函数，`a6a9ff1^` 上没有它——那时 subnet 组的成员在 `crates/rurge-config/src/spec/group.rs::to_group_spec` 的 `if group.kind == GroupKind::Subnet` 一支里定（注释是 "until then the group stands for its `default`"），成员只取 `default`、没写时为空；建组时 `crates/rurge-policy/src/registry.rs` 在 `if cycle.is_none() && members.is_empty()` 里给出 `Note::EmptyGroup { substituted: empty_group == EmptyGroup::Direct }`，一行 `tracing::warn!(group = %g.name, "{note}")`，`substituted: true` 显示为 `policy group has no members; DIRECT substituted`，拨它时兜到 DIRECT——所以第 56 行的结论照旧，错的只是函数名。同一轮评审对着代码核过：第 52 行（执行者的裁定）的三处（`set_exclude` 打开时放进网卡名、关闭时清空；`EncryptedItem::Off` 清空列表；fake 地址那半句不成立）照准。本轮另改了两处：6.4 节那一行里指错的“见上一行”（上一行是 fake 应答 TTL，与 `force-syslib` 无关，改成 6.3 节 `server:force-syslib` 一行）与附录 2026-10-29 那一段里指向仓库之外的文件的半句（“工作区里的 `count_matrix.py`，不在仓库里”） | 本提交 |
 
 ## 延后事项
 
