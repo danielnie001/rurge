@@ -854,3 +854,60 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
 - M4c、M4d 两节与「没有覆盖的」里“CI 还没有见过 M4c 的提交”“M4 的提交 CI 一个也没有见过”“CI 没有见过 M4a 与 M4b 的提交”不再成立：Linux 与 macOS 开设备与挑平台的代码在这两个平台上过了 `cargo clippy --all-targets -- -D warnings`，缺省用例通过。
 - 「没有覆盖的」里“本机没有编译过的 Unix 代码”列的东西，除 `icmp::open` 的“其余平台恒失败”一份（CI 的三个平台也编不到，M4b 延后第 17 行）之外，都在 CI 的 Linux 与 macOS 上编译了，那几条用例在那里通过；`0600` 那条 `#[cfg(unix)]` 的用例与 `the_wintun_dll_option_is_a_usage_error_elsewhere` 同样在 Linux 与 macOS 上通过。这些由测试一步的成功推出，逐条的结果在要登录才能读的任务日志里。
 - 照旧成立的：缺省的用例不建网卡、不改系统设置，三个平台的设备与系统改动都没有真的运行过、没有在真机上验证；Wintun 设备的十个放开的函数没有在任何地方运行过（`RURGE_TEST_WINTUN_DLL` 不设）；L2 特权用例在 Linux 上编译了、没有运行过（`RURGE_TEST_PRIVILEGED` 不设）；`pings_the_loopback` 在 CI 的各平台上走的是哪一条路，没有读到。
+
+## M5　识别、阻断与 `[IP Rewrite]`
+
+阶段 3 / M5（设计 `docs/superpowers/specs/2026-10-28-phase3-m5-recognition-blocking-ip-rewrite-design.md`，实施计划 `docs/superpowers/plans/2026-10-28-phase3-m5-recognition-blocking-ip-rewrite-plan.md`，下面写“M5 记录第 N 行”指计划末尾的「执行期修正记录」）做的是：所有端口上的 QUIC 与 STUN 标签、`block-quic` 的 `adaptive` 与 6.11 的 `auto`、`[IP Rewrite]` 生效、写回虚拟网卡的两条队列（`udp-priority`）、内部 DNS 会话带主机名、手册 6.11 的 WireGuard 写法能加载。这一节只说 API、日志与请求记录上看得到的那一部分；配置与语义在兼容性清单的 1.2、2.1、3.1、4.3、4.6、6.1、6.2、7.2 与 9.10 节。
+
+**这一节的提交都在本地，CI 没有见过**（最近一次被 CI 见过的运行是 `3a76b80` 上的 40611702392）；`[IP Rewrite]` 只在内存设备上测过，`udp-priority` 的效果没有观察过，手工验收一项也没有做（`docs/acceptance/phase3-manual.md` 的 M5 一节是这一轮写的）。
+
+### `GET` / `POST /v1/features/enhanced_mode`：多两个数
+
+M5 之后 `GET` 的形状（`dropped` 多第十一个键 `ipRewrite`，顶层多 `reflected`，它在 `stackPanics` 之后）：
+
+```json
+{"enabled":true,"dropped":{"malformed":0,"fragment":0,"martian":0,"unsupported":0,"queueFull":0,"unknownFake":0,"busy":0,"beyondWindow":0,"rstLimited":0,"icmpLimited":0,"ipRewrite":0},"stackPanics":0,"reflected":0}
+```
+
+本节的例子**替代上面「M4」一节那个**（`GET /v1/features/enhanced_mode` 的旧例子，任务原文把它说成 M3 一节）；旧例子没有改，是这一段订正它。`POST` 的体、成功与失败的应答、接管暂停期间的行为都不变。
+
+- `dropped.ipRewrite`：`[IP Rewrite]` 的 `reject` 与 `drop` 命中的包各计一次（`rurge-tun` 的 `Reason::IpRewrite`）。它是“profile 要的”，所以**从不进 WARN**（`Reason::is_wanted`），每次一行 DEBUG；`reject` 又被 RST 或 ICMP 的限频挡下的那一个包仍计一次 `ipRewrite`，只是没有回包，限频各自计 `rstLimited` / `icmpLimited`。
+- `reflected`：`[IP Rewrite]` 的 `reflect` 送回、并且被写任务的队列收下的包。队列满的那一个计 `queueFull`（两个地址是那个要发出去的包的），不计 `reflected`。它不写日志。两个数在增强模式关着时都是 0；`Counters` 的字段名是 `ip_rewrite` 与 `reflected`，`GET /v1/traffic` 不涉及它们。
+- 计数表的其余十个原因、`stackPanics` 与本页「M3c」一节「计数」一表相同；M5 只加 `queue_full` 的一个来源（`reflect` 的包遇上写任务队列满）与两个限频的一次共用（见下）。
+
+### `protocol` 的 `quic` 与 `stun` 不再限端口
+
+请求记录里的 `protocol` 由引擎的嗅探定（`crates/rurge-engine/src/udp.rs`）：一个 UDP 流的第一个数据报，先试 QUIC（`rurge_net::quic::initial::is_client_initial`：长首部、v1 / v2 / 草案 29 ～ 32、该版本的 Initial 类型、至少 1200 字节，再用自己的 Destination Connection ID 的 Initial 密钥解密确认），再试 STUN（`crates/rurge-engine/src/sniff.rs::is_stun`：RFC 8489 的魔数、首两位、长度恰好等于数据报），都不是就是 `UDP`。**端口是多少都一样**（M5a 之前只有 UDP 443）；`PROTOCOL,QUIC` / `PROTOCOL,STUN` / `block-quic` 都跟着它走。识别不写日志。仿一个 Initial 的普通 UDP 照样标 `UDP`（用例 `a_lookalike_of_a_quic_initial_is_plain_udp`）。
+
+### 内部 DNS 会话的目标是名字
+
+开了 `encrypted-dns-follow-outbound-mode`、上游写成主机名时：
+
+- 流水线看到的会话 `dst` 是**名字与端口**（`dns-up.test:53` 一类），`DOMAIN` 一族与规则集里的域名规则因此能匹配 DNS 服务器的主机名；`IP-CIDR` 一类用跟着会话来的那个地址匹配（`FixedResolve`），不问引擎的解析器；协议标签照旧按 URL 的方案（`DOH` / `DOT` / `DNS` / `DOQ` / `DOH3`）。
+- 请求记录的 `dst` 是名字与端口；`remoteAddr` 照旧（TCP 是拨到的地址，UDP 是 `null`），**没有查找**，所以 `dnsMs` 是 `null`；`listenPort` 仍是 `null`（rurge 自己发起的会话）。
+- **经代理时，代理收到的是引导解析出的地址，不是名字**（M5-D16）：流水线把地址交给终端出站，规则与请求记录只在上游这一侧看到名字；计划「延后事项」第 7 行。`smart` 组给这类会话记的站点也从服务器的地址变成名字。
+- 引擎还没接上时（`dns_pipeline` 的那一支）同样拨引导给的地址，名字只经 `Connector::connect_resolved` / `connect_udp_resolved` 交给回落连接器，绝不进系统解析库（M5 记录第 50 行，用例 `without_an_engine_a_named_server_is_dialled_at_its_address`）。
+
+### 新增的日志行
+
+日志文本是英文；下面都是 DEBUG，要 `--log-level debug`。名字与地址只在 DEBUG。`[IP Rewrite]` 的行里 `reason` 是 `ip_rewrite`（`tun: packet dropped`，字段 `src` / `dst` 是包的两端），第一次也不是 WARN；`reflected` 什么都不写；QUIC / STUN 的识别不写日志。
+
+| 级别 | 文本 | 字段 | 什么时候 |
+| --- | --- | --- | --- |
+| DEBUG | `quic: <名字> falls back to TCP; QUIC stays blocked` | | `block-quic=adaptive`（或 6.11 的 `auto` 落到自适应）在 1 秒的窗口里等到同一个主机名的客户端 TCP 会话：这一次 QUIC 挡住、这个名字以后也一直挡 |
+| DEBUG | `quic: <名字>: no TCP within 1s; QUIC allowed` | | 窗口过了没有 TCP（不论是下一条 QUIC 流还是来晚了的 TCP 让它落定）：这个名字从此放行，下一次 QUIC 直接过 |
+| DEBUG | `tun: packet dropped` | `reason`=`ip_rewrite`、`src`、`dst` | `[IP Rewrite]` 的 `reject` / `drop` 命中的每个包一行；没有 WARN 行 |
+| DEBUG | `tun: packet dropped` | `reason`=`queue_full`、`src`、`dst` | `reflect` 要送回的包遇上写任务队列满（两个地址是那个要发出去的包的，M5 记录第 27 行） |
+
+写任务的两条队列本身不写日志：`udp-priority` 开着时 UDP 的回包与应答器的 UDP 应答进优先队列，其余进普通队列，每一轮先写优先的那一批；两条队列各自的容量都是 `TunOptions.writer_queue`。
+
+### 与 `[IP Rewrite]` 共用的两个限频
+
+`reject` 回的 RST 走虚拟网卡自己的“3 秒 100 个”限频（超出计 `rstLimited`），回的 ICMP“管理上禁止”走虚拟网卡自己的 ICMP 限频（超出计 `icmpLimited`）——与预匹配拒绝、被拒的 UDP 流**同一份**，不是各一份（M5 记录第 28 行）。这两种被限频挡下的包仍计一次 `ipRewrite`（`reject` 命中了），只是没有回包；`src` / `dst` 照被拒的那个包的两端记。
+
+### 没有覆盖的
+
+- **没有真机**：这一节的行为只在内存设备（引擎用例的 `Rig`）与单元用例里验证过；`ping`、真实的应用、真实的 Windows 防火墙、`reflect` 送回的包在真实系统上被怎样回应（操作系统的应答又被送回、靠 TTL 与“不对 RST 回 RST、不对差错回差错”终止）都没有观察过——手工验收的 W42 / M31 / L33 / P32 就是看这个。
+- **`udp-priority` 的效果看不出来**（延迟的差别在真实应用上量不出来），不设手工验收项，兼容性清单 2.1 节照实写着“尽力而为”。
+- **QUIC 少认的版本**（gQUIC、草案 28 以前）与 Surge 那边是否同样不认，没有在 Surge 上核对过；QUIC 里的 SNI、跨几个包的 ClientHello、`auto-quic-block` 都在阶段 4。
+- 全部用例只在一台 Windows 11 x86-64 的开发机上跑过；M5 的提交 CI 一个也没有见过。

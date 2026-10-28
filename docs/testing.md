@@ -157,6 +157,18 @@ cargo test -j 8 --workspace --lib -- tests::dispatch:: queue_bytes a_shard_rebui
 cargo test -j 8 --workspace --test tun -- start_tun_refuses a_second_tun_on_one_engine an_association_returns_when_closed   # 阶段 3 / M4a，任务 2 在引擎里的三条（4 个）：`start_tun` 拒绝 `TunOptions::check` 拒绝的选项与 MTU 小于 1280 的设备且什么也不开（没有 `fake-ip.txt`），一个引擎同时只一个 TUN（第一个结束后第二个能起），以及"引擎放开客户端"以 `STOP_GRACE`（1 秒）为界
 cargo test -p rurge --bin rurge -- cli::enhanced   # 阶段 3 / M4a，可执行文件里增强模式的管理器、三个后端、撤销动作与"想要的"（42 个）：打开的次序、失败的回退与倒着撤销、备份先于它撤销的那一步、备份写不进时不做那一步、读不懂的备份不动、关闭的次序与等 TUN 3 秒、IPv6 的三种情形、`follow` 只做差与出口表始终是超集、路由的 IPv6 一半失败时记下什么与按 IPv6 没开往下做（`Ok(false)`）、设备坏了报哪一次打开、无备份的崩溃把 `features.enhanced_mode` 写回 `false`、平台后端与 `off` 什么都答"不可用"、文件后端的动作与 `fail` / `fail_undo` / `device_fails_after_ms`
 cargo test -p rurge --test cli -- run::enhanced_mode   # 阶段 3 / M4a，增强模式的端到端（20 个，经 `RURGE_ENHANCED_BACKEND=file:` 与真实的 `rurge run`）：启动时开与关（标准输出的次序）、经 API 开关与形状、失败时退 1 与 API 回 500、关闭失败之后仍是使用者要的关（进出暂停也不再打开）、`kill` 之后再起的恢复、`ipv6-vif = always` 与"IPv6 配不上"、设备坏了关掉、接管暂停的两个方向、重载只改变了的、重载开 / 关 IPv6、`ipv6-vif = auto` 随网络、`follow` 失败照开着、两个辅助函数缺省 `off`、未知的 `RURGE_ENHANCED_BACKEND` 以 2 退出
+cargo test -j 8 --workspace --lib -- quic::initial   # 阶段 3 / M5，QUIC 识别的单元用例（`rurge-net`）：RFC 9001 与 RFC 9369 附录 A.2 的客户端 Initial（1200 字节、六位十六进制照抄，用例断言长度与摘要）、构造器造的每一个版本（v1 / v2 / 草案 29 ～ 32，以及 DCID 的 0、1、21 字节）、包头筛不过的（版本、类型、长度、包号偏移）、前缀与头 64 个字节里的每一位翻转、quinn 截的真客户端 Initial（只在回环上，每一步有时限）
+cargo test -j 8 --workspace --test udp -- quic_on_any_port block_quic_blocks_quic_on_any_port a_lookalike stun_flows   # 阶段 3 / M5，引擎：所有端口上的 QUIC 与 STUN 标签（`quic.test:8443`、`stun.test:9000`）、443 以外的 QUIC 被 `block-quic` 挡下、仿 Initial 的普通 UDP、STUN 流的标签与 `PROTOCOL,UDP`
+cargo test -j 8 --workspace --lib -- quic_adaptive   # 阶段 3 / M5，自适应表：第一次挡、1 秒内 TCP 算回落、窗口过了放行、安静窗口、第 201 个名字淘汰最久没用的、状态落定的两行 DEBUG、客户端 TCP 会话通知表、`Internal` 不通知
+cargo test -j 8 --workspace --lib -- every_cell_of_the_quic_verdict   # 阶段 3 / M5，`block-quic` 的判定表（4 全局 × 4 参数 × 直连与否 × 载不载 UDP，逐格比对）与 `adaptive` 的新取值
+cargo test -j 8 --workspace --lib -- ip_rewrite   # 阶段 3 / M5，`rurge-config`：`[IP Rewrite]` 的读法（次序、主机位、单个地址、大小写、坏行 `W0012`、空节）
+cargo test -j 8 --workspace --lib -- tests::rewrite   # 阶段 3 / M5，`rurge-tun`：三种动作、`W0012` / 位置 / 计数 / 重载、两个限频共用、`reflect` 的包、`reflected` 不写日志
+cargo test -j 8 --workspace --lib -- tests::writer   # 阶段 3 / M5，写任务的两条队列：优先批先写、一条队列关着、两条都关才结束、`queue_full`、`STOP_GRACE`、`writer_queue` 是两条各自的容量
+cargo test -j 8 --workspace --lib -- tests::udp:: tests::icmp:: tests::dns::udp::   # 阶段 3 / M5，发送一方选队列：开了进优先、关了进普通（TCP 与 ICMP 总在普通）
+cargo test -j 8 --workspace --lib -- wireguard   # 阶段 3 / M5，`rurge-config`：手册 6.11 的服务端写法（`listen-port` / `accept-incoming` 的 `W0029`、不带 `endpoint` 的 peer、两者混写、没有 `listen-port` 时缺 `endpoint` 仍是 `E0023`）
+cargo test -j 8 --workspace --test outbounds_wireguard -- a_policy_on_a_section_without_peers   # 阶段 3 / M5，引擎：没有 peer 的节上的策略立刻失败，错误说明原因
+cargo test -j 8 --workspace --test pipeline -- a_dns_session_matches_rules_by_the_servers_name an_ip_cidr_rule   # 阶段 3 / M5，内部 DNS 会话按服务器的名字匹配、`IP-CIDR` 仍按地址；单元的三条用 `--lib` 里的名字 `without_an_engine_a_named_server_is_dialled_at_its_address`、`connector_dials_the_resolved_address_and_names_it`、`a_named_quic_server_reaches_its_connector_with_its_name`
+# 阶段 3 / M5 重跑的基准读数（一台机器上的一次运行、**不是 CI**；release，`TUN_BENCH_FAR=memory`；命令仍是上面 B1 / B2 / b3 那三条）：B1 八个量出来的行都过 0.7 Gbit/s 的线（最低的一行 4.065，是线的 5.8 倍），四个计数都是 0，中位数上行 8.03、下行 4.84 Gbit/s；同设置（MTU 1500、`tx_max` 256 KiB）的 5.717 / 5.172 是上一次的 79.7% 与 94.7%。B2 门槛读数（峰值减去全部测试一侧的项）403,671,140 字节（403.7 MB / 385.0 MiB），在线 429,000,000 字节以内、余量 25.3 MB；保守读数（只减去准的应用端套接字缓冲）445,333,604 字节（445.3 MB），超线 16.3 MB——这个读数照旧归项目所有者，这里只记数。b3 中位数 0.9 微秒、p99 2.9 微秒，最大 4542.2 微秒（4.5 ms，落在第 28,673 个查询上，是线的 22.7 倍，两处都是池的 `HashMap` 的翻倍处，读代码与算术得出）。细节与上一次不同的原因见计划「执行期修正记录」第 61 ～ 63 行
 cargo insta test -p rurge-config --review       # 语料库快照有变化时审阅
 cargo clippy --all-targets -- -D warnings       # 零警告（CI 设 RUSTUP_TOOLCHAIN=1.89.0，与本机的 MSRV 工具链一致；更新的 clippy 会多出 lint）
 cargo fmt --all
@@ -237,7 +249,7 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 
 ### 阶段 3 / M3c 起：TUN 与 DNS
 
-阶段 3 / M3c 起另有几条：一、`TunOptions::udp_dns_idle` 不得大于 `udp_idle`（`check` 拒绝），所以把 `udp_idle` 调到 10 秒以下的用例要同时把 `udp_dns_idle` 调到不大于它的值（`crates/rurge-tun/src/tests/udp/sessions.rs` 里的几处就是这样），想测只问 53 端口的会话更早结束的用例反过来单调 `udp_dns_idle`；二、连发一阵查询的用例把 `writer_queue` 设到比这一阵大（应答器在 UDP 上的应答 `try_send` 给写任务，满了就丢并计 `queue_full`，R12；TCP 上的应答写进连接，由分片经同一个写任务的队列送出、等空位，不丢；`a_burst_of_queries_is_answered` 用 1,100）；三、`rurge-tun` 的用例里应答器的转发只去 `FakeDns`（`rurge_tun::testing`，什么也不发出去），`rurge-dns` 里转发的用例只问回环上的 `MockDns` 或内存里的上游（`MockDns::upstream()`），依赖时间的走暂停的时钟；四、经引擎的 DNS 用例（`crates/rurge-engine/tests/tun_dns.rs`，接线在 `tests/common/tun.rs`）守 M3c 计划 P24 的两道防线：TUN 一侧经应答器或池问到的名字由 harness 的 `MockDns` 钉到回环，规则照 M3b 的 `guarded()` 收尾；监听器一侧要测换名字的用例，先用一条显式的规则放过那个名字（`DOMAIN,target.test,DIRECT`），紧跟 `IP-CIDR,198.18.0.0/15,REJECT,no-resolve` 与 `DEST-PORT,<上游端口>,REJECT`，换名字失灵时会话被拒，到不了 harness 追加的 `FINAL,DIRECT`；五、要看到应答器的 TCP 连接占了几个位置（`dns_tcp_max`）用 `TunHandle::dns_connections()`（只在测试构建里；位置在分片收下 SYN 时占、会话返回时还，握手不完成的在半开超时后还），要看池里有几个地址有租约、几个名字有地址用 `FakeIpPool::leased()` 与 `named()`，不要读池的 `Debug` 文字去数。
+阶段 3 / M3c 起另有几条：一、`TunOptions::udp_dns_idle` 不得大于 `udp_idle`（`check` 拒绝），所以把 `udp_idle` 调到 10 秒以下的用例要同时把 `udp_dns_idle` 调到不大于它的值（`crates/rurge-tun/src/tests/udp/sessions.rs` 里的几处就是这样），想测只问 53 端口的会话更早结束的用例反过来单调 `udp_dns_idle`；二、连发一阵查询的用例把 `writer_queue` 设到比这一阵大（应答器在 UDP 上的应答 `try_send` 给写任务，满了就丢并计 `queue_full`，R12；TCP 上的应答写进连接，由分片送出、等空位，不丢；`a_burst_of_queries_is_answered` 用 1,100）。**阶段 3 / M5 起写任务有两条队列**（`udp-priority`）：UDP 的应答（含它分出的片）进优先队列；TCP 的段与重置、ICMP 的消息、回显应答与 `[IP Rewrite]` 送回的都是普通队列，`writer_queue` 是**各自**的容量——上面“设到比这一阵大”要对两条队列都成立才不会丢；三、`rurge-tun` 的用例里应答器的转发只去 `FakeDns`（`rurge_tun::testing`，什么也不发出去），`rurge-dns` 里转发的用例只问回环上的 `MockDns` 或内存里的上游（`MockDns::upstream()`），依赖时间的走暂停的时钟；四、经引擎的 DNS 用例（`crates/rurge-engine/tests/tun_dns.rs`，接线在 `tests/common/tun.rs`）守 M3c 计划 P24 的两道防线：TUN 一侧经应答器或池问到的名字由 harness 的 `MockDns` 钉到回环，规则照 M3b 的 `guarded()` 收尾；监听器一侧要测换名字的用例，先用一条显式的规则放过那个名字（`DOMAIN,target.test,DIRECT`），紧跟 `IP-CIDR,198.18.0.0/15,REJECT,no-resolve` 与 `DEST-PORT,<上游端口>,REJECT`，换名字失灵时会话被拒，到不了 harness 追加的 `FINAL,DIRECT`；五、要看到应答器的 TCP 连接占了几个位置（`dns_tcp_max`）用 `TunHandle::dns_connections()`（只在测试构建里；位置在分片收下 SYN 时占、会话返回时还，握手不完成的在半开超时后还），要看池里有几个地址有租约、几个名字有地址用 `FakeIpPool::leased()` 与 `named()`，不要读池的 `Debug` 文字去数。
 
 ### 阶段 3 / M4a 起：增强模式的测试后端
 
@@ -293,3 +305,21 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 五、**`--wintun-dll` 的那一条只在非 Windows 上运行**：`crates/rurge/tests/cli.rs` 的 `the_wintun_dll_option_is_a_usage_error_elsewhere` 是 `#[cfg_attr(not(windows), test)]` 加 `#[cfg_attr(windows, allow(dead_code))]`，在这台开发机上只编译、不运行（Windows 上这个选项是寻常的那个，带着它起的 `rurge run` 会成功并一直跑下去）；第一次运行是 Linux / macOS 的 CI（M4d 记录第 75、76 行）。`wintun_dll_applies` 自己的单元用例（`crates/rurge/src/cli/run.rs` 的 `wintun_dll_is_only_for_windows`）三个平台都跑。
 
 六、两份名单的数目（阶段 3 / M4d 之后）：`crates/rurge/tests/sockets.rs` 的 `LISTED` 仍是 25 行（M4d 的生产代码不新建套接字，Wintun 不是套接字，`unicast_if` 设在已有的套接字上），`crates/rurge-platform/tests/unsafe_functions.rs` 的 `LISTED` 现在 23 个函数（M4d 加了 `unicast_if`、`in_job` 与 `tun/windows/wintun.rs` 的十二个）——加一处建套接字的地方、加一个放开的函数时就地改，那两条扫描用例会逐处报错。
+
+### 阶段 3 / M5 起：识别、`[IP Rewrite]` 与两条队列
+
+阶段 3 / M5 起另有几条：
+
+一、**QUIC 与 STUN 的测试向量有出处**。两个客户端 Initial 照 RFC 9001 附录 A.2 与 RFC 9369 附录 A.2（从 rfc-editor.org 的正文取，2026-10-28）：各 1200 字节，DCID `8394c8f03e515708`、包号 2、Length `0x449e`；十六进制照抄成 `crates/rurge-net/src/quic/initial.rs` 的 `RFC9001_CLIENT_INITIAL` 与 `RFC9369_CLIENT_INITIAL`，用例断言长度与 SHA-256（改动一个字节就会红）。STUN 的判据照 RFC 8489 第 5、6 节：魔数 `0x2112A442`、首两位为 0、长度是 4 的倍数且恰好等于数据报（`crates/rurge-engine/src/sniff.rs` 的 `binding()` 造消息）。要造一个真的 QUIC Initial 的用例用 `rurge_net::quic::testing::client_initial`（各个 crate 的用例共用）；quinn 只在一条用例里截一个真的客户端 Initial（`a_real_quinn_client_initial_is_one`），只在回环上、每一步有时限（设计第 14 节），超时就把它当失败，不重试。
+
+二、**[IP Rewrite] 的用例从文字造表**（M5 记录第 8 行）：`rurge-tun` 的用例用 `rurge_config::text::parse_str` 取出 `[IP Rewrite]` 一节，交给 `rurge_config::ip_rewrite::parse`，不为用例加公开的构造函数（照 `src/tests/dns/mod.rs` 从文字造 `HostList` 的做法）；文档地址（`192.0.2.0/24` 一类）只作为表的行与内存设备上包的地址，不当可能被拨的目标。
+
+三、**写任务的两条队列各自有容量**（M5 记录第 41 ～ 44 行）：`TunOptions.writer_queue` 是两条队列各自的容量（不是合起来的）；要填满一条队列的用例在 `writer::run` 被 spawn 之前把批放好（`Writer::start` 多一个填队列的闭包），不靠“spawn 之后它还没醒”这个窗口；回包等空位的用例自带五秒的时限（`reply_to_the_app`），免得卡住不回来；`gated_without_priority()`（关着 `udp-priority`、其余同 `gated()`）用在“回包与 ICMP 在一条队列里看次序”的用例上。停止的宽限 `STOP_GRACE`（1 秒）对两条队列都算，两条都关了才结束。
+
+四、**内部 DNS 会话带名字的用例**（M5 记录第 46、50、51、52 行）：上游写成名字时只有引导问得到它，`boot.query_count(…)` 用 `>= 1`（引擎的引导用缺省 `FanoutOpts`，1 秒没回答就重发；数“被问了几次”用不重发的 `FanoutOpts` 是 `CLAUDE.md` 的约定，`engine_from_profile` 设不了它）；`up` 的计数仍是 `0`；整个查找用例自己有五秒的时限。规则不能被交给引擎的解析器（自己解析自己会挂住）；把 `route_internal` 临时改成 `choose_policy` 时两条引擎用例都会在五秒上超时，这是 M5 记录第 53 行的变异结果。引擎还没接上时拨地址的用例（`dns_pipeline::tests::without_an_engine_a_named_server_is_dialled_at_its_address`）盯住回落连接器只收到地址。
+
+五、**自适应的表不靠墙钟**（P8）：表的单元用例用显式的时刻（`Instant` 由调用方传）；“客户端 TCP 会话通知了表”放在 crate 里的单元用例，预置一项一小时之后才过期的“试探中”；不写“第一条 QUIC 被挡、紧接着一个 TCP、第二条仍被挡”的集成用例——两步之间超过 1 秒时它会时红时绿（设计第 20 节第 1 条）。引擎的两条端到端用例（`adaptive_on_a_direct_alias_blocks_the_first_quic_flow`、`auto_blocks_quic_through_a_proxy_that_carries_no_udp`）在解析之前就定下目标（`d.test` / `noudp.test`），照 `per_policy_block_quic_follows_the_terminal_policy` 的写法。
+
+六、**计时用例提交前单独循环二十次以上**：`[IP Rewrite]` 的两组（`tests::rewrite` 与引擎的 `ip_rewrite_in_the_profile`）、写任务的两组（`tests::writer` 与 `writer_queue: 1` 的那几条）、带名字的 DNS 会话的五条（M5 记录第 49、54 行），各单独跑过二十次（M5 记录第 34、40、45、49、54 行）；日志在工作区（git 忽略）。
+
+七、**M5 没有平台代码**（设计第 1 节）：不用 `RURGE_TEST_PRIVILEGED` 与 `RURGE_TEST_WINTUN_DLL`，缺省的 `cargo test` 不建网卡、不改系统设置；全部用例只在一台 Windows 11 x86-64 的开发机上跑过，M5 的提交 CI 一个也没有见过（2026-10-28）。三个基准是唯一用 `-p` 的地方，读数在命令一节 M5 那一条注释里。

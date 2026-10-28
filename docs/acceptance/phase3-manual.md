@@ -610,3 +610,98 @@
 | P30 | **非直连的 VPN 路由的限制与它的办法**（M4b 延后第 14 行、兼容性清单 9.1 节）。装一个拆分隧道的 VPN，它推下来的路由**不是直连的**（`10.0.0.0/8 via 10.8.0.1 dev tun0` 一类）；开着增强模式，让 rurge 自己去访问那一段里的一个地址（例如一个在那段里的订阅源）：(a) 不加任何设置；(b) 把那一段写进 `tun-excluded-routes` 再来 | (a) 应用的流量照系统的路由进 VPN（那条路由比基础前缀更具体），**rurge 自己**到那里的连接却绑在主网卡上、到不了（失败的原因只进 DEBUG 与请求记录）；这就是登记的限制。(b) 写进排除项之后，rurge 自己的连接落在出口判定的“不绑”那一条，照系统的路由走、进 VPN，下载与 DNS 因此也通。把两种情形下的失败文本与耗时记下来 | 请求记录；日志；VPN 的路由表 | | | |
 | P31 | **换网络之后 30 秒内恢复**（阶段 3 的验收标准）。三个平台各做一次：开着增强模式，换网络（Wi-Fi 互换、插拔网线各一次），立刻用浏览器、`curl` 与 `ping` 试着访问；记下从换网络完成到第一次成功的时间 | 30 秒内全部恢复：DNS（应答器仍在被问）、路由（八条基础前缀仍在）、应用与 `ping` 都通；`GET /v1/features/enhanced_mode` 的 `enabled` 一直是 `true`（换网络不关增强模式），十个数不因换网络涨（`unknown_fake` 可能因为换网络那一刻的旧 fake 地址涨一点，记下原因）。超过 30 秒的把日志（`network changed`、`cannot follow the change`）与耗时间记下来 | 秒表；应用成败；日志；计数 | | | |
 
+---
+
+## M5　识别、阻断与 `[IP Rewrite]`
+
+设计 `docs/superpowers/specs/2026-10-28-phase3-m5-recognition-blocking-ip-rewrite-design.md`，计划 `docs/superpowers/plans/2026-10-28-phase3-m5-recognition-blocking-ip-rewrite-plan.md`（末尾两张表是这一节的来由：计划「延后事项」第 1、2、5 ～ 12 行与执行期记录里没有用例覆盖的那几行）；API 与日志行见 `docs/api/phase3.md` 的「M5」一节，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 1.2、2.1、3.1、4.3、4.6、6.1、6.2、7.2 与 9.10 节。
+
+自动化验不了的是真实系统与真实应用对这些包的反应：`reflect` 送回的包由操作系统的协议栈接住、它的应答又被送回；被 `reject` 与 `drop` 处理的连接由真实的应用看到；Windows 的防火墙、真实的浏览器与 `curl` 的 QUIC / STUN、真实的 DoH 服务器都在内存设备之外。**M5 的这一切只在一台 Windows 11 x86-64 开发机的内存设备里测过**（一台机器上的一次运行，不是 CI；M5 的提交 CI 一个也没有见过），`reflect` 送回的包在真机上的去向没有观察过，`udp-priority` 的效果没有观察过；**一项也没有做过**。
+
+**会改系统设置的步骤（开增强模式、写路由、改防火墙）在一次性的 Windows / macOS / Linux 机器或虚拟机上做。**每一项记下日期、系统版本与结果。
+
+编号接着 M4 往下排（W42、M31、L33、P32），整份清单里的编号不重复。
+
+**`udp-priority` 不设手工项**：它的效果是“设备写得慢时 UDP 回包不排在 TCP 后面”，真实应用上量不出来（差别在一次设备写与排队的量级，被网络与系统调度淹没），兼容性清单 2.1 节照实写着“尽力而为”；两条队列由 `tests::writer` 的单元用例与 M5 的二十次循环钉住（M5 记录第 40、45 行）。
+
+### 前置条件
+
+- `cargo build --release`，用得到的二进制（Windows 下是 `target\release\rurge.exe`，其余是 `target/release/rurge`）。下文按平台写作 `rurge.exe`（Windows）或 `./rurge`。
+- 要 root / 管理员；开增强模式（M4 一节的前置条件同样适用，Windows 要 `wintun.dll`）。
+- 一份测试用 Profile（下文的 `<conf>`），每项要加的行写在它自己的操作里，改完重启（增强模式的打开只看启动参数与 `POST`）：
+
+  ```ini
+  [General]
+  http-listen = 127.0.0.1:6152
+  http-api = testkey@127.0.0.1:6171
+  dns-server = 1.1.1.1
+  ipv6-vif = auto
+  # 每一项按需要加：tun-included-routes 把文档地址送进虚拟网卡
+
+  [Rule]
+  FINAL,DIRECT
+  ```
+
+- **文档地址要先被路由进虚拟网卡**（手册：被 `tun-excluded-routes` 或本地网络的路由盖住的，写进 `tun-included-routes`）：`[IP Rewrite]` 用的 `192.0.2.0/24`、`198.51.100.0/24`、`203.0.113.0/24` 写进 `tun-included-routes`（Windows 上是 `tun-included-routes = 192.0.2.0/24,198.51.100.0/24,203.0.113.0/24`），否则包根本不会进虚拟网卡，看起来像“没生效”。
+- 一份能用的 `[IP Rewrite]`（每一行先只写那一项要用的，做完删掉，免得互相影响）：
+
+  ```ini
+  [IP Rewrite]
+  192.0.2.10 = reflect
+  198.51.100.0/24 = reject
+  203.0.113.0/24 = drop
+  ```
+
+- `curl --version` 要看得到 `HTTP3` 特性（没有的话需要换一个带 HTTP/3 的 `curl`，这一项要记下来；不支持 HTTP/3 的 `curl` 做不了 W44 与 W46）；`--http3-only` 是 `curl` 的选项（Windows 上的 `curl.exe` 同样）。
+- 一个 443 以外的 HTTP/3 服务（W44；公开服务很少，可以在局域网的另一台机器上起一个，并把它的地址写进 `tun-included-routes`）；一个支持 HTTP/3 的域名（W46）；一个 DoH 服务器的主机名（W47）；一个载 UDP 的代理策略（`hysteria2` / `masque` / `tuic` / `socks5` + `udp-relay=true` 一类）。
+- 日志：`rurge run -c <conf> --enhanced-mode --log-level debug --log-file <日志路径>`；下文「日志」都指这里。`reflected` 不写日志；`[IP Rewrite]` 的丢弃是 DEBUG 的 `tun: packet dropped`（`reason` 是 `ip_rewrite`）；自适应的两行是 DEBUG 的 `quic: <名字> …`。
+- 计数：`curl -s -H "X-Key: testkey" http://127.0.0.1:6171/v1/features/enhanced_mode`（Windows 用 `curl.exe`）。M5 之后 `dropped` 有十一个键（多 `ipRewrite`），顶层有 `reflected`。
+- 抓包：Windows 用 Wireshark 在 `rurge` 网卡上；macOS `sudo tcpdump -i utunN -n`；Linux `sudo tcpdump -i rurge -n`。
+
+---
+
+### Windows
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| W42 | **`[IP Rewrite]` 的 `reflect`。** `[IP Rewrite]` 只写 `192.0.2.10 = reflect`，`tun-included-routes` 加 `192.0.2.0/24`，重启并开增强模式；先 `curl.exe --connect-timeout 3 http://192.0.2.10/`；再 `ping 192.0.2.10`；Windows 防火墙缺省挡入站的回显请求，放行 ICMPv4 入站（`New-NetFirewallRule -Protocol ICMPv4 -IcmpType 8 -Direction Inbound -Action Allow`）后再 `ping` 一次；前后读 `GET /v1/features/enhanced_mode`；Wireshark 在 `rurge` 网卡上看，日志 `--log-level debug` | `reflected` 每个送回的包涨一、`ipRewrite` 不涨；没有 WARN 行；Wireshark 里包的两个地址对调、**端口与其余字节不变**、TTL 与原来相同（记下 TTL）。`curl` 的连接立刻以“拒绝”结束（操作系统的 RST 又被送回，RST 不再引发回应，所以不会来回不停）；`GET /v1/requests/recent` 里没有这两个地址的会话。`ping`：防火墙放行时收到应答（操作系统的 echo reply 再被送回一次，两次都对调了地址）；没放行时超时（Windows 挡入站回显）——两种都记下来 | `GET` 前后各一份；Wireshark 的两三个包；日志；防火墙规则 | | | |
+| W43 | **`reject` 与 `drop`。** `[IP Rewrite]` 写 `198.51.100.0/24 = reject` 与 `203.0.113.0/24 = drop`；`curl.exe --connect-timeout 3 http://198.51.100.10/`；`curl.exe --connect-timeout 3 http://203.0.113.10/`；再各发一个 UDP 数据报（`nslookup example.com 198.51.100.10` 与 `nslookup example.com 203.0.113.10`）；前后读计数；Wireshark | `reject`：TCP 立刻被拒（RST，`curl` 毫秒级结束而不是等到 3 秒）；UDP 收到 ICMP“管理上禁止”（`nslookup` 立刻失败；Wireshark 看到 ICMP 差错，IPv4 type 3、IPv6 type 1）。`drop`：两者都等到自己的超时（`curl` 3 秒），**没有任何回包**。两者都计 `ipRewrite`（drop 也计），都不进请求记录；日志里每个包一行 DEBUG `tun: packet dropped`（`reason=ip_rewrite`、带两个地址）、没有 WARN。连发几十个再读：`rstLimited` 与 `icmpLimited` 是虚拟网卡自己的限频（3 秒 100 个，ICMP 同一份），超出之后回包停下而 `ipRewrite` 照涨（M5 记录第 28 行） | `curl` 的耗时与错误；`nslookup`；Wireshark；计数前后；日志 | | | |
+| W44 | **443 以外的 QUIC 被挡。** `[Proxy]` 加 `D = direct, block-quic=on`，`[Rule]` 在 `FINAL` 之前加 `DEST-PORT,8443,D`；开着增强模式，`curl.exe --http3-only -I https://<443 以外的 HTTP/3 服务>:8443/`；再把那条规则暂时去掉重试（对照） | 写规则时：`curl` 很快失败（QUIC 被挡，`--http3-only` 不会回落到 TCP），`GET /v1/requests/recent` 里那条 UDP 流的 `protocol` 是 `quic`、`policy` 是 `REJECT`、`error` 是 `QUIC blocked`，端口是 8443。去掉规则：同一条请求能到服务（至少握手），记录里的 `protocol` 仍是 `quic`、这次走 `DIRECT`（或规则选中的策略）。**M5 之前只有 443 会被识别，8443 不会被挡**——这一项要看的就是这个差别；QUIC 少认的版本（gQUIC、草案 28 以前）不在这一项里 | 两次 `curl` 的输出；`recent` 的记录；计数 | | | |
+| W45 | **`PROTOCOL,STUN` 挡掉 WebRTC 的 STUN。** `[Rule]` 在 `FINAL` 之前加 `PROTOCOL,STUN,REJECT`；开着增强模式，在浏览器里打开一个 WebRTC 测试页（或 `chrome://webrtc-internals`）发起一次连接；读 `recent` 与计数；把规则换成 `PROTOCOL,UDP,REJECT` 再对照一次；去掉规则再试一次 | 写 `STUN` 规则时：浏览器收集不到服务器反射候选（`srflx`）或明显变慢/失败；`recent` 里出现 `protocol` 是 `stun` 的 UDP 流（`rule` 是那条 `PROTOCOL,STUN` 规则、`policy` 是 `REJECT`——这里**不**是 `QUIC blocked`，那句话只在 QUIC 被 `block-quic` 挡下时出现），端口不是 443（3478 / 19302 一类，证明所有端口都识别）。换成 `UDP` 规则：STUN 也被挡，但标签是 `UDP`。去掉规则：STUN 通、`srflx` 有。记下浏览器的版本与它用的 STUN 服务器 | `recent` 的记录；浏览器的 WebRTC 统计；计数；日志 | | | |
+| W46 | **`block-quic=adaptive` 与 6.11 的 `auto`。** `[Proxy]` 加一个载 UDP 的代理 `Udp = hysteria2, <server>, 443, password=<口令>, sni=<名字>`；规则 `DOMAIN,<支持 HTTP/3 的域名>,Udp`；`Udp` 的策略参数写 `block-quic=adaptive`（不写时用缺省的 `auto`，对这个代理同样落到自适应——两种都试一次）；开着增强模式，`curl.exe --http3-only -I https://<域名>/` 一次，1 秒以上之后再跑一次；再用浏览器访问同一个域名一次（浏览器会从 QUIC 回落到 TCP）；读计数与日志 | `curl --http3-only`：第一次失败；1 秒之后第二次成功。日志 DEBUG 一行 `quic: <域名>: no TCP within 1s; QUIC allowed`（没有回落），之后这个名字的 QUIC 不再被挡；`recent` 里第一次是 `REJECT` + `QUIC blocked`，第二次经 `Udp` 成功。浏览器：先被挡的 QUIC 之后来一条到同一个名字的 TCP，日志是 `quic: <域名> falls back to TCP; QUIC stays blocked`，之后的 QUIC 仍被挡；**阻断之前已经在的 TCP 不算回落**（M5-D6）。写 `block-quic=off` 的对照：第一次就成功；写 `on` 的对照：一直失败 | 两次 `curl` 的耗时与结果；浏览器的表现；两行 DEBUG；`recent` | | | |
+| W47 | **按 DNS 服务器的主机名写的规则。** `<conf>` 写 `encrypted-dns-server = https://<自己的 DoH 服务器>/dns-query` 与 `encrypted-dns-follow-outbound-mode = true`；`[Rule]` 在 `FINAL` 之前写 `DOMAIN,<DoH 服务器的主机名>,DIRECT`；`rurge.exe dns lookup -c <conf> example.com --trace`；读 `GET /v1/requests/recent`；再把那条规则交给一个载 UDP 的代理、看代理那一侧的访问日志 | 记录里 DNS 会话的 `dst` 是**名字与端口**（`<主机名>:443`），`rule` 是那条 `DOMAIN` 规则、`policy` 是 `DIRECT`；`dnsMs` 是 `null`；`remoteAddr` 是拨到的地址（TCP）或 `null`（QUIC 载体）；`--trace` 里问的是解析出来的地址。把规则写成 `IP-CIDR,<解析出的地址>/32,DIRECT` 也命中（用地址匹配，不查名字）。**交给代理时，代理那一侧看到的是地址，不是名字**（M5-D16）——用代理的访问日志核对 | `recent` 的 JSON；`--trace`；代理的访问日志；日志 | | | |
+
+---
+
+### macOS
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| M31 | **`reflect`。** 照 W42 做（`sudo ./rurge run …`；`curl --connect-timeout 3 http://192.0.2.10/`；`ping 192.0.2.10`） | 同 W42；macOS 的应用防火墙缺省允许 ICMP，应当直接收到应答（记下有没有弹窗）；`tcpdump -i utunN -n icmp` 里看得到两次对调与 TTL | 同 W42，用 `tcpdump` 代替 Wireshark | | | |
+| M32 | **`reject` 与 `drop`。** 照 W43 做 | 同 W43；macOS 上 UDP 收到的 ICMP“管理上禁止”由系统转成下一次读写的错误，记下 `nslookup` 的反应 | 同 W43 | | | |
+| M33 | **443 以外的 QUIC 被挡。** 照 W44 做 | 同 W44 | 同 W44 | | | |
+| M34 | **`PROTOCOL,STUN`。** 照 W45 做（Safari 或 Chrome） | 同 W45；记下浏览器与它用的 STUN 服务器 | 同 W45 | | | |
+| M35 | **`adaptive` 与 `auto`。** 照 W46 做 | 同 W46；macOS 上 `curl` 的 HTTP/3 特性要先 `curl --version` 核对 | 同 W46 | | | |
+| M36 | **按 DNS 服务器主机名的规则。** 照 W47 做 | 同 W47；`remoteAddr` 用 `--trace` 与 `recent` 对一遍 | 同 W47 | | | |
+
+---
+
+### Linux
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| L33 | **`reflect`。** 照 W42 做（`sudo ./rurge run …`；`ping 192.0.2.10`） | 同 W42；Linux 上没有默认的防火墙时直接收到应答；`tcpdump -i rurge -n icmp` 里看得到两次对调与 TTL；`rp_filter` 不影响这两种包（记下它开着时的行为） | 同 W42，用 `tcpdump` | | | |
+| L34 | **`reject` 与 `drop`。** 照 W43 做 | 同 W43；Linux 上 UDP 收到的 ICMP“管理上禁止”在下一次发送时以 `ECONNREFUSED` 一类报到，记下 `nslookup` 与 `curl` 的原话 | 同 W43 | | | |
+| L35 | **443 以外的 QUIC 被挡。** 照 W44 做 | 同 W44 | 同 W44 | | | |
+| L36 | **`PROTOCOL,STUN`。** 照 W45 做（Firefox 或 Chromium） | 同 W45 | 同 W45 | | | |
+| L37 | **`adaptive` 与 `auto`。** 照 W46 做 | 同 W46 | 同 W46 | | | |
+| L38 | **按 DNS 服务器主机名的规则。** 照 W47 做 | 同 W47 | 同 W47 | | | |
+
+---
+
+### 与平台无关
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| P32 | **`reflect` 送回的包在真实系统上的去向与终止。** 三个平台各做一次：`[IP Rewrite]` 写 `192.0.2.10 = reflect` 与 `192.0.2.11 = reflect`；开着增强模式：(a) `ping 192.0.2.10`（防火墙按 W42 处理）；(b) `curl --connect-timeout 3 http://192.0.2.11/`；(c) 发一个 UDP 数据报到 `192.0.2.11`（`nslookup example.com 192.0.2.11`）；(d) 用 `ping -i <TTL>` 一类办法把原包的 TTL 调到很小，看回包的 TTL 与循环何时停（`reflect` 自己不改 TTL）；(e) 让一台机器空闲一分钟，看 CPU 与日志 | (a) 操作系统的 echo reply 又被送回、作为对原 echo request 的应答；`reflected` 涨了两个包；记下回包的 TTL 与直连时是否一样（`reflect` 不改 TTL）。(b) 操作系统回的 RST 又被送回，应用的连接以“拒绝”结束；RST 不再引发回应，所以停了。(c) 操作系统回的 ICMP 端口不可达又被送回；**不对差错回差错**，所以停了。(d) 记下回包在 Wireshark / `tcpdump` 里的 TTL 与直连时相比少了几次（`reflect` 只对调地址，TTL 应当不变）；TTL 小到 1 时照实记下循环怎样停。(e) 空闲一分钟里没有持续的包、CPU 不涨、日志没有新的 `reflected`/丢弃行。三个平台各记一份；与内存设备上的用例（设计 8.4、8.5）对一遍 | 三个平台的抓包；`reflected` 与 `ipRewrite`；日志；`top` / 任务管理器 | | | |
+
