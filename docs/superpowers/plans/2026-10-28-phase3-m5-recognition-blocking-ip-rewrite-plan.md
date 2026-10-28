@@ -1168,6 +1168,7 @@ TUN_BENCH_FAR=memory cargo test -p rurge-tun --release --lib -- --ignored --exac
 | 21 | 3 | 执行者的裁定：`crates/rurge-engine/tests/udp.rs` 的两条新用例放在 `per_policy_block_quic_follows_the_terminal_policy` 之后（它后面是 `protocol_rules_see_udp_and_quic`）；`auto_blocks_quic_through_a_proxy_that_carries_no_udp` 的 `NoUdp` 代理照那条用例的 `FakeSocks5` 起在回环上（不写 `udp-relay`），目标 `noudp.test` 在任何解析之前被挡下；`adaptive_on_a_direct_alias_blocks_the_first_quic_flow` 的目标 `d.test` 同 | 本提交 |
 | 22 | 3 | 执行者的裁定：`quic_adaptive::tests::the_201st_name_evicts_the_least_recently_used` 在放进第 201 个名字之前先断言 `a1` 还在（状态是 `on_tcp` 记下的 `FellBack`），再断言它没了——证明淘汰的是表里记过的名字，不是从没进过表的名字 | 本提交 |
 | 23 | 3 | 执行者的裁定：`udp::tests::every_cell_of_the_quic_verdict` 另写一个 `expected()` 函数把设计 6.2（P7）的表逐行再写一遍，与 `quic_verdict` 逐格比对（4 全局 × 4 参数 × 直连与否 × 载不载 UDP），最后断言格数是 64；用例名与格数照任务，写法由执行者定 | 本提交 |
+| 24 | 4 | 门禁（一台机器上的一次运行，不是 CI）：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过（0 个警告）；`cargo test -j 8 --workspace --no-fail-fast` 86 个结果行、4676 通过、0 失败、13 忽略，是基线 86 / 4670 / 0 / 13 净加 6（删 1 条 `ip_rewrite_is_a_known_section_kept_for_later`，加 7 条）；`cargo test -j 8 --workspace --test corpus` 通过，语料库快照没有变化。日志 `gate-task-4-final.log` 在工作区（git 忽略） | 本提交 |
 
 ## 延后事项
 

@@ -12,7 +12,6 @@ const DEFERRED: &[&str] = &[
     "Script",
     "Panel",
     "Port Forwarding",
-    "IP Rewrite",
     "Ponte",
     "Testing",
     "DHCP",

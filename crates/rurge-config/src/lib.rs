@@ -13,6 +13,7 @@ pub mod glob;
 pub mod host;
 pub mod hostlist;
 pub mod hostname;
+pub mod ip_rewrite;
 pub mod keystore;
 pub mod managed;
 pub mod network;
@@ -44,6 +45,7 @@ pub use general::{
 pub use glob::{Glob, GlobOptions};
 pub use host::{DnsUpstream, HostEntry, HostKey, HostValue, SystemMode};
 pub use hostlist::{HostList, HostListEntry, HostPattern, PortSpec};
+pub use ip_rewrite::{IpRewrite, IpRewriteAction};
 pub use keystore::{KeystoreItem, KeystoreType};
 pub use managed::ManagedConfig;
 pub use network::{NetKind, NetworkCell, NetworkFacts, Primary, WifiLink};

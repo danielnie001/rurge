@@ -4,6 +4,7 @@ use crate::deferred::DeferredSections;
 use crate::diagnostic::{Diagnostic, Diagnostics, ParseError, codes};
 use crate::general::{General, parse_general};
 use crate::host::{HostEntry, HostKey, HostValue, SystemMode, parse_host_entry};
+use crate::ip_rewrite::{self, IpRewrite};
 use crate::keystore::{KeystoreItem, parse_keystore_item, unknown_field};
 use crate::managed::{self, ManagedConfig, parse_managed};
 use crate::network::NetworkFacts;
@@ -240,6 +241,8 @@ pub struct Config {
     pub wireguard: Vec<WireGuardSection>,
     /// The lines of `[SSID Setting]` that can be read, in the order written.
     pub ssid_settings: Vec<SsidSetting>,
+    /// `[IP Rewrite]`: the lines that can be read, in the order written.
+    pub ip_rewrite: IpRewrite,
     pub deferred: DeferredSections,
     /// The `#!MANAGED-CONFIG` line of the text in effect: none when it is a
     /// downloaded copy that carries no line.
@@ -912,6 +915,15 @@ pub fn from_profile(
         &mut diags,
     );
 
+    // [IP Rewrite].
+    let ip_rewrite = ip_rewrite::parse(
+        profile
+            .section("IP Rewrite")
+            .into_iter()
+            .flat_map(Section::active_entries),
+        &mut diags,
+    );
+
     // Deferred and unknown sections.
     let deferred = DeferredSections::collect(&profile);
     if !deferred.sections.is_empty() {
@@ -974,6 +986,7 @@ pub fn from_profile(
         keystore,
         wireguard,
         ssid_settings,
+        ip_rewrite,
         deferred,
         managed,
         unknown_sections,
@@ -1697,6 +1710,7 @@ fn own_listener(general: &General, port: u16) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ip_rewrite::IpRewriteAction;
     use crate::network::{NetKind, NetworkFacts, Primary, WifiLink};
     use crate::remote::fake::{Fake, hours};
     use crate::spec::PolicyPath;
@@ -1714,6 +1728,11 @@ mod tests {
 
     fn codes_of(l: &Loaded) -> Vec<&'static str> {
         l.diagnostics.iter().map(|d| d.code).collect()
+    }
+
+    /// An address written in a profile, for the `[IP Rewrite]` expectations.
+    fn ip(text: &str) -> IpAddr {
+        text.parse().expect("an address")
     }
 
     const QUICK_START: &str = "[General]\ndns-server = system, 1.1.1.1, 8.8.8.8\n\n[Proxy]\nProxyA = https, proxy.example.com, 443, username, password\n\n[Proxy Group]\nProxy = select, ProxyA, DIRECT\n\n[Rule]\nDOMAIN-SUFFIX,example.com,Proxy\nGEOIP,CN,DIRECT\nFINAL,Proxy\n";
@@ -2615,12 +2634,11 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         assert_eq!(l.config.deferred.sections.len(), 2);
     }
 
-    /// `[IP Rewrite]` acts on the virtual interface, which a later version
-    /// brings. Until then the section is read, its lines kept in the order
-    /// they were written, and it is said to be inactive like the other
-    /// sections waiting for that version; it is not an unknown section.
+    /// `[IP Rewrite]` is in effect (phase 3 M5): its active lines are read in
+    /// the order they were written into `Config::ip_rewrite`, and the section
+    /// is no longer one waiting for a later version.
     #[test]
-    fn ip_rewrite_is_a_known_section_kept_for_later() {
+    fn ip_rewrite_is_read_in_order() {
         for header in ["IP Rewrite", "ip rewrite"] {
             let l = load_text(&format!(
                 "[{header}]\n10.0.0.1 = reject\n10.0.0.0/8 = drop\nfd00::/8 = reflect\n\
@@ -2632,37 +2650,145 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
                 l.diagnostics.iter().collect::<Vec<_>>()
             );
             let c = codes_of(&l);
-            assert!(!c.contains(&codes::W_UNKNOWN_SECTION), "{header}: {c:?}");
+            for unwanted in [
+                codes::W_DEFERRED_SECTION,
+                codes::W_UNKNOWN_SECTION,
+                codes::W_UNKNOWN_KEY,
+                codes::W_INVALID_VALUE,
+            ] {
+                assert!(!c.contains(&unwanted), "{header}: {c:?}");
+            }
             assert!(l.config.unknown_sections.is_empty(), "{header}");
-            let inactive: Vec<&str> = l
-                .diagnostics
-                .iter()
-                .filter(|d| d.code == codes::W_DEFERRED_SECTION)
-                .map(|d| d.message.as_str())
-                .collect();
+            assert!(l.config.deferred.get("IP Rewrite").is_none(), "{header}");
+            let table = &l.config.ip_rewrite;
             assert_eq!(
-                inactive,
-                [format!(
-                    "sections parsed but inactive in this version: [{header}]"
-                )],
+                table.action(ip("10.0.0.1")),
+                Some(IpRewriteAction::Reject),
                 "{header}"
             );
-            let section = l
-                .config
-                .deferred
-                .get("IP Rewrite")
-                .unwrap_or_else(|| panic!("{header}: the section is not kept"));
-            let lines: Vec<&str> = section.entries.iter().map(|e| e.raw.as_str()).collect();
             assert_eq!(
-                lines,
-                [
-                    "10.0.0.1 = reject",
-                    "10.0.0.0/8 = drop",
-                    "fd00::/8 = reflect"
-                ],
+                table.action(ip("10.9.9.9")),
+                Some(IpRewriteAction::Drop),
                 "{header}"
             );
+            assert_eq!(
+                table.action(ip("fd00::1")),
+                Some(IpRewriteAction::Reflect),
+                "{header}"
+            );
+            assert_eq!(table.action(ip("192.0.2.1")), None, "{header}");
         }
+    }
+
+    #[test]
+    fn ip_rewrite_actions_ignore_case() {
+        let l = load_text(
+            "[IP Rewrite]\n10.0.0.1 = REFLECT\n10.0.0.2 = Drop\n10.0.0.3 = rEjEcT\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        let c = codes_of(&l);
+        assert!(c.is_empty(), "{c:?}");
+        let table = &l.config.ip_rewrite;
+        assert_eq!(table.action(ip("10.0.0.1")), Some(IpRewriteAction::Reflect));
+        assert_eq!(table.action(ip("10.0.0.2")), Some(IpRewriteAction::Drop));
+        assert_eq!(table.action(ip("10.0.0.3")), Some(IpRewriteAction::Reject));
+    }
+
+    #[test]
+    fn ip_rewrite_host_bits_are_read_as_ip_cidr_reads_them() {
+        let l = load_text(
+            "[IP Rewrite]\n10.1.2.3/8 = drop\n2001:db8::1/32 = drop\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        let table = &l.config.ip_rewrite;
+        assert_eq!(table.action(ip("10.200.0.1")), Some(IpRewriteAction::Drop));
+        assert_eq!(
+            table.action(ip("2001:db8:ffff::1")),
+            Some(IpRewriteAction::Drop)
+        );
+    }
+
+    #[test]
+    fn a_single_address_is_a_slash_32_or_a_slash_128() {
+        let l = load_text(
+            "[IP Rewrite]\n192.0.2.1 = drop\n2001:db8::1 = drop\n\
+[Rule]\nFINAL,DIRECT\n",
+        );
+        let c = codes_of(&l);
+        assert!(c.is_empty(), "{c:?}");
+        let table = &l.config.ip_rewrite;
+        assert_eq!(table.action(ip("192.0.2.1")), Some(IpRewriteAction::Drop));
+        assert_eq!(table.action(ip("192.0.2.2")), None);
+        assert_eq!(table.action(ip("2001:db8::1")), Some(IpRewriteAction::Drop));
+        assert_eq!(table.action(ip("2001:db8::2")), None);
+    }
+
+    #[test]
+    fn bad_ip_rewrite_lines_are_w0012_and_skipped() {
+        let bad = [
+            "10.0.0.1 drop",
+            "10.0.0.300 = drop",
+            "10.0.0.0/33 = drop",
+            "fd00::/129 = drop",
+            "10.0.0.1 = bounce",
+            "10.0.0.1 = drop, now",
+            "= drop",
+            "10.0.0.1 =",
+        ];
+        let mut text = String::from("[IP Rewrite]\n");
+        for line in bad {
+            text.push_str(line);
+            text.push('\n');
+        }
+        text.push_str("10.0.0.0/8 = drop\nfd00::/8 = reflect\n[Rule]\nFINAL,DIRECT\n");
+        let l = load_text(&text);
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.iter().collect::<Vec<_>>()
+        );
+        let said: Vec<(u32, &str)> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_INVALID_VALUE)
+            .map(|d| {
+                let span = d.span.as_ref().expect("a position");
+                (span.line, d.message.as_str())
+            })
+            .collect();
+        let message = "[IP Rewrite]: a line that is not `<address or CIDR> = reflect | reject | drop` is ignored";
+        assert_eq!(said.len(), bad.len(), "{said:?}");
+        for (i, (line, said_message)) in said.iter().enumerate() {
+            assert_eq!(*line, 2 + i as u32, "line {} of {}", i + 1, bad.len());
+            assert_eq!(*said_message, message);
+            assert!(!said_message.contains(bad[i]), "line {} quoted", i + 1);
+        }
+        let table = &l.config.ip_rewrite;
+        assert_eq!(table.action(ip("10.9.9.9")), Some(IpRewriteAction::Drop));
+        assert_eq!(table.action(ip("fd00::1")), Some(IpRewriteAction::Reflect));
+    }
+
+    #[test]
+    fn the_first_line_of_its_family_decides() {
+        let read = |lines: &str| load_text(&format!("[IP Rewrite]\n{lines}[Rule]\nFINAL,DIRECT\n"));
+        let l = read("10.0.0.1 = reflect\n10.0.0.0/8 = drop\n");
+        let table = &l.config.ip_rewrite;
+        assert_eq!(table.action(ip("10.0.0.1")), Some(IpRewriteAction::Reflect));
+        assert_eq!(table.action(ip("10.0.0.2")), Some(IpRewriteAction::Drop));
+        let l = read("10.0.0.0/8 = drop\n10.0.0.1 = reflect\n");
+        assert_eq!(
+            l.config.ip_rewrite.action(ip("10.0.0.1")),
+            Some(IpRewriteAction::Drop)
+        );
+    }
+
+    #[test]
+    fn no_section_is_an_empty_table() {
+        let l = load_text("[Rule]\nFINAL,DIRECT\n");
+        let table = &l.config.ip_rewrite;
+        assert!(table.is_empty());
+        assert_eq!(table.action(ip("10.0.0.1")), None);
+        assert_eq!(table.action(ip("fd00::1")), None);
     }
 
     #[test]
