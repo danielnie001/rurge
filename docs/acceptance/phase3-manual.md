@@ -493,7 +493,7 @@
 
 设计 `docs/superpowers/specs/2026-10-26-phase3-m4-platform-design.md`（先读它第 21 节与末尾「执行期的订正」一节），计划 `docs/superpowers/plans/2026-10-26-phase3-m4a-skeleton-plan.md`、`…-m4b-loop-dns-plan.md`、`…-m4c-linux-macos-plan.md` 与 `…-m4d-windows-wrapup-plan.md`（末尾两张表是这一节的来由：M4b 延后第 9、10、15 行，M4c 延后第 1、2、5 ～ 10 行，M4d 计划的任务 9）；API 与日志行见 `docs/api/phase3.md` 的「M4」、「M4b」、「M4c」与「M4d」四节，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 2.1、6.3、9.1、9.4、10.4 节。
 
-自动化验不了的是真机上的这一整套：真的虚拟网卡、真的地址与路由、真的系统 DNS、真的权限、真的 ICMP、真的睡眠与换网络。三个平台的设备与系统改动在一台 Windows 11 x86-64 的开发机上都没有跑过（Windows 的设备一段也没有运行过；Linux 与 macOS 的设备与挑平台的代码那台机器编不到，CI 还没有见过 M4 的提交）。**一项也没有做过。**
+自动化验不了的是真机上的这一整套：真的虚拟网卡、真的地址与路由、真的系统 DNS、真的权限、真的 ICMP、真的睡眠与换网络。三个平台的设备与系统改动在一台 Windows 11 x86-64 的开发机上都没有跑过（Windows 的设备一段也没有运行过；Linux 与 macOS 的设备与挑平台的代码那台机器编不到。CI 的运行 40611702392 在三个平台上编译了 M4 的代码、缺省用例通过，但缺省的用例不建网卡、不改系统设置）。**一项也没有做过。**
 
 **会改系统设置的步骤（开增强模式、改路由与系统 DNS、改 `rp_filter`、强杀进程）在一次性的 Windows / macOS / Linux 机器或虚拟机上做。**每一项记下日期、系统版本与结果；连原始输出（`netsh` / `ip` / `networksetup` / `scutil` / `resolvectl`）一起记下的那几项，是为核对代码里的读回与解析。
 

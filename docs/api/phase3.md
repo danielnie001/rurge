@@ -846,3 +846,11 @@ sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
 - **三个平台的步骤没有在机器上跑过**：`netsh` 与 `ip` 的写法是按文档与手册页核对出来的（M4a 计划 P2 ～ P5），没有一条在真机上执行过；`rurge check` 的四个码只对着 Profile 的解析测过。
 - **手工验收没有做**：增强模式在真机上的开与关、路由表的样子、系统 DNS 的接管与交还、`kill -9` 之后的恢复、防环、睡眠唤醒与换网络、`ping`、接管暂停，都要等 M4c / M4d 之后；`docs/acceptance/phase3-manual.md` 里还没有 M4 一节（只有 M1、M2、M3），M4d 写它，要验的东西列在设计第 16 节，今天一项也没有做过。
 - 全部用例只在一台 Windows 11 x86-64 的开发机上跑过，`rurge run --enhanced-mode` 的每一种行为都只经文件后端端到端测过；CI 没有见过 M4a 与 M4b 的提交。
+
+### M4 推送之后的 CI（2026-10-28）
+
+**本节订正上面几处“CI 没有见过”的说法**（规矩是历史的段落不逐处改、由后写的段落订正）：M4a ～ M4d 的提交推送了，运行 40611702392（提交 `3a76b80`）三个平台的 `check` 都绿（M4c 记录第 51 行、M4d 记录第 91 行）。
+
+- M4c、M4d 两节与「没有覆盖的」里“CI 还没有见过 M4c 的提交”“M4 的提交 CI 一个也没有见过”“CI 没有见过 M4a 与 M4b 的提交”不再成立：Linux 与 macOS 开设备与挑平台的代码在这两个平台上过了 `cargo clippy --all-targets -- -D warnings`，缺省用例通过。
+- 「没有覆盖的」里“本机没有编译过的 Unix 代码”列的东西，除 `icmp::open` 的“其余平台恒失败”一份（CI 的三个平台也编不到，M4b 延后第 17 行）之外，都在 CI 的 Linux 与 macOS 上编译了，那几条用例在那里通过；`0600` 那条 `#[cfg(unix)]` 的用例与 `the_wintun_dll_option_is_a_usage_error_elsewhere` 同样在 Linux 与 macOS 上通过。这些由测试一步的成功推出，逐条的结果在要登录才能读的任务日志里。
+- 照旧成立的：缺省的用例不建网卡、不改系统设置，三个平台的设备与系统改动都没有真的运行过、没有在真机上验证；Wintun 设备的十个放开的函数没有在任何地方运行过（`RURGE_TEST_WINTUN_DLL` 不设）；L2 特权用例在 Linux 上编译了、没有运行过（`RURGE_TEST_PRIVILEGED` 不设）；`pings_the_loopback` 在 CI 的各平台上走的是哪一条路，没有读到。

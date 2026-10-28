@@ -602,3 +602,7 @@ M4a ～ M4c 各自的最后一个任务更新它碰到的文档（`docs/api/phas
 **终审之后（第 4.3 节）**
 
 32. 第 4.3 节“总要减去的” → Windows 上另减 `240.0.0.0/4`：Windows 所有版本缺省都挡这一段的流量（草案 draft-schoen-intarea-unicast-240 的 Windows 一段；`mstcpip.h` 的 `Ipv4AddressType` 把它判成 `NlatInvalid`），`netsh` 加不加得进没有人核实过；`RouteInputs.class_e` 为假（Windows）时 `RouteSet::compute` 在最后把它挖掉，包含项也带不回来（缺省的 Profile 下 27 条，Linux 与 macOS 仍是 55 条）（M4d 记录第 87 行）。
+
+**推送之后（M4c 任务 10、M4d 任务 8）**
+
+33. 第 2 节与 M4-D1 的“M4c 有一个等 CI 的停点”（与第 25 条加的 M4d 的那一个）→ 两个停点合成一次做完：运行 40611702392（提交 `3a76b80`，2026-10-28）三个平台的 `check` 与 `bench` 都绿，Linux 与 macOS 专有的代码第一次被编译、缺省用例通过，没有要修的；缺省的用例不建网卡、不改系统设置，设备与系统改动照旧只能由手工验收（第 16 节）与 L2（第 14 节）验证（M4c 记录第 51 行、M4d 记录第 91 行）。
