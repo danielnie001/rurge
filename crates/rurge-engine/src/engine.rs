@@ -796,9 +796,10 @@ impl Engine {
 
     /// Mode / rule → policy, shared by `dial`, `dial_internal` and the UDP
     /// flows (M4 §4.1). When a line of a set decided the rule, the session's
-    /// log line and its notes say which. The IP rules ask `resolver`: the
-    /// engine's own, but an internal DNS session comes with the address its
-    /// server was resolved to (phase 3 / M5 design 9.3).
+    /// log line and its notes say which. The IP rules ask the engine's own
+    /// resolver; `choose_policy_with` is the same with rules that ask another
+    /// (the address an internal DNS session comes with, phase 3 / M5 design
+    /// 9.3).
     pub(crate) async fn choose_policy(
         &self,
         rt: &Runtime,
@@ -1089,7 +1090,8 @@ impl Engine {
         };
         let policy = match chosen {
             Chosen::Policy(p) => p,
-            // An IP-literal DNS session never needs resolution; a DnsFailed here
+            // Neither an IP-literal DNS session nor a named one needs a lookup
+            // here (the named one's rules ask its own address); a DnsFailed
             // would only come from a misconfigured rule → direct.
             Chosen::DnsFailed => PolicyRef::Builtin(Builtin::Direct),
         };

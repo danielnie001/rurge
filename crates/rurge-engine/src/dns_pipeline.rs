@@ -100,11 +100,12 @@ impl PipelineConnector {
         let port = target.port;
         let engine = self.engine.get().and_then(Weak::upgrade);
         let Some(engine) = engine else {
-            // Not attached yet (bootstrap phase) → direct.
-            let target = Target::new(host, port);
+            // Not attached yet (bootstrap phase) → direct, and at the address
+            // the bootstrap resolved: the server's name is never a dial target
+            // of its own, only what `connect_resolved` carries along.
             return match name {
-                Some(name) => self.fallback.connect_resolved(name, &target, opts).await,
-                None => self.fallback.connect(&target, opts).await,
+                Some(name) => self.fallback.connect_resolved(name, target, opts).await,
+                None => self.fallback.connect(target, opts).await,
             };
         };
         let mut session = SessionInfo::tcp(host, port);
@@ -141,15 +142,10 @@ impl PipelineConnector {
         let port = target.port;
         let engine = self.engine.get().and_then(Weak::upgrade);
         let Some(engine) = engine else {
-            // Not attached yet (bootstrap phase) → direct.
-            let target = Target::new(host, port);
+            // Not attached yet (bootstrap phase) → direct, as in `connect_with`.
             return match name {
-                Some(name) => {
-                    self.fallback
-                        .connect_udp_resolved(name, &target, opts)
-                        .await
-                }
-                None => self.fallback.connect_udp(&target, opts).await,
+                Some(name) => self.fallback.connect_udp_resolved(name, target, opts).await,
+                None => self.fallback.connect_udp(target, opts).await,
             };
         };
         let mut session = SessionInfo::udp(host, port);
@@ -567,6 +563,98 @@ mod tests {
         .expect("within the bound")
         .expect("a carrier from the fallback");
         assert_eq!(echoed(&carrier, b"ping").await, b"ping");
+    }
+
+    /// A server written as a name is dialled at the address the bootstrap
+    /// resolved, before the engine is attached as well: the fallback is told
+    /// the name (`connect_resolved`) and the address, and a target that is
+    /// the name would hand it to the system's resolver (phase 3 / M5 design
+    /// 9.2).
+    #[tokio::test]
+    async fn without_an_engine_a_named_server_is_dialled_at_its_address() {
+        #[derive(Default)]
+        struct Refusing(Mutex<Vec<String>>);
+
+        impl Refusing {
+            fn note(&self, call: &str, name: &str, target: &Target) -> io::Error {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{call} {name} {}:{}", target.host, target.port));
+                io::Error::new(io::ErrorKind::ConnectionRefused, "refused")
+            }
+
+            fn calls(&self) -> Vec<String> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        impl Connector for Refusing {
+            fn connect<'a>(
+                &'a self,
+                target: &'a Target,
+                _opts: &'a ConnectOpts,
+            ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+                let refused = self.note("connect", "", target);
+                Box::pin(std::future::ready(Err(refused)))
+            }
+
+            fn connect_udp<'a>(
+                &'a self,
+                target: &'a Target,
+                _opts: &'a ConnectOpts,
+            ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+                let refused = self.note("connect_udp", "", target);
+                Box::pin(std::future::ready(Err(refused)))
+            }
+
+            fn connect_resolved<'a>(
+                &'a self,
+                name: &'a str,
+                target: &'a Target,
+                _opts: &'a ConnectOpts,
+            ) -> BoxFuture<'a, io::Result<BoxedStream>> {
+                let refused = self.note("connect_resolved", name, target);
+                Box::pin(std::future::ready(Err(refused)))
+            }
+
+            fn connect_udp_resolved<'a>(
+                &'a self,
+                name: &'a str,
+                target: &'a Target,
+                _opts: &'a ConnectOpts,
+            ) -> BoxFuture<'a, io::Result<BoxedDatagram>> {
+                let refused = self.note("connect_udp_resolved", name, target);
+                Box::pin(std::future::ready(Err(refused)))
+            }
+        }
+
+        let fallback = Arc::new(Refusing::default());
+        let pc = PipelineConnector::new(fallback.clone());
+        let faces = pc.connectors();
+        let target = Target::new(HostName::parse("127.0.0.1"), 853);
+        let opts = ConnectOpts::default();
+        assert!(
+            faces
+                .tls
+                .connect_resolved("dns.test", &target, &opts)
+                .await
+                .is_err()
+        );
+        assert!(
+            faces
+                .quic
+                .connect_udp_resolved("dns.test", &target, &opts)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fallback.calls(),
+            [
+                "connect_resolved dns.test 127.0.0.1:853",
+                "connect_udp_resolved dns.test 127.0.0.1:853",
+            ]
+        );
     }
 
     /// An internal carrier counts what it sends as `up` and what comes back

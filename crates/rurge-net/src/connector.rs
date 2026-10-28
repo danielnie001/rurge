@@ -143,8 +143,9 @@ pub trait Connector: Send + Sync {
 
     /// `connect` to `target`, which is an address `name` resolved to (phase 3
     /// / M5 design 9.2). A connector that tells its sessions by name — the
-    /// engine's DNS pipeline — takes the name along; every other dials
-    /// `target` as `connect` would.
+    /// engine's DNS pipeline — takes the name along, and one that wraps
+    /// another (`rurge-dns`'s `BootstrapConnector`) passes it down; every
+    /// other ignores it and dials `target` as `connect` would.
     fn connect_resolved<'a>(
         &'a self,
         name: &'a str,

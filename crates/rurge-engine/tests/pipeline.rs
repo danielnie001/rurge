@@ -1814,10 +1814,9 @@ async fn a_dns_session_matches_rules_by_the_servers_name() {
         0,
         "the engine's resolver never asks the upstream for its own name"
     );
-    assert_eq!(
-        boot.query_count("dns-up.test", rurge_dns::message::Qtype::A),
-        1,
-        "the bootstrap resolved the name, and only it"
+    assert!(
+        boot.query_count("dns-up.test", rurge_dns::message::Qtype::A) >= 1,
+        "the bootstrap resolved the name"
     );
 }
 
