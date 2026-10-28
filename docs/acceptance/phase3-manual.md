@@ -614,7 +614,7 @@
 
 ## M5　识别、阻断与 `[IP Rewrite]`
 
-设计 `docs/superpowers/specs/2026-10-28-phase3-m5-recognition-blocking-ip-rewrite-design.md`（先读它第 20、21 节的订正），计划 `docs/superpowers/plans/2026-10-28-phase3-m5-recognition-blocking-ip-rewrite-plan.md`（这一节的来由：设计第 16 节与任务原文列的六样，计划「延后事项」第 1 行的手工验收，和执行期记录里写着“只在内存设备上证明过”“没有观察过”的几行——第 32、34、61 ～ 63 行）；API 与日志行见 `docs/api/phase3.md` 的「M5」一节，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 1.2、2.1、3.1、4.3、4.6、6.1、6.2、7.2 与 9.10 节。
+设计 `docs/superpowers/specs/2026-10-28-phase3-m5-recognition-blocking-ip-rewrite-design.md`（先读它第 20、21 节的订正），计划 `docs/superpowers/plans/2026-10-28-phase3-m5-recognition-blocking-ip-rewrite-plan.md`（这一节的来由：设计第 16 节与任务原文列的六样，计划「延后事项」第 1 行的手工验收，和 `docs/api/phase3.md`「M5」一节「没有覆盖的」里“没有真机”一条列的事（只在内存设备与单元用例里验证过的））；API 与日志行见 `docs/api/phase3.md` 的「M5」一节，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 1.2、2.1、3.1、4.3、4.6、6.1、6.2、7.2 与 9.10 节。
 
 自动化验不了的是真实系统与真实应用对这些包的反应：`reflect` 送回的包由操作系统的协议栈接住、它的应答又被送回；被 `reject` 与 `drop` 处理的连接由真实的应用看到；Windows 的防火墙、真实的浏览器与 `curl` 的 QUIC / STUN、真实的 DoH 服务器都在内存设备之外。**M5 的这一切只在一台 Windows 11 x86-64 开发机的内存设备里测过**（一台机器上的一次运行，不是 CI；M5 的提交 CI 一个也没有见过），`reflect` 送回的包在真机上的去向没有观察过，`udp-priority` 的效果没有观察过；**一项也没有做过**。
 

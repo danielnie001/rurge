@@ -316,7 +316,7 @@ fn fragment(next: u8, offset: u16, more: bool) -> Vec<u8> {
 /// `[IP Rewrite]`'s `reject` does not walk a chain of IPv6 extension headers:
 /// what comes after one (beyond the one fragment header it reads) cannot be
 /// read, so nothing is answered, as with any type it cannot read (M5 design
-/// 8.5, plan P11). An ICMPv6 redirect (type 137) is answered with nothing too
+/// 8.5 and 21, plan P11 and its execution record row 70). An ICMPv6 redirect (type 137) is answered with nothing too
 /// (RFC 4443 2.4(e)). Pure function: no TUN, no network, no files.
 #[test]
 fn refusal_reads_past_no_ipv6_extension_header() {
@@ -418,8 +418,9 @@ fn refusal_reads_past_no_ipv6_extension_header() {
 /// An IPv6 packet is quoted up to what fits in the smallest MTU every IPv6
 /// link has, 1280 bytes, less the IPv6 and ICMPv6 headers: 1232 bytes (RFC
 /// 4443 2.4(c)). A fragment header can sit before the transport header, so the
-/// quote cannot stop at the IP header and eight bytes as IPv4's does (plan
-/// P11, which this test corrects).
+/// quote cannot stop at the IP header and eight bytes as IPv4's does (the
+/// phase 3 / M5 plan's execution record row 71; P11 quoted the header and
+/// eight bytes for both families).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reject_quotes_an_ipv6_packet_up_to_the_minimum_mtu() {
     let mut lab = lab_with_table("203.0.113.0/24 = reject\n2001:db8::/32 = reject\n");

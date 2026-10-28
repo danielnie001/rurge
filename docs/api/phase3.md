@@ -903,7 +903,7 @@ M5 之后 `GET` 的形状（`dropped` 多第十一个键 `ipRewrite`，顶层多
 
 ### 与 `[IP Rewrite]` 共用的两个限频
 
-`reject` 回的 RST 走虚拟网卡自己的“3 秒 100 个”限频（超出计 `rstLimited`），回的 ICMP“管理上禁止”走虚拟网卡自己的 ICMP 限频（另一份，同样每 3 秒 100 个，超出计 `icmpLimited`）：**RST 与 ICMP 是两份限频**，`reject` 的 RST 与预匹配拒绝的 RST 共用一份，`reject` 的 ICMP 与被拒 UDP 流的 ICMP 共用另一份（M5 记录第 28 行）。这两种被限频挡下的包仍计一次 `ipRewrite`（`reject` 命中了），只是没有回包；`src` / `dst` 照被拒的那个包的两端记。
+`reject` 回的 RST 走虚拟网卡自己的“3 秒 100 个”限频（超出计 `rstLimited`），回的 ICMP“管理上禁止”走虚拟网卡自己的 ICMP 限频（另一份，同样每 3 秒 100 个，超出计 `icmpLimited`）：**RST 与 ICMP 是两份限频**，`reject` 的 RST 与虚拟网卡自己回的 RST（停止中、忙、发往 rurge 自己的地址、不认识的 fake IP、预匹配拒绝，都经 `tcp/shard.rs` 的 `turn_away`）共用一份，`reject` 的 ICMP 与被拒 UDP 流的 ICMP 共用另一份（M5 记录第 28 行）。这两种被限频挡下的包仍计一次 `ipRewrite`（`reject` 命中了），只是没有回包；`src` / `dst` 照被拒的那个包的两端记。
 
 ### 没有覆盖的
 
