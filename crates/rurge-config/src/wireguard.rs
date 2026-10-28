@@ -482,7 +482,7 @@ pub fn parse_section(section: &Section, diags: &mut Diagnostics) -> Option<WireG
                 if parse_bool(value) != Some(false) {
                     report.inert(
                         span,
-                        "`accept-incoming` has no effect: this version accepts no incoming WireGuard peers",
+                        "`accept-incoming` has no effect: this version does not accept connections the peer opens through the tunnel",
                     );
                 }
             }
@@ -681,7 +681,8 @@ peer = (public-key = {PUBLIC}, allowed-ips = 10.8.0.2/32)\n"
     }
 
     /// `accept-incoming = false` asks for what rurge does anyway; anything
-    /// else asks for incoming peers, which rurge does not accept.
+    /// else asks for connections the peer opens through the tunnel, which
+    /// rurge does not accept.
     #[test]
     fn accept_incoming_false_says_nothing_and_anything_else_is_w0029() {
         let text = |value: &str| {
@@ -702,7 +703,7 @@ peer = (public-key = {PUBLIC}, allowed-ips = 10.8.0.2/32, endpoint = a.test:5182
                 found,
                 [(
                     codes::W_PARAM_NOT_EFFECTIVE,
-                    "[WireGuard a]: `accept-incoming` has no effect: this version accepts no incoming WireGuard peers"
+                    "[WireGuard a]: `accept-incoming` has no effect: this version does not accept connections the peer opens through the tunnel"
                 )],
                 "{value}"
             );
