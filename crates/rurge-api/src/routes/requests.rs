@@ -360,6 +360,18 @@ mod tests {
         assert_eq!(j.protocol, Some("mtproto"));
     }
 
+    /// The two protocols phase 3 / M5 gave a UDP flow — QUIC and STUN — reach
+    /// the JSON lowercased like the others.
+    #[test]
+    fn quic_and_stun_flows_are_named_quic_and_stun() {
+        let mut r = record(1, ListenerKind::Tun);
+        r.transport = Transport::Udp;
+        r.protocol = Some(rurge_config::rule::ProtocolKind::Quic);
+        assert_eq!(RequestJson::from(&r).protocol, Some("quic"));
+        r.protocol = Some(rurge_config::rule::ProtocolKind::Stun);
+        assert_eq!(RequestJson::from(&r).protocol, Some("stun"));
+    }
+
     /// `notes` is always a list, empty when the session has none.
     #[test]
     fn notes_are_a_list() {
