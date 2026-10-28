@@ -1,7 +1,7 @@
 //! Loopback QUIC servers for tests: a certificate and the configurations on
 //! either side of it, an echo server, a server socket on several ports for
-//! port hopping, and a port whose endpoints restart. Never used by
-//! production code.
+//! port hopping, a port whose endpoints restart, and a client's first
+//! datagram. Never used by production code.
 
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::udp::{RecvMeta, Transmit};
@@ -9,6 +9,7 @@ use quinn::{
     AsyncUdpSocket, Connection, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig,
     Runtime, ServerConfig, TokioRuntime, UdpPoller,
 };
+use rustls::Side;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
@@ -453,4 +454,63 @@ impl AsyncUdpSocket for Gate {
     fn may_fragment(&self) -> bool {
         self.socket.may_fragment()
     }
+}
+
+/// A client's first datagram: one Initial packet of `version` (1,
+/// 0x6b3343cf or a draft 0xff00001d–0xff000020) to the Destination
+/// Connection ID `dcid` (any length, so that a test can make a wrong one),
+/// sealed with the client Initial keys of that DCID and version, header
+/// protection applied (RFC 9001 §5), the datagram 1200 bytes long (plan
+/// P5). Panics on any other version.
+pub fn client_initial(version: u32, dcid: &[u8]) -> Vec<u8> {
+    let quic = crate::quic::initial::quic_version(version)
+        .unwrap_or_else(|| panic!("not a version whose Initial keys we have: {version:#x}"));
+    let kind: u8 = match quic {
+        rustls::quic::Version::V2 => 0b01,
+        _ => 0b00,
+    };
+    let dcid_len = u8::try_from(dcid.len()).expect("a connection ID of at most 255 bytes");
+    // a long header with the fixed bit, the version's Initial type, and a
+    // 4-byte packet number
+    let mut datagram = Vec::with_capacity(1200);
+    datagram.push(0xc0 | (kind << 4) | 0x03);
+    datagram.extend_from_slice(&version.to_be_bytes());
+    datagram.push(dcid_len);
+    datagram.extend_from_slice(dcid);
+    datagram.push(0); // source connection ID length
+    datagram.push(0); // token length
+    // the Length field in two bytes, so that the packet fills 1200 exactly
+    let pn_offset = datagram.len() + 2;
+    let length = u16::try_from(1200 - pn_offset).expect("room for the Length field");
+    datagram.extend_from_slice(&(0x4000 | length).to_be_bytes());
+    let pn_offset = datagram.len();
+    datagram.extend_from_slice(&[0u8; 4]); // packet number 0
+    // the plaintext: PADDING frames only — the check reads no frame — up to
+    // where the 16-byte tag starts
+    datagram.resize(1200 - 16, 0);
+
+    let keys = crate::quic::initial::initial_suite().keys(dcid, Side::Client, quic);
+    let (header, payload) = datagram.split_at_mut(pn_offset + 4);
+    let tag = keys
+        .local
+        .packet
+        .encrypt_in_place(0, header, payload)
+        .expect("a payload the AEAD takes");
+    datagram.extend_from_slice(tag.as_ref());
+
+    // header protection (RFC 9001 §5.4): the sample is the ciphertext at
+    // packet number offset plus four
+    let sample: [u8; 16] = datagram[pn_offset + 4..pn_offset + 4 + 16]
+        .try_into()
+        .expect("the sample");
+    let mut first = datagram[0];
+    let mut number = [0u8; 4];
+    number.copy_from_slice(&datagram[pn_offset..pn_offset + 4]);
+    keys.local
+        .header
+        .encrypt_in_place(&sample, &mut first, &mut number)
+        .expect("a 16-byte sample");
+    datagram[0] = first;
+    datagram[pn_offset..pn_offset + 4].copy_from_slice(&number);
+    datagram
 }

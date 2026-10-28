@@ -1156,6 +1156,8 @@ TUN_BENCH_FAR=memory cargo test -p rurge-tun --release --lib -- --ignored --exac
 | 9 | 0 | R2（协调者的裁定，接任务 3）：任务 3 的 `QuicAdaptive` 记"最近用到"用一个递增的序号（一条 QUIC 流被记或刷新时加一），不用 `Instant`、不比较时刻；同一时刻的几次调用按调用的次序排，淘汰时取序号最小的那一项。`the_201st_name_evicts_the_least_recently_used` 的调用不带不同的时刻，按 `Instant` 排会并列 | 本提交 |
 | 10 | 0 | 第 4 项：`Cargo.lock` 的 `[[package]]` 519 个；`crates/rurge-platform/tests/unsafe_functions.rs` 的 `LISTED` 是 `[(&str, &str); 23]`（`:18` ～ `:42`），数下来 23 项。都与计划写的一样 | 本提交 |
 | 11 | 0 | 第 5 项（门禁，一台机器上的一次运行，不是 CI）：`cargo fmt --all --check` 通过（退出码 0）；`cargo clippy --all-targets -- -D warnings` 通过（0 个警告，日志工作区的 `gate-task-0-clippy.log`）；`cargo test -j 8 --workspace --no-fail-fast` 第一次 85 个结果行、4630 通过、0 失败、13 忽略，`outbounds_hysteria2` 的可执行文件以 `STATUS_HEAP_CORRUPTION`（`0xc0000374`）退出（本机管控软件的钩子 DLL，`CLAUDE.md`「这台开发机」），单独重跑 `cargo test -j 8 --workspace --test outbounds_hysteria2` 得 1 个结果行、11 通过、0 失败、0 忽略；两次合起来 86 个结果行、4641 通过、0 失败、13 忽略，与基线 86 / 4641 / 0 / 13 相同。日志 `gate-task-0.log` 与 `gate-task-0-rerun.log` 在工作区（git 忽略） | 本提交 |
+| 12 | 1 | 执行者的裁定：套件与版本的取法（P2 的 `TLS13_AES_128_GCM_SHA256` → `.tls13()` → `.quic_suite()`，P4 的版本表）写在 `crates/rurge-net/src/quic/initial.rs` 的 `pub(crate) fn initial_suite()` 与 `pub(crate) fn quic_version(u32) -> Option<rustls::quic::Version>` 里，`testing.rs` 的构造器调它们，两处不各写一份；`initial.rs` 的 `Header` / `header` / `opens` / `varint` 都是私有的 | 本提交 |
+| 13 | 1 | 执行者的裁定：构造器对 Destination Connection ID 只接受 0 ～ 255 字节——P5 的"任何长度"以长度字段的一个字节为上限，更长的 `client_initial` panic（用例只要 0 与 21 字节） | 本提交 |
 
 ## 延后事项
 
