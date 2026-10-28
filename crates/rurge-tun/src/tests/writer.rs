@@ -111,11 +111,21 @@ struct Writer {
 impl Writer {
     /// A writer on a device that takes every write, or on one that takes
     /// nothing until it is opened, with two queues of `capacity` batches and at
-    /// most `limit` of them taken at a time.
-    fn start(capacity: usize, limit: usize, gated: bool) -> (Writer, Queues) {
+    /// most `limit` of them taken at a time. `fill` puts what the test wants
+    /// waiting into the queues before the writer's task is started, so that the
+    /// writer finds all of it when it first looks: a batch put in afterwards
+    /// may be taken on its own, before the rest has come.
+    fn start(
+        capacity: usize,
+        limit: usize,
+        gated: bool,
+        fill: impl FnOnce(&Queues),
+    ) -> (Writer, Queues) {
         let (device, _end, begun) = Recording::pair(gated);
         let (priority, from_priority) = mpsc::channel(capacity);
         let (normal, from_normal) = mpsc::channel(capacity);
+        let queues = Queues { priority, normal };
+        fill(&queues);
         let life = Arc::new(Life::default());
         let task = tokio::spawn(writer::run(
             device.clone(),
@@ -130,7 +140,7 @@ impl Writer {
             life,
             task,
         };
-        (writer, Queues { priority, normal })
+        (writer, queues)
     }
 
     /// Waits for a write to begin, which says that the writer has taken what
@@ -154,19 +164,18 @@ impl Writer {
 /// order they were put in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn priority_batches_go_first_in_the_next_write() {
-    let (writer, queues) = Writer::start(8, 8, false);
-    for batch in [b"n1", b"n2", b"n3"] {
+    let (writer, queues) = Writer::start(8, 8, false, |queues| {
+        for batch in [b"n1", b"n2", b"n3"] {
+            queues
+                .normal
+                .try_send(vec![batch.to_vec()])
+                .expect("the queue has room");
+        }
         queues
-            .normal
-            .send(vec![batch.to_vec()])
-            .await
+            .priority
+            .try_send(vec![b"p1".to_vec()])
             .expect("the queue has room");
-    }
-    queues
-        .priority
-        .send(vec![b"p1".to_vec()])
-        .await
-        .expect("the queue has room");
+    });
     eventually("the first write", WITHIN, || {
         !writer.device.writes().is_empty()
     })
@@ -188,14 +197,14 @@ async fn priority_batches_go_first_in_the_next_write() {
 /// One queue alone keeps the order the batches came in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_queue_alone_keeps_the_order_of_arrival() {
-    let (writer, queues) = Writer::start(8, 8, false);
-    for batch in [b"n1", b"n2", b"n3"] {
-        queues
-            .normal
-            .send(vec![batch.to_vec()])
-            .await
-            .expect("the queue has room");
-    }
+    let (writer, queues) = Writer::start(8, 8, false, |queues| {
+        for batch in [b"n1", b"n2", b"n3"] {
+            queues
+                .normal
+                .try_send(vec![batch.to_vec()])
+                .expect("the queue has room");
+        }
+    });
     eventually("the first write", WITHIN, || {
         !writer.device.writes().is_empty()
     })
@@ -213,7 +222,7 @@ async fn one_queue_alone_keeps_the_order_of_arrival() {
 /// normal queue full, the priority queue still takes a batch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_normal_queue_leaves_room_in_the_priority_queue() {
-    let (mut writer, queues) = Writer::start(1, 1, true);
+    let (mut writer, queues) = Writer::start(1, 1, true, |_| {});
     queues
         .normal
         .send(vec![b"n1".to_vec()])
@@ -256,7 +265,7 @@ async fn a_full_normal_queue_leaves_room_in_the_priority_queue() {
 /// writes what comes to the other one, and its task goes on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_writer_goes_on_with_one_queue_closed() {
-    let (writer, queues) = Writer::start(4, 4, false);
+    let (writer, queues) = Writer::start(4, 4, false, |_| {});
     let Queues { priority, normal } = queues;
     // the only sender of the priority queue
     drop(priority);
@@ -287,7 +296,7 @@ async fn the_writer_goes_on_with_one_queue_closed() {
 /// nothing has to be written for it to be.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_writer_ends_when_both_queues_have_closed() {
-    let (writer, queues) = Writer::start(4, 4, false);
+    let (writer, queues) = Writer::start(4, 4, false, |_| {});
     drop(queues);
     writer.ended().await;
 }
@@ -297,7 +306,7 @@ async fn the_writer_ends_when_both_queues_have_closed() {
 /// `STOP_GRACE`, the priority queue's batches first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_stop_grace_holds_for_both_queues() {
-    let (mut writer, queues) = Writer::start(8, 8, true);
+    let (mut writer, queues) = Writer::start(8, 8, true, |_| {});
     queues
         .normal
         .send(vec![b"n1".to_vec()])
@@ -457,14 +466,19 @@ async fn clogged(watched: &mut Watched) {
 }
 
 /// The reply the session has for the app, as the dialer hands it over: it waits
-/// for room in the queue it goes to, for as long as that queue is full.
+/// for room in the queue it goes to, for as long as that queue is full, but not
+/// on past five seconds — a reply that never gets room is a test to fail, not a
+/// run to hang in.
 async fn reply_to_the_app(watched: &Watched) -> io::Result<()> {
     let (app, far) = (addr(APP), addr(UDP_FAR));
     let target = Target::new(HostName::Ip(far.ip()), far.port());
-    watched
-        .dialer
-        .send_to_app(app, target.clone(), Some(target), b"reply".to_vec())
-        .await
+    in_five_seconds(
+        "the reply to be taken by the writer's queue",
+        watched
+            .dialer
+            .send_to_app(app, target.clone(), Some(target), b"reply".to_vec()),
+    )
+    .await
 }
 
 /// Waits until the reply and the SYN-ACKs of the second and third connections
