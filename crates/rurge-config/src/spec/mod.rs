@@ -248,9 +248,12 @@ impl NotImplemented {
                     "to use an `external` policy, load a profile without `#!MANAGED-CONFIG` that takes the downloaded parts in by `#!include`",
                 )
             }
-            NotImplemented::SsCipher(_) | NotImplemented::SnellVersion(_) | NotImplemented::WireGuardNoPeers => {
+            NotImplemented::SsCipher(_)
+            | NotImplemented::SnellVersion(_)
+            | NotImplemented::WireGuardNoPeers => {
                 Diagnostic::warning(codes::W_PROTOCOL_NOT_IMPLEMENTED, self.warning())
-            }        }
+            }
+        }
     }
 
     /// What the session log says after "policy protocol not implemented: ".
