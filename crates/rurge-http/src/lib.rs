@@ -5,5 +5,9 @@
 //! the listeners or the sessions: it is handed a stream and gives it back.
 
 pub mod prefix;
+pub mod sniff;
+pub mod tls;
 
 pub use prefix::Prefixed;
+pub use sniff::{Judged, MAX_PREFIX, SNIFF_WAIT, Sniffed, judge, sniff};
+pub use tls::ClientHello;
