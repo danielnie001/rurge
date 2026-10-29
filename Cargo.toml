@@ -61,6 +61,7 @@ tracing-subscriber = "0.3"
 rurge-proto = { path = "crates/rurge-proto" }
 rurge-policy = { path = "crates/rurge-policy" }
 rurge-inbound = { path = "crates/rurge-inbound" }
+rurge-http = { path = "crates/rurge-http" }
 rurge-engine = { path = "crates/rurge-engine" }
 base64 = "0.22"
 tokio-util = { version = "0.7", features = ["rt"] }

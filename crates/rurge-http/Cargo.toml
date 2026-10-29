@@ -1,0 +1,17 @@
+[package]
+name = "rurge-http"
+description = "HTTP engine for rurge: protocol sniffing, plain HTTP/1.1 and MITM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+
+[lints]
+workspace = true

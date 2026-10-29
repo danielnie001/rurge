@@ -3346,6 +3346,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rurge-http"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "rurge-inbound"
 version = "0.1.0"
 dependencies = [
