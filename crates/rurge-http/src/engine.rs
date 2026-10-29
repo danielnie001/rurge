@@ -147,7 +147,7 @@ pub trait Upstreams: Send + Sync + 'static {
     /// registered, its token a child of `Conn::token`, the connection's
     /// process slot.
     fn open(&self, session: SessionInfo) -> Arc<SessionHandle>;
-    /// The rules and the policy (design 8.4 "选路"). Refusals come back
+    /// The rules and the policy (design 8.4, routing). Refusals come back
     /// unfinished: the HTTP engine answers, sets the status and finishes the
     /// handle (`P4`).
     fn route<'a>(
@@ -155,7 +155,7 @@ pub trait Upstreams: Send + Sync + 'static {
         handle: &'a Arc<SessionHandle>,
         forwardable: bool,
     ) -> BoxFuture<'a, Routed<Self::Route, Self::Key>>;
-    /// Dials what `route` chose (design 8.4 "拨号"), in the request's own
+    /// Dials what `route` chose (design 8.4, the dial), in the request's own
     /// task.
     fn dial<'a>(
         &'a self,
@@ -1698,11 +1698,28 @@ pub async fn serve_connection<U: Upstreams>(client: BoxedStream, requests: Reque
         _ = abort.cancelled() => None,
         res = conn.as_mut() => res.err().map(|e| e.to_string()),
         _ = token.cancelled() => {
-            conn.as_mut().graceful_shutdown();
-            tokio::select! {
-                biased;
-                _ = abort.cancelled() => None,
-                res = conn.as_mut() => res.err().map(|e| e.to_string()),
+            if counter.routed() == 0 {
+                // Nothing of this connection reached the rules, so there is
+                // nothing to wind down: dropping the connection is what ends
+                // it, as `abort` does. A graceful shutdown could not end it
+                // anyway while the first head is still incomplete: hyper
+                // starts a new connection from `KA::Busy` (`proto/h1/conn.rs`),
+                // and the dispatcher's `disable_keep_alive` ends a connection
+                // at once only when its write side is closed or its read and
+                // write are both untouched and its read buffer is empty
+                // (`proto/h1/dispatch.rs`, `has_initial_read_write_state`);
+                // otherwise `Conn::disable_keep_alive` only ends a `KA::Idle`
+                // connection. A sniffed connection's first bytes are in that
+                // buffer, so the stop would wait for the head or its timeout
+                // (design 8.10).
+                None
+            } else {
+                conn.as_mut().graceful_shutdown();
+                tokio::select! {
+                    biased;
+                    _ = abort.cancelled() => None,
+                    res = conn.as_mut() => res.err().map(|e| e.to_string()),
+                }
             }
         }
     };
@@ -2063,6 +2080,19 @@ mod tests {
         idle: Duration,
         drop_hold: Duration,
     ) -> Rig {
+        rig_head_wait(entry, target, idle, drop_hold, Duration::from_secs(5)).await
+    }
+
+    /// As `rig_timed`, with the request-head timeout the connection waits by
+    /// (design 8.10): `rig_timed` keeps the five seconds its tests are bounded
+    /// by.
+    async fn rig_head_wait(
+        entry: Entry,
+        target: SocketAddr,
+        idle: Duration,
+        drop_hold: Duration,
+        head_wait: Duration,
+    ) -> Rig {
         let token = CancellationToken::new();
         let fake = Fake::new(token.clone(), target);
         let session = SessionInfo::tcp(HostName::parse("target.test"), 80);
@@ -2070,7 +2100,7 @@ mod tests {
             session,
             entry,
             idle,
-            head_wait: Duration::from_secs(5),
+            head_wait,
             drop_hold,
             abort: CancellationToken::new(),
             token: token.clone(),
@@ -3086,6 +3116,40 @@ mod tests {
         assert_eq!(served.routed, 1);
         let handle = fake.finished(0).await;
         assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+    }
+
+    /// A stop that comes while the first request head is still half read ends
+    /// the connection at once, not at the head timeout (design 8.10, 8.11):
+    /// nothing of the connection reached the rules, so there is nothing to
+    /// wind down.
+    #[tokio::test]
+    async fn a_stop_before_the_first_head_is_whole_ends_the_connection_at_once() {
+        let origin = TestServer::spawn().await;
+        // far beyond this test's bounds: the stop is what has to end it
+        let mut rig = rig_head_wait(
+            Entry::Sniffed,
+            addr_of(&origin),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .await;
+        // one write, and no blank line: the head is not whole
+        rig.client
+            .send("GET / HTTP/1.1\r\nHost: target.test\r\n")
+            .await
+            .unwrap();
+        // The `select!` in `serve_connection` is `biased`, in the order abort,
+        // the connection, the token: hyper is polled once before the token is
+        // looked at and reads these bytes into its buffer, so a half head is
+        // there when the stop comes.
+        rig.stop();
+        let served = tokio::time::timeout(Duration::from_secs(2), rig.served)
+            .await
+            .expect("the connection ends at once, not at the 60 s head timeout")
+            .expect("the serving task did not panic");
+        assert_eq!(served.routed, 0);
+        assert_eq!(served.error, None, "nothing was read as a request");
     }
 
     #[tokio::test]

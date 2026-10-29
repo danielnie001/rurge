@@ -2,8 +2,10 @@
 //! 7): which sessions those are (`sniffable_session`), what happens to one of
 //! them (`serve_sniffed`), and how the sniffs are counted. A sniffable session
 //! is answered at once by whoever accepted it, comes here with its stream, and
-//! is sniffed, given the SNI and the protocol it showed, and dialed and relayed
-//! as any other session is — with the bytes that were read forwarded whole.
+//! is sniffed and given the SNI and the protocol it showed: one judged HTTP —
+//! or one the settings force into the engine — is served by `serve_http` as the
+//! HTTP engine's own requests, and every other is dialed and relayed as any
+//! other session is, with the bytes that were read forwarded whole.
 
 use crate::FAKE_ADDRESS_NOT_KNOWN;
 use crate::control::Mode;
@@ -276,7 +278,9 @@ impl Engine {
     }
 
     /// Serves a session its entry answered "connected" already, to its end
-    /// (design 7.1): sniff it, say what it showed, dial it, relay it.
+    /// (design 7.1): sniff it, say what it showed, and then either hand it to
+    /// `serve_http` (judged HTTP, or forced in by `force-http-engine-hosts`)
+    /// or dial it and relay it.
     ///
     /// The sniff is raced with the stop and with the engine's sessions root:
     /// nothing is held and no record made while it waits, so a stop ends it at

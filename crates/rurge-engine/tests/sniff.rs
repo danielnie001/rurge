@@ -789,6 +789,10 @@ async fn the_prefix_reaches_the_upstream_whole() {
     // the 100 ms splits the opening bytes into two reads, so that the sniff is
     // over one prefix made of both: this is not a wait for nothing to happen
     tokio::time::sleep(Duration::from_millis(100)).await;
+    // the lowercase `t` makes `GEt` no method, so the sniff judges the bytes
+    // `Other` and they are relayed as they are; a `T` would make this HTTP,
+    // and an HTTP request goes to the engine, whose upstream here is the echo
+    // (the phase 4 / M1b plan's P11)
     let rest = b"t / not http\r\n\r\n";
     sent.extend_from_slice(rest);
     sent.extend(std::iter::repeat_n(0x5a, 10 * 1024));

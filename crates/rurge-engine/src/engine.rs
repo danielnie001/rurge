@@ -1560,7 +1560,7 @@ pub(crate) fn settle(handle: &SessionHandle, refused: &Refused) {
 }
 
 impl Engine {
-    /// The rules and the policy (design 8.4 "选路"), up to the attempts in
+    /// The rules and the policy (design 8.4, routing), up to the attempts in
     /// line; the dial itself is `dial_route`. A refusal comes back unfinished:
     /// the caller answers and finishes the handle (`P4`).
     pub(crate) async fn route_session(

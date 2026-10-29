@@ -42,7 +42,8 @@ pub(crate) struct ConnUpstreams {
     process: ProcessSlot,
     /// The lease of the fake address the connection came in on, if any: held
     /// here rather than in `serve_http`, so that an upgraded relay, which
-    /// outlives that function, keeps the address the name's (design 9, R27).
+    /// outlives that function, keeps the address the name's (the phase 4 /
+    /// M1b plan's P9).
     _lease: Option<Lease>,
     /// The adapter's stop, if the connection came in through it: an upgraded
     /// relay outlives `serve_http` and still has to end when the adapter does
