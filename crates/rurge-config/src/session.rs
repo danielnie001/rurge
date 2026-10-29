@@ -71,11 +71,11 @@ pub struct SessionInfo {
     pub sni: Option<String>,
     pub http_host: Option<String>,
     pub user_agent: Option<String>,
-    /// Full URL; only known for plain HTTP or after MITM. The engine reads
-    /// `listener == Http` together with `url.is_some()` as "the HTTP listener
-    /// is forwarding a plain request" (absolute-form forwarding to an HTTP
-    /// proxy): whoever sets `url` on another kind of session (MITM, phase 4)
-    /// must revisit `Engine::dial`.
+    /// The URL of an HTTP request: the request line's, or rebuilt from
+    /// `Host` and the path, and without userinfo. Every request the HTTP
+    /// engine carries has one (`phase 4 M1 design 8.3`); whether it may go to
+    /// an HTTP proxy in absolute form is the engine's own word
+    /// (`may_forward`), never inferred from this field and `listener`.
     pub url: Option<String>,
     /// A process the caller knew before the session was evaluated, which is
     /// what `rurge rule match --process` fills in. A session that came in

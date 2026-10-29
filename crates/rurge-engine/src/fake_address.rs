@@ -8,6 +8,7 @@ use crate::engine::Engine;
 use rurge_config::HostName;
 use rurge_config::session::{ListenerKind, SessionInfo};
 use rurge_dns::fakeip::{Lease, in_space};
+use rurge_http::Named;
 
 /// What became of the destination of a session at a proxy port (`turn_back`).
 pub(crate) enum Turned {
@@ -25,6 +26,28 @@ pub(crate) enum Turned {
 }
 
 impl Engine {
+    /// The name behind `host` if it is an address of rurge's space with one,
+    /// and a lease on it (`phase 4 M1 design 9`, R27): what a listener request
+    /// asks of the host its URL or `Host` names. `Named::No` for a name, for
+    /// an address outside rurge's space, and when no TUN runs (an address of
+    /// rurge's space is an address like any other then); `Named::Unknown` for
+    /// an address of rurge's space that no name stands behind.
+    pub(crate) fn named_fake_address(&self, host: &HostName) -> Named<Lease> {
+        let HostName::Ip(ip) = host else {
+            return Named::No;
+        };
+        if !in_space(*ip) {
+            return Named::No;
+        }
+        let Some(pool) = self.fake_pool.load_full() else {
+            return Named::No;
+        };
+        match pool.lease(ip.to_canonical()) {
+            Some((name, lease)) => Named::Name(name, lease),
+            None => Named::Unknown,
+        }
+    }
+
     /// Turns the destination of `session` back into the name behind it, if it
     /// is a session of the HTTP or SOCKS5 listener (a flow of a SOCKS5
     /// association is) whose destination is an address of rurge's space, and
@@ -34,21 +57,13 @@ impl Engine {
         if !matches!(session.listener, ListenerKind::Http | ListenerKind::Socks5) {
             return Turned::Unchanged;
         }
-        let HostName::Ip(ip) = session.dst_host else {
-            return Turned::Unchanged;
-        };
-        if !in_space(ip) {
-            return Turned::Unchanged;
-        }
-        let Some(pool) = self.fake_pool.load_full() else {
-            return Turned::Unchanged;
-        };
-        match pool.lease(ip.to_canonical()) {
-            Some((name, lease)) => {
+        match self.named_fake_address(&session.dst_host) {
+            Named::No => Turned::Unchanged,
+            Named::Name(name, lease) => {
                 session.dst_host = HostName::Domain(name);
                 Turned::Name(lease)
             }
-            None => Turned::Unknown,
+            Named::Unknown => Turned::Unknown,
         }
     }
 }

@@ -1,29 +1,26 @@
-//! HTTP/1.1 proxy listener on hyper (M3 design §6.2): CONNECT tunnels and
-//! absolute-URI plain requests, Basic authentication, per-request dialing.
+//! HTTP/1.1 proxy listener on hyper (M3 design §6.2, phase 4 M1 design 9):
+//! CONNECT tunnels, Basic authentication, and the absolute-form requests an
+//! HTTP proxy carries, which are the HTTP engine's (`Dialer::plain_requests`).
 
 use crate::listener::{HttpAuth, ListenerOpts, Running, bind, canonical_peer, serve};
-use crate::responses::{self, BoxError, ResponseBody};
+use crate::responses::{self, ResponseBody};
 use crate::session::{
-    Counting, DialError, Dialed, Dialer, FailKind, ServeOpts, SessionHandle, SessionOutcome,
+    ClientConn, Close, DialError, Dialer, FailKind, PlainRequests, ServeOpts, SessionHandle,
+    SessionOutcome,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use http::{
-    HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header,
-};
-use http_body_util::BodyExt;
+use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rurge_config::HostName;
-use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_net::connector::BoxedStream;
 use rurge_proto::RejectKind;
-use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -40,21 +37,16 @@ struct Ctx {
     here: Option<SocketAddr>,
     peer: SocketAddr,
     tracker: TaskTracker,
+    /// The connection's `Conn::abort`, built by the HTTP engine's object for
+    /// this connection: cancelled when it needs the connection gone at once,
+    /// and raced against the connection below (`phase 4 M1 design 8.10`,
+    /// 8.11).
+    abort: CancellationToken,
+    /// The engine's requests of this connection, asked for when its first
+    /// absolute-form request arrives (`P12`): a connection that only ever
+    /// sends `CONNECT` needs no process lookup and no upstream pool.
+    plain: OnceLock<Option<Arc<dyn PlainRequests>>>,
 }
-
-/// Returned from the service to make hyper close the connection without a response.
-#[derive(Debug)]
-pub(crate) enum HandlerError {
-    Close,
-}
-
-impl fmt::Display for HandlerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("connection closed by policy")
-    }
-}
-
-impl std::error::Error for HandlerError {}
 
 impl HttpListener {
     pub async fn bind(
@@ -80,6 +72,8 @@ impl HttpListener {
                     here: stream.local_addr().ok().map(canonical_peer),
                     peer,
                     tracker: tracker.clone(),
+                    abort: CancellationToken::new(),
+                    plain: OnceLock::new(),
                 });
                 async move { serve_connection(stream, ctx).await }
             },
@@ -89,6 +83,7 @@ impl HttpListener {
 
 async fn serve_connection(stream: TcpStream, ctx: Arc<Ctx>) {
     let handshake_timeout = ctx.opts.handshake_timeout;
+    let abort = ctx.abort.clone();
     let service = service_fn(move |req: Request<Incoming>| {
         let ctx = ctx.clone();
         async move { handle(req, ctx).await }
@@ -100,7 +95,18 @@ async fn serve_connection(stream: TcpStream, ctx: Arc<Ctx>) {
         .header_read_timeout(handshake_timeout)
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades();
-    if let Err(e) = conn.await {
+    let mut conn = std::pin::pin!(conn);
+    // The engine's word that the connection has to go at once ends it here:
+    // `rurge-http` cancels `abort` when a request is killed or stopped and
+    // when a client stops reading its response (`Conn::abort`), and a
+    // connection whose body is no longer polled could not see any of that. The
+    // connection is the listener's, so dropping it is the listener's to do.
+    let error = tokio::select! {
+        biased;
+        _ = abort.cancelled() => None,
+        res = conn.as_mut() => res.err(),
+    };
+    if let Some(e) = error {
         tracing::debug!(listener = "http", error = %e, "http connection ended");
     }
 }
@@ -138,24 +144,67 @@ pub(crate) fn authorized(auth: &HttpAuth, header: Option<&HeaderValue>) -> bool 
     }
 }
 
-async fn handle(
-    req: Request<Incoming>,
-    ctx: Arc<Ctx>,
-) -> Result<Response<ResponseBody>, HandlerError> {
+async fn handle(req: Request<Incoming>, ctx: Arc<Ctx>) -> Result<Response<ResponseBody>, Close> {
+    let mut req = req;
     if let Some(auth) = &ctx.opts.auth
         && !authorized(auth, req.headers().get(header::PROXY_AUTHORIZATION))
     {
         return Ok(responses::proxy_auth_required());
     }
+    // The client's credentials for rurge are this hop's alone: verified
+    // above, and never passed on (`phase 4 M1 design 9`).
+    req.headers_mut().remove(header::PROXY_AUTHORIZATION);
     if req.method() == Method::CONNECT {
         return connect(req, ctx).await;
     }
     if req.uri().scheme().is_some() && req.uri().authority().is_some() {
-        return forward(req, ctx).await;
+        return plain(req, ctx).await;
     }
     Ok(responses::bad_request(
         "rurge is an HTTP proxy: send CONNECT or an absolute-URI request",
     ))
+}
+
+/// An absolute-form request is the HTTP engine's (`phase 4 M1 design 9`): the
+/// connection's `PlainRequests` answers it. A dialer without one — only a
+/// test's — gets a 502 that says so.
+async fn plain(req: Request<Incoming>, ctx: Arc<Ctx>) -> Result<Response<ResponseBody>, Close> {
+    // TLS is tunnelled with CONNECT; anything else is not ours to forward (M5).
+    if req.uri().scheme() != Some(&http::uri::Scheme::HTTP) {
+        return Ok(responses::bad_request(
+            "only http:// absolute URIs can be forwarded",
+        ));
+    }
+    let requests = ctx.plain.get_or_init(|| {
+        ctx.dialer.plain_requests(ClientConn {
+            src: ctx.peer,
+            in_port: ctx.local.port(),
+            local: ctx.here,
+            abort: ctx.abort.clone(),
+        })
+    });
+    let Some(requests) = requests else {
+        let authority = req.uri().authority().cloned();
+        let dst = authority.as_ref().map_or(String::new(), |authority| {
+            format!(
+                "{}:{}",
+                authority.host(),
+                authority.port_u16().unwrap_or(80)
+            )
+        });
+        return Ok(responses::error_page(
+            StatusCode::BAD_GATEWAY,
+            &responses::ErrorPage {
+                title: "Connection failed",
+                session_id: 0,
+                dst,
+                rule: None,
+                chain: Vec::new(),
+                message: "This listener has no HTTP engine behind it.".to_string(),
+            },
+        ));
+    };
+    requests.handle(req).await
 }
 
 fn session_for(ctx: &Ctx, host: HostName, port: u16) -> SessionInfo {
@@ -171,7 +220,7 @@ fn session_for(ctx: &Ctx, host: HostName, port: u16) -> SessionInfo {
 async fn connect(
     mut req: Request<Incoming>,
     ctx: Arc<Ctx>,
-) -> Result<Response<ResponseBody>, HandlerError> {
+) -> Result<Response<ResponseBody>, Close> {
     let Some(authority) = req.uri().authority().cloned() else {
         return Ok(responses::bad_request("CONNECT needs host:port"));
     };
@@ -252,9 +301,9 @@ async fn connect(
             ..
         }) => {
             tokio::time::sleep(ctx.opts.drop_hold).await;
-            Err(HandlerError::Close)
+            Err(Close)
         }
-        Err(DialError::Reject { .. }) => Err(HandlerError::Close),
+        Err(DialError::Reject { .. }) => Err(Close),
         Err(DialError::Failed {
             kind,
             message,
@@ -271,114 +320,13 @@ async fn connect(
     }
 }
 
-/// Connection-specific headers a proxy must not pass on (RFC 7230 §6.1),
-/// plus the two `Proxy-*` headers that belong to this hop only.
-const HOP_BY_HOP: [HeaderName; 9] = [
-    header::CONNECTION,
-    HeaderName::from_static("keep-alive"),
-    HeaderName::from_static("proxy-connection"),
-    header::TE,
-    header::TRAILER,
-    header::TRANSFER_ENCODING,
-    header::UPGRADE,
-    header::PROXY_AUTHENTICATE,
-    header::PROXY_AUTHORIZATION,
-];
-
-/// The authority without any `user:password@` prefix (RFC 7230 §5.4 forbids
-/// userinfo in `Host`, and it must never reach a log or the session record).
-pub(crate) fn host_port(authority: &http::uri::Authority) -> String {
-    match authority.port_u16() {
-        Some(p) => format!("{}:{p}", authority.host()),
-        None => authority.host().to_string(),
-    }
-}
-
-/// Removes every hop-by-hop header, including the ones `Connection` names.
-/// hyper re-frames the body itself, so dropping `Transfer-Encoding` is safe.
-pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
-    let listed: Vec<HeaderName> = headers
-        .get_all(header::CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .filter_map(|t| HeaderName::try_from(t.trim()).ok())
-        .collect();
-    for name in listed {
-        headers.remove(name);
-    }
-    for name in HOP_BY_HOP {
-        headers.remove(name);
-    }
-}
-
-/// Rewrites a proxy request into the form the origin expects: origin-form
-/// URI, a `Host` header matching the request target, and no hop-by-hop headers.
-pub(crate) fn origin_form(req: &mut Request<Incoming>) -> Result<(), http::Error> {
-    let authority = req.uri().authority().map(host_port);
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    *req.uri_mut() = path.parse::<Uri>()?;
-    strip_hop_by_hop(req.headers_mut());
-    // RFC 7230 §5.4: the request target wins over whatever `Host` the client sent.
-    if let Some(a) = authority
-        && let Ok(v) = HeaderValue::from_str(&a)
-    {
-        req.headers_mut().insert(header::HOST, v);
-    }
-    Ok(())
-}
-
-/// Keeps a proxy request in absolute form for an upstream HTTP proxy
-/// (`always-use-connect = false`): the URI is rebuilt without userinfo, the
-/// hop-by-hop headers go, `Host` follows the request target, and `extra` —
-/// the upstream's `Proxy-Authorization` and configured headers — replaces
-/// same-name headers, `Host` included (manual: Policies › HTTP).
-pub(crate) fn absolute_form<B>(
-    req: &mut Request<B>,
-    extra: &[(String, String)],
-) -> Result<(), http::Error> {
-    let authority = req.uri().authority().map(host_port).unwrap_or_default();
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    *req.uri_mut() = format!("http://{authority}{path}").parse::<Uri>()?;
-    strip_hop_by_hop(req.headers_mut());
-    if let Ok(v) = HeaderValue::from_str(&authority) {
-        req.headers_mut().insert(header::HOST, v);
-    }
-    for (name, value) in extra {
-        let (Ok(name), Ok(value)) = (
-            HeaderName::try_from(name.as_str()),
-            HeaderValue::from_str(value),
-        ) else {
-            // the outbound validated its templates; whatever the http crate
-            // still refuses is dropped rather than sent malformed. The name
-            // only, Debug-escaped; the value is a credential.
-            tracing::debug!(
-                listener = "http",
-                name = ?name,
-                "dropped an upstream proxy header"
-            );
-            continue;
-        };
-        req.headers_mut().insert(name, value);
-    }
-    Ok(())
-}
-
 fn failure_response(
     ctx: &Ctx,
     handle: &SessionHandle,
     message: &str,
-) -> Result<Response<ResponseBody>, HandlerError> {
+) -> Result<Response<ResponseBody>, Close> {
     if !ctx.opts.show_error_page {
-        return Err(HandlerError::Close);
+        return Err(Close);
     }
     let s = handle.session();
     Ok(responses::error_page(
@@ -394,203 +342,11 @@ fn failure_response(
     ))
 }
 
-async fn forward(
-    mut req: Request<Incoming>,
-    ctx: Arc<Ctx>,
-) -> Result<Response<ResponseBody>, HandlerError> {
-    let Some(authority) = req.uri().authority().cloned() else {
-        return Ok(responses::bad_request("absolute URI without a host"));
-    };
-    // TLS is tunnelled with CONNECT; anything else is not ours to forward (M5).
-    if req.uri().scheme() != Some(&http::uri::Scheme::HTTP) {
-        return Ok(responses::bad_request(
-            "only http:// absolute URIs can be forwarded",
-        ));
-    }
-    let host = HostName::parse(authority.host()).canonical();
-    let port = authority.port_u16().unwrap_or(80);
-    let mut session = session_for(&ctx, host, port);
-    session.protocol = Some(ProtocolKind::Http);
-    session.url = Some(format!(
-        "http://{}{}",
-        host_port(&authority),
-        req.uri()
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/")
-    ));
-    session.http_host = Some(authority.host().to_ascii_lowercase());
-    session.user_agent = req
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
-    let dialed = match ctx.dialer.dial(session).await {
-        Ok(d) => d,
-        Err(DialError::Reject {
-            kind: RejectKind::TinyGif,
-            ..
-        }) => return Ok(responses::tiny_gif()),
-        Err(DialError::Reject {
-            kind: RejectKind::Drop,
-            ..
-        }) => {
-            tokio::time::sleep(ctx.opts.drop_hold).await;
-            return Err(HandlerError::Close);
-        }
-        Err(DialError::Reject { kind, rule, handle }) => {
-            if !ctx.opts.show_error_page_for_reject {
-                return Err(HandlerError::Close);
-            }
-            let s = handle.session();
-            return Ok(responses::error_page(
-                StatusCode::FORBIDDEN,
-                &responses::ErrorPage {
-                    title: "Request rejected",
-                    session_id: handle.id(),
-                    dst: format!("{}:{}", s.dst_host, s.dst_port),
-                    rule,
-                    chain: handle.policy_chain(),
-                    message: format!("The request was rejected by the {} policy.", kind.name()),
-                },
-            ));
-        }
-        Err(DialError::Failed {
-            kind,
-            message,
-            handle,
-            ..
-        }) => {
-            let what = match kind {
-                FailKind::Dns => "DNS lookup failed",
-                FailKind::Timeout => "Connection timed out",
-                FailKind::Connect | FailKind::Other => "Connection failed",
-            };
-            return failure_response(&ctx, &handle, &format!("{what}: {message}"));
-        }
-    };
-
-    let Dialed {
-        stream: upstream,
-        handle,
-        forward: upstream_headers,
-    } = dialed;
-    let io = TokioIo::new(Counting::new(upstream, handle.clone()));
-    let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            handle.finish(SessionOutcome::Failed(format!(
-                "upstream handshake failed: {e}"
-            )));
-            return failure_response(&ctx, &handle, &format!("Upstream handshake failed: {e}"));
-        }
-    };
-    let conn_handle = handle.clone();
-    // Cancelled when this handler returns, i.e. once the code below has had
-    // its say about the response head (an upstream 407 is a failed session).
-    // `SessionHandle::finish` is first-wins and the driver would otherwise get
-    // there first: the response head and the end of the upstream connection
-    // can arrive in one and the same poll of the driver task.
-    let handled = CancellationToken::new();
-    let driver_waits = handled.clone();
-    let _handled = handled.drop_guard();
-    ctx.tracker.spawn(async move {
-        // Inner task: this driver is tracked by the engine, not by the accept
-        // loop's `JoinSet`, so its panics would otherwise go unreported.
-        let inner = tokio::spawn(async move {
-            // Race the session token: `kill` and the graceful shutdown's
-            // `cancel_sessions` end the exchange by dropping the connection,
-            // which is what makes a streaming `http://` response killable.
-            let outcome = tokio::select! {
-                biased;
-                _ = conn_handle.token().cancelled() => cancelled_outcome(&conn_handle),
-                res = conn => match res {
-                    Ok(()) => SessionOutcome::Completed,
-                    Err(e) => SessionOutcome::Failed(format!("upstream connection error: {e}")),
-                },
-            };
-            driver_waits.cancelled().await;
-            conn_handle.finish(outcome);
-        });
-        if let Err(e) = inner.await
-            && e.is_panic()
-        {
-            tracing::error!(listener = "http", "upstream connection task panicked: {e}");
-        }
-    });
-    // To an HTTP proxy the request stays in absolute form; to anything else
-    // (an origin, a tunnel) it goes in origin form.
-    let rewritten = match &upstream_headers {
-        Some(headers) => absolute_form(&mut req, headers),
-        None => origin_form(&mut req),
-    };
-    if let Err(e) = rewritten {
-        handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
-        return Ok(responses::bad_request("malformed request URI"));
-    }
-    // `biased`: once the token is cancelled the answer is always "closed by
-    // policy", never the error page the dropped upstream connection would
-    // otherwise produce.
-    let sent = tokio::select! {
-        biased;
-        _ = handle.token().cancelled() => {
-            handle.finish(cancelled_outcome(&handle));
-            return Err(HandlerError::Close);
-        }
-        res = sender.send_request(req) => res,
-    };
-    match sent {
-        Ok(mut resp) => {
-            if upstream_headers.is_some()
-                && resp.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED
-            {
-                // the credentials in question are rurge's own, towards its
-                // upstream: the client can do nothing about them, and the
-                // challenge header is hop-by-hop. Both texts come from the
-                // status code, never from the upstream's reason phrase.
-                handle.finish(SessionOutcome::Failed(
-                    "http proxy answered 407 Proxy Authentication Required".to_string(),
-                ));
-                return failure_response(
-                    &ctx,
-                    &handle,
-                    "Upstream proxy rejected the request: 407 Proxy Authentication Required",
-                );
-            }
-            strip_hop_by_hop(resp.headers_mut());
-            Ok(resp.map(|body| body.map_err(BoxError::from).boxed()))
-        }
-        Err(e) => {
-            // no response head: upstream gave up while the client waits —
-            // unless the error is the request's own (a client that left in
-            // the middle of its upload), which is no failure of upstream's
-            if !e.is_user() {
-                handle.mark_upstream_failed();
-            }
-            handle.finish(SessionOutcome::Failed(format!(
-                "upstream request failed: {e}"
-            )));
-            failure_response(&ctx, &handle, &format!("Upstream request failed: {e}"))
-        }
-    }
-}
-
-/// How a session the cancellation token ended is recorded: an operator `kill`
-/// is a failure, the graceful shutdown's `cancel_sessions` is not.
-fn cancelled_outcome(handle: &SessionHandle) -> SessionOutcome {
-    if handle.was_killed() {
-        SessionOutcome::Failed("killed".to_string())
-    } else {
-        SessionOutcome::Completed
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::{FakeDialer, echo_server};
-    use rurge_net::testing::TestServer;
+    use http::Uri;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -611,61 +367,6 @@ mod tests {
         .await
         .unwrap();
         (running, dialer)
-    }
-
-    async fn listener_with_target(opts: ListenerOpts) -> (Running, Arc<FakeDialer>, TestServer) {
-        let target = TestServer::spawn().await;
-        let target_addr: SocketAddr = format!("127.0.0.1:{}", target.url("/").port().unwrap())
-            .parse()
-            .unwrap();
-        let echo = echo_server().await;
-        let dialer = FakeDialer::new(echo, Some(target_addr));
-        let running = HttpListener::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            dialer.clone(),
-            opts,
-            CancellationToken::new(),
-            TaskTracker::new(),
-        )
-        .await
-        .unwrap();
-        (running, dialer, target)
-    }
-
-    /// Reads one full HTTP/1.1 response (headers + Content-Length body) from `s`.
-    async fn read_response(s: &mut TcpStream) -> (String, Vec<u8>) {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut chunk))
-                .await
-                .unwrap()
-                .unwrap();
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let head = String::from_utf8_lossy(&buf[..pos]).to_string();
-                let len = head
-                    .lines()
-                    .find_map(|l| {
-                        l.split_once(':')
-                            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap_or(0);
-                while buf.len() < pos + 4 + len {
-                    let n = s.read(&mut chunk).await.unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-                return (head, buf[pos + 4..].to_vec());
-            }
-        }
-        (String::from_utf8_lossy(&buf).to_string(), Vec::new())
     }
 
     /// Sends raw bytes and reads until the connection closes or `until` matches.
@@ -715,9 +416,10 @@ mod tests {
         assert!(sessions[0].is_finished());
     }
 
-    /// A client may write an IPv4 target in IPv6 form (`::ffff:a.b.c.d`), in a
-    /// CONNECT or in an absolute URI: the dialer, and with it the rules, get the
-    /// IPv4 address, as they do from the SOCKS5 listener.
+    /// A client may write an IPv4 target in IPv6 form (`::ffff:a.b.c.d`) in a
+    /// CONNECT: the dialer, and with it the rules, get the IPv4 address, as
+    /// they do from the SOCKS5 listener. (An absolute URI is the HTTP engine's
+    /// and is pinned there, `phase 4 M1 design 9`.)
     #[tokio::test]
     async fn an_ipv4_mapped_target_is_dialed_as_ipv4() {
         let (running, dialer) = listener(ListenerOpts::default()).await;
@@ -726,18 +428,13 @@ mod tests {
             "CONNECT [::ffff:127.0.0.1]:443 HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:443\r\n\r\n",
         )
         .await;
-        let _ = raw(
-            running.local_addr,
-            "GET http://[::ffff:127.0.0.1]:8080/ HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:8080\r\n\r\n",
-        )
-        .await;
         let want = HostName::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let dialed: Vec<(HostName, u16)> = dialer
             .sessions()
             .iter()
             .map(|h| (h.session().dst_host.clone(), h.session().dst_port))
             .collect();
-        assert_eq!(dialed, [(want.clone(), 443), (want, 8080)]);
+        assert_eq!(dialed, [(want, 443)]);
         // `FakeDialer` reaches its echo server through "127.0.0.1" only:
         // dialed in another form, the CONNECT would have been refused
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
@@ -745,42 +442,25 @@ mod tests {
 
     /// What `SRC-IP`, `SRC-PORT` and `IN-PORT` rules read is taken off the
     /// connection: the client's own address with the port it connected from,
-    /// and the port of the listener it came in on — for a tunnel and for a
-    /// plain request alike. The session also says which address of rurge the
-    /// client connected to.
+    /// and the port of the listener it came in on. The session also says which
+    /// address of rurge the client connected to. (A plain request's record is
+    /// pinned in the engine's own tests.)
     #[tokio::test]
     async fn a_session_names_the_client_and_the_listener_port() {
-        let (running, dialer, target) = listener_with_target(ListenerOpts::default()).await;
-        target.set("/hello", "hi there");
-        let port = target.url("/").port().unwrap();
+        let (running, dialer) = listener(ListenerOpts::default()).await;
         let (tunnel, head) = raw(
             running.local_addr,
             "CONNECT echo.test:443 HTTP/1.1\r\nHost: echo.test:443\r\n\r\n",
         )
         .await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        let mut plain = TcpStream::connect(running.local_addr).await.unwrap();
-        plain
-            .write_all(
-                format!(
-                    "GET http://target.test:{port}/hello HTTP/1.1\r\nHost: target.test:{port}\r\n\r\n"
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        let (head, _) = read_response(&mut plain).await;
-        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        let clients = [tunnel.local_addr().unwrap(), plain.local_addr().unwrap()];
-        assert_ne!(clients[0].port(), clients[1].port());
+        let client = tunnel.local_addr().unwrap();
         let sessions = dialer.sessions();
-        assert_eq!(sessions.len(), 2);
-        for (session, client) in sessions.iter().zip(clients) {
-            let info = session.session();
-            assert_eq!(info.src, client);
-            assert_eq!(info.in_port, running.local_addr.port());
-            assert_eq!(info.local, Some(running.local_addr));
-        }
+        assert_eq!(sessions.len(), 1);
+        let info = sessions[0].session();
+        assert_eq!(info.src, client);
+        assert_eq!(info.in_port, running.local_addr.port());
+        assert_eq!(info.local, Some(running.local_addr));
     }
 
     #[tokio::test]
@@ -887,24 +567,6 @@ mod tests {
         assert!(ct_eq(b"", b""));
     }
 
-    #[test]
-    fn hop_by_hop_headers_and_the_tokens_connection_names_are_dropped() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("connection", HeaderValue::from_static("keep-alive, X-Hop"));
-        headers.insert("x-hop", HeaderValue::from_static("leaked"));
-        headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
-        headers.insert("te", HeaderValue::from_static("trailers"));
-        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
-        headers.insert("upgrade", HeaderValue::from_static("websocket"));
-        headers.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
-        headers.insert("x-keep", HeaderValue::from_static("kept"));
-        strip_hop_by_hop(&mut headers);
-        assert_eq!(
-            headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
-            vec!["x-keep"]
-        );
-    }
-
     #[tokio::test]
     async fn non_proxy_requests_get_400() {
         let (running, _dialer) = listener(ListenerOpts::default()).await;
@@ -946,273 +608,6 @@ mod tests {
             }
         }
     }
-
-    #[tokio::test]
-    async fn plain_requests_are_forwarded_per_request_with_rewritten_headers() {
-        let (running, dialer, target) = listener_with_target(ListenerOpts::default()).await;
-        target.set("/hello", "hi there");
-        // a hop-by-hop header the origin puts on the response must not come back out
-        target.set_header("/hello", "connection", "X-Down");
-        target.set_header("/hello", "x-down", "leaked");
-        let port = target.url("/").port().unwrap();
-        let mut s = TcpStream::connect(running.local_addr).await.unwrap();
-        // userinfo in the request target, a lying Host, and a pile of hop-by-hop headers
-        s.write_all(
-            format!(
-                "GET http://u:p@target.test:{port}/hello HTTP/1.1\r\nHost: evil.internal\r\nUser-Agent: t/1\r\nProxy-Authorization: Basic eDp5\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive, X-Hop\r\nX-Hop: leaked\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-        let (head, body) = read_response(&mut s).await;
-        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        assert_eq!(body, b"hi there");
-        let lower = head.to_ascii_lowercase();
-        assert!(
-            !lower.contains("x-down") && !lower.contains("\r\nconnection:"),
-            "response hop-by-hop headers survived: {head}"
-        );
-        let reqs = target.requests();
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].path, "/hello");
-        // RFC 7230 §5.4: Host comes from the request target, userinfo stripped
-        assert_eq!(
-            reqs[0].header("host"),
-            Some(format!("target.test:{port}").as_str())
-        );
-        for gone in [
-            "proxy-authorization",
-            "proxy-connection",
-            "connection",
-            "x-hop",
-            "keep-alive",
-            "te",
-        ] {
-            assert!(reqs[0].header(gone).is_none(), "{gone} was forwarded");
-        }
-        assert_eq!(reqs[0].header("user-agent"), Some("t/1"));
-        // second request on the same client connection hits a different rule (tinygif)
-        s.write_all(b"GET http://reject.test:446/ad.gif HTTP/1.1\r\nHost: reject.test\r\n\r\n")
-            .await
-            .unwrap();
-        let (head, body) = read_response(&mut s).await;
-        assert!(
-            head.starts_with("HTTP/1.1 200")
-                && head
-                    .to_ascii_lowercase()
-                    .contains("content-type: image/gif"),
-            "{head}"
-        );
-        assert_eq!(body.len(), 43);
-        drop(s);
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let sessions = dialer.sessions();
-        assert_eq!(sessions.len(), 2);
-        let first = sessions[0].session();
-        assert_eq!(
-            (first.protocol, first.dst_port),
-            (Some(ProtocolKind::Http), port)
-        );
-        // the recorded URL is rebuilt without the `u:p@` the client sent (M11)
-        assert_eq!(
-            first.url.as_deref(),
-            Some(format!("http://target.test:{port}/hello").as_str())
-        );
-        assert_eq!(first.http_host.as_deref(), Some("target.test"));
-        assert_eq!(first.user_agent.as_deref(), Some("t/1"));
-        assert!(
-            sessions[0].is_finished(),
-            "completed when the upstream connection closed"
-        );
-        let (up, down) = sessions[0].bytes();
-        assert!(up > 0 && down > 0, "{up} {down}");
-        assert_eq!(
-            sessions[1].outcome(),
-            Some(SessionOutcome::Rejected(RejectKind::TinyGif))
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_and_failures_render_pages_or_close() {
-        // defaults: reject closes, failures show a 502 page
-        let (running, _d, _t) = listener_with_target(ListenerOpts {
-            drop_hold: Duration::from_millis(200),
-            ..ListenerOpts::default()
-        })
-        .await;
-        let (_s, head) = raw(
-            running.local_addr,
-            "GET http://reject.test/ HTTP/1.1\r\nHost: reject.test\r\n\r\n",
-        )
-        .await;
-        assert!(head.is_empty(), "reject must close: {head}");
-        let mut s = TcpStream::connect(running.local_addr).await.unwrap();
-        s.write_all(b"GET http://dns.test/ HTTP/1.1\r\nHost: dns.test\r\n\r\n")
-            .await
-            .unwrap();
-        let (head, body) = read_response(&mut s).await;
-        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
-        let html = String::from_utf8_lossy(&body);
-        assert!(
-            html.contains("DNS lookup failed") && html.contains("dns.test:80"),
-            "{html}"
-        );
-        let started = std::time::Instant::now();
-        let (_s, head) = raw(
-            running.local_addr,
-            "GET http://reject.test:444/ HTTP/1.1\r\nHost: reject.test\r\n\r\n",
-        )
-        .await;
-        assert!(
-            head.is_empty() && started.elapsed() >= Duration::from_millis(180),
-            "{head}"
-        );
-        // error page for rejects when enabled; no page for failures when disabled
-        let (running, _d, _t) = listener_with_target(ListenerOpts {
-            show_error_page: false,
-            show_error_page_for_reject: true,
-            ..ListenerOpts::default()
-        })
-        .await;
-        let mut s = TcpStream::connect(running.local_addr).await.unwrap();
-        s.write_all(b"GET http://reject.test:445/x HTTP/1.1\r\nHost: reject.test\r\n\r\n")
-            .await
-            .unwrap();
-        let (head, body) = read_response(&mut s).await;
-        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
-        let html = String::from_utf8_lossy(&body);
-        assert!(
-            html.contains("REJECT-NO-DROP") && html.contains("FAKE,rule"),
-            "{html}"
-        );
-        let (_s, head) = raw(
-            running.local_addr,
-            "GET http://fail.test/ HTTP/1.1\r\nHost: fail.test\r\n\r\n",
-        )
-        .await;
-        assert!(
-            head.is_empty(),
-            "failure must close when pages are off: {head}"
-        );
-    }
-
-    /// A plain `http://` exchange is a session like any other: `kill` has to
-    /// end it, not report success and leave it running. The target here reads
-    /// the request and never answers, which is the shape of the session an
-    /// operator actually wants to kill (an endless download or SSE stream).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn plain_forward_session_is_killable() {
-        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let silent_addr = silent.local_addr().unwrap();
-        let (got_tx, got_rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let mut got_tx = Some(got_tx);
-            // Hold every accepted connection open and never write back.
-            let mut held = Vec::new();
-            while let Ok((mut s, _)) = silent.accept().await {
-                if let Some(tx) = got_tx.take() {
-                    let mut buf = [0u8; 1024];
-                    let _ = s.read(&mut buf).await;
-                    let _ = tx.send(());
-                }
-                held.push(s);
-            }
-        });
-        let echo = echo_server().await;
-        let dialer = FakeDialer::new(echo, Some(silent_addr));
-        let running = HttpListener::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            dialer.clone(),
-            ListenerOpts::default(),
-            CancellationToken::new(),
-            TaskTracker::new(),
-        )
-        .await
-        .unwrap();
-
-        let mut s = TcpStream::connect(running.local_addr).await.unwrap();
-        s.write_all(b"GET http://target.test/hang HTTP/1.1\r\nHost: target.test\r\n\r\n")
-            .await
-            .unwrap();
-        // the request reached the target, so `send_request` is in flight
-        tokio::time::timeout(Duration::from_secs(3), got_rx)
-            .await
-            .expect("the target never saw the forwarded request")
-            .unwrap();
-        let handle = dialer.sessions().pop().expect("a forwarded session");
-        handle.kill();
-
-        // the client connection ends rather than hanging or getting a 502
-        let mut buf = [0u8; 64];
-        let n = tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf))
-            .await
-            .expect("the killed session did not close the client connection")
-            .unwrap();
-        assert_eq!(n, 0, "{:?}", String::from_utf8_lossy(&buf[..n]));
-        assert_eq!(
-            handle.outcome(),
-            Some(SessionOutcome::Failed("killed".into()))
-        );
-    }
-
-    /// A client that leaves in the middle of its upload is no failure of
-    /// upstream's: the error `send_request` then returns is the request
-    /// body's own (M3c design 4.3).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_client_leaving_mid_upload_is_no_upstream_failure() {
-        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let silent_addr = silent.local_addr().unwrap();
-        let (got_tx, got_rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let mut got_tx = Some(got_tx);
-            // Hold every accepted connection open and never write back.
-            let mut held = Vec::new();
-            while let Ok((mut s, _)) = silent.accept().await {
-                if let Some(tx) = got_tx.take() {
-                    let mut buf = [0u8; 1024];
-                    let _ = s.read(&mut buf).await;
-                    let _ = tx.send(());
-                }
-                held.push(s);
-            }
-        });
-        let echo = echo_server().await;
-        let dialer = FakeDialer::new(echo, Some(silent_addr));
-        let running = HttpListener::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            dialer.clone(),
-            ListenerOpts::default(),
-            CancellationToken::new(),
-            TaskTracker::new(),
-        )
-        .await
-        .unwrap();
-
-        let mut s = TcpStream::connect(running.local_addr).await.unwrap();
-        s.write_all(
-            b"POST http://target.test/up HTTP/1.1\r\nHost: target.test\r\nContent-Length: 10\r\n\r\nabc",
-        )
-        .await
-        .unwrap();
-        // the request reached the target, so `send_request` is in flight
-        tokio::time::timeout(Duration::from_secs(3), got_rx)
-            .await
-            .expect("the target never saw the forwarded request")
-            .unwrap();
-        let handle = dialer.sessions().pop().expect("a forwarded session");
-        drop(s);
-
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while handle.outcome().is_none() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the session did not end");
-        assert!(!handle.upstream_failed(), "{:?}", handle.outcome());
-    }
-
     /// `connect` and `forward` hand `authority.host()` to `HostName::parse`
     /// without further checks. That is sound only because `http::Uri` cannot
     /// hold these bytes; this test pins the guarantee we rely on.
@@ -1228,67 +623,6 @@ mod tests {
             assert!(format!("http://{bad}/").parse::<Uri>().is_err(), "{bad:?}");
         }
     }
-
-    #[test]
-    fn absolute_form_keeps_the_uri_and_applies_the_upstream_headers() {
-        let mut req = Request::builder()
-            .method("GET")
-            .uri("http://user:pw@example.test:8080/a?b=1")
-            .header("Host", "lying.internal")
-            .header("Proxy-Authorization", "Basic Y2xpZW50")
-            .header("Proxy-Connection", "keep-alive")
-            .header("Connection", "X-Hop")
-            .header("X-Hop", "1")
-            .header("X-Keep", "1")
-            .body(())
-            .unwrap();
-        absolute_form(
-            &mut req,
-            &[
-                ("Proxy-Authorization".to_string(), "Basic dXA=".to_string()),
-                ("X-Pad".to_string(), "abc".to_string()),
-            ],
-        )
-        .unwrap();
-        // still absolute, without the userinfo
-        assert_eq!(req.uri().to_string(), "http://example.test:8080/a?b=1");
-        let h = req.headers();
-        assert_eq!(h.get("host").unwrap(), "example.test:8080");
-        // the client's credentials for this hop are gone, the upstream's are on
-        assert_eq!(h.get("proxy-authorization").unwrap(), "Basic dXA=");
-        assert_eq!(h.get("x-pad").unwrap(), "abc");
-        assert_eq!(h.get("x-keep").unwrap(), "1");
-        for gone in ["proxy-connection", "connection", "x-hop"] {
-            assert!(h.get(gone).is_none(), "{gone}");
-        }
-    }
-
-    #[test]
-    fn the_upstream_headers_replace_same_name_headers_including_host() {
-        let mut req = Request::builder()
-            .uri("http://example.test/")
-            .header("User-Agent", "client/1")
-            .body(())
-            .unwrap();
-        absolute_form(
-            &mut req,
-            &[
-                ("Host".to_string(), "edge.example".to_string()),
-                ("User-Agent".to_string(), "rurge".to_string()),
-                ("Bad Name".to_string(), "dropped".to_string()),
-            ],
-        )
-        .unwrap();
-        assert_eq!(req.headers().get("host").unwrap(), "edge.example");
-        assert_eq!(req.headers().get_all("user-agent").iter().count(), 1);
-        assert_eq!(req.headers().get("user-agent").unwrap(), "rurge");
-        assert_eq!(
-            req.headers().len(),
-            2,
-            "the malformed header is dropped, not sent"
-        );
-    }
-
     /// A sniffable `CONNECT` is answered 200 before anything is dialed, and
     /// a dial that then fails ends the tunnel with no second answer.
     #[tokio::test]
@@ -1328,5 +662,32 @@ mod tests {
             .expect("the echo came back within 5 s")
             .unwrap();
         assert_eq!(&buf, b"tunnelled");
+    }
+
+    /// An absolute-form request is the engine's (`phase 4 M1 design 9`): a
+    /// dialer without an HTTP engine behind it answers it 502, naming the
+    /// request's target, and dials nothing. Only a test dialer is like that.
+    #[tokio::test]
+    async fn an_absolute_form_request_without_an_engine_is_a_502() {
+        let (running, dialer) = listener(ListenerOpts::default()).await;
+        let mut s = TcpStream::connect(running.local_addr).await.unwrap();
+        s.write_all(
+            b"GET http://echo.test/hello HTTP/1.1\r\nHost: echo.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf))
+            .await
+            .expect("the answer comes within the bound")
+            .unwrap();
+        let answer = String::from_utf8_lossy(&buf);
+        assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+        assert!(answer.contains("no HTTP engine"), "{answer}");
+        assert!(
+            answer.contains("echo.test:80"),
+            "the page names the request's target: {answer}"
+        );
+        assert!(dialer.sessions().is_empty(), "nothing was dialed");
     }
 }

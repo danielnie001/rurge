@@ -1,6 +1,9 @@
 //! The seam between listeners and the engine (M3 design §6.1).
 
 use crate::process::ProcessSlot;
+use crate::responses::ResponseBody;
+use http::{Request, Response};
+use hyper::body::Incoming;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::SessionInfo;
 use rurge_net::BoxFuture;
@@ -9,6 +12,7 @@ use rurge_net::trail::Trail;
 use rurge_proto::RejectKind;
 use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -40,6 +44,33 @@ impl std::error::Error for Close {}
 
 type FinishHook = Box<dyn FnOnce(&SessionHandle, &SessionOutcome) + Send>;
 type FirstByteHook = Box<dyn FnOnce(&SessionHandle) + Send>;
+
+/// The client side of one connection the HTTP listener accepted, as the
+/// engine's HTTP side needs it (`phase 4 M1 design 9`, `P12`).
+pub struct ClientConn {
+    /// The client's address and the port it connected from.
+    pub src: SocketAddr,
+    /// The port of the listener the connection came in on.
+    pub in_port: u16,
+    /// rurge's end of the connection: the address the client connected to.
+    pub local: Option<SocketAddr>,
+    /// The connection's `Conn::abort`: cancelled when the HTTP engine needs
+    /// the connection gone at once (a request killed or stopped, a client that
+    /// stopped reading). The listener builds it, owns the connection, and
+    /// races the connection against it.
+    pub abort: CancellationToken,
+}
+
+/// Carries the absolute-form requests of one accepted connection to the HTTP
+/// engine (`phase 4 M1 design 9`): `handle` answers a request the way the
+/// connection's requests are answered, or `Close` to end the connection with
+/// no answer.
+pub trait PlainRequests: Send + Sync {
+    fn handle(
+        &self,
+        req: Request<Incoming>,
+    ) -> BoxFuture<'_, Result<Response<ResponseBody>, Close>>;
+}
 
 /// Per-session bookkeeping shared by the listener (bytes) and the engine
 /// (rule, policy chain, outcome). Finishing is idempotent.
@@ -573,6 +604,14 @@ pub trait Dialer: Send + Sync {
                 Err(_) => {}
             }
         })
+    }
+    /// The HTTP engine's requests of one accepted connection (`phase 4 M1
+    /// design 9`): asked once per connection, when its first absolute-form
+    /// request arrives (`P12`), and `None` answers them 502. The default:
+    /// never, for a dialer with no HTTP engine behind it.
+    fn plain_requests(&self, conn: ClientConn) -> Option<Arc<dyn PlainRequests>> {
+        let _ = conn;
+        None
     }
     /// Asked before a UDP association is set up.
     fn admit_udp(&self) -> UdpAdmission {

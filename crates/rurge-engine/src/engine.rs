@@ -15,12 +15,13 @@ use rurge_config::HostName;
 use rurge_config::NetworkFacts;
 use rurge_config::general::{General, UdpFallback};
 use rurge_config::rule::PolicyRef;
-use rurge_config::session::{ListenerKind, SessionInfo};
+use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_config::spec::{PolicySpec, ProtoSpec};
 use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::{
-    DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, ProcessSlot,
-    Running, ServeOpts, SessionHandle, SessionOutcome, Socks5Listener, UdpAdmission, UdpClient,
+    ClientConn, DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts,
+    PlainRequests, ProcessSlot, Running, ServeOpts, SessionHandle, SessionOutcome, Socks5Listener,
+    UdpAdmission, UdpClient,
 };
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedDatagram, BoxedStream, ConnectOpts, Connector, Target};
@@ -1456,8 +1457,8 @@ fn log_session(h: &SessionHandle, outcome: &SessionOutcome) {
     let status = h.status().map(|code| code.to_string()).unwrap_or_default();
     match outcome {
         SessionOutcome::Completed => {
-            // the path is DEBUG-only, as the processes and the addresses of
-            // the sessions are
+            // only this line carries the path, and only at DEBUG; the rejected
+            // and failed lines are INFO and leave it out (design 12)
             let url = logged_url(s.url.as_deref());
             tracing::debug!(
                 session = h.id(), listener = ?s.listener, src = %s.src, dst = %dst, rule = %rule, policy = %policy,
@@ -1810,15 +1811,11 @@ impl Engine {
         registry: Arc<PolicyRegistry>,
         handle: Arc<SessionHandle>,
     ) -> Result<Dialed, DialError> {
-        // a plain request of the HTTP listener can go to an HTTP proxy in
-        // absolute form (M1 design 6.5); everything else is tunnelled. Task 6
-        // stops the listener from making such sessions and removes this.
-        let forwardable =
-            handle.session().listener == ListenerKind::Http && handle.session().url.is_some();
-        let way = match self
-            .route_session(&rt, &registry, &handle, forwardable)
-            .await
-        {
+        // Sessions that come through `Dialer::dial` are tunnels (design 8.4):
+        // the HTTP listener's plain requests reach the engine through
+        // `plain_requests` instead, where a request may be forwarded in
+        // absolute form.
+        let way = match self.route_session(&rt, &registry, &handle, false).await {
             Ok(way) => way,
             Err(refused) => return refused_dial(handle, refused),
         };
@@ -1921,6 +1918,44 @@ impl Dialer for Engine {
             }
             crate::udp::serve(engine, client, session, closed).await;
         })
+    }
+
+    fn plain_requests(&self, conn: ClientConn) -> Option<Arc<dyn PlainRequests>> {
+        let engine = self.me.upgrade()?;
+        // One session for the connection; every request replaces its target
+        // with its URL's (`rurge-http`), so this target is only a placeholder
+        // until the first request arrives (`phase 4 M1 design 9`).
+        let mut session = SessionInfo::tcp(HostName::Ip(Ipv4Addr::UNSPECIFIED.into()), 0);
+        session.src = conn.src;
+        session.in_port = conn.in_port;
+        session.local = conn.local;
+        session.listener = ListenerKind::Http;
+        session.transport = Transport::Tcp;
+        // The process behind the connection is looked up once, for all its
+        // requests: the lookup reads the listener, the transport, the source,
+        // the local address and the listener port, never the target
+        // (`owner.rs`, `query_for`).
+        let process = self.look_up_owner(&session);
+        let token = self.session_token();
+        let conn = rurge_http::Conn {
+            session,
+            entry: rurge_http::Entry::Listener,
+            idle: self.runtime().idle_timeout,
+            // The listener's own hyper service times a request head with its
+            // `handshake_timeout`; `head_wait` is only for
+            // `rurge_http::serve_connection`, which this path does not use.
+            head_wait: HANDSHAKE_TIMEOUT,
+            drop_hold: DROP_HOLD,
+            abort: conn.abort,
+            token: token.clone(),
+            tracker: self.tracker().clone(),
+        };
+        // The listener has no stop of its own: an upgraded relay is ended by
+        // the connection's own token, which a stop of the engine cancels.
+        let upstreams = crate::http::ConnUpstreams::new(engine, token, process, None, None, true);
+        Some(Arc::new(crate::http::PlainRequests::new(
+            rurge_http::Requests::new(conn, upstreams),
+        )))
     }
 }
 

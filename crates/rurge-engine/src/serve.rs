@@ -249,6 +249,7 @@ impl Engine {
             process,
             lease,
             opts.stop.clone(),
+            false,
         );
         let mut serving = std::pin::pin!(rurge_http::serve_connection(
             Box::new(client),

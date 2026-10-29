@@ -11,6 +11,8 @@ mod common;
 use common::tun::*;
 use common::*;
 use rurge_config::rule::ProtocolKind;
+use rurge_engine::FAKE_ADDRESS_NOT_KNOWN;
+use std::time::Instant;
 
 /// How long the sniffs of these tests wait for the first bytes: short, so
 /// that a session that says nothing ends in a moment rather than after the 15
@@ -828,4 +830,494 @@ async fn the_request_log_line_shows_no_query_and_no_userinfo() {
     assert!(line.contains(" method=GET"), "{line}");
     assert!(line.contains(" status=403"), "{line}");
     assert!(!line.contains("url="), "the path is DEBUG only: {line}");
+}
+
+// ---- the HTTP listener's absolute-form requests, through the engine
+
+/// Before a listener request reaches the origin, its absolute form is
+/// rewritten: the request target's authority becomes `Host`, the hop-by-hop
+/// headers and the client's `Proxy-Authorization` go, and hop-by-hop headers
+/// of the response do not come back (design 8.7, 9). A second request on the
+/// same connection takes the policy its own rule names.
+#[tokio::test]
+async fn the_listener_rewrites_a_plain_request_for_the_origin() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    // hop-by-hop headers the origin puts on its response must not come back out
+    origin.set_header("/hello", "connection", "X-Down");
+    origin.set_header("/hello", "x-down", "leaked");
+    let port = origin_addr(&origin).port();
+    let h = harness(Profile {
+        rules: "URL-REGEX,ad\\.gif$,REJECT-TINYGIF\nFINAL,DIRECT",
+        ..Profile::default()
+    })
+    .await;
+
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    // userinfo in the request target, a lying Host, and a pile of hop-by-hop
+    // headers
+    s.write_all(
+        format!(
+            "GET http://u:p@target.test:{port}/hello HTTP/1.1\r\nHost: evil.internal\r\n\
+             User-Agent: t/1\r\nProxy-Authorization: Basic eDp5\r\n\
+             Proxy-Connection: keep-alive\r\nConnection: keep-alive, X-Hop\r\n\
+             X-Hop: leaked\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let first = read_response(&mut s).await;
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    assert!(first.ends_with("hi there"), "{first}");
+    let lower = first.to_ascii_lowercase();
+    assert!(
+        !lower.contains("\r\nx-down:") && !lower.contains("\r\nconnection:"),
+        "response hop-by-hop headers survived: {first}"
+    );
+    // the same connection carries the next request, which its own rule rejects
+    s.write_all(
+        format!(
+            "GET http://target.test:{port}/ad.gif HTTP/1.1\r\nHost: target.test:{port}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let second = read_response(&mut s).await;
+    assert!(
+        second.starts_with("HTTP/1.1 200")
+            && second
+                .to_ascii_lowercase()
+                .contains("content-type: image/gif"),
+        "{second}"
+    );
+    drop(s);
+
+    let reqs = origin.requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].path, "/hello");
+    // RFC 9112 §3.2.2: the request target wins over whatever `Host` came in
+    assert_eq!(
+        reqs[0].header("host"),
+        Some(format!("target.test:{port}").as_str())
+    );
+    for gone in [
+        "proxy-authorization",
+        "proxy-connection",
+        "connection",
+        "x-hop",
+        "keep-alive",
+        "te",
+    ] {
+        assert!(reqs[0].header(gone).is_none(), "{gone} was forwarded");
+    }
+    assert_eq!(reqs[0].header("user-agent"), Some("t/1"));
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].protocol, Some(ProtocolKind::Http), "{records:?}");
+    assert_eq!(records[0].method.as_deref(), Some("GET"), "{records:?}");
+    assert_eq!(
+        records[0].url.as_deref(),
+        Some(format!("http://target.test:{port}/hello").as_str()),
+        "the recorded URL is rebuilt without the `u:p@`"
+    );
+    assert_eq!(records[0].status_code, Some(200), "{records:?}");
+    assert_eq!(
+        records[1].status,
+        RecordStatus::Rejected("REJECT-TINYGIF".into()),
+        "{records:?}"
+    );
+    assert_eq!(records[1].status_code, Some(200), "{records:?}");
+}
+
+/// A listener request's refusals and failures are answered as the profile
+/// says (design 8.8): a REJECT closes the connection, or shows its page when
+/// `show-error-page-for-reject` is on; a failure answers the 502 page, or
+/// closes when `show-error-page` is off. REJECT-DROP's 30-second hold is not
+/// waited for here.
+#[tokio::test]
+async fn the_listener_answers_refusals_and_failures_as_the_profile_says() {
+    // the defaults: a reject closes, a failure shows a 502 page. The IP rule
+    // makes the rules need the name's addresses, so a name with none fails
+    // the lookup itself.
+    let h = harness(Profile {
+        rules: "DOMAIN,reject.test,REJECT\nIP-CIDR,10.0.0.0/8,REJECT",
+        ..Profile::default()
+    })
+    .await;
+    assert!(
+        plain_get(h.http(), "http://reject.test/", "reject.test")
+            .await
+            .is_empty(),
+        "a reject closes without an answer"
+    );
+    let page = plain_get(h.http(), "http://bad.test/", "bad.test").await;
+    assert!(page.starts_with("HTTP/1.1 502"), "{page}");
+    assert!(
+        page.contains("DNS lookup failed") && page.contains("bad.test:80"),
+        "{page}"
+    );
+
+    // with the reject page on and the error page off: a `REJECT-NO-DROP`
+    // shows its rule, a failure says nothing
+    let h = harness(Profile {
+        general: "show-error-page = false\nshow-error-page-for-reject = true",
+        rules: "DOMAIN,nodrop.test,REJECT-NO-DROP\nIP-CIDR,10.0.0.0/8,REJECT",
+        ..Profile::default()
+    })
+    .await;
+    let page = plain_get(h.http(), "http://nodrop.test/x", "nodrop.test").await;
+    assert!(page.starts_with("HTTP/1.1 403"), "{page}");
+    assert!(
+        page.contains("REJECT-NO-DROP") && page.contains("DOMAIN,nodrop.test,REJECT-NO-DROP"),
+        "{page}"
+    );
+    assert!(
+        plain_get(h.http(), "http://bad.test/", "bad.test")
+            .await
+            .is_empty(),
+        "a failure closes when pages are off"
+    );
+}
+
+/// A listener request is a session like any other: `kill` ends it, the client
+/// connection goes with no answer, and the record says why (design 8.11).
+#[tokio::test]
+async fn a_plain_request_is_killable() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hang", "late");
+    // the origin holds the answer back, so the request is waiting when the
+    // kill comes; the test ends far sooner than this
+    origin.set_delay("/hang", Duration::from_secs(600));
+    let port = origin_addr(&origin).port();
+    let h = harness(Profile::default()).await;
+
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(
+        format!("GET http://target.test:{port}/hang HTTP/1.1\r\nHost: target.test:{port}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    wait_until("the request to reach its upstream", || {
+        !h.engine.request_log().active().is_empty()
+    })
+    .await;
+    let id = h.engine.request_log().active()[0].id;
+    assert!(h.engine.kill(id));
+
+    // the connection ends rather than hanging or getting a 502
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(WITHIN, s.read_to_end(&mut buf)).await;
+    assert!(read.is_ok(), "the kill ends the connection at once");
+    assert!(
+        buf.is_empty(),
+        "the client is let go, not answered: {:?}",
+        String::from_utf8_lossy(&buf)
+    );
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(records[0].error.as_deref(), Some("killed"), "{records:?}");
+}
+
+/// A client that leaves in the middle of its upload is no failure of
+/// upstream's (design 8.6): the record says the client left, and the `smart`
+/// member the request went through is not counted as failing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_leaving_mid_upload_is_no_upstream_failure() {
+    // an HTTP proxy that reads the request and never answers
+    let rude = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = rude.local_addr().unwrap();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut seen_tx = Some(seen_tx);
+        let mut held = Vec::new();
+        while let Ok((mut s, _)) = rude.accept().await {
+            if let Some(tx) = seen_tx.take() {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let _ = tx.send(());
+            }
+            held.push(s);
+        }
+    });
+    let proxies = format!("Rude = http, 127.0.0.1, {}", addr.port());
+    let h = harness(Profile {
+        proxies: &proxies,
+        groups: "S = smart, Rude",
+        rules: "DOMAIN,target.test,S",
+        ..Profile::default()
+    })
+    .await;
+
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(
+        b"POST http://target.test/up HTTP/1.1\r\nHost: target.test\r\nContent-Length: 10\r\n\r\nabc",
+    )
+    .await
+    .unwrap();
+    // the request reached the proxy, so the client's leaving is what ends it
+    tokio::time::timeout(WITHIN, seen_rx)
+        .await
+        .expect("the upstream saw the request")
+        .unwrap();
+    drop(s);
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    // the record is finished before the member's watchdog looks, so the
+    // client's own error must not be there: the member is not at fault
+    let registry = h.engine.registry();
+    let failed = registry
+        .auto()
+        .smart
+        .site("target.test", Instant::now())
+        .failed;
+    assert!(
+        failed.is_empty(),
+        "the client's own error counted against the member: {failed:?}"
+    );
+}
+
+/// The record of a listener request names the client and the listener port,
+/// as a tunnel's record does (design 8.3, 10.1).
+#[tokio::test]
+async fn a_plain_request_record_names_the_client_and_the_listener_port() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let port = origin_addr(&origin).port();
+    let h = harness(Profile::default()).await;
+
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    let client = s.local_addr().unwrap();
+    s.write_all(
+        format!("GET http://target.test:{port}/hello HTTP/1.1\r\nHost: target.test:{port}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    assert!(read_response(&mut s).await.starts_with("HTTP/1.1 200"));
+    drop(s);
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].listener, ListenerKind::Http, "{records:?}");
+    assert_eq!(records[0].src, client, "{records:?}");
+    assert_eq!(records[0].listen_port, h.http().port(), "{records:?}");
+    assert_eq!(records[0].dst, format!("target.test:{port}"), "{records:?}");
+}
+
+/// A URL host written in IPv4-mapped IPv6 form is the IPv4 address the rules
+/// and the dial see, as it is on a `CONNECT` (design 9).
+#[tokio::test]
+async fn an_ipv4_mapped_url_host_is_dialed_as_ipv4() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let port = origin_addr(&origin).port();
+    let h = harness(Profile {
+        rules: "IP-CIDR,127.0.0.1/32,DIRECT",
+        ..Profile::default()
+    })
+    .await;
+
+    let answer = plain_get(
+        h.http(),
+        &format!("http://[::ffff:127.0.0.1]:{port}/hello"),
+        &format!("[::ffff:127.0.0.1]:{port}"),
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert!(answer.ends_with("hi there"), "{answer}");
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].dst, format!("127.0.0.1:{port}"), "{records:?}");
+    assert_eq!(
+        records[0].rule.as_deref(),
+        Some("IP-CIDR,127.0.0.1/32,DIRECT"),
+        "the rules saw the IPv4 address: {records:?}"
+    );
+}
+
+/// The fake address of a name, named in a listener request's URL and `Host`,
+/// is the name before anything else sees it: the rules, the record and the
+/// origin's `Host`, and a lease holds the address until the request ends
+/// (design 9, R27).
+#[tokio::test]
+async fn a_fake_address_in_a_plain_request_is_turned_back_into_its_name() {
+    let origin = TestServer::spawn().await;
+    origin.set("/x", "a body");
+    let port = origin_addr(&origin).port();
+    let rig = Rig::new(profile(&guarded("DOMAIN,target.test,DIRECT"))).await;
+    let (fake, _) = rig.fakes("target.test");
+
+    let answer = plain_get(
+        rig.h.http(),
+        &format!("http://{fake}:{port}/x"),
+        &format!("{fake}:{port}"),
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert!(answer.ends_with("a body"), "{answer}");
+
+    let records = the_records(&rig.h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].dst, format!("target.test:{port}"), "{records:?}");
+    assert_eq!(
+        records[0].url.as_deref(),
+        Some(format!("http://target.test:{port}/x").as_str()),
+        "{records:?}"
+    );
+    assert_eq!(
+        records[0].rule.as_deref(),
+        Some("DOMAIN,target.test,DIRECT"),
+        "{records:?}"
+    );
+    let reqs = origin.requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(
+        reqs[0].header("host"),
+        Some(format!("target.test:{port}").as_str()),
+        "the origin is sent the name"
+    );
+}
+
+/// An address of rurge's space with no name behind it fails the listener's
+/// request, which says so and dials nothing (design 9). Unlike a `CONNECT`,
+/// the rules see the request first — they are asked before the address is
+/// known to be nameless — so the record carries whatever rule matched it.
+#[tokio::test]
+async fn an_unknown_fake_address_in_a_plain_request_is_a_502() {
+    let origin = TestServer::spawn().await;
+    origin.set("/x", "a body");
+    let port = origin_addr(&origin).port();
+    let rig = Rig::new(profile("DOMAIN,target.test,DIRECT")).await;
+
+    let answer = plain_get(
+        rig.h.http(),
+        &format!("http://198.18.200.1:{port}/x"),
+        &format!("198.18.200.1:{port}"),
+    )
+    .await;
+    assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+    assert!(answer.contains(FAKE_ADDRESS_NOT_KNOWN), "{answer}");
+
+    let records = the_records(&rig.h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0].dst,
+        format!("198.18.200.1:{port}"),
+        "{records:?}"
+    );
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some(FAKE_ADDRESS_NOT_KNOWN),
+        "{records:?}"
+    );
+    assert!(records[0].remote_addr.is_none(), "nothing was dialed");
+}
+
+/// An origin that answers 200 with a body of `total` bytes and keeps writing
+/// until the client goes: `TestServer` serves a body whole, which a client
+/// that never reads would take at once.
+async fn streaming_origin(total: usize) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match s.read(&mut byte).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => head.push(byte[0]),
+                    }
+                }
+                let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n");
+                if s.write_all(answer.as_bytes()).await.is_err() {
+                    return;
+                }
+                let chunk = vec![b'x'; 16 * 1024];
+                let mut sent = 0;
+                while sent < total {
+                    let take = chunk.len().min(total - sent);
+                    if s.write_all(&chunk[..take]).await.is_err() {
+                        return;
+                    }
+                    sent += take;
+                }
+                let mut sink = [0u8; 1024];
+                while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
+            });
+        }
+    });
+    addr
+}
+
+/// A killed request whose client does not read goes at once (`design 8.10`,
+/// 8.11): nothing polls the response body any more, so only the listener's
+/// race with `Conn::abort` can end the connection, and the record is the
+/// killed one.
+#[tokio::test]
+async fn a_killed_plain_request_whose_client_does_not_read_is_closed() {
+    let origin = streaming_origin(4 * 1024 * 1024).await;
+    let port = origin.port();
+    let h = harness(Profile::default()).await;
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(
+        format!("GET http://target.test:{port}/big HTTP/1.1\r\nHost: target.test:{port}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    // The client reads nothing, so the response stops inside the socket's
+    // buffers. The kill comes only once the download has filled them: while
+    // hyper still polls the body, the `Tail` sees the cancelled token by
+    // itself and the connection ends without the listener's race; filled,
+    // nothing polls it again, and only the race can end it. Two samples 200 ms
+    // apart that agree say the buffers took no more.
+    let deadline = tokio::time::Instant::now() + WITHIN;
+    let mut last = 0u64;
+    loop {
+        let down = h
+            .engine
+            .request_log()
+            .active()
+            .first()
+            .map(|record| record.down)
+            .unwrap_or(0);
+        if down > 0 && down == last {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the download never filled the client's buffers"
+        );
+        last = down;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let id = h.engine.request_log().active()[0].id;
+    assert!(h.engine.kill(id));
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(records[0].error.as_deref(), Some("killed"), "{records:?}");
+
+    // what was buffered is read and the connection ends; a reset is an end
+    // too
+    let mut sink = Vec::new();
+    let read = tokio::time::timeout(WITHIN, s.read_to_end(&mut sink)).await;
+    assert!(read.is_ok(), "the connection ends within the bound");
 }

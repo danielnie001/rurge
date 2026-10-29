@@ -10,10 +10,11 @@ use rurge_config::HostName;
 use rurge_config::session::SessionInfo;
 use rurge_dns::fakeip::Lease;
 use rurge_http::{Named, Pages, Refusal, Routed, Upstream, Upstreams};
-use rurge_inbound::{ProcessSlot, SessionHandle};
+use rurge_inbound::{Close, ProcessSlot, ResponseBody, SessionHandle};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, Route, Target};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// What a pooled upstream connection is kept under (phase 4 M1 design 8.5):
@@ -49,6 +50,11 @@ pub(crate) struct ConnUpstreams {
     /// relay outlives `serve_http` and still has to end when the adapter does
     /// (`rurge-tun`: a stop cancels the sessions it is relaying).
     stop: Option<CancellationToken>,
+    /// The connection carries the HTTP listener's absolute-form requests
+    /// (`Entry::Listener`), not a sniffed connection's (`phase 4 M1 design 9`):
+    /// the two differ in whether a request's host is asked of the fake pool
+    /// and in whether each request is a TCP session for `block-quic=adaptive`.
+    listener: bool,
 }
 
 impl ConnUpstreams {
@@ -58,6 +64,7 @@ impl ConnUpstreams {
         process: ProcessSlot,
         lease: Option<Lease>,
         stop: Option<CancellationToken>,
+        listener: bool,
     ) -> ConnUpstreams {
         ConnUpstreams {
             engine,
@@ -65,6 +72,7 @@ impl ConnUpstreams {
             process,
             _lease: lease,
             stop,
+            listener,
         }
     }
 }
@@ -74,16 +82,32 @@ impl Upstreams for ConnUpstreams {
     type Route = Way;
     type Lease = Lease;
 
-    fn named(&self, _host: &HostName) -> Named<Lease> {
-        // A sniffed connection named its target before it came in: the engine
-        // turns a fake address back into its name in `serve_http`, once for
-        // the whole connection.
-        Named::No
+    fn named(&self, host: &HostName) -> Named<Lease> {
+        if !self.listener {
+            // A sniffed connection named its target before it came in: the
+            // engine turns a fake address back into its name in `serve_http`,
+            // once for the whole connection.
+            return Named::No;
+        }
+        // A listener request names its target in its URL: a fake address there
+        // is the name behind it, and no name at all is a failure (design 9,
+        // R27).
+        self.engine.named_fake_address(host)
     }
 
     fn open(&self, session: SessionInfo) -> Arc<SessionHandle> {
-        self.engine
-            .new_handle_under(session, self.process.clone(), &self.token)
+        let handle = self
+            .engine
+            .new_handle_under(session, self.process.clone(), &self.token);
+        if self.listener {
+            // One request on the listener is one session of a client's, as it
+            // was before the engine carried them: a host whose QUIC the engine
+            // blocked is that client falling back (phase 3 M5 design 6.3).
+            self.engine
+                .quic_adaptive()
+                .on_tcp(&handle.session().dst_host.to_string(), Instant::now());
+        }
+        handle
     }
 
     fn route<'a>(
@@ -189,5 +213,27 @@ impl From<Refused> for Refusal {
             Refused::Reject(kind) => Refusal::Reject(kind),
             Refused::Fail { kind, message } => Refusal::Fail { kind, message },
         }
+    }
+}
+
+/// The HTTP listener's requests of one accepted connection (`phase 4 M1
+/// design 9`, `P12`): the engine's own request flow, one record and one pool
+/// per connection, exactly as a sniffed connection's requests have.
+pub(crate) struct PlainRequests {
+    requests: rurge_http::Requests<ConnUpstreams>,
+}
+
+impl PlainRequests {
+    pub(crate) fn new(requests: rurge_http::Requests<ConnUpstreams>) -> PlainRequests {
+        PlainRequests { requests }
+    }
+}
+
+impl rurge_inbound::PlainRequests for PlainRequests {
+    fn handle(
+        &self,
+        req: rurge_inbound::Request<rurge_inbound::Incoming>,
+    ) -> BoxFuture<'_, Result<rurge_inbound::Response<ResponseBody>, Close>> {
+        Box::pin(async move { self.requests.handle(req).await })
     }
 }
