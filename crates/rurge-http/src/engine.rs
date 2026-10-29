@@ -475,7 +475,7 @@ impl<U: Upstreams> Requests<U> {
         let switching = resp.status() == StatusCode::SWITCHING_PROTOCOLS;
         if switching && !upgrade {
             // the upstream switched protocols nobody asked it to; a proxy
-            // answers 502, as Go's reversing proxy does (design 8.9)
+            // answers 502, as Go's reverse proxy does (design 8.9)
             return self.failed(
                 &guard,
                 pages,
@@ -860,8 +860,6 @@ impl<U: Upstreams> Requests<U> {
         let idle = self.shared.conn.idle;
         let shared = self.shared.clone();
         let tracker = self.shared.conn.tracker.clone();
-        // The guard travels with the relay: it ends the handle if the task is
-        // ended before the relay gets to (a failed upgrade, a stop).
         tracker.spawn(async move {
             let inner = tokio::spawn(async move {
                 // the guard lives with the relay: it is what ends the handle
@@ -1008,7 +1006,7 @@ fn is_idempotent(method: &http::Method) -> bool {
 
 /// Whether a request asks for an upgrade (WebSocket, `phase 4 M1 design 8.9`):
 /// HTTP/1.1, an `Upgrade` header, and a `Connection` that lists the `upgrade`
-/// token. The same reading Go's reversing proxy makes.
+/// token. The same reading Go's reverse proxy makes.
 fn wants_upgrade<B>(req: &Request<B>) -> bool {
     req.version() == http::Version::HTTP_11
         && req.headers().contains_key(header::UPGRADE)
@@ -2784,26 +2782,36 @@ mod tests {
 
     /// An origin that reads one request head, writes `answer` in one go, and
     /// then echoes whatever it reads; it counts every byte it read and every
-    /// byte it wrote (`design 8.9`).
+    /// byte it wrote, and keeps the head of every request it was sent
+    /// (`design 8.9`).
     async fn upgrading_origin(
         answer: &'static [u8],
-    ) -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    ) -> (
+        SocketAddr,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let read = Arc::new(AtomicUsize::new(0));
         let written = Arc::new(AtomicUsize::new(0));
-        let (r, w) = (read.clone(), written.clone());
+        let heads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (r, w, h) = (read.clone(), written.clone(), heads.clone());
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
-                let (r, w) = (r.clone(), w.clone());
+                let (r, w, h) = (r.clone(), w.clone(), h.clone());
                 tokio::spawn(async move {
                     let mut buf: Vec<u8> = Vec::new();
                     let Some(at) = read_head(&mut buf, &mut stream).await else {
                         return;
                     };
+                    h.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..at]).to_string());
                     r.fetch_add(at + 4, Ordering::Relaxed);
                     buf.drain(..at + 4);
                     if stream.write_all(answer).await.is_err() {
@@ -2836,7 +2844,7 @@ mod tests {
                 });
             }
         });
-        (addr, read, written)
+        (addr, read, written, heads)
     }
 
     /// An origin whose first connection answers its first request, reads its
@@ -3361,7 +3369,7 @@ mod tests {
     #[tokio::test]
     async fn a_websocket_upgrade_is_relayed_and_counted_once() {
         let answer = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nhello websocket";
-        let (addr, read, written) = upgrading_origin(answer).await;
+        let (addr, read, written, heads) = upgrading_origin(answer).await;
         let mut rig = connected(Entry::Sniffed, addr).await;
         rig.client
             .send(
@@ -3384,6 +3392,24 @@ mod tests {
         let handle = rig.fake.finished(0).await;
         assert_eq!(handle.status(), Some(101));
         assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        // what the origin was sent: the upgrade went on, and `Connection`
+        // came back naming exactly it (design 8.7, 8.9)
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 1, "one request reached the origin");
+        let received = heads[0].to_ascii_lowercase();
+        assert!(received.contains("upgrade: websocket"), "{received}");
+        let connection = heads[0]
+            .lines()
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+                    .map(|(_, v)| v.trim())
+            })
+            .expect("the origin was told the connection upgrades");
+        assert!(
+            connection.eq_ignore_ascii_case("upgrade"),
+            "connection: {connection}"
+        );
         let (up, down) = handle.bytes();
         assert_eq!(
             (up, down),
@@ -3397,7 +3423,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_connect_on_a_sniffed_connection_goes_to_its_target() {
-        let (addr, _, _) =
+        let (addr, _, _, heads) =
             upgrading_origin(b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n")
                 .await;
         let mut rig = connected(Entry::Sniffed, addr).await;
@@ -3422,6 +3448,15 @@ mod tests {
         let handle = rig.fake.finished(0).await;
         assert_eq!(handle.status(), Some(200));
         assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        // the `CONNECT` reached the connection's target as it came (design
+        // 8.9)
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 1, "one request reached the origin");
+        assert!(
+            heads[0].starts_with("CONNECT x.test:443 HTTP/1.1"),
+            "{}",
+            heads[0]
+        );
     }
 
     #[tokio::test]
