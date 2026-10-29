@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -248,6 +249,10 @@ impl<U: Upstreams> Requests<U> {
         // an absolute `http://` one is no request of this engine's (design 9).
         let authority = match self.shared.conn.entry {
             Entry::Sniffed => None,
+            // The listener handles `CONNECT` itself (its own tunnel, before a
+            // request ever reaches this engine); one that reaches here has an
+            // authority-form request line and no URL, and is a bad request,
+            // answered before a handle is made (design 8.9).
             Entry::Listener => match req.uri().authority().cloned() {
                 None => return Ok(responses::bad_request("absolute URI without a host")),
                 Some(_) if req.uri().scheme() != Some(&http::uri::Scheme::HTTP) => {
@@ -300,7 +305,10 @@ impl<U: Upstreams> Requests<U> {
             let mut pool = self.shared.pool.lock().expect("pool");
             pool.take(&key, Instant::now())
         };
-        let (mut sender, meter, forward, peer) = match borrowed {
+        // The route of a borrowed connection is still unused: a request the
+        // borrowed connection does not carry is sent again on a connection
+        // dialled with it (design 8.6).
+        let (mut sender, mut meter, mut forward, mut peer, mut route) = match borrowed {
             Some(pooled) => {
                 // a borrowed connection is ready now, and its dial is the one
                 // the record's peer address and bytes belong to
@@ -309,61 +317,33 @@ impl<U: Upstreams> Requests<U> {
                     handle.trail().set_peer(peer);
                 }
                 pooled.meter.set(Some(handle.clone()));
-                (pooled.sender, pooled.meter, pooled.forward, pooled.peer)
+                (
+                    pooled.sender,
+                    pooled.meter,
+                    pooled.forward,
+                    pooled.peer,
+                    Some(route),
+                )
             }
             None => {
-                let upstream = match self.shared.upstreams.dial(&handle, route).await {
-                    Ok(upstream) => upstream,
-                    Err(refusal) => return self.answer(&guard, refusal, pages).await,
+                let (sender, meter, forward, peer) = match self.redial(&guard, pages, route).await {
+                    Ok(parts) => parts,
+                    Err(answer) => return answer,
                 };
-                if handle.token().is_cancelled() {
-                    return Err(Close);
-                }
-                let meter = Meter::new();
-                meter.set(Some(handle.clone()));
-                let io = TokioIo::new(Metered::new(upstream.stream, meter.clone()));
-                let (sender, conn) = match hyper::client::conn::http1::Builder::new()
-                    .preserve_header_case(true)
-                    .handshake(io)
-                    .await
-                {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        return self.failed(
-                            &guard,
-                            pages,
-                            format!("upstream handshake failed: {e}"),
-                            format!("Upstream handshake failed: {e}"),
-                        );
-                    }
-                };
-                // The connection runs on the engine's tracker; an inner task
-                // restores the ERROR log for a panic. It finishes no handle:
-                // the response body's wrapper and the request's guard do.
-                let tracker = self.shared.conn.tracker.clone();
-                tracker.spawn(async move {
-                    let inner = tokio::spawn(async move {
-                        if let Err(e) = conn.with_upgrades().await {
-                            tracing::debug!(error = %e, "upstream connection ended");
-                        }
-                    });
-                    if let Err(e) = inner.await
-                        && e.is_panic()
-                    {
-                        tracing::error!("upstream connection task panicked: {e}");
-                    }
-                });
-                (sender, meter, upstream.forward, upstream.peer)
+                (sender, meter, forward, peer, None)
             }
         };
 
         // 5. the request as its upstream takes it (design 8.7), sent with the
         // idle timeout between the frames of its body
         let sniffed = self.shared.conn.entry == Entry::Sniffed;
+        // Only an upgrade keeps `Upgrade` and `Connection: upgrade`; every
+        // other request drops them (design 8.7, 8.9).
+        let upgrade = wants_upgrade(&req);
         headers::strip(
             req.headers_mut(),
             Keep {
-                upgrade: false,
+                upgrade,
                 proxy_authorization: sniffed,
             },
         );
@@ -389,6 +369,18 @@ impl<U: Upstreams> Requests<U> {
                 HeaderValue::from_static("chunked"),
             );
         }
+        // The client's side of an upgrade is taken before the request is
+        // split: a request that asked for one, and a `CONNECT` on a sniffed
+        // connection, whose 2xx answer becomes a tunnel (design 8.9).
+        let tunnel = sniffed && req.method() == http::Method::CONNECT;
+        // An idempotent request with no body keeps its head: if a borrowed
+        // connection cuts it off after it was written, it goes again on a new
+        // one (design 8.6).
+        let head = (route.is_some()
+            && is_idempotent(req.method())
+            && (req.body().is_end_stream() || req.body().size_hint().exact() == Some(0)))
+        .then(|| head_of(&req));
+        let client_upgrade = (upgrade || tunnel).then(|| hyper::upgrade::on(&mut req));
         let idle = self.shared.conn.idle;
         let progress = Progress::new();
         let (parts, body) = req.into_parts();
@@ -399,24 +391,65 @@ impl<U: Upstreams> Requests<U> {
         let answered = tokio::select! {
             biased;
             _ = handle.token().cancelled() => return Err(Close),
-            res = sender.send_request(req) => res,
-            _ = head_deadline(progress, idle) => return self.timed_out(&guard, pages),
+            sent = send(&mut sender, req) => sent,
+            _ = head_deadline(progress.clone(), idle) => return self.timed_out(&guard, pages),
         };
         let mut resp = match answered {
-            Ok(resp) => resp,
-            Err(e) => {
-                // no response head: upstream gave up while the client waits —
-                // unless the error is the request's own (a client that left
-                // in the middle of its upload)
-                if !e.is_user() {
-                    handle.mark_upstream_failed();
+            Sent::Answered(resp) => resp,
+            Sent::NotWritten(req, e) => {
+                // Not a byte of the request went out (hyper hands it back
+                // whole): any method goes again, whole, on a new connection
+                // (design 8.6).
+                let Some(route) = route.take() else {
+                    return self.upstream_failed(&guard, pages, e);
+                };
+                meter.set(None);
+                let sent = match self.retry(&guard, pages, route, req, &progress, idle).await {
+                    Ok((sent, new_sender, new_meter, new_forward, new_peer)) => {
+                        sender = new_sender;
+                        meter = new_meter;
+                        forward = new_forward;
+                        peer = new_peer;
+                        sent
+                    }
+                    Err(answer) => return answer,
+                };
+                match sent {
+                    Sent::Answered(resp) => resp,
+                    Sent::NotWritten(_, e) | Sent::Failed(e) => {
+                        return self.upstream_failed(&guard, pages, e);
+                    }
                 }
-                return self.failed(
-                    &guard,
-                    pages,
-                    format!("upstream request failed: {e}"),
-                    format!("Upstream request failed: {e}"),
-                );
+            }
+            Sent::Failed(e) => {
+                // The request may have been written: only an idempotent one
+                // with no body whose connection cut the answer off goes again,
+                // from the head kept above (design 8.6).
+                let (Some(head), Some(route), true) =
+                    (head, route.take(), e.is_incomplete_message())
+                else {
+                    return self.upstream_failed(&guard, pages, e);
+                };
+                meter.set(None);
+                let sent = match self
+                    .retry(&guard, pages, route, with_empty_body(head), &progress, idle)
+                    .await
+                {
+                    Ok((sent, new_sender, new_meter, new_forward, new_peer)) => {
+                        sender = new_sender;
+                        meter = new_meter;
+                        forward = new_forward;
+                        peer = new_peer;
+                        sent
+                    }
+                    Err(answer) => return answer,
+                };
+                match sent {
+                    Sent::Answered(resp) => resp,
+                    Sent::NotWritten(_, e) | Sent::Failed(e) => {
+                        return self.upstream_failed(&guard, pages, e);
+                    }
+                }
             }
         };
         if forward.is_some() && resp.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
@@ -433,8 +466,29 @@ impl<U: Upstreams> Requests<U> {
             );
         }
 
-        // 7. the answer (design 8.2): its status, its headers, and a body that
-        // ends the request when it ends and puts the connection back
+        // 7. the answer (design 8.2): an upgrade first, then its status, its
+        // headers, and a body that ends the request when it ends and puts the
+        // connection back. The branch for an upgrade does not build a `Tail`:
+        // a 101 and a 2xx to `CONNECT` have no body, so a `Tail` would end the
+        // request at once and put the connection back, while a relay is about
+        // to run on it (design 8.9).
+        let switching = resp.status() == StatusCode::SWITCHING_PROTOCOLS;
+        if switching && !upgrade {
+            // the upstream switched protocols nobody asked it to; a proxy
+            // answers 502, as Go's reversing proxy does (design 8.9)
+            return self.failed(
+                &guard,
+                pages,
+                "upstream answered 101 Switching Protocols unasked".to_string(),
+                "Upstream answered 101 Switching Protocols to a request that did not ask to upgrade"
+                    .to_string(),
+            );
+        }
+        if (upgrade && switching) || (tunnel && resp.status().is_success()) {
+            let upstream_upgrade = hyper::upgrade::on(&mut resp);
+            let client_upgrade = client_upgrade.expect("an upgrade was asked for");
+            return Ok(self.promote(guard, resp, client_upgrade, upstream_upgrade, meter, tunnel));
+        }
         handle.set_status(resp.status().as_u16());
         headers::strip(resp.headers_mut(), Keep::NONE);
         let (parts, body) = resp.into_parts();
@@ -489,8 +543,21 @@ impl<U: Upstreams> Requests<U> {
                 true
             }
         };
-        let (url, http_host) = form_of(req, (&session.dst_host, session.dst_port));
-        session.url = Some(url);
+        // A `CONNECT` on a sniffed connection names its target in the request
+        // line and goes there as it came, so it has no URL; the host the rules
+        // see is the request line's (design 8.9).
+        let (url, http_host) = if req.method() == http::Method::CONNECT {
+            (
+                None,
+                req.uri()
+                    .authority()
+                    .map(|authority| authority.host().to_ascii_lowercase()),
+            )
+        } else {
+            let (url, host) = form_of(req, (&session.dst_host, session.dst_port));
+            (Some(url), host)
+        };
+        session.url = url;
         session.http_host = http_host;
         Prepared {
             session,
@@ -610,6 +677,274 @@ impl<U: Upstreams> Requests<U> {
             },
         )
     }
+
+    /// Dials the route and starts its hyper client on the tracker
+    /// (`phase 4 M1 design 8.4`): the first send and a send after the request
+    /// was not written both come through here. The dial is not raced against
+    /// the request's token; what it brings back is dropped when the token
+    /// fired meanwhile (`P1`).
+    async fn connect(
+        &self,
+        handle: &Arc<SessionHandle>,
+        route: U::Route,
+    ) -> Result<
+        (
+            SendRequest<ReqBody>,
+            Meter,
+            Option<Vec<(String, String)>>,
+            Option<SocketAddr>,
+        ),
+        DialError,
+    > {
+        let upstream = match self.shared.upstreams.dial(handle, route).await {
+            Ok(upstream) => upstream,
+            Err(refusal) => return Err(DialError::Refused(refusal)),
+        };
+        if handle.token().is_cancelled() {
+            return Err(DialError::Stopped);
+        }
+        let meter = Meter::new();
+        meter.set(Some(handle.clone()));
+        let io = TokioIo::new(Metered::new(upstream.stream, meter.clone()));
+        let (sender, conn) = match hyper::client::conn::http1::Builder::new()
+            .preserve_header_case(true)
+            .handshake(io)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => return Err(DialError::Handshake(e.to_string())),
+        };
+        // The connection runs on the engine's tracker; an inner task restores
+        // the ERROR log for a panic. It finishes no handle: the response
+        // body's wrapper, the request's guard or the relay of an upgrade do.
+        let tracker = self.shared.conn.tracker.clone();
+        tracker.spawn(async move {
+            let inner = tokio::spawn(async move {
+                if let Err(e) = conn.with_upgrades().await {
+                    tracing::debug!(error = %e, "upstream connection ended");
+                }
+            });
+            if let Err(e) = inner.await
+                && e.is_panic()
+            {
+                tracing::error!("upstream connection task panicked: {e}");
+            }
+        });
+        Ok((sender, meter, upstream.forward, upstream.peer))
+    }
+
+    /// A new connection for a request sent again, with the failures of the
+    /// dial already answered for the client (`phase 4 M1 design 8.6`, `P4`).
+    async fn redial(
+        &self,
+        guard: &Guard,
+        pages: Pages,
+        route: U::Route,
+    ) -> Result<
+        (
+            SendRequest<ReqBody>,
+            Meter,
+            Option<Vec<(String, String)>>,
+            Option<SocketAddr>,
+        ),
+        Result<Response<ResponseBody>, Close>,
+    > {
+        match self.connect(guard.handle(), route).await {
+            Ok(parts) => Ok(parts),
+            Err(DialError::Refused(refusal)) => Err(self.answer(guard, refusal, pages).await),
+            Err(DialError::Stopped) => Err(Err(Close)),
+            Err(DialError::Handshake(e)) => Err(self.failed(
+                guard,
+                pages,
+                format!("upstream handshake failed: {e}"),
+                format!("Upstream handshake failed: {e}"),
+            )),
+        }
+    }
+
+    /// The one send a request sent again gets: on a new connection under the
+    /// same route, with the wait for the answer started over (`phase 4 M1
+    /// design 8.6`, `P1`). The new connection's parts come back with the
+    /// result so that the caller keeps answering on it.
+    async fn retry(
+        &self,
+        guard: &Guard,
+        pages: Pages,
+        route: U::Route,
+        req: Request<ReqBody>,
+        progress: &Arc<Progress>,
+        idle: Duration,
+    ) -> Result<
+        (
+            Sent,
+            SendRequest<ReqBody>,
+            Meter,
+            Option<Vec<(String, String)>>,
+            Option<SocketAddr>,
+        ),
+        Result<Response<ResponseBody>, Close>,
+    > {
+        let (mut sender, meter, forward, peer) = match self.redial(guard, pages, route).await {
+            Ok(parts) => parts,
+            Err(answer) => return Err(answer),
+        };
+        let handle = guard.handle();
+        handle.mark_connected();
+        if let Some(peer) = peer {
+            handle.trail().set_peer(peer);
+        }
+        meter.set(Some(handle.clone()));
+        progress.restart();
+        let sent = tokio::select! {
+            biased;
+            _ = handle.token().cancelled() => return Err(Err(Close)),
+            sent = send(&mut sender, req) => sent,
+            _ = head_deadline(progress.clone(), idle) => {
+                return Err(self.timed_out(guard, pages));
+            }
+        };
+        Ok((sent, sender, meter, forward, peer))
+    }
+
+    /// The send failed for good: upstream is counted as failed unless the
+    /// error was the client's own, and the client gets the failure page
+    /// (`phase 4 M1 design 8.8`).
+    fn upstream_failed(
+        &self,
+        guard: &Guard,
+        pages: Pages,
+        e: hyper::Error,
+    ) -> Result<Response<ResponseBody>, Close> {
+        if !e.is_user() {
+            guard.handle().mark_upstream_failed();
+        }
+        self.failed(
+            guard,
+            pages,
+            format!("upstream request failed: {e}"),
+            format!("Upstream request failed: {e}"),
+        )
+    }
+
+    /// Hands an upgraded exchange to a relay on the tracker (`phase 4 M1
+    /// design 8.9`): the status and the headers the client needs, the bytes
+    /// the upstream read ahead, and the guard, whose handle the relay ends.
+    /// The upstream connection is not put back: it is the tunnel now.
+    fn promote(
+        &self,
+        guard: Guard,
+        mut resp: Response<Incoming>,
+        client: hyper::upgrade::OnUpgrade,
+        upstream: hyper::upgrade::OnUpgrade,
+        meter: Meter,
+        tunnel: bool,
+    ) -> Response<ResponseBody> {
+        let handle = guard.handle().clone();
+        handle.set_status(resp.status().as_u16());
+        if tunnel {
+            headers::strip(resp.headers_mut(), Keep::NONE);
+            // a 2xx to `CONNECT` carries no length: hyper's server voids the
+            // answer if one is there (`proto/h1/role.rs`, RFC 9110 §9.3.6)
+            resp.headers_mut().remove(header::CONTENT_LENGTH);
+        } else {
+            headers::strip(
+                resp.headers_mut(),
+                Keep {
+                    upgrade: true,
+                    proxy_authorization: false,
+                },
+            );
+        }
+        let (parts, _) = resp.into_parts();
+        let abort = self.shared.conn.abort.clone();
+        let idle = self.shared.conn.idle;
+        let shared = self.shared.clone();
+        let tracker = self.shared.conn.tracker.clone();
+        // The guard travels with the relay: it ends the handle if the task is
+        // ended before the relay gets to (a failed upgrade, a stop).
+        tracker.spawn(async move {
+            let inner = tokio::spawn(async move {
+                // the guard lives with the relay: it is what ends the handle
+                // if the task is cut off before the relay does
+                let _guard = guard;
+                let (client, upstream) = tokio::select! {
+                    biased;
+                    _ = handle.token().cancelled() => {
+                        // the server may still be writing the 101; ending the
+                        // client connection is what closes it
+                        abort.cancel();
+                        return;
+                    }
+                    pair = async { tokio::join!(client, upstream) } => pair,
+                };
+                let (client, upstream) = match (client, upstream) {
+                    (Ok(client), Ok(upstream)) => (client, upstream),
+                    (Err(e), _) | (_, Err(e)) => {
+                        handle.finish(SessionOutcome::Failed(format!("upgrade failed: {e}")));
+                        return;
+                    }
+                };
+                // The bytes hyper read ahead while it parsed the 101 are
+                // already counted as down; from here the relay counts, so the
+                // meter is cleared before anything reads the upstream again
+                // (design 8.9).
+                meter.set(None);
+                let (client, upstream): (BoxedStream, BoxedStream) = match upstream
+                    .downcast::<TokioIo<Metered<BoxedStream>>>()
+                {
+                    Ok(parts) => {
+                        let hyper::upgrade::Parts { io, read_buf, .. } = parts;
+                        let mut client = TokioIo::new(client);
+                        if !read_buf.is_empty() {
+                            // the client is owed these before the tunnel opens
+                            let wrote = tokio::select! {
+                                biased;
+                                _ = handle.token().cancelled() => None,
+                                res = tokio::time::timeout(idle, client.write_all(&read_buf)) => {
+                                    Some(res)
+                                }
+                            };
+                            match wrote {
+                                None => {
+                                    abort.cancel();
+                                    return;
+                                }
+                                Some(Ok(Ok(()))) => {}
+                                Some(Ok(Err(e))) => {
+                                    handle.finish(SessionOutcome::Failed(format!(
+                                        "upgrade failed: {e}"
+                                    )));
+                                    return;
+                                }
+                                Some(Err(_)) => {
+                                    handle.finish(SessionOutcome::Failed(
+                                        "upgrade failed: writing to the client timed out"
+                                            .to_string(),
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                        (Box::new(client), Box::new(io.into_inner()))
+                    }
+                    Err(upstream) => (
+                        Box::new(TokioIo::new(client)),
+                        Box::new(TokioIo::new(upstream)),
+                    ),
+                };
+                shared
+                    .upstreams
+                    .relay(client, upstream, handle.clone())
+                    .await;
+            });
+            if let Err(e) = inner.await
+                && e.is_panic()
+            {
+                tracing::error!("upgrade relay panicked: {e}");
+            }
+        });
+        Response::from_parts(parts, responses::empty())
+    }
 }
 
 /// One request's session, worked out before its handle is made.
@@ -620,6 +955,94 @@ struct Prepared<L> {
     /// The request named an address of rurge's own with no name behind it: it
     /// is answered as a failure once the rules have seen it (`design 9`).
     unknown: bool,
+}
+
+/// Why a fresh upstream connection could not be had (`phase 4 M1 design 8.4`).
+enum DialError {
+    /// The engine's `dial` refused, unanswered (`P4`).
+    Refused(Refusal),
+    /// The request's token fired while the connection was being dialled: the
+    /// dial is not raced against it, but what it brings back is dropped (`P1`).
+    Stopped,
+    /// The stream was there, hyper's handshake was not.
+    Handshake(String),
+}
+
+/// The three ways one send can end (`phase 4 M1 design 8.6`).
+enum Sent {
+    /// A response head came back.
+    Answered(Response<Incoming>),
+    /// The request was never written and is handed back whole, to be sent
+    /// again on another connection.
+    NotWritten(Request<ReqBody>, hyper::Error),
+    /// The request may have been written; a second attempt has to be built
+    /// from its head, if the request allows one at all.
+    Failed(hyper::Error),
+}
+
+/// Sends one request and tells the caller whether it was written
+/// (`phase 4 M1 design 8.6`).
+async fn send(sender: &mut SendRequest<ReqBody>, req: Request<ReqBody>) -> Sent {
+    match sender.try_send_request(req).await {
+        Ok(resp) => Sent::Answered(resp),
+        Err(mut e) => match e.take_message() {
+            Some(req) => Sent::NotWritten(req, e.into_error()),
+            None => Sent::Failed(e.into_error()),
+        },
+    }
+}
+
+/// The methods a request may be sent again after it was written (RFC 9110
+/// §9.2.2, `phase 4 M1 design 8.6`).
+fn is_idempotent(method: &http::Method) -> bool {
+    matches!(
+        *method,
+        http::Method::GET
+            | http::Method::HEAD
+            | http::Method::OPTIONS
+            | http::Method::TRACE
+            | http::Method::PUT
+            | http::Method::DELETE
+    )
+}
+
+/// Whether a request asks for an upgrade (WebSocket, `phase 4 M1 design 8.9`):
+/// HTTP/1.1, an `Upgrade` header, and a `Connection` that lists the `upgrade`
+/// token. The same reading Go's reversing proxy makes.
+fn wants_upgrade<B>(req: &Request<B>) -> bool {
+    req.version() == http::Version::HTTP_11
+        && req.headers().contains_key(header::UPGRADE)
+        && req
+            .headers()
+            .get_all(header::CONNECTION)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+/// A request's head alone, kept so that an idempotent request with no body can
+/// be built again after its connection cut it off (`phase 4 M1 design 8.6`).
+fn head_of<B>(req: &Request<B>) -> Request<()> {
+    let mut head = Request::builder()
+        .method(req.method().clone())
+        .version(req.version())
+        .uri(req.uri().clone())
+        .body(())
+        .expect("a request's own head is a valid request");
+    *head.headers_mut() = req.headers().clone();
+    head
+}
+
+/// The request of a kept head, with no body at all (`phase 4 M1 design 8.6`).
+fn with_empty_body(head: Request<()>) -> Request<ReqBody> {
+    let (parts, _) = head.into_parts();
+    Request::from_parts(
+        parts,
+        http_body_util::Empty::<Bytes>::new()
+            .map_err(|never| match never {})
+            .boxed(),
+    )
 }
 
 /// The three prefixes a failed connection's page and record start with, by the
@@ -795,7 +1218,13 @@ impl std::error::Error for Stalled {}
 /// frame on waits for its reader, and one whose last poll found nothing waits
 /// for its source.
 struct Progress {
-    started: tokio::time::Instant,
+    /// The clock every other field counts from. It never moves, so that a
+    /// request sent again on a new connection can start its count over
+    /// without a lock (`restart`).
+    epoch: tokio::time::Instant,
+    /// Milliseconds since `epoch` at which this attempt started. Zero for the
+    /// first one.
+    started: AtomicU64,
     /// Milliseconds since `started` of the last frame handed on, or of the
     /// end; zero until the first frame moves it.
     last: AtomicU64,
@@ -806,16 +1235,34 @@ struct Progress {
 impl Progress {
     fn new() -> Arc<Progress> {
         Arc::new(Progress {
-            started: tokio::time::Instant::now(),
+            epoch: tokio::time::Instant::now(),
+            started: AtomicU64::new(0),
             last: AtomicU64::new(0),
             waiting_on_source: AtomicBool::new(false),
         })
     }
 
+    /// How long this attempt has been going.
+    fn since_started(&self) -> Duration {
+        self.epoch
+            .elapsed()
+            .saturating_sub(Duration::from_millis(self.started.load(Ordering::Relaxed)))
+    }
+
+    /// A request sent again on a new connection starts its wait for the
+    /// response head over: the dial of the new connection is no upload and no
+    /// late answer (`phase 4 M1 design 8.6`).
+    fn restart(&self) {
+        self.started
+            .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.last.store(0, Ordering::Relaxed);
+        self.waiting_on_source.store(false, Ordering::Relaxed);
+    }
+
     /// A frame was handed on, or the body reached its end.
     fn moved(&self) {
         self.last
-            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            .store(self.since_started().as_millis() as u64, Ordering::Relaxed);
         self.waiting_on_source.store(false, Ordering::Relaxed);
     }
 
@@ -831,7 +1278,7 @@ impl Progress {
     /// How much of `idle` is left before the body counts as stopped.
     fn remaining(&self, idle: Duration) -> Duration {
         let last = Duration::from_millis(self.last.load(Ordering::Relaxed));
-        (last + idle).saturating_sub(self.started.elapsed())
+        (last + idle).saturating_sub(self.since_started())
     }
 }
 
@@ -862,7 +1309,10 @@ async fn head_deadline(progress: Arc<Progress>, idle: Duration) {
 struct Idle<B> {
     inner: B,
     idle: Duration,
-    deadline: Pin<Box<Sleep>>,
+    /// Started by the first poll, not by `new`: a request sent again on a new
+    /// connection must not count the dial of that connection as an upload
+    /// that stopped (`phase 4 M1 design 8.6`).
+    deadline: Option<Pin<Box<Sleep>>>,
     /// What the wait for the response head reads (`design 8.10`).
     progress: Arc<Progress>,
 }
@@ -872,7 +1322,7 @@ impl<B> Idle<B> {
         Idle {
             inner,
             idle,
-            deadline: Box::pin(tokio::time::sleep(idle)),
+            deadline: None,
             progress,
         }
     }
@@ -894,9 +1344,13 @@ where
         if this.inner.is_end_stream() {
             return Poll::Ready(None);
         }
+        let idle = this.idle;
+        let deadline = this
+            .deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                this.deadline
+                deadline
                     .as_mut()
                     .reset(tokio::time::Instant::now() + this.idle);
                 this.progress.moved();
@@ -909,7 +1363,7 @@ where
             }
             Poll::Pending => {
                 this.progress.waiting();
-                if this.deadline.as_mut().poll(cx).is_ready() {
+                if deadline.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(Some(Err(Box::new(Stalled("request body stalled")))));
                 }
                 Poll::Pending
@@ -1465,7 +1919,14 @@ mod tests {
             Box::pin(async move {
                 let mut client = client;
                 let mut upstream = upstream;
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                if let Ok((up, down)) =
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await
+                {
+                    // the relay counts what it moves: client to upstream is
+                    // up, upstream to client is down (`design 8.9`, 10.1)
+                    handle.add_up(up);
+                    handle.add_down(down);
+                }
                 handle.finish(SessionOutcome::Completed);
             })
         }
@@ -1543,6 +2004,14 @@ mod tests {
             let head = String::from_utf8_lossy(&self.buf[..at]).to_string();
             self.buf.drain(..at + 4);
             head
+        }
+
+        /// Reads exactly `n` bytes, however many reads it takes.
+        async fn take(&mut self, n: usize) -> Vec<u8> {
+            while self.buf.len() < n {
+                assert!(self.fill().await, "the connection closed early");
+            }
+            self.buf.drain(..n).collect()
         }
 
         /// Everything the engine says until it closes the connection.
@@ -2298,6 +2767,143 @@ mod tests {
         }
     }
 
+    /// Reads until the end of a request head, returning where it ends; `None`
+    /// when the connection ended first.
+    async fn read_head(buf: &mut Vec<u8>, stream: &mut tokio::net::TcpStream) -> Option<usize> {
+        loop {
+            if let Some(at) = find(buf, b"\r\n\r\n") {
+                return Some(at);
+            }
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    /// An origin that reads one request head, writes `answer` in one go, and
+    /// then echoes whatever it reads; it counts every byte it read and every
+    /// byte it wrote (`design 8.9`).
+    async fn upgrading_origin(
+        answer: &'static [u8],
+    ) -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let read = Arc::new(AtomicUsize::new(0));
+        let written = Arc::new(AtomicUsize::new(0));
+        let (r, w) = (read.clone(), written.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let (r, w) = (r.clone(), w.clone());
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let Some(at) = read_head(&mut buf, &mut stream).await else {
+                        return;
+                    };
+                    r.fetch_add(at + 4, Ordering::Relaxed);
+                    buf.drain(..at + 4);
+                    if stream.write_all(answer).await.is_err() {
+                        return;
+                    }
+                    w.fetch_add(answer.len(), Ordering::Relaxed);
+                    // anything that came with the request head belongs to the
+                    // exchange that follows it
+                    if !buf.is_empty() {
+                        r.fetch_add(buf.len(), Ordering::Relaxed);
+                        if stream.write_all(&buf).await.is_err() {
+                            return;
+                        }
+                        w.fetch_add(buf.len(), Ordering::Relaxed);
+                        buf.clear();
+                    }
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                r.fetch_add(n, Ordering::Relaxed);
+                                if stream.write_all(&chunk[..n]).await.is_err() {
+                                    return;
+                                }
+                                w.fetch_add(n, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, read, written)
+    }
+
+    /// An origin whose first connection answers its first request, reads its
+    /// second whole and then closes without an answer; every later connection
+    /// answers every request (`design 8.6`).
+    async fn cutting_origin() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let cut = std::mem::replace(&mut first, false);
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut answered = 0u32;
+                    loop {
+                        let Some(at) = read_head(&mut buf, &mut stream).await else {
+                            return;
+                        };
+                        let head = String::from_utf8_lossy(&buf[..at]).to_string();
+                        buf.drain(..at + 4);
+                        let len = content_length(&head);
+                        if !fill_to(&mut buf, &mut stream, len).await {
+                            return;
+                        }
+                        buf.drain(..len);
+                        answered += 1;
+                        if cut && answered >= 2 {
+                            // the request was read whole; closing now is what
+                            // the engine has to recover from
+                            return;
+                        }
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// An origin that reads one request whole and closes without an answer.
+    async fn cuts_after_reading() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf: Vec<u8> = Vec::new();
+                if let Some(at) = read_head(&mut buf, &mut stream).await {
+                    let head = String::from_utf8_lossy(&buf[..at]).to_string();
+                    buf.drain(..at + 4);
+                    let len = content_length(&head);
+                    let _ = fill_to(&mut buf, &mut stream, len).await;
+                }
+            }
+        });
+        addr
+    }
+
     fn content_length(head: &str) -> usize {
         head.lines()
             .find_map(|l| {
@@ -2743,5 +3349,209 @@ mod tests {
         );
         let served = rig.served().await;
         assert_eq!(served.routed, 1);
+    }
+
+    /// A body with nothing in it, for a request built directly.
+    fn no_body() -> ReqBody {
+        http_body_util::Empty::<Bytes>::new()
+            .map_err(|never| -> BoxError { match never {} })
+            .boxed()
+    }
+
+    #[tokio::test]
+    async fn a_websocket_upgrade_is_relayed_and_counted_once() {
+        let answer = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nhello websocket";
+        let (addr, read, written) = upgrading_origin(answer).await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.client
+            .send(
+                "GET /ws HTTP/1.1\r\nHost: target.test\r\n\
+                 Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let lower = head.to_ascii_lowercase();
+        assert!(lower.contains("upgrade: websocket"), "{head}");
+        assert!(lower.contains("connection: upgrade"), "{head}");
+        // the greeting was written with the 101, and may already be in `buf`
+        assert_eq!(rig.client.take(15).await, b"hello websocket");
+        rig.client.send("ping").await.unwrap();
+        assert_eq!(rig.client.take(4).await, b"ping");
+        rig.client.stream.shutdown().await.unwrap();
+        while rig.client.fill().await {}
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(101));
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        let (up, down) = handle.bytes();
+        assert_eq!(
+            (up, down),
+            (
+                read.load(Ordering::Relaxed) as u64,
+                written.load(Ordering::Relaxed) as u64
+            ),
+            "the bytes of the request and of the tunnel, each counted once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_on_a_sniffed_connection_goes_to_its_target() {
+        let (addr, _, _) =
+            upgrading_origin(b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.client
+            .send("CONNECT x.test:443 HTTP/1.1\r\nHost: x.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        rig.client.send("ping").await.unwrap();
+        assert_eq!(rig.client.take(4).await, b"ping");
+        rig.client.stream.shutdown().await.unwrap();
+        while rig.client.fill().await {}
+        let seen = rig.fake.seen();
+        let s = &seen[0];
+        // the target is still the connection's; the request line names the
+        // client's own proxy, and it has no URL (design 8.9)
+        assert_eq!(s.session.dst_host, HostName::parse("target.test"));
+        assert_eq!(s.session.dst_port, 80);
+        assert_eq!(s.session.url, None);
+        assert_eq!(s.session.http_host.as_deref(), Some("x.test"));
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(200));
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+    }
+
+    #[tokio::test]
+    async fn a_connect_refused_by_the_target_is_answered_as_it_is() {
+        let origin =
+            holding_origin(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\n\r\nnope").await;
+        let mut rig = connected(Entry::Sniffed, origin.addr).await;
+        rig.client
+            .send("CONNECT x.test:443 HTTP/1.1\r\nHost: x.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(body, b"nope");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(403));
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+    }
+
+    #[tokio::test]
+    async fn a_101_the_request_did_not_ask_for_is_a_502() {
+        let origin = holding_origin(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        )
+        .await;
+        let mut rig = connected(Entry::Sniffed, origin.addr).await;
+        rig.client
+            .send("GET /plain HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert!(
+            String::from_utf8_lossy(&body).contains(
+                "Upstream answered 101 Switching Protocols to a request that did not ask to upgrade"
+            ),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(502));
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(
+                "upstream answered 101 Switching Protocols unasked".into()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_not_yet_written_is_sent_again_on_a_new_connection() {
+        // A connection nobody polls: its dispatch is gone, so `try_send`
+        // refuses the request on the spot and hands it back whole. That is
+        // the `NotWritten` a second attempt is built on (design 8.6).
+        let (server, _client) = tokio::io::duplex(64);
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(server))
+            .await
+            .unwrap();
+        drop(conn);
+        let req = Request::builder()
+            .method("POST")
+            .uri("http://target.test/x")
+            .body(no_body())
+            .unwrap();
+        match send(&mut sender, req).await {
+            Sent::NotWritten(req, e) => {
+                assert_eq!(req.method(), http::Method::POST);
+                assert_eq!(req.uri(), &"http://target.test/x".parse::<Uri>().unwrap());
+                assert!(e.is_canceled(), "{e}");
+            }
+            Sent::Answered(_) => panic!("a connection nobody polled answered"),
+            Sent::Failed(e) => panic!("the request was not handed back: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idempotent_request_cut_off_is_sent_again_once() {
+        let addr = cutting_origin().await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        for path in ["/one", "/two"] {
+            rig.client
+                .send(&format!("GET {path} HTTP/1.1\r\nHost: target.test\r\n\r\n"))
+                .await
+                .unwrap();
+            let (head, body) = rig.client.response().await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            assert_eq!(body, b"ok");
+        }
+        assert_eq!(rig.fake.dials(), 2, "the cut-off request dials again");
+        let second = rig.fake.finished(1).await;
+        assert_eq!(second.outcome(), Some(SessionOutcome::Completed));
+    }
+
+    #[tokio::test]
+    async fn a_post_cut_off_after_it_was_written_is_a_502() {
+        let addr = cutting_origin().await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.client
+            .send("GET /one HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, _) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        rig.client
+            .send(
+                "POST /two HTTP/1.1\r\nHost: target.test\r\n\
+                 Content-Length: 5\r\n\r\nabcde",
+            )
+            .await
+            .unwrap();
+        let (head, _) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert_eq!(rig.fake.dials(), 1, "a request with a body goes again");
+        let second = rig.fake.finished(1).await;
+        assert!(matches!(second.outcome(), Some(SessionOutcome::Failed(_))));
+    }
+
+    #[tokio::test]
+    async fn a_request_on_a_new_connection_is_not_sent_again() {
+        let addr = cuts_after_reading().await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.client
+            .send("GET /once HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, _) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert_eq!(rig.fake.dials(), 1, "a fresh connection gets one send");
+        let handle = rig.fake.finished(0).await;
+        assert!(matches!(handle.outcome(), Some(SessionOutcome::Failed(_))));
     }
 }
