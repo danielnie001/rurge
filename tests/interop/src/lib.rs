@@ -57,52 +57,67 @@ pub fn sing_box_or_skip(test: &str) -> Option<PathBuf> {
     None
 }
 
-/// A port that was free a moment ago.
-pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("a free loopback port")
-        .port()
-}
-
-/// A UDP port that was free a moment ago.
-pub fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("a free loopback port")
-        .port()
-}
-
-/// A port that was free a moment ago for TCP and for UDP alike: for a server
-/// that binds both on one number.
-pub fn free_tcp_and_udp_port() -> u16 {
+/// A number of the range `unassigned` walks, with what `take` made of it.
+///
+/// The number lies in 20000–29999, a range none of the three systems hands a
+/// dynamic port out of: Windows (as set up by default), Linux and macOS all
+/// start their ephemeral ports above it. A number the system hands out is
+/// free for anyone to take again the moment it is let go — a test running in
+/// parallel in this binary, another reference server —, a number of this
+/// range is not.
+///
+/// One walk of the range is shared by the whole process, so no two calls come
+/// by the same number, and every number is tried on the spot before it is
+/// handed out.
+fn unassigned<T>(mut take: impl FnMut(u16) -> Option<T>) -> (T, u16) {
+    const PORTS: std::ops::Range<u64> = 20_000..30_000;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // this process starts somewhere else in the range than the one before it
+    let start = u64::from(std::process::id()).wrapping_mul(7919);
     for _ in 0..100 {
-        let port = free_port();
-        if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
-            return port;
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = PORTS.start + start.wrapping_add(n) % (PORTS.end - PORTS.start);
+        let port = u16::try_from(port).expect("a port");
+        if let Some(held) = take(port) {
+            return (held, port);
         }
     }
-    panic!("no loopback port was free for TCP and UDP alike")
+    panic!("no port of {PORTS:?} is free");
+}
+
+/// A port of `unassigned` that was free a moment ago; the listener that tried
+/// it is let go, so the number is free again when it is handed out.
+pub fn free_port() -> u16 {
+    unassigned(|port| TcpListener::bind(("127.0.0.1", port)).ok()).1
+}
+
+/// A UDP port of `unassigned` that was free a moment ago; the socket that
+/// tried it is let go, so the number is free again when it is handed out.
+pub fn free_udp_port() -> u16 {
+    unassigned(|port| UdpSocket::bind(("127.0.0.1", port)).ok()).1
+}
+
+/// A port of `unassigned` that was free a moment ago for TCP and for UDP
+/// alike: for a server that binds both on one number.
+pub fn free_tcp_and_udp_port() -> u16 {
+    hold(true).1
 }
 
 /// What keeps a port's number taken: its TCP listener, and its UDP socket
 /// when it is a port for both.
 type Held = (TcpListener, Option<UdpSocket>);
 
-/// A loopback port that is free for TCP — and for UDP too when `udp_too` —
-/// with the sockets that hold it.
+/// A port of `unassigned` that is free for TCP — and for UDP too when
+/// `udp_too` —, with the sockets that hold it.
 fn hold(udp_too: bool) -> (Held, u16) {
-    for _ in 0..100 {
-        let tcp = TcpListener::bind("127.0.0.1:0").expect("a free loopback port");
-        let port = tcp.local_addr().expect("the listener's address").port();
-        if !udp_too {
-            return ((tcp, None), port);
-        }
-        if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) {
-            return ((tcp, Some(udp)), port);
-        }
-    }
-    panic!("no loopback port was free for TCP and UDP alike")
+    unassigned(|port| {
+        let tcp = TcpListener::bind(("127.0.0.1", port)).ok()?;
+        let udp = match udp_too {
+            true => Some(UdpSocket::bind(("127.0.0.1", port)).ok()?),
+            false => None,
+        };
+        Some((tcp, udp))
+    })
 }
 
 /// One port of `hold` for each entry of `udp_too`, none of them let go
@@ -114,9 +129,9 @@ fn choose<H>(udp_too: &[bool], hold: impl FnMut(bool) -> (H, u16)) -> Vec<u16> {
 
 /// A port for each entry of `udp_too` that was free a moment ago — for TCP,
 /// and where the entry says so for UDP as well, for a server that binds both
-/// on one number —, and no two of them the same. Taken one at a time, two
-/// listeners of one configuration can come by the same number: a port is
-/// free again by the time the next one is asked for.
+/// on one number —, and no two of them the same. Every number comes from one
+/// walk of the range `unassigned` keeps, and all of them are held until the
+/// last is chosen: the numbers are let go together.
 pub fn free_ports(udp_too: &[bool]) -> Vec<u16> {
     choose(udp_too, hold)
 }
@@ -1136,6 +1151,34 @@ mod tests {
         };
         assert_eq!(choose(&[false, true, false], lowest_free), [1, 2, 3]);
         assert!(taken.borrow().is_empty(), "and all are released in the end");
+    }
+
+    /// Every port a fixture is handed lies below the ranges the three systems
+    /// hand out dynamic ports from.
+    #[test]
+    fn every_port_lies_below_the_dynamic_ranges() {
+        let mut ports = vec![free_port(), free_udp_port(), free_tcp_and_udp_port()];
+        ports.extend(free_ports(&[false, true]));
+        for port in ports {
+            assert!((20_000..30_000).contains(&port), "{port}");
+        }
+    }
+
+    /// All the functions that hand out a port share one walk of the range, so
+    /// no two calls, of one or another of them, come by the same number.
+    #[test]
+    fn no_two_calls_give_one_port() {
+        let mut ports = Vec::new();
+        for _ in 0..10 {
+            ports.push(free_port());
+            ports.push(free_udp_port());
+            ports.push(free_tcp_and_udp_port());
+            ports.extend(free_ports(&[true, false]));
+        }
+        let mut distinct = ports.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), ports.len(), "{ports:?}");
     }
 
     #[test]
