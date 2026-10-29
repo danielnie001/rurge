@@ -30,9 +30,9 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::BoxedStream;
 use rurge_proto::RejectKind;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -66,6 +66,11 @@ pub struct Conn {
     pub head_wait: Duration,
     /// REJECT-DROP (design 8.8).
     pub drop_hold: Duration,
+    /// Cancelled by the HTTP engine when the connection has to go at once — a
+    /// request killed or stopped, or a client that stopped reading (design
+    /// 8.10, 8.11). Whoever serves the connection drops it then. Not a child of
+    /// `token`.
+    pub abort: CancellationToken,
     /// The connection's token; each request's token is its child (design 8.11).
     pub token: CancellationToken,
     /// The engine's tracker: the upstream connections' hyper tasks and the
@@ -373,16 +378,29 @@ impl<U: Upstreams> Requests<U> {
                 return Ok(responses::bad_request("malformed request URI"));
             }
         }
+        // A body whose length nobody named goes upstream chunked: hyper reads
+        // an unknown length as no body at all for GET, HEAD and CONNECT
+        // (`proto/h1/role.rs`), which would drop the body silently. A body
+        // already at its end cannot reach here, and hyper drops the header
+        // again for one that ends up with nothing to send.
+        if !req.body().is_end_stream() && req.body().size_hint().exact().is_none() {
+            req.headers_mut().insert(
+                header::TRANSFER_ENCODING,
+                HeaderValue::from_static("chunked"),
+            );
+        }
         let idle = self.shared.conn.idle;
+        let progress = Progress::new();
         let (parts, body) = req.into_parts();
-        let req = Request::from_parts(parts, Idle::new(body, idle).boxed());
+        let req = Request::from_parts(parts, Idle::new(body, idle, progress.clone()).boxed());
         // `biased`: once the token is cancelled the answer is "closed by
-        // policy", never the error page a dropped upstream would produce
+        // policy", never the error page a dropped upstream would produce; a
+        // response head that arrived beats the deadline that ran out
         let answered = tokio::select! {
             biased;
             _ = handle.token().cancelled() => return Err(Close),
-            _ = tokio::time::sleep(idle) => return self.timed_out(&guard, pages),
             res = sender.send_request(req) => res,
+            _ = head_deadline(progress, idle) => return self.timed_out(&guard, pages),
         };
         let mut resp = match answered {
             Ok(resp) => resp,
@@ -648,9 +666,28 @@ fn form_of<B>(req: &Request<B>, fallback: (&HostName, u16)) -> (String, Option<S
         );
     }
     (
-        format!("http://{}:{}{}", fallback.0, fallback.1, path),
+        format!(
+            "http://{}{}",
+            origin_authority(fallback.0, fallback.1),
+            path
+        ),
         None,
     )
+}
+
+/// A target as a URL can carry it: the port unless it is 80, and an IPv6
+/// address in brackets (`HostName`'s own display has none, `types.rs`).
+fn origin_authority(host: &HostName, port: u16) -> String {
+    let host = match host {
+        HostName::Domain(d) => d.clone(),
+        HostName::Ip(IpAddr::V6(v6)) => format!("[{v6}]"),
+        HostName::Ip(IpAddr::V4(v4)) => v4.to_string(),
+    };
+    if port == 80 {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// Turns the fake address a listener request names back into its name (`phase
@@ -751,6 +788,72 @@ impl std::fmt::Display for Stalled {
 
 impl std::error::Error for Stalled {}
 
+/// How far a body got, for the two idle timeouts of a request (`phase 4 M1
+/// design 8.10`): when it last handed a frame on, and whether its last poll
+/// found its source empty. hyper polls a body again whenever it can take more
+/// (`proto/h1/dispatch.rs`, `poll_write`), so a body whose last poll handed a
+/// frame on waits for its reader, and one whose last poll found nothing waits
+/// for its source.
+struct Progress {
+    started: tokio::time::Instant,
+    /// Milliseconds since `started` of the last frame handed on, or of the
+    /// end; zero until the first frame moves it.
+    last: AtomicU64,
+    /// The last poll found the source empty.
+    waiting_on_source: AtomicBool,
+}
+
+impl Progress {
+    fn new() -> Arc<Progress> {
+        Arc::new(Progress {
+            started: tokio::time::Instant::now(),
+            last: AtomicU64::new(0),
+            waiting_on_source: AtomicBool::new(false),
+        })
+    }
+
+    /// A frame was handed on, or the body reached its end.
+    fn moved(&self) {
+        self.last
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.waiting_on_source.store(false, Ordering::Relaxed);
+    }
+
+    /// The last poll found the source empty.
+    fn waiting(&self) {
+        self.waiting_on_source.store(true, Ordering::Relaxed);
+    }
+
+    fn is_waiting(&self) -> bool {
+        self.waiting_on_source.load(Ordering::Relaxed)
+    }
+
+    /// How much of `idle` is left before the body counts as stopped.
+    fn remaining(&self, idle: Duration) -> Duration {
+        let last = Duration::from_millis(self.last.load(Ordering::Relaxed));
+        (last + idle).saturating_sub(self.started.elapsed())
+    }
+}
+
+/// Waits for the response head with the request's body in mind (`phase 4 M1
+/// design 8.10`): a head that does not come while the body is not moving is
+/// late; one that does not come while the body waits for the client is not,
+/// because `Idle` times that wait itself.
+async fn head_deadline(progress: Arc<Progress>, idle: Duration) {
+    loop {
+        if progress.is_waiting() {
+            // the body waits for the client: `Idle` is the one to time that
+            tokio::time::sleep(idle).await;
+            continue;
+        }
+        let remaining = progress.remaining(idle);
+        if remaining.is_zero() {
+            return;
+        }
+        tokio::time::sleep(remaining).await;
+    }
+}
+
 /// The body of a request being sent upstream, with `Conn::idle` allowed
 /// between two of its frames (`phase 4 M1 design 8.10`). `is_end_stream` and
 /// `size_hint` are the inner body's: hyper's client decides by them whether
@@ -760,14 +863,17 @@ struct Idle<B> {
     inner: B,
     idle: Duration,
     deadline: Pin<Box<Sleep>>,
+    /// What the wait for the response head reads (`design 8.10`).
+    progress: Arc<Progress>,
 }
 
 impl<B> Idle<B> {
-    fn new(inner: B, idle: Duration) -> Idle<B> {
+    fn new(inner: B, idle: Duration, progress: Arc<Progress>) -> Idle<B> {
         Idle {
             inner,
             idle,
             deadline: Box::pin(tokio::time::sleep(idle)),
+            progress,
         }
     }
 }
@@ -793,11 +899,16 @@ where
                 this.deadline
                     .as_mut()
                     .reset(tokio::time::Instant::now() + this.idle);
+                this.progress.moved();
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(None) => {
+                this.progress.moved();
+                Poll::Ready(None)
+            }
             Poll::Pending => {
+                this.progress.waiting();
                 if this.deadline.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(Some(Err(Box::new(Stalled("request body stalled")))));
                 }
@@ -826,6 +937,12 @@ struct Tail<U: Upstreams> {
     /// The request's token: `kill` and a stop end the exchange here, because
     /// ending one response on HTTP/1.1 means ending the client connection.
     cancelled: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    /// How far the body got, for the watchdog that watches the client
+    /// (`design 8.10`).
+    progress: Arc<Progress>,
+    /// Fired when the body is over (or the body is dropped): the watchdog
+    /// stops caring.
+    watchdog: CancellationToken,
     guard: Guard,
     shared: Arc<Shared<U>>,
     /// The upstream connection, until the body is over and it goes back.
@@ -842,11 +959,15 @@ impl<U: Upstreams> Tail<U> {
     ) -> Tail<U> {
         let idle = shared.conn.idle;
         let cancelled = Box::pin(guard.handle().token().clone().cancelled_owned());
+        let progress = Progress::new();
+        let watchdog = CancellationToken::new();
         let mut tail = Tail {
             inner,
             idle,
             deadline: Box::pin(tokio::time::sleep(idle)),
             cancelled,
+            progress,
+            watchdog,
             guard,
             shared,
             outing: Some(Box::new(outing)),
@@ -857,8 +978,62 @@ impl<U: Upstreams> Tail<U> {
         // all is read to its end here, where it can still be ended properly
         if tail.inner.is_end_stream() {
             tail.complete();
+        } else {
+            tail.watch_the_client();
         }
         tail
+    }
+
+    /// Watches the client while this body is on its way to it (`design 8.10,
+    /// 8.11`): a client that stopped reading never polls the body again, so
+    /// `kill`, a stop and the idle timeout could not be seen from `poll_frame`.
+    /// The watchdog ends them: the connection goes at once, and the guard says
+    /// how the request ended.
+    fn watch_the_client(&self) {
+        let progress = self.progress.clone();
+        let handle = self.guard.handle().clone();
+        let request = handle.token().clone();
+        let abort = self.shared.conn.abort.clone();
+        let done = self.watchdog.clone();
+        let idle = self.idle;
+        let tracker = self.shared.conn.tracker.clone();
+        tracker.spawn(async move {
+            let inner = tokio::spawn(async move {
+                loop {
+                    // What to sleep for, and whether that sleep is a deadline
+                    // at all: a body waiting for upstream is `Tail`'s to time,
+                    // so the watchdog only sleeps and looks again.
+                    let sleep_for = if progress.is_waiting() {
+                        idle
+                    } else {
+                        let remaining = progress.remaining(idle);
+                        if remaining.is_zero() {
+                            handle.finish(SessionOutcome::Failed(
+                                "client stopped reading".to_string(),
+                            ));
+                            tracing::debug!("a client stopped reading its response");
+                            abort.cancel();
+                            return;
+                        }
+                        remaining
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = done.cancelled() => return,
+                        _ = request.cancelled() => {
+                            abort.cancel();
+                            return;
+                        }
+                        _ = tokio::time::sleep(sleep_for) => {}
+                    }
+                }
+            });
+            if let Err(e) = inner.await
+                && e.is_panic()
+            {
+                tracing::error!("response watchdog panicked: {e}");
+            }
+        });
     }
 
     /// The body was read to its end: the request is complete, and the
@@ -868,6 +1043,7 @@ impl<U: Upstreams> Tail<U> {
             return;
         }
         self.done = true;
+        self.watchdog.cancel();
         self.guard.handle().finish(SessionOutcome::Completed);
         if let Some(outing) = self.outing.take() {
             let Outing {
@@ -901,6 +1077,7 @@ impl<U: Upstreams> Tail<U> {
             return;
         }
         self.done = true;
+        self.watchdog.cancel();
         self.outing.take();
         self.guard.handle().finish(SessionOutcome::Failed(message));
     }
@@ -911,8 +1088,17 @@ impl<U: Upstreams> Tail<U> {
             return;
         }
         self.done = true;
+        self.watchdog.cancel();
         self.outing.take();
         self.guard.retire();
+    }
+}
+
+impl<U: Upstreams> Drop for Tail<U> {
+    /// The body went away without a word (hyper dropped it): there is nothing
+    /// left for the watchdog to watch.
+    fn drop(&mut self) {
+        self.watchdog.cancel();
     }
 }
 
@@ -937,6 +1123,7 @@ impl<U: Upstreams> Body for Tail<U> {
                 this.deadline
                     .as_mut()
                     .reset(tokio::time::Instant::now() + this.idle);
+                this.progress.moved();
                 // the frame just handed out was the last one: hyper will drop
                 // the body now instead of polling it again
                 if this.inner.is_end_stream() {
@@ -949,10 +1136,12 @@ impl<U: Upstreams> Body for Tail<U> {
                 Poll::Ready(Some(Err(Box::new(e))))
             }
             Poll::Ready(None) => {
+                this.progress.moved();
                 this.complete();
                 Poll::Ready(None)
             }
             Poll::Pending => {
+                this.progress.waiting();
                 if this.cancelled.as_mut().poll(cx).is_ready() {
                     this.stop();
                     return Poll::Ready(Some(Err(Box::new(Close))));
@@ -974,6 +1163,7 @@ impl<U: Upstreams> Body for Tail<U> {
         self.inner.size_hint()
     }
 }
+/// The guard of one request (`phase 4 M1 design 8.11`, P18): while the future
 /// lives it holds the handle; dropped first, it ends the handle the way the
 /// request ended — killed, stopped with the connection, or left by the client.
 struct Guard {
@@ -1033,6 +1223,7 @@ pub struct Served {
 pub async fn serve_connection<U: Upstreams>(client: BoxedStream, requests: Requests<U>) -> Served {
     let head_wait = requests.shared.conn.head_wait;
     let token = requests.token().clone();
+    let abort = requests.shared.conn.abort.clone();
     let counter = requests.clone();
     let service = service_fn(move |req: Request<Incoming>| {
         let requests = requests.clone();
@@ -1047,11 +1238,20 @@ pub async fn serve_connection<U: Upstreams>(client: BoxedStream, requests: Reque
         .serve_connection(TokioIo::new(client), service)
         .with_upgrades();
     let mut conn = std::pin::pin!(conn);
+    // `abort` is the engine's word that the connection has to go at once (a
+    // killed request, a client that stopped reading): dropping the connection
+    // is what ends it then, and no error is recorded for it.
     let error = tokio::select! {
+        biased;
+        _ = abort.cancelled() => None,
         res = conn.as_mut() => res.err().map(|e| e.to_string()),
         _ = token.cancelled() => {
             conn.as_mut().graceful_shutdown();
-            conn.await.err().map(|e| e.to_string())
+            tokio::select! {
+                biased;
+                _ = abort.cancelled() => None,
+                res = conn.as_mut() => res.err().map(|e| e.to_string()),
+            }
         }
     };
     Served {
@@ -1405,6 +1605,7 @@ mod tests {
             idle,
             head_wait: Duration::from_secs(5),
             drop_hold,
+            abort: CancellationToken::new(),
             token: token.clone(),
             tracker: TaskTracker::new(),
         };
@@ -1511,7 +1712,12 @@ mod tests {
         let seen = rig.fake.seen();
         let s = &seen[0];
         assert!(!s.forwardable, "a sniffed request is never forwarded on");
-        // the URL is rebuilt from the `Host` header as the client wrote it;\n        // the host the rules read (`http_host`) is the lowercase one\n        assert_eq!(\n            s.session.url.as_deref(),\n            Some("http://Target.Test:8080/a/b?q=1")\n        );
+        // the URL is rebuilt from the `Host` header as the client wrote it;
+        // the host the rules read (`http_host`) is the lowercase one
+        assert_eq!(
+            s.session.url.as_deref(),
+            Some("http://Target.Test:8080/a/b?q=1")
+        );
         assert_eq!(s.session.http_host.as_deref(), Some("target.test"));
         assert_eq!(s.session.dst_host, HostName::parse("target.test"));
         assert_eq!(s.session.dst_port, 80, "the connection's target");
@@ -1860,6 +2066,52 @@ mod tests {
         body: Vec<u8>,
     }
 
+    /// Reads until at least `len` bytes are in `buf`; false when the
+    /// connection ended first.
+    async fn fill_to(buf: &mut Vec<u8>, stream: &mut tokio::net::TcpStream, len: usize) -> bool {
+        while buf.len() < len {
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        true
+    }
+
+    /// Reads a `Transfer-Encoding: chunked` body out of `buf` and `stream`,
+    /// unwrapped; `None` when the connection ended before its end.
+    async fn read_chunked(
+        buf: &mut Vec<u8>,
+        stream: &mut tokio::net::TcpStream,
+    ) -> Option<Vec<u8>> {
+        let mut body = Vec::new();
+        loop {
+            let at = loop {
+                if let Some(at) = find(buf, b"\r\n") {
+                    break at;
+                }
+                let mut chunk = [0u8; 4096];
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            };
+            let line = String::from_utf8_lossy(&buf[..at]).to_string();
+            buf.drain(..at + 2);
+            let size =
+                usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16).ok()?;
+            if !fill_to(buf, stream, size + 2).await {
+                return None;
+            }
+            body.extend_from_slice(&buf[..size]);
+            buf.drain(..size + 2);
+            if size == 0 {
+                return Some(body);
+            }
+        }
+    }
+
     /// An origin that reads every request whole, records it and answers `ok`,
     /// on as many connections and requests as it is given.
     async fn recording_origin() -> (SocketAddr, Arc<Mutex<Vec<Recorded>>>) {
@@ -1888,18 +2140,22 @@ mod tests {
                         };
                         let head = String::from_utf8_lossy(&buf[..at]).to_string();
                         buf.drain(..at + 4);
-                        let len = content_length(&head);
-                        while buf.len() < len {
-                            let mut chunk = [0u8; 4096];
-                            match stream.read(&mut chunk).await {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        let body = if head
+                            .to_ascii_lowercase()
+                            .contains("transfer-encoding: chunked")
+                        {
+                            let Some(body) = read_chunked(&mut buf, &mut stream).await else {
+                                return;
+                            };
+                            body
+                        } else {
+                            let len = content_length(&head);
+                            if !fill_to(&mut buf, &mut stream, len).await {
+                                return;
                             }
-                        }
-                        rec.lock().unwrap().push(Recorded {
-                            head,
-                            body: buf.drain(..len).collect(),
-                        });
+                            buf.drain(..len).collect()
+                        };
+                        rec.lock().unwrap().push(Recorded { head, body });
                         if stream
                             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                             .await
@@ -1921,6 +2177,80 @@ mod tests {
         addr: SocketAddr,
         accepted: Arc<AtomicUsize>,
         closed: Arc<AtomicUsize>,
+    }
+
+    /// How large the answer of `streaming_origin` is: far more than the
+    /// rig's duplex (64 KiB) and hyper's write buffer, so whoever serves it
+    /// stops reading it once the client stops taking bytes.
+    const BIG_BODY: usize = 4 << 20;
+
+    /// An origin that answers 200 with `BIG_BODY` bytes and writes them until
+    /// the client stops taking them. It counts the connections it accepted
+    /// and those whose peer ended them.
+    async fn streaming_origin() -> Holding {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let (a, c) = (accepted.clone(), closed.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                a.fetch_add(1, Ordering::Relaxed);
+                let c = c.clone();
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    loop {
+                        if find(&buf, b"\r\n\r\n").is_some() {
+                            break;
+                        }
+                        let mut chunk = [0u8; 4096];
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => {
+                                c.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {BIG_BODY}\r\n\r\n");
+                    if stream.write_all(head.as_bytes()).await.is_err() {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    let chunk = vec![b'x'; 16 * 1024];
+                    let mut sent = 0;
+                    while sent < BIG_BODY {
+                        if stream.write_all(&chunk).await.is_err() {
+                            c.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        sent += chunk.len();
+                    }
+                    let mut chunk = [0u8; 1024];
+                    while matches!(stream.read(&mut chunk).await, Ok(n) if n > 0) {}
+                    c.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+        });
+        Holding {
+            addr,
+            accepted,
+            closed,
+        }
+    }
+
+    /// Waits (5 s at most) until `done` holds.
+    async fn wait_until(mut done: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the condition held within 5 s");
     }
 
     async fn holding_origin(answer: &'static [u8]) -> Holding {
@@ -2115,6 +2445,33 @@ mod tests {
         rig.stop();
         let served = rig.served().await;
         assert_eq!(served.routed, 0);
+
+        // an answer on its way to a client that does not read it: the
+        // graceful shutdown would wait for it to be written
+        let origin = streaming_origin().await;
+        let Rig {
+            mut client,
+            fake,
+            token,
+            served,
+        } = rig_timed(
+            Entry::Sniffed,
+            origin.addr,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        client
+            .send("GET /big HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let handle = fake.handle(0).await;
+        wait_until(|| handle.status() == Some(200) && handle.bytes().1 > 0).await;
+        token.cancel();
+        let served = served_of(served).await;
+        assert_eq!(served.routed, 1);
+        let handle = fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
     }
 
     #[tokio::test]
@@ -2239,12 +2596,152 @@ mod tests {
             .unwrap();
         let (head, _) = rig.client.response().await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        let records = records.lock().unwrap();
-        let none = records[2].head.to_ascii_lowercase();
+        {
+            let recorded = records.lock().unwrap();
+            let none = recorded[2].head.to_ascii_lowercase();
+            assert!(
+                !none.contains("transfer-encoding") && !none.contains("content-length"),
+                "a POST with no body was framed: {}",
+                recorded[2].head
+            );
+        }
+
+        // A body the client never gave a length for keeps its framing even on
+        // a method hyper would otherwise send with no body at all.
+        rig.client
+            .send(
+                "GET /chunked HTTP/1.1\r\nHost: target.test\r\n\
+                 Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let (head, _) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let recorded = records.lock().unwrap();
         assert!(
-            !none.contains("transfer-encoding") && !none.contains("content-length"),
-            "a POST with no body was framed: {}",
-            records[2].head
+            recorded[3]
+                .head
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "the body lost its framing: {}",
+            recorded[3].head
         );
+        assert_eq!(recorded[3].body, b"hello");
+    }
+
+    /// A body that arrives slower than `Conn::idle`: the wait for the response
+    /// head counts from the last frame of the request's body, not from the
+    /// send (`phase 4 M1 design 8.10`). The body is written in pieces on
+    /// purpose — that is what the test is about — and `docs/testing.md` allows
+    /// it for a test of a body that arrives late.
+    #[tokio::test]
+    async fn a_slow_upload_is_not_a_late_response() {
+        let (addr, records) = recording_origin().await;
+        let mut rig = rig_timed(
+            Entry::Sniffed,
+            addr,
+            Duration::from_millis(400),
+            Duration::from_secs(5),
+        )
+        .await;
+        rig.client
+            .send("POST /slow HTTP/1.1\r\nHost: target.test\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            // the engine may answer early: the write that finds it closed is no failure of the test
+            let _ = rig.client.send("1\r\nx\r\n").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = rig.client.send("0\r\n\r\n").await;
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        let records = records.lock().unwrap();
+        assert_eq!(records[0].body, b"xxxxxxxx");
+    }
+
+    /// An origin-form request with no `Host` is named by the connection's
+    /// target, written as a URL can carry it (`design 8.3`): the port only
+    /// when it is not 80, an IPv6 address in brackets.
+    #[test]
+    fn a_request_without_host_is_named_by_its_target() {
+        for (host, port, want) in [
+            ("target.test", 80, "http://target.test/n"),
+            ("target.test", 8080, "http://target.test:8080/n"),
+            ("::1", 8080, "http://[::1]:8080/n"),
+            ("::1", 80, "http://[::1]/n"),
+        ] {
+            let req = Request::builder().uri("/n").body(()).unwrap();
+            let (url, http_host) = form_of(&req, (&HostName::parse(host), port));
+            assert_eq!(url, want, "{host}:{port}");
+            assert_eq!(http_host, None, "{host}:{port}");
+        }
+    }
+
+    /// A client that takes the answer and then stops reading it: hyper stops
+    /// polling the body once its write buffer is full, so `kill`, a stop and
+    /// the idle timeout could not be seen from the body — the watchdog is what
+    /// ends such a request (`design 8.10`, 8.11).
+    #[tokio::test]
+    async fn a_client_that_stops_reading_fails_after_idle() {
+        let origin = streaming_origin().await;
+        let mut rig = rig_timed(
+            Entry::Sniffed,
+            origin.addr,
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+        )
+        .await;
+        rig.client
+            .send("GET /big HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        // the client reads nothing at all
+        let handle = rig.fake.handle(0).await;
+        wait_until(|| handle.status() == Some(200) && handle.bytes().1 > 0).await;
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("client stopped reading".into()))
+        );
+        assert_eq!(handle.status(), Some(200));
+        let served = rig.served().await;
+        assert_eq!(served.routed, 1);
+        assert_eq!(
+            served.error, None,
+            "the engine dropped the connection itself"
+        );
+        wait_until(|| origin.closed.load(Ordering::Relaxed) > 0).await;
+        assert_eq!(origin.accepted.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_killed_response_whose_client_does_not_read_is_closed() {
+        let origin = streaming_origin().await;
+        let mut rig = rig_timed(
+            Entry::Sniffed,
+            origin.addr,
+            // long enough that the idle deadline is not the one that ends it
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        rig.client
+            .send("GET /big HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let handle = rig.fake.handle(0).await;
+        wait_until(|| handle.status() == Some(200) && handle.bytes().1 > 0).await;
+        handle.kill();
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("killed".into()))
+        );
+        let served = rig.served().await;
+        assert_eq!(served.routed, 1);
     }
 }
