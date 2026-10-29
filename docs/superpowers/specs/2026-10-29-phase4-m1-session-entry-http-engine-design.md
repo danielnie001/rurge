@@ -528,6 +528,16 @@ M1a 的计划（`docs/superpowers/plans/2026-10-29-phase4-m1a-sniffing-plan.md`�
 10. **第 16 节的核对**：V1 ～ V10、V15、V16 的结论写在计划 P21 与 P18 里（V8：rustls 只开了 ring，没有 ML-KEM，第 14 节第 1 条已照此写）。V11 ～ V14 是 M1b 的，写 M1b 的计划时核。
 11. **`CLAUDE.md`「架构」的一句**（计划 P20）："`rurge-http` 到后面的阶段才建"在 M1a 之后不再对。M1a 的收尾把它改成事实；它不是进度，所以不受"`CLAUDE.md` 只改「现在在哪里」"的限制。
 
+M1b 的计划（`docs/superpowers/plans/2026-10-29-phase4-m1b-http-engine-plan.md`）对着 `376cb56` 写，又改了本文下面几处（接着编号）。同样以计划为准，理由在计划「计划期决定」的对应行。
+
+12. **第 8.2、8.4 节与第 3 节的接口草图：选路分成两步**（计划 P1）。`open` 是同步的，建请求的句柄（编号、登记、连接令牌的孩子、连接的进程槽），`rurge-http` 拿到它就建守卫；`route` 是异步的，求规则、选策略、算池键。hyper 在客户端走了时丢掉请求的 future，丢在第一个 `await` 上时，`route` 里建好、登记好的句柄就没有人结束了。`route` 与 `dial` 都不与令牌竞速（同第 7.1 节"拨号不竞速"），返回之后看令牌。
+13. **第 8.2 节的流程图与第 8.8 节的表：REJECT 一族是拨号的结果**（计划 P3）。`REJECT` 的出站在拨号时返回 `OutboundError::Reject`，再经 `escalation` 升级，同今天的 `connect_session`；选路只会因暂停、DNS 失败与求值失败拒绝。答复照第 8.8 节的表，不变。
+14. **第 3 节的接口草图：交回的拒绝与失败不结束句柄**（计划 P4）。`route_session` 与 `dial_route` 交回 `Refused`，今天的会话由 `connect_session` 照旧结束；引擎里的请求由 `rurge-http` 先设状态码、再结束，记录与会话日志因此带着码。`Upstreams` 的确切形状（`named`、`open`、`route`、`dial`、`relay` 与 `Key`、`Route`、`Lease`）以计划的任务 2 为准。
+15. **第 9 节：监听器在一条连接上第一个绝对形式请求到来时才问 `plain_requests`**（计划 P12），不是连接开始时：只发 `CONNECT` 的连接不必查进程、不必建池。
+16. **第 8.11 节：守卫的结局多一种**（计划 P18）。连接令牌已取消（停止、守护进程退出）的记 `Completed`，同今天 `forward()` 的 `cancelled_outcome`；被终止的记 `Failed("killed")`；其余记 `Failed("client closed the connection")`。
+17. **第 8.3 节的 `http_host`：绝对形式的请求取请求行的主机**（计划 P22）。RFC 9112 第 3.2.2 节：代理收到绝对形式的请求时忽略收到的 `Host`，换成请求目标的主机；今天的 `forward()` 也取 URL 的。源站形式照旧取 `Host` 头。
+18. **第 3 节与第 16 节要核对的事项**：`http-body` 不是工作区依赖，`Body`、`Frame` 用 hyper 的再导出（计划 P2）；第 8.5 节的 `TCP_NODELAY` 已经开着（`crates/rurge-net/src/connector.rs:532`），不用改；V11 ～ V16 的结论写在计划 P21 里，`Expect: 100-continue` 读 hyper 源码的结论写在计划 P23 里。
+
 ## 21. 执行期的订正
 
 执行时改了本文下面两处。以这里为准，理由在计划「执行期修正记录」的对应行；第 20 节各条的订正照旧有效。
