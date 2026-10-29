@@ -442,6 +442,19 @@ DOMAIN,plain.example,REJECT,pre-matching\nFINAL,DIRECT\n\
     assert_eq!(hits(), [1, 2, 1, 0]);
 }
 
+/// The question the engine asks before it answers a session at a proxy port
+/// it would sniff: the SYN layer's rules decide it, and no hit is counted,
+/// because the session's own evaluation counts it when the rule refuses it.
+#[test]
+fn pre_refuses_answers_as_pre_match_and_counts_nothing() {
+    let e = engine_with_geo(&flagged("DOMAIN,ads.test"));
+    assert!(e.pre_refuses(&syn("ads.test", 443)));
+    assert!(!e.pre_refuses(&syn("other.test", 443)));
+    assert_eq!(e.rules()[0].hits(), 0);
+    assert!(at_syn(&e, "ads.test", 443).is_some());
+    assert_eq!(e.rules()[0].hits(), 1);
+}
+
 /// `evaluate` has no use for a verdict that says "the connection is needed":
 /// every session it is given has one. The decisions of rules that look at
 /// ports, addresses, `NOT` and sets, flagged `pre-matching` or not, are the

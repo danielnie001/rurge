@@ -20,6 +20,13 @@ pub struct CompiledSet {
     pub kind: SetKind,
     pub needs_dns: bool,
     pub version: u64,
+    /// Whether a line of the set carried `extended-matching`, in which case
+    /// every domain rule of the set does: "Note that if any domain rule
+    /// inside the set file already carries the flag, it is applied to all
+    /// domain rules of that set" (`rules/ruleset.html`). The lines of a
+    /// domain set file (`SetLine::Domain`) take no parameters, so a domain
+    /// set is extended only through the line that refers to it.
+    extended: bool,
     domains: DomainIndex,
     ips: IpIndex,
     /// Whether a line in `ips` may ask for a lookup, that is, one that did not
@@ -43,6 +50,20 @@ pub struct CompiledSet {
     entries: Vec<Box<str>>,
 }
 
+/// The kinds the manual calls domain rules: a flag on one of them extends to
+/// every one of the set's domain rules (`rules/ruleset.html`). `DOMAIN-SET`
+/// counts: `matcher.rs` treats it as one of the domain family.
+fn is_domain_rule(kind: &RuleKind) -> bool {
+    matches!(
+        kind,
+        RuleKind::Domain(_)
+            | RuleKind::DomainSuffix(_)
+            | RuleKind::DomainKeyword(_)
+            | RuleKind::DomainWildcard(_)
+            | RuleKind::DomainSet(_)
+    )
+}
+
 impl CompiledSet {
     pub fn empty(name: &str, kind: SetKind) -> CompiledSet {
         CompiledSet {
@@ -50,6 +71,7 @@ impl CompiledSet {
             kind,
             needs_dns: false,
             version: 0,
+            extended: false,
             domains: DomainIndex::default(),
             ips: IpIndexBuilder::new().build(),
             ips_resolve: false,
@@ -75,6 +97,11 @@ impl CompiledSet {
         let mut ips_resolve = false;
         let mut asns = HashMap::new();
         let mut asns_resolve = false;
+        // One domain rule carrying the flag makes every domain rule of the set
+        // carry it.
+        let extended = parsed.lines.iter().any(|line| {
+            matches!(line, SetLine::Rule(sub) if sub.extended_matching && is_domain_rule(&sub.kind))
+        });
         for (i, line) in parsed.lines.iter().enumerate() {
             let i = u32::try_from(i).expect("set size is bounded by MAX_ENTRIES");
             match line {
@@ -129,7 +156,11 @@ impl CompiledSet {
                             {
                                 needs_dns = true;
                             }
-                            linear.push((i, compile_subrule(sub, sets)));
+                            let mut rule = compile_subrule(sub, sets);
+                            if extended && is_domain_rule(&sub.kind) {
+                                rule.extended = true;
+                            }
+                            linear.push((i, rule));
                         }
                     }
                 }
@@ -140,6 +171,7 @@ impl CompiledSet {
             kind,
             needs_dns,
             version,
+            extended,
             domains: domains.build(),
             ips: ips.build(),
             ips_resolve,
@@ -201,7 +233,7 @@ impl CompiledSet {
         if !self.domains.is_empty() {
             let mut targets: Vec<&str> = Vec::with_capacity(3);
             targets.extend(s.dst_host.as_domain());
-            if extended {
+            if extended || self.extended {
                 targets.extend(s.sni.as_deref());
                 targets.extend(s.http_host.as_deref());
             }
@@ -1269,6 +1301,106 @@ DEST-PORT,8443
                 .verdict,
             Verdict::NoMatch
         );
+    }
+
+    #[test]
+    fn a_flag_on_one_domain_line_applies_to_every_domain_line() {
+        let set = compile(
+            SetKind::RuleSet,
+            "\
+DOMAIN,exact.com
+DOMAIN-SUFFIX,suffix.com
+DOMAIN-KEYWORD,kw
+DOMAIN-WILDCARD,*.wild.com
+DOMAIN,flag.com,extended-matching
+",
+            &Stub::default(),
+        );
+        let hits = [
+            ("exact.com", "DOMAIN,exact.com"),
+            ("x.suffix.com", "DOMAIN-SUFFIX,suffix.com"),
+            ("akwb.com", "DOMAIN-KEYWORD,kw"),
+            ("a.wild.com", "DOMAIN-WILDCARD,*.wild.com"),
+        ];
+        let mut ctx = EvalCtx::new(&NoGeo);
+        for (sni, entry) in hits {
+            let mut s = session("1.2.3.4");
+            s.sni = Some(sni.into());
+            let v = set.eval(&s, &mut ctx, false, false);
+            assert_eq!(v.entry.as_deref(), Some(entry), "{sni}");
+        }
+    }
+
+    #[test]
+    fn without_a_flag_a_rule_set_ignores_the_sni() {
+        let set = compile(
+            SetKind::RuleSet,
+            "\
+DOMAIN,exact.com
+DOMAIN-SUFFIX,suffix.com
+DOMAIN-KEYWORD,kw
+DOMAIN-WILDCARD,*.wild.com
+",
+            &Stub::default(),
+        );
+        let mut ctx = EvalCtx::new(&NoGeo);
+        for sni in ["exact.com", "x.suffix.com", "akwb.com", "a.wild.com"] {
+            let mut s = session("1.2.3.4");
+            s.sni = Some(sni.into());
+            assert_eq!(
+                set.eval(&s, &mut ctx, false, false).verdict,
+                Verdict::NoMatch,
+                "{sni}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flag_on_a_rule_that_is_not_a_domain_rule_does_not_spread() {
+        let set = compile(
+            SetKind::RuleSet,
+            "DOMAIN,exact.com\nURL-REGEX,^http://x\\.com/,extended-matching\n",
+            &Stub::default(),
+        );
+        let mut s = session("1.2.3.4");
+        s.sni = Some("exact.com".into());
+        let mut ctx = EvalCtx::new(&NoGeo);
+        assert_eq!(
+            set.eval(&s, &mut ctx, false, false).verdict,
+            Verdict::NoMatch
+        );
+    }
+
+    #[test]
+    fn a_domain_set_line_takes_and_gives_the_flag() {
+        let mut stub = Stub::default();
+        let inner = compile(SetKind::DomainSet, ".inner.com\n", &stub);
+        stub.0.insert("inner.txt".into(), SetHandle::new(inner));
+        // a flag elsewhere makes the DOMAIN-SET line extended: it passes the
+        // flag on to the set it refers to
+        let outer = compile(
+            SetKind::RuleSet,
+            "DOMAIN-SET,inner.txt\nDOMAIN,flag.com,extended-matching\n",
+            &stub,
+        );
+        let mut s = session("1.2.3.4");
+        s.sni = Some("a.inner.com".into());
+        let mut ctx = EvalCtx::new(&NoGeo);
+        let v = outer.eval(&s, &mut ctx, false, false);
+        assert_eq!(v.verdict, Verdict::Match);
+        assert_eq!(v.entry.as_deref(), Some("DOMAIN-SET,inner.txt"));
+        // and a flag on the DOMAIN-SET line makes the whole set extended
+        let outer = compile(
+            SetKind::RuleSet,
+            "DOMAIN,exact.com\nDOMAIN-SET,inner.txt,extended-matching\n",
+            &stub,
+        );
+        let mut s = session("1.2.3.4");
+        s.sni = Some("exact.com".into());
+        let mut ctx = EvalCtx::new(&NoGeo);
+        let v = outer.eval(&s, &mut ctx, false, false);
+        assert_eq!(v.verdict, Verdict::Match);
+        assert_eq!(v.entry.as_deref(), Some("DOMAIN,exact.com"));
     }
 
     #[test]

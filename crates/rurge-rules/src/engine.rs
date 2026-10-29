@@ -551,6 +551,32 @@ impl RuleEngine {
     /// a rule that depends on one is not a hit; at `Syn` the session is the
     /// connection. Counts the hit. Does not look at the outbound mode.
     pub fn pre_match(&self, s: &SessionInfo, layer: PreMatchLayer) -> Option<PreMatch> {
+        self.first_pre_hit(s, layer).map(|(rule, sub_rule)| {
+            rule.hits.fetch_add(1, Ordering::Relaxed);
+            PreMatch {
+                rule: rule.index,
+                policy: rule.policy.clone(),
+                sub_rule,
+            }
+        })
+    }
+
+    /// Whether `pre_match(s, PreMatchLayer::Syn)` would refuse `s`, without
+    /// counting a hit. The engine asks it before it answers a session at a
+    /// proxy port that it would sniff (phase 4 M1 design 4.3); the session's
+    /// evaluation counts the hit when the rule refuses it there.
+    pub fn pre_refuses(&self, s: &SessionInfo) -> bool {
+        self.first_pre_hit(s, PreMatchLayer::Syn).is_some()
+    }
+
+    /// The shared judgment of `pre_match` and `pre_refuses`: the first flagging
+    /// rule that refuses `s` at `layer`, with what it found in a set, and
+    /// nothing counted.
+    fn first_pre_hit(
+        &self,
+        s: &SessionInfo,
+        layer: PreMatchLayer,
+    ) -> Option<(&CompiledRule, Option<SubRuleHit>)> {
         let facts = self.network.load();
         let mut ctx = EvalCtx::with_network(self.geo.as_ref(), &facts, self.wifi_always_match);
         ctx.before_connection = layer == PreMatchLayer::Dns;
@@ -560,12 +586,7 @@ impl RuleEngine {
             let matched = Self::pre_matches(rule, s, &mut ctx);
             ctx.notes.clear();
             if matched {
-                rule.hits.fetch_add(1, Ordering::Relaxed);
-                return Some(PreMatch {
-                    rule: rule.index,
-                    policy: rule.policy.clone(),
-                    sub_rule: ctx.sub_hit.take(),
-                });
+                return Some((rule, ctx.sub_hit.take()));
             }
         }
         None
