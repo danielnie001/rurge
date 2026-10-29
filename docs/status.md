@@ -643,7 +643,7 @@ M1a 做完了（2026-10-29；计划 `docs/superpowers/plans/2026-10-29-phase4-m1
 - **计数只在嗅探有结局时加**：被停止或守护进程退出打断的不计（没有一个结局），读出错的算 `closed`；读数自进程启动起累计，重载不清零。
 - **讲“拨号之后才答”的现有用例用不嗅探的端口**（P9：443 → 8443、80 → 8080，断言不改、加一行英文注释）：M1a 改了六处（M1a 记录第 12 行与第 29 行）；新写的这类用例照做，否则它在 15 秒的等待上变红或变慢。
 - **`give_up` 那一条偶发**：`crates/rurge/tests/cli.rs` 的 `run::enhanced_mode::an_unknown_enhanced_backend_ends_the_start_with_2` 在任务 3 的第一遍全量里以 "rurge run did not give up within 20 s" 失败，标准错误里已经有期望的 `error: unknown RURGE_ENHANCED_BACKEND value …` 一行；读代码，那一行之后只有立刻返回的 `recover_without_a_log` 与退出码 2，卡在进程退出的路上，原因不知道。这是阶段 1 / M5a 计划延后第 37 行那种卡住的再现，那一行把“有 `error:` 一行”算成产品的缺陷，这次的读法不支持那个归类，也没有否定它。单独重跑通过；任务 4 ～ 8 的全量里没有再出现（M1a 记录第 23 行）。
-- **同一天 `STATUS_HEAP_CORRUPTION` 出现过五次**（`CLAUDE.md`「这台开发机」里那种、与本轮改动无关），都单独重跑通过：任务 3 的第一、三次全量（`outbounds_masque`，与 `rurge-api` 的单元测试二进制），任务 5 的全量（`outbounds_masque` 与 `udp`），任务 6 的全量（`udp`）。任务 0、1、2、4、7、8 的全量里没有（M1a 记录第 23、27、30 行）。
+- **同一天 `STATUS_HEAP_CORRUPTION` 出现过五次**（`CLAUDE.md`「这台开发机」里那种、与本轮改动无关），都单独重跑通过：任务 3 的第二、三次全量（一次是 `outbounds_masque`，一次是 `rurge-api` 的单元测试二进制），任务 5 的全量（`outbounds_masque` 与 `udp`），任务 6 的全量（`udp`）。任务 0、1、2、4、7、8 的全量里没有（M1a 记录第 23、27、30 行）。
 - **重跑的数怎么算**：修正记录里把第一次全量的数与单独重跑的数合起来记（例如任务 6 的 88 / 4738 加 `udp` 的 38 条得 89 / 4776）；上面的 68 条是各任务通过数之差的和。
 
 去向写着项目所有者的（后来的会话不要自己定）：
