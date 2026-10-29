@@ -208,7 +208,8 @@ fn read_alpn(body: &[u8]) -> Option<Vec<Vec<u8>>> {
 pub(crate) enum Reassembled {
     /// The whole handshake message is there and it is a ClientHello.
     Hello(ClientHello),
-    /// Telling more needs at least this many bytes in all.
+    /// Telling more needs at least this many bytes in all: no ClientHello can
+    /// be whole in fewer, so nothing is judged again before they are there.
     NeedMore(usize),
     /// Not a ClientHello carried by handshake records.
     Other,
@@ -219,6 +220,14 @@ pub(crate) enum Reassembled {
 /// 6.2). `limit` is the most a prefix is read for (`MAX_PREFIX` in
 /// [`crate::sniff`]): a number of bytes above it is
 /// [`Reassembled::Other`] rather than a wait that could never end.
+///
+/// A `NeedMore` asks for the place where the handshake message can first be
+/// whole: the handshake header until it is there, the whole message after
+/// that. Judging only then is what keeps a run of tiny records from being put
+/// together again at every record boundary. The price is that a later record
+/// whose header does not fit is judged [`Reassembled::Other`] later than its
+/// header comes — the answer is the same, and a client that sends half a
+/// ClientHello and then another record is not one rurge expects.
 pub(crate) fn reassemble(prefix: &[u8], limit: usize) -> Reassembled {
     let mut at = 0;
     let mut handshake = Vec::new();
@@ -240,7 +249,7 @@ pub(crate) fn reassemble(prefix: &[u8], limit: usize) -> Reassembled {
                     return Reassembled::Other;
                 }
             }
-            return need(at + 5, limit);
+            return need(at + 5 + (wanted(&handshake) - handshake.len()), limit);
         };
         // The header is five bytes, so these indices are in bounds.
         let kind = header[0];
@@ -262,15 +271,12 @@ pub(crate) fn reassemble(prefix: &[u8], limit: usize) -> Reassembled {
         };
         handshake.extend_from_slice(bytes);
 
-        let message_end = if handshake.len() >= HANDSHAKE_HEADER {
+        if handshake.len() >= HANDSHAKE_HEADER {
             // Four handshake bytes are there, so these indices are in bounds.
             if handshake[0] != CLIENT_HELLO {
                 return Reassembled::Other;
             }
-            let total = HANDSHAKE_HEADER
-                + ((usize::from(handshake[1]) << 16)
-                    | (usize::from(handshake[2]) << 8)
-                    | usize::from(handshake[3]));
+            let total = wanted(&handshake);
             if total > limit {
                 return Reassembled::Other;
             }
@@ -283,14 +289,33 @@ pub(crate) fn reassemble(prefix: &[u8], limit: usize) -> Reassembled {
                     None => Reassembled::Other,
                 };
             }
-            at + 5 + (total - before)
-        } else {
-            at + 5 + (HANDSHAKE_HEADER - before)
-        };
+        }
         if prefix.len() < record_end {
-            return need(record_end.min(message_end), limit);
+            // Where the message can first be whole, were the rest of this
+            // record its bytes; if that is past this record's end, at least
+            // one more record header comes before the message can be.
+            let end = at + 5 + (wanted(&handshake) - before);
+            return if end <= record_end {
+                need(end, limit)
+            } else {
+                need(end + 5, limit)
+            };
         }
         at = record_end;
+    }
+}
+
+/// How many bytes the handshake message has in all: its header and body once
+/// four bytes are there, and four bytes until then.
+fn wanted(handshake: &[u8]) -> usize {
+    match handshake.get(..HANDSHAKE_HEADER) {
+        Some(header) => {
+            HANDSHAKE_HEADER
+                + ((usize::from(header[1]) << 16)
+                    | (usize::from(header[2]) << 8)
+                    | usize::from(header[3]))
+        }
+        None => HANDSHAKE_HEADER,
     }
 }
 
@@ -370,7 +395,7 @@ pub(crate) mod tests {
 
     /// A hand-made ClientHello message with `extensions` after the fixed
     /// fields.
-    fn hand_made_hello(extensions: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn hand_made_hello(extensions: &[Vec<u8>]) -> Vec<u8> {
         let mut block = Vec::new();
         for extension in extensions {
             block.extend_from_slice(extension);
@@ -402,7 +427,7 @@ pub(crate) mod tests {
         out
     }
 
-    fn extension(kind: u16, body: &[u8]) -> Vec<u8> {
+    pub(crate) fn extension(kind: u16, body: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&kind.to_be_bytes());
         out.extend_from_slice(&(body.len() as u16).to_be_bytes());
@@ -411,7 +436,7 @@ pub(crate) mod tests {
     }
 
     /// A `server_name` extension with one `host_name` entry.
-    fn server_name(name: &[u8]) -> Vec<u8> {
+    pub(crate) fn server_name(name: &[u8]) -> Vec<u8> {
         let mut list = Vec::new();
         list.push(0);
         list.extend_from_slice(&(name.len() as u16).to_be_bytes());
@@ -568,7 +593,7 @@ pub(crate) mod tests {
         let mut no_compression = good.clone();
         no_compression[4 + 2 + 32 + 1 + 2 + 2] = 0x00;
 
-        // The `server_name` list says 20 bytes follow 13.
+        // The `server_name` list says 20 bytes follow, and 11 do.
         let mut list = Vec::new();
         list.extend_from_slice(&[0x00, 0x14]);
         list.extend_from_slice(&[0x00, 0x00, 0x08]);

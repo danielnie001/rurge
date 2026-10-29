@@ -19,9 +19,10 @@ pub const MAX_PREFIX: usize = 64 * 1024;
 /// What the bytes at the start of a connection are (design 6.2).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Judged {
-    /// Not enough to tell. Telling needs at least this many bytes in all,
-    /// always more than there are and never more than `MAX_PREFIX` (P3 of the
-    /// phase 4 / M1a plan).
+    /// Not enough to tell. No ClientHello can be whole in fewer bytes than
+    /// this, so nothing is judged again before they are there: always more
+    /// than there are, and never more than `MAX_PREFIX` (P3 of the phase 4 /
+    /// M1a plan).
     NeedMore(usize),
     Tls(ClientHello),
     Http,
@@ -90,9 +91,11 @@ pub enum Sniffed {
 pub async fn sniff<S: AsyncRead + Unpin>(stream: &mut Prefixed<S>, wait: Duration) -> Sniffed {
     let deadline = Instant::now() + wait;
     // How many bytes in all the last judge asked for; nothing is judged again
-    // until that many are there, so a client that drips one byte at a time
-    // does not make the prefix be read over and over (P3 of the phase 4 / M1a
-    // plan).
+    // until that many are there. `NeedMore` asks for the place where the
+    // ClientHello can first be whole, so a client that drips one byte at a
+    // time and a run of tiny records both walk the prefix in a few steps
+    // rather than making it be put together again at every record (P3 of the
+    // phase 4 / M1a plan).
     let mut enough = 0;
     loop {
         if stream.buffered().len() >= enough {
@@ -122,7 +125,9 @@ mod tests {
 
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, duplex};
 
-    use crate::tls::tests::{handshake_bytes, hello_records, into_records};
+    use crate::tls::tests::{
+        extension, hand_made_hello, handshake_bytes, hello_records, into_records, server_name,
+    };
 
     use super::*;
 
@@ -163,9 +168,57 @@ mod tests {
         let message = handshake_bytes(&records);
         assert_eq!(records.len(), 5 + message.len(), "the hello is one record");
 
-        assert_eq!(judge(&records[..3]), Judged::NeedMore(5));
+        // The first record waits for the handshake header too: the message
+        // cannot be whole before it is there.
+        assert_eq!(judge(&records[..3]), Judged::NeedMore(9));
         assert_eq!(judge(&records[..6]), Judged::NeedMore(9));
         assert_eq!(judge(&records[..9]), Judged::NeedMore(records.len()));
+    }
+
+    #[test]
+    fn a_drip_of_tiny_records_is_judged_a_few_times() {
+        // `NeedMore` asks for the place where the ClientHello can first be
+        // whole, so a run of tiny records is walked in a few steps. With the
+        // record's own end as the bound it was judged once or twice per
+        // record: about 500 times for the first message here, and about
+        // 13000 for the second. What this keeps is that the number of
+        // judgements grows with the logarithm of the message, not with the
+        // number of records.
+        let message = handshake_bytes(&hello_records("sni.test", &[b"h2"]));
+        let lens = vec![1; message.len()];
+        judge_a_drip(&into_records(&message, &lens), "one-byte records");
+
+        let padding = vec![0u8; 20 * 1024];
+        let big = hand_made_hello(&[server_name(b"sni.test"), extension(21, &padding)]);
+        assert!(big.len() < MAX_PREFIX, "a hello of {} bytes", big.len());
+        let lens = vec![3; big.len().div_ceil(3)];
+        judge_a_drip(&into_records(&big, &lens), "three-byte records");
+    }
+
+    /// Judges `bytes` the way `sniff` does — asking for the number the last
+    /// judgement wanted — and checks the ClientHello and the count.
+    fn judge_a_drip(bytes: &[u8], what: &str) {
+        let mut have = 0;
+        let mut judges = 0;
+        loop {
+            judges += 1;
+            match judge(&bytes[..have]) {
+                Judged::NeedMore(n) => {
+                    assert!(
+                        n > have && n <= bytes.len(),
+                        "{what}: asked for {n} after {have} of {}",
+                        bytes.len()
+                    );
+                    have = n;
+                }
+                Judged::Tls(hello) => {
+                    assert_eq!(hello.sni.as_deref(), Some("sni.test"), "{what}");
+                    assert!(judges <= 40, "{what}: {judges} judgements");
+                    return;
+                }
+                other => panic!("{what}: expected TLS, got {other:?}"),
+            }
+        }
     }
 
     #[test]
