@@ -623,7 +623,7 @@ M1a 做完了（2026-10-29；计划 `docs/superpowers/plans/2026-10-29-phase4-m1
 - **任务 6**（`894d78e`、文档订正 `64e5c9d`、修正第 1 轮 `d15c5a6`）：引擎先答后读、嗅探之后照 SNI 与协议求规则、记录与计数；+5 条、+1 个结果行（新的 `tests/sniff.rs`，89 / 4776）。
 - **任务 7**（`624a2e9`、修正第 1 轮 `5201660`）：嗅探的端到端用例（`crates/rurge-engine/tests/sniff.rs` 从 5 条到 21 条）；+16 条（89 / 4792）。
 - **任务 8**（`5b8ee14`）：`GET /v1/rurge/http`（`crates/rurge-api/src/routes/rurge_http.rs`，用例 `rurge_http_counts_start_at_zero`）；+1 条（89 / 4793）。
-- **任务 9**（本节所在的 `docs:` 提交）：文档收尾，代码一行也没有改；兼容性清单改了 16 行、状态标记只改了 3.5 节那一行，附录整张重数（577 行，✅ 396、🟡 130、🔁 32、⛔ 14、❓ 5，只比上一版多一个 ✅）；阶段 1 的三个数从“2 句没有做完”变成“1 句没有做完”；新写 `docs/api/phase4.md`；`docs/testing.md`、`CLAUDE.md`、`docs/README.md`、设计第 21 节、计划的两张表。
+- **任务 9**（`6293faf`、`562e42c`、`38baa64`，修正第 1 轮的提交）：文档收尾，代码一行也没有改；兼容性清单改了 16 行、状态标记只改了 3.5 节那一行，附录整张重数（577 行，✅ 396、🟡 130、🔁 32、⛔ 14、❓ 5，只比上一版多一个 ✅）；阶段 1 的三个数从“2 句没有做完”变成“1 句没有做完”；新写 `docs/api/phase4.md`；`docs/testing.md`、`CLAUDE.md`、`docs/README.md`、设计第 21 节、计划的两张表。
 
 一共 68 条用例、3 个结果行、1 个包（`Cargo.lock` 519 → 520，多的是 `rurge-http` 自己；`LISTED` 仍是 23 项）。门禁（任务 8 与本任务各一次，一台 Windows 11 x86-64 开发机上的一次运行，**不是 CI**）：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过（0 个警告）；`cargo test -j 8 --workspace --no-fail-fast` **89 个结果行、4793 通过、0 失败、13 忽略**（M1a 之前 `41c35d4` 上是 86 / 4725 / 0 / 13）。重跑过的偶发写在下一条「以后的会话必须知道的事」里。
 

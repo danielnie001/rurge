@@ -2,7 +2,7 @@
 
 阶段 4 / M1a（嗅探与规则之前的 SNI，设计 `docs/superpowers/specs/2026-10-29-phase4-m1-session-entry-http-engine-design.md` 的第 4 ～ 7、11、12 节，计划 `docs/superpowers/plans/2026-10-29-phase4-m1a-sniffing-plan.md`）**新增一个端点** `GET /v1/rurge/http`，改了请求记录里 `sni` 与 `protocol` 的取值，并且没有新增日志行（见「日志」）。鉴权（`X-Key`）、错误体（`{"error":"<message>"}`）与无内容的成功响应（`{}`）沿用阶段 1 的约定，见 `docs/api/phase1.md`；本页只记录变了的与新增的部分。M1b（明文 HTTP 引擎）在同一份文档里加引擎的端点、记录的变化与 `GET /v1/rurge/http` 的 `requests`。
 
-**这一份写的是本地提交的行为：M1a 的提交都在本地，CI 没有见过。** 下面每一处行为都只在一台 Windows 11 x86-64 的开发机上的一次运行里证明过（一个机器上的一次运行，不是 CI），没有手工验收；阶段 4 的手工清单从 M2 起建，M1 的行为随它写进去。
+**这一份写的是本地提交的行为：M1a 的提交都在本地，CI 没有见过。** 下面每一处行为都只在一台 Windows 11 x86-64 开发机上的一次运行里由用例断言过（一台机器上的一次运行，不是 CI），没有手工验收；阶段 4 的手工清单从 M2 起建，M1 的行为随它写进去。
 
 ## M1a　嗅探与规则之前的 SNI
 
@@ -59,5 +59,5 @@
 ### 没有覆盖的
 
 - 没有手工验收；**M1a 的提交都在本地，CI 没有见过**，上面每一条只在一台机器上的一次运行里证明过。
-- `timeout` 那一个数只在把 `EngineShared.sniff_wait` 调短的用例里出现过；等满缺省的 15 秒只有一条（`a_stop_during_the_wait_ends_a_tun_session_at_once`，它证明的是停止、不是时限）。
+- `timeout` 那一个数只在把 `EngineShared.sniff_wait` 调短的用例里出现过；没有用例等满缺省的 15 秒，用缺省的 15 秒、不调短的只有一条（`a_stop_during_the_wait_ends_a_tun_session_at_once`），它让停止落在等待之中，证明的是停止、不是时限。
 - 只有 HTTP 监听器与 SOCKS5 的应答次序改了；`CONNECT` 的 502 错误页、SOCKS5 的失败应答码在可嗅探的会话上不再出现，那两种失败现在是一个随即关闭的隧道（设计第 13 节第 1 条，登记在兼容性清单 7.1 节），没有在真机上观察过。
