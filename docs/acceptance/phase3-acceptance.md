@@ -72,7 +72,7 @@ CI：`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），CI 运行 406
 5. `PROCESS-NAME` 在三个平台命中：L1 与 CI 是三个平台上查测试进程自己的用例（`crates/rurge-platform/src/procinfo/` 下 Windows / Linux / macOS 各一条 `this_process_owns_its_loopback_sockets`；Windows 另有 `the_system_process_has_no_path`（`describe(4)` 是 `("System", None)`）、`a_process_that_does_not_exist_is_not_described`（`describe(u32::MAX)` 是 `None`）、`the_addresses_of_the_machine_include_its_loopback_address` 与读连接表的四条（见第二部分第 5 条）；macOS 另有 `a_process_that_does_not_exist_is_not_described`（`u32::MAX` 与 `i32::MAX` 都是 `None`））与起真实二进制的 `crates/rurge/tests/cli.rs` 的 `a_process_rule_matches_the_test_process`（文件名、完整路径与目录前缀三种写法各命中一次，记录里的 `pid` 是本进程、`processPath` 是本二进制），CI 运行 40611702392 在三个平台上都跑过；L3 是 W11、W12、W15、M9、M11、M13、L10、L11、L13 与 P17，没有做。
 6. 性能基准达到 NFR-01 目标的 70% 以上：阶段 3 / M5 重跑的 B1、B2、b3（内存设备，一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；数字照 M5 计划「执行期修正记录」第 61 ～ 63 行）：B1 八个量出来的行都过 0.7 Gbit/s 的线，最低 4.065 Gbit/s；B2 门槛读数 403.7 MB 在 429 MB 的线内、保守读数 445.3 MB 超线 16.3 MB（归项目所有者）；b3 中位数 0.9 µs、p99 2.9 µs 在 200 µs 的线内，最大 4542.2 µs 是线的 22.7 倍。真实设备上的数没有量（总设计 Q7）。
 7. 需求逐句对照过代码、三个数照实写：就是本文第一部分（141 行、十张表），三个数与第四个数见上面的表；没有做完的五句照实写。
-8. 三平台 CI 绿：M5 与 M6 推送之后的运行 40798658216（`32238be`，2026-10-29）**没有全绿**——`bench` 与 Linux、Windows 的 `check` 通过，macOS 的 `check` 只失败一条阶段 2 的互操作用例（测试夹具取端口的竞争，不是 M5、M6 的代码）；夹具修在 `41c35d4`，CI 还没有见过它，所以这一条要等 `41c35d4` 推送之后的运行。上一次全绿是 40611702392（`3a76b80`，2026-10-28）。
+8. 三平台 CI 绿：**满足**，以 `41c35d4` 为准——它上面的运行 40824893108（2026-10-29）三个平台全绿（`bench` 与三个 `check` 都成功）。此前 M5 与 M6 推送之后的运行 40798658216（`32238be`，同日）没有全绿：macOS 的 `check` 失败一条阶段 2 的互操作用例（测试夹具取端口的竞争，不是 M5、M6 的代码），夹具修在 `41c35d4`。`41c35d4` 之后的提交只改文档。
 
 ## 第一部分：需求逐句对照代码
 
@@ -345,7 +345,7 @@ CI：`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），CI 运行 406
 
 ## 第二部分：总设计第 14 节八条验收标准
 
-下面每一条照 M6 设计第 6 节写四种证据。L1 是内存设备与假实现上的用例，名字在写本文的那个提交上逐个核对过；全量门禁是这一段写的那一次运行——一台 Windows 11 x86-64 开发机上的一次运行，**不是 CI**：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过（0 个警告），`cargo test -j 8 --workspace --no-fail-fast` **86 个结果行、4723 通过、0 失败、13 忽略**（`rurge-engine` 的 `outbounds_tuic` 二进制第一次以 `STATUS_HEAP_CORRUPTION` 退出，单独重跑 10 条全过；那是这台开发机的终端管控软件注入的钩子 DLL 造成的，不是 rurge 或它的依赖的缺陷）。L2 是特权用例的名字，没有运行过。L3 是手工清单里证明这一条的项，按平台；一项也没有做过。CI 是最近一次运行 40611702392（`3a76b80`，2026-10-28）是否覆盖了这一条的 L1 用例。每条最后写“还缺什么”。
+下面每一条照 M6 设计第 6 节写四种证据。L1 是内存设备与假实现上的用例，名字在写本文的那个提交上逐个核对过；全量门禁是这一段写的那一次运行——一台 Windows 11 x86-64 开发机上的一次运行，**不是 CI**：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 通过（0 个警告），`cargo test -j 8 --workspace --no-fail-fast` **86 个结果行、4723 通过、0 失败、13 忽略**（`rurge-engine` 的 `outbounds_tuic` 二进制第一次以 `STATUS_HEAP_CORRUPTION` 退出，单独重跑 10 条全过；那是这台开发机的终端管控软件注入的钩子 DLL 造成的，不是 rurge 或它的依赖的缺陷）。L2 是特权用例的名字，没有运行过。L3 是手工清单里证明这一条的项，按平台；一项也没有做过。CI 是运行 40611702392（`3a76b80`，2026-10-28，写这一段时最近的一次）是否覆盖了这一条的 L1 用例；其后的两次运行见第 8 条与「靠 CI 的」。每条最后写“还缺什么”。
 
 ### 第 1 条：浏览器、命令行工具与不支持代理的应用的流量出现在请求记录里，并按规则分流
 
@@ -407,8 +407,8 @@ CI：`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），CI 运行 406
 - **L1**：不适用。
 - **L2**：不适用。
 - **L3**：不适用（清单里这一行写的就是一次推送之后的 CI 运行）。
-- **CI**：M5 与 M6 的提交推送了（`32238be`，2026-10-29）。运行 40798658216 的四个任务里 `bench` 与 Linux、Windows 的 `check` 成功，**macOS 的 `check` 失败**：`cargo fmt --all --check` 与 clippy 都过，测试一步只失败一条——`-p rurge-interop --test tuic :: v5_tcp_against_sing_box`，sing-box 起来就退出（`listen udp 127.0.0.1:55875: bind: address already in use`）。照源码读出的原因在测试夹具：`tests/interop/src/lib.rs` 取参照服务端的端口时先绑 0 号端口、读号、放掉，再把号写进参照服务端的配置，号在放掉之后、sing-box 绑上之前被别的套接字拿走（测试约定不许这样取号）；不是 M5、M6 的代码，这次推送的提交没有动 `tests/`，竞争从阶段 2 起就在。夹具修在 `41c35d4`（四个取号函数改为从 20000–29999 取号、交出去之前现场试绑），**CI 还没有见过它**，所以这一条不能按现在的仓库状态算满足。上一次全绿是 40611702392（`3a76b80`，2026-10-28，三个平台的 `check` 与 `bench` 都通过）。
-- **还缺什么**：项目所有者推送 `41c35d4` 之后，那一次运行三个平台都绿；再失败就修，再重读。
+- **CI**：M5 与 M6 的提交推送了（`32238be`，2026-10-29）。运行 40798658216 的四个任务里 `bench` 与 Linux、Windows 的 `check` 成功，**macOS 的 `check` 失败**：`cargo fmt --all --check` 与 clippy 都过，测试一步只失败一条——`-p rurge-interop --test tuic :: v5_tcp_against_sing_box`，sing-box 起来就退出（`listen udp 127.0.0.1:55875: bind: address already in use`）。照源码读出的原因在测试夹具：`tests/interop/src/lib.rs` 取参照服务端的端口时先绑 0 号端口、读号、放掉，再把号写进参照服务端的配置，号在放掉之后、sing-box 绑上之前被别的套接字拿走（测试约定不许这样取号）；不是 M5、M6 的代码，这次推送的提交没有动 `tests/`，竞争从阶段 2 起就在。夹具修在 `41c35d4`（四个取号函数改为从 20000–29999 取号、交出去之前现场试绑）。所有者同日推送了 `41c35d4`：运行 40824893108 的四个任务都成功——三个 `check` 的 fmt、clippy 与测试一步都成功，`Report the failed tests` 都跳过，注解只有平台的；那一条在 macOS 上对真实的 sing-box 通过（由测试一步的结论推出，测试一步带 `--no-fail-fast`）。这是第三次全绿（第一次 40283632986，`ac0a98a`；第二次 40611702392，`3a76b80`）。一次全绿不证明取号的竞争不会再出现（旧的夹具在前两次全绿里也没有撞上），修正的依据是源码：号不再来自系统分临时端口的区间。
+- **还缺什么**：不缺，以 `41c35d4` 为准（它之后的提交只改文档，CI 没有见过）；以后改代码的提交照样要推送之后三个平台都绿。
 
 ## 靠手工验收的
 
@@ -440,14 +440,14 @@ CI：`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），CI 运行 406
 
 **L2 特权用例**（写好、没有运行过；要不要在 CI 上启用是总设计 Q4，归项目所有者）：`tests/privileged/tests/linux_netns.rs` 的 `a_tcp_round_trip_and_a_ping_go_through_the_adapter_and_out_direct`、`rurges_own_dns_queries_do_not_enter_the_adapter`、`a_killed_run_is_undone_by_the_next_start`，与 `crates/rurge-platform/src/tun/windows/wintun.rs` 的 `a_real_wintun_dll_passes`（要 `RURGE_TEST_WINTUN_DLL` 与一份 WireGuard LLC 签名的 `wintun.dll`）。
 
-**CI 见过的与没有见过的**：最近一次运行是 40798658216（`32238be`，2026-10-29，M5 与 M6 推送之后），**没有全绿**：`bench` 与 Linux、Windows 的 `check` 成功，macOS 的 `check` 失败一条阶段 2 的互操作用例（见第二部分第 8 条）。`32238be` 上的用例（带 `#[ignore]` 的除外；含本文补的三条 `5e00564`、`fcf9464`、`37616a0` 与 M5 自己的用例）那一次运行在它们编译得到的平台上都跑过，除那一条之外都通过，上面列的只在 Linux 或 macOS 上编译的用例也在其中——这由测试一步的结论与失败摘要推出，逐条的结果在要登录才能读的任务日志里。**`32238be` 之后的提交（修那一条用例的测试夹具的 `41c35d4`，与其后的文档提交）CI 还没有见过**。上一次全绿是 40611702392（`3a76b80`，2026-10-28）。CI 的测试一步是 `cargo test --workspace --no-fail-fast`（三个平台），带 `#[ignore]` 的用例不跑（全工作区 13 条，与阶段 3 有关的是三条基准与 Windows 的 `a_lookup_with_many_connections_open`）；`bench` 任务只在 Linux 上 `cargo bench --no-run` 编 `rurge-rules` 与 `rurge-dns` 的基准，三条基准用例不在其中。
+**CI 见过的与没有见过的**：最近一次运行是 40824893108（`41c35d4`，2026-10-29，修测试夹具的提交推送之后），**三个平台全绿**：`bench` 与三个平台的 `check` 都成功。`41c35d4` 上的用例（带 `#[ignore]` 的除外；含本文补的三条 `5e00564`、`fcf9464`、`37616a0` 与 M5 自己的用例）那一次运行在它们编译得到的平台上都跑过并通过，上面列的只在 Linux 或 macOS 上编译的用例也在其中——这由测试一步的结论推出，逐条的结果在要登录才能读的任务日志里。它的前一次是 40798658216（`32238be`，同日，M5 与 M6 推送之后），macOS 的 `check` 失败一条阶段 2 的互操作用例（见第二部分第 8 条）。**`41c35d4` 之后的提交只改文档，CI 还没有见过**。CI 的测试一步是 `cargo test --workspace --no-fail-fast`（三个平台），带 `#[ignore]` 的用例不跑（全工作区 13 条，与阶段 3 有关的是三条基准与 Windows 的 `a_lookup_with_many_connections_open`）；`bench` 任务只在 Linux 上 `cargo bench --no-run` 编 `rurge-rules` 与 `rurge-dns` 的基准，三条基准用例不在其中。
 
 ## 留给项目所有者的
 
 下面各事的去向都是项目所有者；后来的会话不要自己定。
 
 1. **手工验收**：阶段 1（`docs/acceptance/phase1-manual.md`）、阶段 2（`docs/acceptance/phase2-manual.md`）、阶段 3（`docs/acceptance/phase3-manual.md`，172 项：W 50、M 39、L 42、P 41，按节 M1 37、M2 23、M3 19、M4 55、M5 19、M6 19）三份清单，一项也没有做过。阶段 3 的清单里被本文“真机上”一列点到 133 项（见「靠手工验收的」），L2 的四条特权用例也没有运行过。
-2. **推送与读回 CI**：M5 与 M6 推送了（`32238be`），推送之后的运行 40798658216 读回了（macOS 一条互操作用例失败，见第二部分第 8 条）；修那一条的 `41c35d4` 与其后的提交还在本地。推送之后要读那次运行的注解与任务摘要，把本文第 8 条、「靠 CI 的」与 `docs/status.md`「M6 推送之后的 CI」里写着“CI 还没有见过”的几处改成读到的结果。
+2. **推送与读回 CI**：做完了。M5 与 M6 推送了（`32238be`），推送之后的运行 40798658216 读回了（macOS 一条互操作用例失败）；修那一条的 `41c35d4` 推送之后的运行 40824893108 三个平台全绿（第二部分第 8 条）。其后只改文档的提交照常由项目所有者推送。
 3. **总设计 Q1 ～ Q8**，尤其：Q3（Wintun 的再分发要不要先向 WireGuard LLC 书面确认、发行包附不附带官方签名的 `wintun.dll`——NFR-11 的“确认”就是 #141）、Q4（L2 特权用例要不要在 CI 上启用、macOS 与 Windows 的冒烟）、Q7（NFR-01 在真实设备上怎样量、由谁量——#132、#133）、Q8（需求文档要不要为 `[IP Rewrite]` 另立一行；FR-IN-10 的 `suspend` 与 FR-OUT-11 的“UDP 443”改不改字面——#99、#104 与「有意不同的」里 `suspend` 那一行）。
 4. **对照查出的**：
    - 「需求文字的问题」4 句（#20、#32、#99、#104）：各句的需求文字或阶段栏怎么改。
