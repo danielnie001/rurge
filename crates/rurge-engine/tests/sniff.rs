@@ -594,13 +594,19 @@ async fn force_http_engine_hosts_sniff_another_port() {
     let h = harness("force-http-engine-hosts = target.test:8080").await;
     let (reply, mut s) = socks5_connect(h.socks(), "target.test", 8080).await;
     assert_eq!(reply[1], 0x00, "{reply:?}");
-    s.write_all(b"hello").await.unwrap();
+    // the settings keep the forced port in the engine whatever it sends: the
+    // dial `A` refuses fails, so the engine answers a 502 of its own (design
+    // 6.4, 8.8)
+    s.write_all(b"GET / HTTP/1.1\r\nHost: target.test:8080\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
     let mut back = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut back))
         .await
         .expect("the failed dial ends the tunnel within the bound")
         .unwrap();
-    assert!(back.is_empty(), "nothing was echoed: {back:?}");
+    let back = String::from_utf8_lossy(&back);
+    assert!(back.starts_with("HTTP/1.1 502"), "{back}");
 
     // a name without a port is port 80, so 8080 is not sniffed
     let h = harness("force-http-engine-hosts = target.test").await;
@@ -783,7 +789,7 @@ async fn the_prefix_reaches_the_upstream_whole() {
     // the 100 ms splits the opening bytes into two reads, so that the sniff is
     // over one prefix made of both: this is not a wait for nothing to happen
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let rest = b"T / HTTP/1.1\r\nHost: x\r\n\r\n";
+    let rest = b"t / not http\r\n\r\n";
     sent.extend_from_slice(rest);
     sent.extend(std::iter::repeat_n(0x5a, 10 * 1024));
     s.write_all(rest).await.unwrap();
@@ -896,14 +902,16 @@ async fn the_sniffs_are_counted() {
         "a plain echo is no TLS server"
     );
 
-    // an HTTP request
+    // an HTTP request: the engine carries it, and the plain echo is no HTTP
+    // server, so its answer is the engine's 502
     let mut s = connect_via_socks5(h.socks(), "target.test", 443).await;
     s.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
-    let mut back = [0u8; 18];
+    let mut back = [0u8; 12];
     tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut back))
         .await
-        .expect("the echo comes back within the bound")
+        .expect("the engine answers within the bound")
         .unwrap();
+    assert_eq!(&back, b"HTTP/1.1 502", "the echo is no HTTP server");
     drop(s);
 
     // neither: `hello` is not a method

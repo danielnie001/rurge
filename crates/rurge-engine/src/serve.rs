@@ -5,18 +5,21 @@
 //! is sniffed, given the SNI and the protocol it showed, and dialed and relayed
 //! as any other session is — with the bytes that were read forwarded whole.
 
+use crate::FAKE_ADDRESS_NOT_KNOWN;
 use crate::control::Mode;
 use crate::engine::{Engine, policy_known};
+use crate::fake_address::Turned;
 use rurge_config::HostName;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_dns::fakeip::in_space;
 use rurge_http::{Prefixed, Sniffed};
-use rurge_inbound::{DialError, Dialer, ServeOpts, hold_dropped};
+use rurge_inbound::{DialError, Dialer, ServeOpts, SessionHandle, SessionOutcome, hold_dropped};
 use rurge_net::connector::BoxedStream;
 use rurge_proto::RejectKind;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// How the sniffs of an engine ended (design 7.5), as `GET /v1/rurge/http`
@@ -104,21 +107,8 @@ impl Engine {
         // An address that no name stands behind is not sniffed: its dial fails
         // as it does today (the plan's P5).
         let at_a_proxy_port = matches!(session.listener, ListenerKind::Http | ListenerKind::Socks5);
-        let probed: Cow<'_, SessionInfo> = match &session.dst_host {
-            HostName::Ip(ip) if at_a_proxy_port && in_space(*ip) => {
-                match self.fake_pool.load_full() {
-                    // no TUN runs: the address is an address like any other
-                    None => Cow::Borrowed(session),
-                    Some(pool) => match pool.name_of(ip.to_canonical()) {
-                        Some(name) => Cow::Owned(SessionInfo {
-                            dst_host: HostName::Domain(name),
-                            ..session.clone()
-                        }),
-                        None => return false,
-                    },
-                }
-            }
-            _ => Cow::Borrowed(session),
+        let Some(probed) = self.named_at_a_proxy_port(session) else {
+            return false;
         };
         // the settings are the ones of the generation in use now, as the rules
         // will be when the session is dialed
@@ -157,6 +147,134 @@ impl Engine {
         true
     }
 
+    /// The session with the name behind a fake address it names at a proxy
+    /// port: `None` when the address is rurge's and no name stands behind it.
+    /// The pool is only asked, not leased: the dial (`turn_back`) is what
+    /// leases the address. Both the judgement of `sniffable_session` and the
+    /// settings' forced hosts of `serve_sniffed` read the same name through
+    /// this, so the two cannot disagree about one connection (design 6.4).
+    fn named_at_a_proxy_port<'s>(&self, session: &'s SessionInfo) -> Option<Cow<'s, SessionInfo>> {
+        let at_a_proxy_port = matches!(session.listener, ListenerKind::Http | ListenerKind::Socks5);
+        match &session.dst_host {
+            HostName::Ip(ip) if at_a_proxy_port && in_space(*ip) => {
+                match self.fake_pool.load_full() {
+                    // no TUN runs: the address is an address like any other
+                    None => Some(Cow::Borrowed(session)),
+                    Some(pool) => pool.name_of(ip.to_canonical()).map(|name| {
+                        Cow::Owned(SessionInfo {
+                            dst_host: HostName::Domain(name),
+                            ..session.clone()
+                        })
+                    }),
+                }
+            }
+            _ => Some(Cow::Borrowed(session)),
+        }
+    }
+
+    /// Whether the settings force `session` into the engine even though the
+    /// sniff did not say HTTP (design 6.4): `force-http-engine-hosts` is
+    /// matched against the name behind a fake address, if that is what came
+    /// in.
+    fn forces_http_engine(&self, session: &SessionInfo) -> bool {
+        let Some(named) = self.named_at_a_proxy_port(session) else {
+            return false;
+        };
+        self.runtime()
+            .config
+            .general
+            .force_http_engine_hosts
+            .matches(&named.dst_host, named.dst_port)
+            == Some(true)
+    }
+
+    /// Serves a connection the engine judges HTTP (`P9`, `P10`): a sniffed one
+    /// whose first bytes are a request, or one `force-http-engine-hosts` keeps
+    /// in the engine whatever it sent. Every request is routed and dialed on
+    /// its own (`ConnUpstreams`); the connection itself gets a record only
+    /// when none of them reached the rules (design 10.2).
+    async fn serve_http(
+        &self,
+        mut session: SessionInfo,
+        client: Prefixed<BoxedStream>,
+        opts: ServeOpts,
+    ) {
+        let Some(engine) = self.self_arc() else {
+            return;
+        };
+        let turned = self.turn_back(&mut session);
+        let process = self.look_up_owner(&session);
+        // The connection's token: each request's is its child, and an upgraded
+        // relay's too. The carrier handle is not registered: it gets a record
+        // only if no request reached the rules (design 10.2, P10).
+        let token = self.session_token();
+        let carrier = SessionHandle::new_with_slot(
+            self.next_id(),
+            session.clone(),
+            token.clone(),
+            process.clone(),
+        );
+        let lease = match turned {
+            Turned::Unchanged => None,
+            Turned::Name(lease) => Some(lease),
+            Turned::Unknown => {
+                self.attach_observers(&carrier);
+                carrier.finish(SessionOutcome::Failed(FAKE_ADDRESS_NOT_KNOWN.to_string()));
+                return;
+            }
+        };
+        // a client's TCP session to a host whose QUIC the engine blocked is
+        // that client falling back (phase 3 M5 design 6.3): once for the
+        // connection, as `dial` does for a session of its own
+        self.quic_adaptive()
+            .on_tcp(&session.dst_host.to_string(), Instant::now());
+        let runtime = self.runtime();
+        let conn = rurge_http::Conn {
+            session,
+            entry: rurge_http::Entry::Sniffed,
+            idle: runtime.idle_timeout,
+            head_wait: runtime.idle_timeout,
+            drop_hold: opts.drop_hold,
+            // the engine's word that the connection has to go at once; not a
+            // child of the connection's token (design 8.10, 8.11)
+            abort: CancellationToken::new(),
+            token: token.clone(),
+            tracker: self.tracker().clone(),
+        };
+        let upstreams = crate::http::ConnUpstreams::new(
+            engine,
+            token.clone(),
+            process,
+            lease,
+            opts.stop.clone(),
+        );
+        let mut serving = std::pin::pin!(rurge_http::serve_connection(
+            Box::new(client),
+            rurge_http::Requests::new(conn, upstreams),
+        ));
+        // A stop cancels the connection's token and then waits for the same
+        // future, not for another one: it is what ends the requests (design
+        // 8.11). A connection that ends by itself (the client left, a request
+        // was killed, hyper gave an upgraded connection up) does not cancel
+        // the token: an upgraded relay's is its child and goes on.
+        let served = tokio::select! {
+            biased;
+            _ = stopped(opts.stop.as_ref()) => {
+                token.cancel();
+                serving.await
+            }
+            served = &mut serving => served,
+        };
+        if served.routed == 0 {
+            // nothing of the connection reached the rules: it gets a record of
+            // its own, and the reason hyper had for ending it
+            self.attach_observers(&carrier);
+            carrier.finish(SessionOutcome::Failed(
+                served.error.unwrap_or_else(|| "no request".to_string()),
+            ));
+        }
+    }
+
     /// Serves a session its entry answered "connected" already, to its end
     /// (design 7.1): sniff it, say what it showed, dial it, relay it.
     ///
@@ -180,7 +298,12 @@ impl Engine {
             sniffed = rurge_http::sniff(&mut client, self.sniff_wait()) => sniffed,
         };
         self.sniff_counts.count(&sniffed);
+        // whether the settings keep the connection in the engine whatever it
+        // showed, judged by the same name `sniffable_session` judged (design
+        // 6.4)
+        let forced = self.forces_http_engine(&session);
         let mut session = session;
+        let mut into_engine = false;
         match sniffed {
             Sniffed::Tls(hello) => {
                 // the ClientHello's SNI is lowercase already, or absent when it
@@ -188,11 +311,20 @@ impl Engine {
                 session.sni = hello.sni;
                 session.protocol = Some(ProtocolKind::Https);
             }
-            Sniffed::Http => session.protocol = Some(ProtocolKind::Http),
-            // design 7.1: forwarded as it is, with no protocol on the record
-            Sniffed::Other | Sniffed::Timeout | Sniffed::Closed => {}
+            Sniffed::Http => {
+                session.protocol = Some(ProtocolKind::Http);
+                into_engine = true;
+            }
+            // design 7.1: forwarded as it is, with no protocol on the record;
+            // the settings may still keep it in the engine (design 6.4)
+            Sniffed::Other | Sniffed::Closed => into_engine = forced,
+            Sniffed::Timeout => {}
             // the client is gone: nothing to dial for, nothing to record
             Sniffed::Failed => return,
+        }
+        if into_engine {
+            self.serve_http(session, client, opts).await;
+            return;
         }
         let client: BoxedStream = Box::new(client);
         match self.dial(session).await {
@@ -245,7 +377,7 @@ impl Engine {
 
 /// `stop` as a future: never done when there is none (the listeners stop their
 /// sessions with the engine's root, not with their own).
-async fn stopped(stop: Option<&CancellationToken>) {
+pub(crate) async fn stopped(stop: Option<&CancellationToken>) {
     match stop {
         Some(stop) => stop.cancelled().await,
         None => std::future::pending().await,

@@ -92,6 +92,19 @@ pub async fn runtime_edited(
     shared: EngineShared,
     edit: impl FnOnce(&mut rurge_config::Config),
 ) -> Runtime {
+    runtime_timed(dir, profile, shared, Duration::from_secs(600), edit).await
+}
+
+/// As `runtime_edited`, with the idle timeout the HTTP engine times its waits
+/// by (the phase 4 / M1b plan's P15): for the tests that wait for it to run
+/// out.
+pub async fn runtime_timed(
+    dir: &std::path::Path,
+    profile: &str,
+    shared: EngineShared,
+    idle: Duration,
+    edit: impl FnOnce(&mut rurge_config::Config),
+) -> Runtime {
     std::fs::write(dir.join("t.conf"), profile).unwrap();
     let mut loaded = from_text(profile, &dir.join("t.conf"), &LoadOptions::for_tests());
     assert!(
@@ -109,7 +122,7 @@ pub async fn runtime_edited(
         RuntimeOptions {
             stack: stack_options(dir),
             outbound_mode: OutboundMode::Rule,
-            idle_timeout: Duration::from_secs(600),
+            idle_timeout: idle,
             shared,
             request_log_size: 1000,
         },
@@ -239,13 +252,28 @@ pub async fn harness_edited(
     shared: EngineShared,
     edit: impl FnOnce(&mut rurge_config::Config),
 ) -> Harness {
+    harness_at(p, shared, Duration::from_secs(600), edit).await
+}
+
+/// As `harness_edited`, with the idle timeout the HTTP engine times its waits
+/// by (`runtime_timed`).
+pub async fn harness_timed(p: Profile<'_>, shared: EngineShared, idle: Duration) -> Harness {
+    harness_at(p, shared, idle, |_| {}).await
+}
+
+async fn harness_at(
+    p: Profile<'_>,
+    shared: EngineShared,
+    idle: Duration,
+    edit: impl FnOnce(&mut rurge_config::Config),
+) -> Harness {
     let dns = MockDns::spawn().await;
     for name in ["target.test", "alt.test"] {
         dns.set(name, &["127.0.0.1"], &[], 60);
     }
     let dir = tempfile::tempdir().unwrap();
     let text = p.text(dns.addr());
-    let engine = Engine::new(runtime_edited(dir.path(), &text, shared, edit).await);
+    let engine = Engine::new(runtime_timed(dir.path(), &text, shared, idle, edit).await);
     let listeners = engine.bind_listeners().await.unwrap();
     Harness {
         dir,

@@ -520,9 +520,29 @@ impl Engine {
         session: SessionInfo,
         process: ProcessSlot,
     ) -> Arc<SessionHandle> {
+        self.new_handle_under(session, process, &self.sessions_root)
+    }
+
+    /// `new_handle_with` under a parent token of the caller's: the HTTP
+    /// engine's carrier connection hands each request a child of the
+    /// connection's token (design 8.11).
+    pub(crate) fn new_handle_under(
+        &self,
+        session: SessionInfo,
+        process: ProcessSlot,
+        parent: &CancellationToken,
+    ) -> Arc<SessionHandle> {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed) + 1;
-        let handle =
-            SessionHandle::new_with_slot(id, session, self.sessions_root.child_token(), process);
+        let handle = SessionHandle::new_with_slot(id, session, parent.child_token(), process);
+        self.attach_observers(&handle);
+        handle
+    }
+
+    /// Hooks the session log and the request record onto `handle` and marks it
+    /// active: what a registered handle gets when it is made
+    /// (`new_handle_under`), and a carrier connection when it ends with no
+    /// request routed (`serve_http`, design 10.2).
+    pub(crate) fn attach_observers(&self, handle: &Arc<SessionHandle>) {
         // Weak: the active index holds the handle and the handle holds this
         // hook, so a strong `Arc<Observe>` here would be a reference cycle.
         let observe = Arc::downgrade(&self.observe);
@@ -535,8 +555,7 @@ impl Engine {
                 o.log.record_finished(h, outcome, &o.traffic);
             }
         });
-        self.observe.log.mark_active(&handle);
-        handle
+        self.observe.log.mark_active(handle);
     }
 }
 
@@ -1361,6 +1380,16 @@ impl Engine {
     pub fn tracker(&self) -> &TaskTracker {
         &self.tracker
     }
+    /// The next session number, for a handle that is not made by
+    /// `new_handle_with` (the HTTP engine's carrier connection).
+    pub(crate) fn next_id(&self) -> u64 {
+        self.next_session.fetch_add(1, Ordering::Relaxed) + 1
+    }
+    /// The engine itself, for what has to hold an owned `Arc`: the
+    /// connection's `Upstreams`. `None` while the engine is going away.
+    pub(crate) fn self_arc(&self) -> Option<Arc<Engine>> {
+        self.me.upgrade()
+    }
 }
 
 impl Engine {
@@ -1436,9 +1465,13 @@ fn fail(
     // routed this way, not why the dial itself then failed: the record needs
     // both, or it hides the failure behind the note. The `DialError` below
     // keeps the plain failure message.
-    if let Some(note) = handle.error() {
-        handle.set_error(format!("{note}; {message}"));
-    }
+    settle(
+        &handle,
+        &Refused::Fail {
+            kind,
+            message: message.clone(),
+        },
+    );
     handle.finish(SessionOutcome::Failed(message.clone()));
     let rule = handle.rule();
     Err(DialError::Failed {
@@ -1447,6 +1480,15 @@ fn fail(
         rule,
         handle,
     })
+}
+
+/// Finishes a session its routing refused, the way `connect_session` did
+/// (`P4`): a failure sets the error and ends, a rejection only ends.
+fn refused_dial(handle: Arc<SessionHandle>, refused: Refused) -> Result<Dialed, DialError> {
+    match refused {
+        Refused::Fail { kind, message } => fail(handle, kind, message),
+        Refused::Reject(kind) => reject(handle, kind),
+    }
 }
 
 /// Connects `outbound` to `target`: a plain request goes in absolute form to
@@ -1489,36 +1531,77 @@ pub(crate) fn rule_raw(rules: &rurge_rules::RuleEngine, index: usize) -> Option<
         .map(|pos| all[pos].raw.clone())
 }
 
+/// A session its routing refused, before or while dialing: whoever asked for
+/// the routing answers it and finishes the handle (`P4`).
+pub(crate) enum Refused {
+    Reject(rurge_proto::RejectKind),
+    Fail { kind: FailKind, message: String },
+}
+
+/// What `route_session` worked out and `dial_route` needs (`P21` V11).
+pub(crate) struct Way {
+    pub(crate) target: Target,
+    pub(crate) may_forward: bool,
+    pub(crate) attempts: Vec<Resolution>,
+    pub(crate) book: Arc<rurge_policy::smart::SmartBook>,
+}
+
+/// Sets the handle's error the way `fail` does, without finishing it (`P4`):
+/// a note already on the handle (a group cycle, an unsupported protocol, an
+/// empty group standing in for DIRECT) explains why the session was routed
+/// this way, not why the dial itself then failed, so a failure gets both, or
+/// it hides behind the note.
+pub(crate) fn settle(handle: &SessionHandle, refused: &Refused) {
+    if let Refused::Fail { message, .. } = refused
+        && let Some(note) = handle.error()
+    {
+        handle.set_error(format!("{note}; {message}"));
+    }
+}
+
 impl Engine {
-    /// `Dialer::dial` from the session's handle on, run inside the trail of
-    /// the session.
-    async fn connect_session(
+    /// The rules and the policy (design 8.4 "选路"), up to the attempts in
+    /// line; the dial itself is `dial_route`. A refusal comes back unfinished:
+    /// the caller answers and finishes the handle (`P4`).
+    pub(crate) async fn route_session(
         &self,
-        rt: Arc<Runtime>,
-        registry: Arc<PolicyRegistry>,
-        handle: Arc<SessionHandle>,
-    ) -> Result<Dialed, DialError> {
+        rt: &Arc<Runtime>,
+        registry: &Arc<PolicyRegistry>,
+        handle: &Arc<SessionHandle>,
+        forwardable: bool,
+    ) -> Result<Way, Refused> {
         // Refused before anything is asked of the rules, a name lookup or a
         // `smart` group: each would count a session that goes nowhere. The
         // lookup of the session's process, which `dial` started with the
         // session, is left to finish: the record of a refused session still
         // names its process.
         if self.is_suspended() {
-            return fail(handle, FailKind::Other, REFUSED_STRICT);
+            return Err(Refused::Fail {
+                kind: FailKind::Other,
+                message: REFUSED_STRICT.to_string(),
+            });
         }
-        let policy = match self.choose_policy(&rt, &registry, &handle).await {
+        let policy = match self.choose_policy(rt, registry, handle).await {
             Chosen::Policy(p) => p,
-            Chosen::DnsFailed => return fail(handle, FailKind::Dns, "dns lookup failed"),
+            Chosen::DnsFailed => {
+                return Err(Refused::Fail {
+                    kind: FailKind::Dns,
+                    message: "dns lookup failed".to_string(),
+                });
+            }
         };
         // `load-balance` with `persistent=true` picks by the host
         let ctx = SelectCtx {
             host: Some(handle.session().dst_host.to_string()),
         };
-        let mut resolution = match resolve_ready(&registry, &policy, &ctx).await {
+        let mut resolution = match resolve_ready(registry, &policy, &ctx).await {
             Ok(resolution) => resolution,
             Err(chain) => {
                 handle.set_policy_chain(chain);
-                return fail(handle, FailKind::Connect, EVALUATION_FAILED);
+                return Err(Refused::Fail {
+                    kind: FailKind::Connect,
+                    message: EVALUATION_FAILED.to_string(),
+                });
             }
         };
         handle.set_policy_chain(resolution.chain.clone());
@@ -1555,18 +1638,6 @@ impl Engine {
         if let Some(ip) = pinned_ip {
             target = Target::new(HostName::Ip(ip), target.port);
         }
-        // A plain request of the HTTP listener can go to an HTTP proxy in
-        // absolute form instead of through a tunnel (M1 design 6.5). The
-        // inbound writes the request line, so the target is checked here
-        // first, and the headers are rendered once for this connection
-        // (the two obligations `HttpForward` puts on its caller).
-        let plain_http =
-            handle.session().listener == ListenerKind::Http && handle.session().url.is_some();
-        // a pinned address only reaches the proxy through a tunnel: in
-        // absolute form the request URI carries the name
-        let may_forward = plain_http && !pinned;
-        let host = handle.session().dst_host.to_string();
-        let book = registry.auto().smart.clone();
         // a name no member can send is refused by all of them alike: the
         // session goes through the one the group picked as through a
         // policy of its own — no other is tried, and the group is told
@@ -1574,9 +1645,37 @@ impl Engine {
         if resolution.smart.is_some() && crate::smart::unsendable(&target) {
             resolution.smart = None;
         }
+        // a pinned address only reaches the proxy through a tunnel: in
+        // absolute form the request URI carries the name
+        let may_forward = forwardable && !pinned;
+        let book = registry.auto().smart.clone();
         // the member a `smart` group picked, then the next ones in line
         // while they do not connect (phase 2 M3c design §7)
-        let attempts = crate::smart::attempts(&registry, resolution);
+        let attempts = crate::smart::attempts(registry, resolution);
+        Ok(Way {
+            target,
+            may_forward,
+            attempts,
+            book,
+        })
+    }
+
+    /// Dials what `route_session` chose (`P4`): the attempts in line, each
+    /// with its share of the time that is left, and the failure mapped the way
+    /// it was.
+    pub(crate) async fn dial_route(
+        &self,
+        handle: &Arc<SessionHandle>,
+        way: Way,
+    ) -> Result<(BoxedStream, Option<Vec<(String, String)>>), Refused> {
+        let Way {
+            target,
+            may_forward,
+            attempts,
+            book,
+        } = way;
+        // the `smart` group is told of the dial by the name the rules saw
+        let host = handle.session().dst_host.to_string();
         let begun = Instant::now();
         let mut tried: Vec<String> = Vec::new();
         let mut failure = None;
@@ -1607,7 +1706,7 @@ impl Engine {
                         book.used(&pick.group, &pick.member, Instant::now());
                         let outbound = &attempt.outbound;
                         crate::smart::watch(
-                            &handle,
+                            handle,
                             book.clone(),
                             &pick.member,
                             outbound,
@@ -1623,11 +1722,7 @@ impl Engine {
                             ));
                         }
                     }
-                    return Ok(Dialed {
-                        stream,
-                        handle,
-                        forward,
-                    });
+                    return Ok((stream, forward));
                 }
                 Err(e) => e,
             };
@@ -1653,24 +1748,66 @@ impl Engine {
                 crate::smart::quoted(&tried)
             ));
         }
-        match failure.expect("a dial was tried") {
+        Err(match failure.expect("a dial was tried") {
             OutboundError::Reject(kind) => {
                 let effective = self
                     .escalation
                     .refusal(handle.session(), kind, Instant::now());
-                reject(handle, effective)
+                Refused::Reject(effective)
             }
             OutboundError::Unsupported(what) => {
                 // what the outbound cannot do here (M4-D7): say so
                 handle.set_error(Note::Unsupported(what).to_string());
-                reject(handle, rurge_proto::RejectKind::Reject)
+                Refused::Reject(rurge_proto::RejectKind::Reject)
             }
-            OutboundError::Dns(m) => fail(handle, FailKind::Dns, m),
-            OutboundError::Io(e) => fail(handle, FailKind::Connect, e.to_string()),
-            OutboundError::Timeout => fail(handle, FailKind::Timeout, "connect timed out"),
+            OutboundError::Dns(m) => Refused::Fail {
+                kind: FailKind::Dns,
+                message: m,
+            },
+            OutboundError::Io(e) => Refused::Fail {
+                kind: FailKind::Connect,
+                message: e.to_string(),
+            },
+            OutboundError::Timeout => Refused::Fail {
+                kind: FailKind::Timeout,
+                message: "connect timed out".to_string(),
+            },
             e @ (OutboundError::Proxy(_)
             | OutboundError::Tls(_)
-            | OutboundError::Unavailable(_)) => fail(handle, FailKind::Connect, e.to_string()),
+            | OutboundError::Unavailable(_)) => Refused::Fail {
+                kind: FailKind::Connect,
+                message: e.to_string(),
+            },
+        })
+    }
+
+    /// `Dialer::dial` from the session's handle on, run inside the trail of
+    /// the session.
+    async fn connect_session(
+        &self,
+        rt: Arc<Runtime>,
+        registry: Arc<PolicyRegistry>,
+        handle: Arc<SessionHandle>,
+    ) -> Result<Dialed, DialError> {
+        // a plain request of the HTTP listener can go to an HTTP proxy in
+        // absolute form (M1 design 6.5); everything else is tunnelled. Task 6
+        // stops the listener from making such sessions and removes this.
+        let forwardable =
+            handle.session().listener == ListenerKind::Http && handle.session().url.is_some();
+        let way = match self
+            .route_session(&rt, &registry, &handle, forwardable)
+            .await
+        {
+            Ok(way) => way,
+            Err(refused) => return refused_dial(handle, refused),
+        };
+        match self.dial_route(&handle, way).await {
+            Ok((stream, forward)) => Ok(Dialed {
+                stream,
+                handle,
+                forward,
+            }),
+            Err(refused) => refused_dial(handle, refused),
         }
     }
 }

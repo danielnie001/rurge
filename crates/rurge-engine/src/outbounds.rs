@@ -7,7 +7,9 @@ use rurge_config::diagnostic::codes;
 use rurge_config::spec::{CommonOpts, IpVersion, PolicySpec, ProtoSpec};
 use rurge_config::{Config, Diagnostic, Diagnostics, KeystoreItem};
 use rurge_net::BoxFuture;
-use rurge_net::connector::{Connector, DirectConnector, Resolve, ResolveVia, SystemResolve, Via};
+use rurge_net::connector::{
+    Connector, DirectConnector, Resolve, ResolveVia, Route, SystemResolve, Via,
+};
 use rurge_net::socket::{NoopSocketHook, SocketHook, SocketOpts};
 use rurge_policy::{BuildError, OutboundFactory};
 use rurge_proto::anytls::AnyTlsOutbound;
@@ -93,6 +95,12 @@ impl EngineFactory {
         self.external_logs = logs;
         self.externals = externals;
         self
+    }
+
+    /// The egress table rurge's own sockets are bound to now (`P8`), as the
+    /// pool of upstream connections keeps it with its key (design 8.5).
+    pub(crate) fn egress_route(&self) -> Option<Route> {
+        self.hook.egress_route()
     }
 
     fn dry(cfg: &Config) -> EngineFactory {

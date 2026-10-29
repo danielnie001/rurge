@@ -8,6 +8,7 @@ pub mod dns_pipeline;
 pub mod engine;
 mod external_resources;
 mod fake_address;
+mod http;
 pub mod observe;
 pub mod outbounds;
 pub mod owner;
