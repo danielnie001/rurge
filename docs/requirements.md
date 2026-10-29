@@ -200,7 +200,7 @@ flowchart LR
 | `rurge-net` | 内部 HTTP 客户端、连接器抽象、外部资源管理器（下载 / 缓存 / 更新间隔 / 文件监视） | `rurge-config` |
 | `rurge-inbound` | HTTP / SOCKS5 监听、端口转发、内置 Snell / MTProto 服务器、局域网访问限制 | `rurge-config` |
 | `rurge-tun` | 用户态 TCP/IP 栈、包的去向、UDP 会话表、ICMP 转发、DNS 应答器（fake-IP）、`[IP Rewrite]`、网关模式、DHCP 服务器；平台无关，虚拟网卡设备与路由、系统 DNS 的设置在 `rurge-platform`（阶段 3 设计第 4 节） | `rurge-inbound` `rurge-dns` |
-| `rurge-http` | HTTP 引擎、MITM 与 CA 管理、URL / Header / Body 重写、Map Local、请求记录与抓包 | `rurge-rules` `rurge-policy` |
+| `rurge-http` | HTTP 引擎、MITM 与 CA 管理、URL / Header / Body 重写、Map Local、抓包；请求记录仍在 `rurge-engine`，规则、策略与拨号经 `rurge-engine` 实现的 trait 进来（阶段 4 设计第 4 节） | `rurge-config` `rurge-net` `rurge-inbound` `rurge-proto` |
 | `rurge-script` | JavaScript 引擎封装、Surge API 绑定、脚本调度与限制、persistentStore | `rurge-http` `rurge-policy` |
 | `rurge-engine` | 会话流水线编排、请求记录、流量统计、运行时状态、热重载 | 各领域 crate |
 | `rurge-api` | HTTP API、鉴权与封禁、Prometheus 指标、Web Dashboard 静态资源、事件中心 / Logbook | 全部 |
@@ -228,7 +228,7 @@ flowchart LR
 5. **规则匹配**：自上而下；域名规则不触发 DNS；遇到 IP 规则时按需解析并在本次评估内缓存；`no-resolve` / `dns-failed` 语义。
 6. **策略解析**：策略组决策（含临时覆盖）、别名、`underlying-proxy` 链、UDP 支持判断。
 7. **出站建立**：网卡绑定、`ip-version`、TFO / TOS / ECN、QUIC 阻断、UDP 中继。
-8. **HTTP 引擎**（若适用）：MITM 解密 → Header Rewrite → URL Rewrite → Body Rewrite → 脚本 → Map Local 短路。
+8. **HTTP 引擎**（若适用）：MITM 解密之后，每个请求各自做第 5、6 步（规则匹配、策略解析），再依次 Header Rewrite → URL Rewrite → Map Local（命中即短路）→ Body Rewrite → 脚本，最后经选定的策略做第 7 步（上游连接可以复用；阶段 4 设计第 6.2 节）。
 9. **观测**：请求记录（含规则、策略、耗时、流量、备注）、流量统计、日志、通知。
 
 ### 3.4 配置生命周期
@@ -380,7 +380,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | FR-HTTP-01 | HTTP 引擎：HTTP/1.1 请求 / 响应解析与转发、keep-alive、chunked、WebSocket 升级透传、80 / 443 协议嗅探、`force-http-engine-hosts`、`always-raw-tcp-hosts` / `always-raw-tcp-keywords` | P0 | 4 |
 | FR-HTTP-02 | HTTP/2：MITM 后与客户端 / 上游使用 HTTP/2（`h2=true`），`:authority` 提取 | P1 | 4 |
-| FR-HTTP-03 | MITM：`[MITM]` 九个键；按主机名签发并缓存叶子证书；SNI 命中忽略端口；`client-source-address`；`skip-server-cert-verify`；证书固定提示日志；CA 通过 `ca-p12` / `ca-keystore-name` 提供；`rurge mitm ca generate` 生成 CA 并给出各平台信任安装指引；`GET /v1/mitm/ca` 导出 DER | P0 | 4 |
+| FR-HTTP-03 | MITM：`[MITM]` 九个键；按主机名签发并缓存叶子证书；靠嗅探到的 SNI 认出的 TLS 与 QUIC 连接，不带端口的项不看端口（阶段 4 设计第 7.1 节）；`client-source-address`；`skip-server-cert-verify`；证书固定提示日志；CA 通过 `ca-p12` / `ca-keystore-name` 提供；`rurge mitm ca generate` 生成 CA 并给出各平台信任安装指引；`GET /v1/mitm/ca` 导出 DER | P0 | 4 |
 | FR-HTTP-04 | `auto-quic-block`：解析 QUIC Initial 的 SNI，命中 MITM 列表时阻断 UDP 使客户端回落 | P1 | 4 |
 | FR-HTTP-05 | URL Rewrite：`header` / `302` / `307` / `reject`；首个 header 规则生效；结果 URL 合法性；`{{{GATEWAY_ADDRESS}}}`；对 Host 与连接主机名重建的 URL 也匹配 | P0 | 4 |
 | FR-HTTP-06 | Header Rewrite：方向、四种动作、顺序生效、改动消息框架头则拒绝并使请求失败 | P0 | 4 |
