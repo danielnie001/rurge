@@ -306,7 +306,8 @@ mod tests {
 
     /// The bytes of a pooled stream count onto the request it is lent to
     /// right then: the meter is changed under it, then cleared. The end of
-    /// the stream is no byte: it neither counts nor marks the first one.
+    /// the stream is no byte: lent to `b`, it neither counts onto `b` nor
+    /// marks `b`'s first one.
     #[tokio::test]
     async fn a_metered_stream_counts_onto_the_current_request_only() {
         let (mut client, upstream) = tokio::io::duplex(64);
@@ -351,9 +352,10 @@ mod tests {
             "nobody has it lent"
         );
 
+        meter.set(Some(b.clone()));
         client.shutdown().await.unwrap();
         assert_eq!(metered.read(&mut buf).await.unwrap(), 0, "the end");
-        assert_eq!(b.bytes(), (1, 0));
+        assert_eq!(b.bytes(), (1, 0), "the end is no byte");
         assert!(!b.first_byte_seen(), "the end is no first byte");
     }
 }
