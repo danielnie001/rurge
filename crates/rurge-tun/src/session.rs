@@ -3,8 +3,11 @@
 //! connected to, and relays between the two. A rejection is answered with a
 //! reset, except REJECT-DROP, which is answered with nothing for a while. A
 //! stop cancels the session of a relay and ends the hold of REJECT-DROP. A
-//! connection to port 53 of the responder is no session of the engine's: the
-//! responder answers the queries on it (`dns::tcp`).
+//! session that the dialer would sniff (`Dialer::sniffable`) is handed to
+//! `Dialer::serve` whole once the handshake is over: it reads the app's first
+//! bytes, dials and relays, and holds a REJECT-DROP itself. A connection to
+//! port 53 of the responder is no session of the engine's: the responder
+//! answers the queries on it (`dns::tcp`).
 
 use crate::dns::tcp::serve_dns;
 use crate::dns::{Ask, Responder};
@@ -12,7 +15,7 @@ use crate::tcp::{DnsPlace, TunStream, Tuple};
 use crate::{Life, TunOptions};
 use rurge_config::{HostName, ListenerKind, SessionInfo, Transport};
 use rurge_dns::fakeip::Lease;
-use rurge_inbound::{DialError, Dialer};
+use rurge_inbound::{DialError, Dialer, ServeOpts};
 use rurge_proto::RejectKind;
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,6 +170,21 @@ async fn dial_and_relay(
     };
     let session = tcp_session(&tuple, name.as_deref());
     let dialer = &serving.dialer;
+    if dialer.sniffable(&session) {
+        // answered already, the handshake is over: the dialer reads the app's
+        // first bytes before it dials (phase 4 M1 design 5.3). `_lease` is held
+        // to the end of this function, which is the end of `serve`.
+        let opts = ServeOpts {
+            stop: Some(life.session_stop()),
+            drop_hold: serving.holds.drop_hold,
+            linger: serving.holds.linger,
+        };
+        // Not raced with the stop here: `serve` races its dial and its relay
+        // with `opts.stop` itself, and the relay's end is what finishes the
+        // session's handle.
+        dialer.serve(session, Box::new(stream), opts).await;
+        return;
+    }
     // The dial is not raced with the stop: it runs in the dialer, which holds
     // the session's handle, and a dial dropped half way would leave the record
     // of the session open for good. It ends within its own time limits.

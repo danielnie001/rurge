@@ -5,11 +5,13 @@
 //! stop: every connection is reset and the app is told, a relay stuck on its
 //! upstream is cancelled, the resets reach the device even when the device is
 //! slow, and a device that takes nothing cannot hold the stop up for longer than
-//! a grace. Then a device that fails. The last tests run one shard's task by
-//! hand, with channels of their own in place of the reader and the writer.
+//! a grace. Then a device that fails. Then a session the dialer would sniff,
+//! which is handed whole to `Dialer::serve`. The last tests run one shard's task
+//! by hand, with channels of their own in place of the reader and the writer.
 
 mod device_fails;
 mod rejects;
+mod serve;
 mod shard_task;
 mod stop;
 
