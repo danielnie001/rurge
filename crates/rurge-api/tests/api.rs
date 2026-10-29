@@ -1105,6 +1105,34 @@ async fn the_current_speed_follows_the_bytes_that_move_and_stops_with_them() {
     drop(s);
 }
 
+/// `GET /v1/rurge/http` (phase 4 M1 design 11): the five ways a sniff ended,
+/// zero until a sniffable session ends one of them. The counts are pinned on
+/// the raw bytes as well as on the parsed body, because the key order is part
+/// of the shape this endpoint promises.
+#[tokio::test]
+async fn rurge_http_counts_start_at_zero() {
+    let api = api().await;
+    assert_eq!(
+        get(&api, "/v1/rurge/http").await,
+        (
+            200,
+            json!({
+                "sniffed": {"tls": 0, "http": 0, "other": 0, "timeout": 0, "closed": 0}
+            })
+        )
+    );
+    let (status, _, bytes) = call_raw(api.addr, "GET", "/v1/rurge/http", Some(KEY), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        bytes.as_ref(),
+        br#"{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0}}"#.as_slice()
+    );
+    assert_eq!(
+        call(api.addr, "GET", "/v1/rurge/http", None, None).await,
+        (401, json!({ "error": "unauthorized" }))
+    );
+}
+
 #[tokio::test]
 async fn dns_cache_flush_and_delay() {
     let api = api().await;

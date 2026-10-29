@@ -97,6 +97,7 @@ pub(crate) fn router(key: String, ctx: ApiContext) -> Router {
         .route("/v1/requests/active", get(routes::requests::active))
         .route("/v1/requests/kill", post(routes::requests::kill))
         .route("/v1/traffic", get(routes::traffic::traffic))
+        .route("/v1/rurge/http", get(routes::rurge_http::http))
         .route("/v1/dns", get(routes::dns::dns))
         .route("/v1/dns/flush", post(routes::dns::flush))
         .route("/v1/test/dns_delay", post(routes::dns::dns_delay))
