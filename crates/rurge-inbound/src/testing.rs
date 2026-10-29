@@ -10,7 +10,7 @@ use rurge_proto::RejectKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 
@@ -20,6 +20,8 @@ use tokio::net::TcpStream;
 pub(crate) struct FakeDialer {
     pub echo: SocketAddr,
     pub target: Option<SocketAddr>,
+    /// What `sniffable` answers: false unless a test sets it.
+    pub sniff: AtomicBool,
     next_id: AtomicU64,
     pub handles: Mutex<Vec<Arc<SessionHandle>>>,
 }
@@ -29,6 +31,7 @@ impl FakeDialer {
         Arc::new(FakeDialer {
             echo,
             target,
+            sniff: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             handles: Mutex::new(Vec::new()),
         })
@@ -47,6 +50,10 @@ impl FakeDialer {
 }
 
 impl Dialer for FakeDialer {
+    fn sniffable(&self, _session: &SessionInfo) -> bool {
+        self.sniff.load(Ordering::Relaxed)
+    }
+
     fn dial<'a>(&'a self, session: SessionInfo) -> BoxFuture<'a, Result<Dialed, DialError>> {
         Box::pin(async move {
             let host = match &session.dst_host {

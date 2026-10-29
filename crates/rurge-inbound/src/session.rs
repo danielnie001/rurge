@@ -445,6 +445,21 @@ pub enum UdpAdmission {
     Busy,
 }
 
+/// How `Dialer::serve` holds and stops a session it was handed (phase 4 M1
+/// design 5, 7.4).
+#[derive(Clone, Debug)]
+pub struct ServeOpts {
+    /// Cancelled when whoever handed the connection over stops (the TUN).
+    /// `None` from the listeners: their sessions end with the engine's.
+    pub stop: Option<CancellationToken>,
+    /// REJECT-DROP: how long the connection is held.
+    pub drop_hold: Duration,
+    /// REJECT-DROP: after the hold, the longest the peer is waited for to
+    /// close its side, what it sends being read and discarded. 0 from the
+    /// listeners.
+    pub linger: Duration,
+}
+
 /// Implemented by the engine: rules → policy → outbound (`dial`), then the
 /// counted bidirectional copy (`relay`, which finishes the handle).
 pub trait Dialer: Send + Sync {
@@ -455,6 +470,60 @@ pub trait Dialer: Send + Sync {
         upstream: BoxedStream,
         handle: Arc<SessionHandle>,
     ) -> BoxFuture<'a, ()>;
+    /// Whether `session` is to be answered "connected" first and dialed only
+    /// after its first bytes are read (phase 4 M1 design 4). Its entry then
+    /// answers at once and hands the connection to `serve`. The default:
+    /// never.
+    fn sniffable(&self, session: &SessionInfo) -> bool {
+        let _ = session;
+        false
+    }
+
+    /// Serves a session whose client was answered "connected" already, to
+    /// its end (phase 4 M1 design 5, 7). The default dials it and relays,
+    /// cancelling the session at `opts.stop`; REJECT-DROP holds the
+    /// connection (`hold_dropped`); any other rejection or failure lets it go.
+    fn serve<'a>(
+        &'a self,
+        session: SessionInfo,
+        client: BoxedStream,
+        opts: ServeOpts,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            // The dial is not raced with the stop: it runs in the dialer, which
+            // holds the session's handle, and a dial dropped half way would
+            // leave the record of the session open for good (rurge-tun's
+            // `dial_and_relay`). It ends within its own time limits.
+            match self.dial(session).await {
+                Ok(dialed) => {
+                    let token = dialed.handle.token().clone();
+                    let mut relay = self.relay(client, dialed.stream, dialed.handle);
+                    // The stop cancels the session as well as being raced with
+                    // the relay: a relay that waits on its upstream in both
+                    // directions touches its streams in neither and would not
+                    // notice. It is then waited for to its end, not dropped: it
+                    // is what finishes the session's handle.
+                    match &opts.stop {
+                        Some(stop) => tokio::select! {
+                            biased;
+                            _ = stop.cancelled() => {
+                                token.cancel();
+                                relay.await;
+                            }
+                            _ = &mut relay => {}
+                        },
+                        None => relay.await,
+                    }
+                }
+                Err(DialError::Reject {
+                    kind: RejectKind::Drop,
+                    ..
+                }) => crate::hold::hold_dropped(client, &opts).await,
+                // any other rejection and a failed dial let the stream go
+                Err(_) => {}
+            }
+        })
+    }
     /// Asked before a UDP association is set up.
     fn admit_udp(&self) -> UdpAdmission {
         UdpAdmission::NotSupported
@@ -679,6 +748,56 @@ mod tests {
             path: None,
         }));
         assert_eq!(h.process().found().and_then(|p| p.pid), Some(7));
+    }
+
+    /// The default `serve` relays the session and stops it when the stop
+    /// fires: the session's token is cancelled, the relay is waited for to
+    /// its end, and nothing is left running.
+    #[tokio::test]
+    async fn the_default_serve_cancels_the_session_at_the_stop() {
+        let dialer = crate::testing::FakeDialer::new(crate::testing::echo_server().await, None);
+        let session = SessionInfo::tcp(HostName::parse("echo.test"), 443);
+        let (mut client, server) = tokio::io::duplex(64);
+        let stop = CancellationToken::new();
+        let serving = dialer.clone();
+        let opts = ServeOpts {
+            stop: Some(stop.clone()),
+            drop_hold: Duration::from_secs(30),
+            linger: Duration::ZERO,
+        };
+        let served =
+            tokio::spawn(async move { serving.serve(session, Box::new(server), opts).await });
+        // a byte each way first: the relay has started
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut buf))
+            .await
+            .expect("the echo came back within 5 s")
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+        stop.cancel();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let cancelled = dialer
+                .sessions()
+                .first()
+                .is_some_and(|h| h.token().is_cancelled());
+            if cancelled {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session was not cancelled within 5 s of the stop"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // `FakeDialer`'s relay does not look at the token: closing the client
+        // is what ends it
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the serve ended within 5 s of the client closing")
+            .unwrap();
     }
 
     #[test]

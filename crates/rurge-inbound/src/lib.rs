@@ -3,6 +3,7 @@
 //! rules, policies, outbound connections and relaying belong to the engine,
 //! reached through the `Dialer` trait.
 
+mod hold;
 pub mod http;
 pub mod listener;
 mod process;
@@ -14,11 +15,12 @@ pub mod socks5;
 pub(crate) mod testing;
 mod udp;
 
+pub use hold::hold_dropped;
 pub use http::HttpListener;
 pub use listener::{HttpAuth, ListenerOpts, Running};
 pub use process::ProcessSlot;
 pub use session::{
-    Counting, DialError, Dialed, Dialer, FailKind, SessionHandle, SessionOutcome, UdpAdmission,
-    UdpClient,
+    Counting, DialError, Dialed, Dialer, FailKind, ServeOpts, SessionHandle, SessionOutcome,
+    UdpAdmission, UdpClient,
 };
 pub use socks5::Socks5Listener;

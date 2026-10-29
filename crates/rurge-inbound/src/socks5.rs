@@ -2,7 +2,7 @@
 //! and UDP ASSOCIATE (phase 2 M5 design 5.1).
 
 use crate::listener::{ListenerOpts, Running, bind, canonical_peer, serve};
-use crate::session::{DialError, Dialer, FailKind, SessionOutcome, UdpAdmission};
+use crate::session::{DialError, Dialer, FailKind, ServeOpts, SessionOutcome, UdpAdmission};
 use crate::udp::Socks5UdpClient;
 use rurge_config::HostName;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
@@ -10,6 +10,7 @@ use rurge_proto::RejectKind;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
@@ -207,6 +208,19 @@ async fn handle(
     session.local = stream.local_addr().ok().map(canonical_peer);
     session.listener = ListenerKind::Socks5;
     session.transport = Transport::Tcp;
+
+    if dialer.sniffable(&session) {
+        // answered first, dialed after the client's first bytes (phase 4 M1
+        // design 5.1); a failure to answer ends it here, as below
+        stream.write_all(&reply(REP_SUCCESS)).await?;
+        let serve_opts = ServeOpts {
+            stop: None,
+            drop_hold: opts.drop_hold,
+            linger: Duration::ZERO,
+        };
+        dialer.serve(session, Box::new(stream), serve_opts).await;
+        return Ok(());
+    }
 
     match dialer.dial(session).await {
         Ok(dialed) => {
@@ -821,5 +835,96 @@ mod tests {
         let mut s = negotiate(running.local_addr).await;
         s.write_all(&[5, 1, 0, 0x09]).await.unwrap(); // 0x09 is not a valid ATYP
         assert_eq!(read_reply(&mut s).await[1], REP_ADDR_TYPE_NOT_SUPPORTED);
+    }
+
+    /// A sniffable session is answered "connected" before anything is dialed,
+    /// and a dial that then fails ends it with no second reply.
+    #[tokio::test]
+    async fn a_sniffable_session_is_answered_before_it_is_dialed() {
+        let (running, dialer) = listener(Duration::from_secs(30)).await;
+        dialer.sniff.store(true, Ordering::Relaxed);
+        let mut s = negotiate(running.local_addr).await;
+        s.write_all(&domain_request("fail.test", 443))
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut s).await[1], REP_SUCCESS);
+        let mut eof = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut eof))
+            .await
+            .expect("the session ended within 5 s")
+            .unwrap();
+        assert_eq!(n, 0, "nothing more is said after the answer");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let finished = dialer
+                .sessions()
+                .first()
+                .filter(|h| h.is_finished())
+                .cloned();
+            if let Some(handle) = finished {
+                assert!(
+                    matches!(handle.outcome(), Some(SessionOutcome::Failed(_))),
+                    "{:?}",
+                    handle.outcome()
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session never finished within 5 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A sniffable session is dialed and relayed as before; only the answer
+    /// comes before the dial.
+    #[tokio::test]
+    async fn a_sniffable_session_is_relayed_after_the_answer() {
+        let (running, dialer) = listener(Duration::from_secs(30)).await;
+        dialer.sniff.store(true, Ordering::Relaxed);
+        let mut s = negotiate(running.local_addr).await;
+        s.write_all(&domain_request("echo.test", 443))
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut s).await[1], REP_SUCCESS);
+        s.write_all(b"after the answer").await.unwrap();
+        let mut buf = [0u8; 16];
+        tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut buf))
+            .await
+            .expect("the echo came back within 5 s")
+            .unwrap();
+        assert_eq!(&buf, b"after the answer");
+    }
+
+    /// REJECT-DROP after the answer: the connection is held with nobody
+    /// answered, until the client closes its side.
+    #[tokio::test]
+    async fn a_dropped_sniffable_session_is_held_after_the_answer() {
+        let (running, dialer) = listener(Duration::from_secs(30)).await;
+        dialer.sniff.store(true, Ordering::Relaxed);
+        let mut s = negotiate(running.local_addr).await;
+        s.write_all(&domain_request("reject.test", 444))
+            .await
+            .unwrap();
+        assert_eq!(read_reply(&mut s).await[1], REP_SUCCESS);
+        s.write_all(b"held").await.unwrap();
+        // Nothing comes back and the connection stays open. This watches for
+        // 300 ms, a hundredth of the 30 s hold, so the hold is still running
+        // when it ends.
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), s.read(&mut buf))
+                .await
+                .is_err(),
+            "the dropped session answered or closed during the hold"
+        );
+        // the client closing its side ends the hold (the listeners linger 0)
+        s.shutdown().await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("the hold ended within 5 s of the client closing")
+            .unwrap();
+        assert_eq!(n, 0, "the hold closed its side");
     }
 }

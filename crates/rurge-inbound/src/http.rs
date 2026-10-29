@@ -4,7 +4,7 @@
 use crate::listener::{HttpAuth, ListenerOpts, Running, bind, canonical_peer, serve};
 use crate::responses::{self, ResponseBody};
 use crate::session::{
-    Counting, DialError, Dialed, Dialer, FailKind, SessionHandle, SessionOutcome,
+    Counting, DialError, Dialed, Dialer, FailKind, ServeOpts, SessionHandle, SessionOutcome,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -24,6 +24,7 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -180,6 +181,45 @@ async fn connect(
         return Ok(responses::bad_request("CONNECT needs host:port"));
     };
     let session = session_for(&ctx, host, port);
+    if ctx.dialer.sniffable(&session) {
+        // answered first, dialed after the client's first bytes (phase 4 M1
+        // design 5.2); the tunnel runs on the tracker, as below
+        let upgrade = hyper::upgrade::on(&mut req);
+        let dialer = ctx.dialer.clone();
+        let drop_hold = ctx.opts.drop_hold;
+        ctx.tracker.spawn(async move {
+            // an inner task restores the ERROR log for a panic (design §6.4)
+            let inner = tokio::spawn(async move {
+                match upgrade.await {
+                    Ok(upgraded) => {
+                        dialer
+                            .serve(
+                                session,
+                                Box::new(TokioIo::new(upgraded)),
+                                ServeOpts {
+                                    stop: None,
+                                    drop_hold,
+                                    linger: Duration::ZERO,
+                                },
+                            )
+                            .await;
+                    }
+                    // no handle yet: the session never began
+                    Err(e) => tracing::debug!(
+                        listener = "http",
+                        error = %e,
+                        "CONNECT upgrade failed before the session began"
+                    ),
+                }
+            });
+            if let Err(e) = inner.await
+                && e.is_panic()
+            {
+                tracing::error!(listener = "http", "tunnel task panicked: {e}");
+            }
+        });
+        return Ok(responses::connect_established());
+    }
     match ctx.dialer.dial(session).await {
         Ok(dialed) => {
             let upgrade = hyper::upgrade::on(&mut req);
@@ -552,6 +592,7 @@ mod tests {
     use crate::testing::{FakeDialer, echo_server};
     use rurge_net::testing::TestServer;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::sync::CancellationToken;
@@ -1246,5 +1287,46 @@ mod tests {
             2,
             "the malformed header is dropped, not sent"
         );
+    }
+
+    /// A sniffable `CONNECT` is answered 200 before anything is dialed, and
+    /// a dial that then fails ends the tunnel with no second answer.
+    #[tokio::test]
+    async fn a_sniffable_connect_is_answered_before_it_is_dialed() {
+        let (running, dialer) = listener(ListenerOpts::default()).await;
+        dialer.sniff.store(true, Ordering::Relaxed);
+        let (mut s, head) = raw(
+            running.local_addr,
+            "CONNECT fail.test:443 HTTP/1.1\r\nHost: fail.test:443\r\n\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut eof = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut eof))
+            .await
+            .expect("the tunnel ended within 5 s")
+            .unwrap();
+        assert_eq!(n, 0, "nothing more is said after the answer");
+    }
+
+    /// A sniffable `CONNECT` is dialed and relayed as before; only the answer
+    /// comes before the dial.
+    #[tokio::test]
+    async fn a_sniffable_connect_is_relayed_after_the_answer() {
+        let (running, dialer) = listener(ListenerOpts::default()).await;
+        dialer.sniff.store(true, Ordering::Relaxed);
+        let (mut s, head) = raw(
+            running.local_addr,
+            "CONNECT echo.test:443 HTTP/1.1\r\nHost: echo.test:443\r\n\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        s.write_all(b"tunnelled").await.unwrap();
+        let mut buf = [0u8; 9];
+        tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut buf))
+            .await
+            .expect("the echo came back within 5 s")
+            .unwrap();
+        assert_eq!(&buf, b"tunnelled");
     }
 }
