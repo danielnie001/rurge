@@ -167,6 +167,13 @@ cargo test -j 8 --workspace --lib -- tests::udp:: tests::icmp:: tests::dns::udp:
 cargo test -j 8 --workspace --lib -- wireguard   # 阶段 3 / M5，`rurge-config`：手册 6.11 的服务端写法（`listen-port` / `accept-incoming` 的 `W0029`、不带 `endpoint` 的 peer、两者混写、没有 `listen-port` 时缺 `endpoint` 仍是 `E0023`）
 cargo test -j 8 --workspace --test outbounds_wireguard -- a_policy_on_a_section_without_peers   # 阶段 3 / M5，引擎：没有 peer 的节上的策略立刻失败，错误说明原因
 cargo test -j 8 --workspace --test pipeline -- a_dns_session_matches_rules_by_the_servers_name an_ip_cidr_rule   # 阶段 3 / M5，内部 DNS 会话按服务器的名字匹配、`IP-CIDR` 仍按地址；单元的三条用 `--lib` 里的名字 `without_an_engine_a_named_server_is_dialled_at_its_address`、`connector_dials_the_resolved_address_and_names_it`、`a_named_quic_server_reaches_its_connector_with_its_name`
+cargo test -j 8 --workspace --lib -- prefix::   # 阶段 4 / M1a，`rurge-http` 的前缀流（4 条）：前缀先于底下的流被读到、读的缓冲比前缀小时分批给出、写与关写端直通、缓冲读完之后 `fill` 读到流的末
+cargo test -j 8 --workspace --lib -- tls::tests::   # 阶段 4 / M1a，`rurge-http` 的 ClientHello（10 条）：真的 rustls 客户端产生的一条、任意切分、跨记录、大于一个记录、超过 64 KiB、SNI 大写与没有 SNI、ALPN、损坏的字节不 panic、长度对不上
+cargo test -j 8 --workspace --lib -- sniff::tests::   # 阶段 4 / M1a，`rurge-http` 判断与嗅探的本体（14 条）：方法记号、`PRI`、小写与 21 个字符、只来了一半、判的次数（一个字节一个字节发、一串小记录）、`sniff` 的五种结局（超时用调短的时限）、前缀在嗅探之后照旧完整
+cargo test -j 8 --workspace --lib -- hold::   # 阶段 4 / M1a，`rurge-inbound` 的停留（4 条）：读到 EOF、读出错、`drop_hold` 到、停止立刻放手，以及 `linger` 读的那一段
+cargo test -j 8 --workspace --lib -- sniffable   # 阶段 4 / M1a，`rurge-inbound` 两个监听器的先答后交（5 条）：SOCKS5 与 `CONNECT` 先答、再交给 `serve`，停留与转发的用例；`rurge-tun` 的 `tests::outcomes::serve::a_sniffable_connection_is_served_with_the_tuns_holds` 也带这个词，所以这一条过滤词会多一条
+cargo test -j 8 --workspace --lib -- outcomes::serve   # 阶段 4 / M1a，`rurge-tun`（3 条）：可嗅探的会话整个交给 `serve`，拿到的 `ServeOpts` 是 TUN 的 `drop_hold` / `linger` 与停止令牌，缺省 `serve` 真的拨了号，停止到得了
+cargo test -j 8 --workspace --test sniff   # 阶段 4 / M1a，经引擎的嗅探端到端（21 条；`EngineShared.sniff_wait` 300 毫秒，只有一条等满缺省的 15 秒）：三种入口上的 SNI 与协议、`PROTOCOL` 在拨号之前、三个设置、预匹配与暂停、服务器先说话、前缀不丢、计数
 # 阶段 3 / M5 重跑的基准读数（一台机器上的一次运行、**不是 CI**；release，`TUN_BENCH_FAR=memory`；命令仍是上面 B1 / B2 / b3 那三条）：B1 八个量出来的行都过 0.7 Gbit/s 的线（最低的一行 4.065，是线的 5.8 倍），四个计数都是 0，中位数上行 8.03、下行 4.84 Gbit/s（两个 MTU 混在一起，只作量级）；同设置（MTU 1500、`tx_max` 256 KiB）的 5.717 / 5.172 是上一次的 79.7% 与 94.7%。B2 门槛读数（峰值减去全部测试一侧的项）403,671,140 字节（403.7 MB / 385.0 MiB），在线 429,000,000 字节以内、余量 25.3 MB；保守读数（只减去准的应用端套接字缓冲）445,333,604 字节（445.3 MB），超线 16.3 MB——这个读数照旧归项目所有者，这里只记数。b3 中位数 0.9 微秒、p99 2.9 微秒，最大 4542.2 微秒（4.5 ms，落在第 28,673 个查询上，是线的 22.7 倍，两处都是池的 `HashMap` 的翻倍处，读代码与算术得出）。细节与上一次不同的原因见计划「执行期修正记录」第 61 ～ 63 行
 cargo insta test -p rurge-config --review       # 语料库快照有变化时审阅
 cargo clippy --all-targets -- -D warnings       # 零警告（CI 设 RUSTUP_TOOLCHAIN=1.89.0，与本机的 MSRV 工具链一致；更新的 clippy 会多出 lint）
@@ -322,3 +329,17 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 六、**计时用例提交前单独循环二十次以上**：`[IP Rewrite]` 的两组（`tests::rewrite` 与引擎的 `ip_rewrite_in_the_profile`）、写任务的两组（`tests::writer` 与 `writer_queue: 1` 的那几条）、带名字的 DNS 会话的五条（M5 记录第 49、54 行），各单独跑过二十次（M5 记录第 34、40、45、49、54 行）；日志在工作区（git 忽略）。
 
 七、**M5 没有平台代码**（设计第 1 节）：不用 `RURGE_TEST_PRIVILEGED` 与 `RURGE_TEST_WINTUN_DLL`，缺省的 `cargo test` 不建网卡、不改系统设置；M5 的用例在一台 Windows 11 x86-64 的开发机上跑过，CI 运行 40798658216（`32238be`，2026-10-29）在三个平台上跑过并通过（那一次运行在 macOS 上失败的是一条阶段 2 的互操作用例，见 `docs/status.md`「M6 推送之后的 CI」）。三个基准是唯一用 `-p` 的地方，读数在命令一节 M5 那一条注释里。
+
+### 阶段 4 / M1a 起：嗅探
+
+阶段 4 / M1a 起另有几条（计划 `docs/superpowers/plans/2026-10-29-phase4-m1a-sniffing-plan.md`，下面写“M1a 记录第 N 行”指它末尾的「执行期修正记录」；M1a 的提交都在本地，CI 没有见过）：
+
+一、**用例绑不了、也不该拨回环的 80 与 443**（计划 P14）。经 SOCKS5、`CONNECT` 与虚拟网卡到 80、443 的会话（还有 `force-http-engine-hosts` 让别的端口可嗅探的那些），规则一律把它们送到一个 SOCKS5 策略，策略指向 `rurge_proto::testing::FakeSocks5`，`Socks5Script::connect_to` 是回环上那个真服务器（`TlsFixture`、`rurge_proto::testing::echo_server()` 或“服务器先说话”的 `TestServer`）：不论被问到哪里都连到回环，看哪个 `FakeSocks5` 被问、问的是什么就知道哪条规则命中。没有规则接住的会话会落到 harness 追加的 `FINAL,DIRECT`、拨回环的 80 / 443，那个端口不一定开着，所以**不许有这样的会话**；写了主机名的 Profile 另给第二道防线（监听器的用例里加一行 `[Host]` 钉到 `127.0.0.1`，虚拟网卡的用例用 `guarded`）。例子在 `crates/rurge-engine/tests/sniff.rs` 的 `two_policies` 与 `socks5_connect`。
+
+二、**`EngineShared.sniff_wait`**（`crates/rurge-engine/tests/common/mod.rs`）：只供测试调短嗅探的等待，缺省是 `rurge_http::sniff::SNIFF_WAIT`（15 秒，`EngineShared::new` 给的），不进命令行与环境变量；交给 `harness_with` 时用 `EngineShared { sniff_wait: Duration::from_millis(300), ..EngineShared::default() }`（`sniff.rs` 的 `sniffing()`）。端到端用例用 300 毫秒；**要等满缺省 15 秒的只有一条**：`a_stop_during_the_wait_ends_a_tun_session_at_once`（它证明的是“停止结束了等待”，不是“15 秒到了”，所以不能用调短的时限）。
+
+三、**讲“拨号之后才答”的现有用例改用不嗅探的端口**（计划 P9，设计第 14 节第 6 条）：经 SOCKS5、`CONNECT` 与虚拟网卡连 80、443 的现有用例里，断言应答码、错误页、被拒时的关闭，或客户端不先发字节就等结果的，目标端口改成不嗅探的（443 → 8443，80 → 8080），写到这个端口的地方（`dst`、规则）随之改，断言不改，改的地方加一行英文注释（例如 `// 8443 is not sniffed (phase 4 M1 design 4.1): the answer still waits for the dial`）。改了哪六处见 M1a 记录第 12 行与第 29 行（`tests/outbounds.rs` 两条、`tests/pipeline.rs` 两条、`tests/process.rs` 一条、`tests/tun.rs` 一条）；客户端先发字节的用例照过。新行为（先答后读）由 `crates/rurge-engine/tests/sniff.rs` 的用例钉住。
+
+四、**带等待的嗅探用例提交前各自单独循环跑二十次以上**（全过才算数）：`rurge-http` 的 `sniff::tests`（任务 2 的 13 条，修正第 1 轮之后是 14 条）、`rurge-inbound` 的 `hold::tests` 四条与 SOCKS5 的 `a_dropped_sniffable_session_is_held_after_the_answer`、`the_default_serve_cancels_the_session_at_the_stop`（任务 4）、`rurge-tun` 的 `tests::outcomes::serve` 三条（任务 5）、整个 `sniff` 二进制（任务 6 时 5 条、任务 7 时 21 条，各循环一轮），以及修正轮里改过等待的那一条（`extended_matching_rules_a_tls_session_by_its_sni`）。日志在工作区（git 忽略），命令行见 M1a 记录第 19、21、25、27、30、31、33、34 行。
+
+五、`CLAUDE.md`「测试约定」里没有要随之改的句子：M1a 的规矩都是上面几条的具体做法（第二道防线、有界等待、循环跑二十次），那几节已经写着。
