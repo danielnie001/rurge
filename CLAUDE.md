@@ -105,7 +105,7 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 
 所有用例只在一台 Windows 11 x86-64 的开发机上跑过。
 
-- 测试二进制偶发以 `STATUS_HEAP_CORRUPTION` 退出：来自开发机的终端管控软件注入的钩子 DLL，不是 rurge 或其依赖的缺陷（M8 设计 3.5），单独重跑那个二进制。`STATUS_ACCESS_VIOLATION` 见过一次（`rurge-api` 的测试二进制），单独重跑通过，原因没有查明（阶段 3 / M1 计划延后第 12 行）。
+- 测试二进制偶发以 `STATUS_HEAP_CORRUPTION` 退出：来自开发机的终端管控软件注入的钩子 DLL，不是 rurge 或其依赖的缺陷（M8 设计 3.5），单独重跑那个二进制。`STATUS_ACCESS_VIOLATION` 见过两次，两次的原因都没有查明：第一次是 `rurge-api` 的测试二进制，单独重跑通过（阶段 3 / M1 计划延后第 12 行）；第二次是阶段 4 / M1b 任务 8 的 `--test http` 循环，没有结果行，之后几次都全过（M1b 计划「执行期修正记录」第 81 行）。
 - rustc 1.89 在增量编译里出过内部编译器错误：删掉出错的那一个编译目标在 `target/debug/incremental/` 下的目录（可再生的缓存）再编译。
 - 回环的 TCP / UDP 7、9、13、17、19 号端口开着（Windows 的 Simple TCP/IP Services），CI 上关着，所以测试不能假定任何固定端口的状态；关着的回环端口在 Windows 上约 2 秒才拒绝连接，在 Linux / macOS 上立刻拒绝。
 - 分临时端口的区间不是 Windows 的缺省（49152–65535）：`bind("127.0.0.1:0")` 拿到过 7442（2026-10-29，阶段 3 / M6 任务 8a），上下界没有查。测试约定的 20000–29999 在 Linux、macOS 与 Windows 缺省的区间之外，在这台机器上不一定：那样取的端口在这里偶发“地址已被占用”时，先想到这一条。

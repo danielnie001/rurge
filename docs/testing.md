@@ -174,7 +174,7 @@ cargo test -j 8 --workspace --lib -- hold::   # 阶段 4 / M1a，`rurge-inbound`
 cargo test -j 8 --workspace --lib -- sniffable   # 阶段 4 / M1a，`rurge-inbound` 两个监听器的先答后交（5 条）：SOCKS5 与 `CONNECT` 先答、再交给 `serve`，停留与转发的用例；`rurge-tun` 的 `tests::outcomes::serve::a_sniffable_connection_is_served_with_the_tuns_holds` 也带这个词，所以这一条过滤词会多一条
 cargo test -j 8 --workspace --lib -- outcomes::serve   # 阶段 4 / M1a，`rurge-tun`（3 条）：可嗅探的会话整个交给 `serve`，拿到的 `ServeOpts` 是 TUN 的 `drop_hold` / `linger` 与停止令牌，缺省 `serve` 真的拨了号，停止到得了
 cargo test -j 8 --workspace --test sniff   # 阶段 4 / M1a，经引擎的嗅探端到端（21 条；`EngineShared.sniff_wait` 300 毫秒，只有一条用缺省的 15 秒、不调短（`a_stop_during_the_wait_ends_a_tun_session_at_once`：让停止落在等待之中，不等满））：三种入口上的 SNI 与协议、`PROTOCOL` 在拨号之前、三个设置、预匹配与暂停、服务器先说话、前缀不丢、计数
-cargo test -j 8 --workspace --lib -- engine::tests::   # 阶段 4 / M1b，`rurge-http` 的引擎本体（30 条）：每个请求的流程、守卫、应答正文的包装、逐跳的头、拒绝与失败、504 与两个页开关、借来的连接上的重发、升级与隧道里的 `CONNECT`；`rurge-rules` 里同名的 `engine::tests` 也会连带跑（9 条，无妨）
+cargo test -j 8 --workspace --lib -- engine::tests::   # 阶段 4 / M1b，`rurge-http` 的引擎本体（30 条）：每个请求的流程、守卫、应答正文的包装、逐跳的头、拒绝与失败、504 与两个页开关、借来的连接上的重发、升级与隧道里的 `CONNECT`；这个过滤词一共选中 102 条：除了 `rurge-http` 的 30 条，还连带 `rurge-engine` 的 9 条与 `rurge-rules` 的 63 条（`engine::tests` 51 条，`engine::tests::pre_match` 12 条）
 cargo test -j 8 --workspace --test http   # 阶段 4 / M1b，经引擎的明文 HTTP 端到端（36 条）：四种入口、每条客户端连接的池与借来的连接、字节只数上游一侧、WebSocket、chunked、`Expect: 100-continue`、重发的两种情形、终止与停止、承载连接的记录、记录与会话日志的新字段、`requests` 的计数
 # 阶段 3 / M5 重跑的基准读数（一台机器上的一次运行、**不是 CI**；release，`TUN_BENCH_FAR=memory`；命令仍是上面 B1 / B2 / b3 那三条）：B1 八个量出来的行都过 0.7 Gbit/s 的线（最低的一行 4.065，是线的 5.8 倍），四个计数都是 0，中位数上行 8.03、下行 4.84 Gbit/s（两个 MTU 混在一起，只作量级）；同设置（MTU 1500、`tx_max` 256 KiB）的 5.717 / 5.172 是上一次的 79.7% 与 94.7%。B2 门槛读数（峰值减去全部测试一侧的项）403,671,140 字节（403.7 MB / 385.0 MiB），在线 429,000,000 字节以内、余量 25.3 MB；保守读数（只减去准的应用端套接字缓冲）445,333,604 字节（445.3 MB），超线 16.3 MB——这个读数照旧归项目所有者，这里只记数。b3 中位数 0.9 微秒、p99 2.9 微秒，最大 4542.2 微秒（4.5 ms，落在第 28,673 个查询上，是线的 22.7 倍，两处都是池的 `HashMap` 的翻倍处，读代码与算术得出）。细节与上一次不同的原因见计划「执行期修正记录」第 61 ～ 63 行
 cargo insta test -p rurge-config --review       # 语料库快照有变化时审阅
@@ -362,8 +362,8 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 
 六、**kill 与停止之前等源站收到请求**（M1b 记录第 63、74 行）：`TestServer` 先记下请求再按 `set_delay` 等，所以 `origin.requests().len() == 1` 才是“请求已经到了上游”；记录在拨号之前就有，等“有一条活动的记录”会让 kill 落在拨号或发请求时。
 
-七、**代理端口上的 fake 地址用 `listener_rules`**（`crates/rurge-engine/tests/common/tun.rs`，M1b 记录第 60 行）：除了那条按地址的规则，上游的端口也拒，反查或“反查不到就拒”一回落，请求也不会拨到回环之外。
+七、**代理端口上的 fake 地址用 `listener_rules`**（`crates/rurge-engine/tests/common/tun.rs`，M1b 记录第 60 行）：那个夹具的规则有三行——`DOMAIN,target.test,DIRECT` 把名字放过去；之后 `IP-CIDR,198.18.0.0/15,REJECT,no-resolve` 拒掉 rurge 的整个 fake 地址段；`DEST-PORT,<上游端口>,REJECT` 拒掉上游的端口。没被反查成名字的地址被后两行拒掉，到不了夹具末尾的 `FINAL,DIRECT`；所以即使反查那一步、或“反查不到就拒”那一步退回去了，请求也不会被拨到回环之外（`tun_dns.rs` 开头的说明也是这个意思）。
 
 八、**规则里回环之外的地址段只写 `REJECT`**（M1b 记录第 79 行）：`IP-CIDR,10.0.0.0/8,REJECT` 逼求值去查地址，但不能写成可能被拨的目标。
 
-九、**带等待的引擎用例提交前各自单独循环跑二十次以上**（全过才算数）：`crates/rurge-engine/tests/http.rs` 整个二进制（36 条）、`--test sniff`、`crates/rurge-http` 的 `engine::tests`（与 `rurge-rules` 里同名的 9 条）与 `pool::tests`；`--test api` 里新加的那一条（`requests_carry_the_method_the_url_and_the_status_code`）也单独循环过。日志在工作区（git 忽略），命令行见 M1b 记录第 23、27、34、35、43、48、59、78 行。
+九、**带等待的引擎用例提交前各自单独循环跑二十次以上**（全过才算数）：`crates/rurge-engine/tests/http.rs` 整个二进制（36 条）、`--test sniff`、`crates/rurge-http` 的 `engine::tests`（那个过滤词一共选中 102 条：`rurge-http` 30、`rurge-engine` 9、`rurge-rules` 63）与 `pool::tests`；`--test api` 里新加的那一条（`requests_carry_the_method_the_url_and_the_status_code`）也单独循环过。日志在工作区（git 忽略），命令行见 M1b 记录第 23、27、34、35、43、48、59、78 行。

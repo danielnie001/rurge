@@ -74,15 +74,21 @@
 {"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0},"requests":0}
 ```
 
-`requests` 是走到选路的请求数（设计第 11 节，计划 P19）：嗅探到的连接、监听器的绝对形式与虚拟网卡三种入口都走 `ConnUpstreams::route`，在那里加一，**被拒的请求也算**（`REJECT` 一族是拨号时才生效的）；读不出请求头的连接（发半个头就关、请求头超时、假地址反查不到）不算——它在承载连接的记录里（见下）。自进程启动起累计，重载不清零。`sniffed` 的五个数的意思不变（见「M1a」）。用例：`the_requests_are_counted`（`crates/rurge-engine/tests/http.rs`：嗅探到的连接上两个请求、监听器上一个被 `REJECT` 的请求，`requests` 是 3）、`the_sniffs_are_counted`（那段里的一个请求）与 `rurge_http_counts_start_at_zero`（零与键序，`crates/rurge-api/tests/api.rs`）。
+`requests` 是走到选路的请求数（设计第 11 节，计划 P19）：嗅探到的连接、监听器的绝对形式与虚拟网卡三种入口都走 `ConnUpstreams::route`，在那里加一，**被拒的请求也算**（`REJECT` 一族是拨号时才生效的）。自进程启动起累计，重载不清零。`sniffed` 的五个数的意思不变（见「M1a」）。
+
+**不算的：一个请求也没走到选路的连接**，包括两类。一是读不出请求头的：发半个头就关、读不懂、请求头超时。二是**目的地**是反查不到名字的 fake 地址的连接：`serve_http` 在读任何请求之前就以 `fake address not known` 结束承载连接（`crates/rurge-engine/src/serve.rs` 的 `Turned::Unknown`）。这两种都在承载连接的记录里（见下）。
+
+**算的：HTTP 监听器上绝对形式的请求，请求行里的主机是反查不到名字的 fake 地址**——`rurge-http` 先 `route`（计数就在那里），再看反查的结果（`crates/rurge-http/src/engine.rs` 的 `prepared.unknown`）；那个请求有自己的记录，结果是 `fake address not known`（`show-error-page` 开着时答 502，关着时不答就关），承载连接不另记。两条路次序不同，出处是设计第 21 节第 10 条与延后第 3 行。
+
+用例：`the_requests_are_counted`（`crates/rurge-engine/tests/http.rs`：嗅探到的连接上两个请求、监听器上一个被 `REJECT` 的请求，`requests` 是 3）、`the_sniffs_are_counted`（那段里的一个请求）与 `rurge_http_counts_start_at_zero`（零与键序，`crates/rurge-api/tests/api.rs`）。
 
 ### 请求记录
 
 引擎里的明文 HTTP **一个请求一条记录**（不再是一条连接一条，设计第 10.1 节）。记录（`RequestRecord`）与它的 JSON（`RequestJson`）在 `protocol` 之后多三项，次序就是 `method`、`url`、`statusCode`：
 
 - `method`：请求的方法名（`GET`、`POST` 等）；
-- `url`：去掉 userinfo、**留着查询串**（总设计 Q1 的临时做法），源站形式的请求由 `Host` 头重建（`http://主机[:端口]/路径`），绝对形式的就是请求行里的那个，主机是 fake 地址时先换成它的名字；嗅探到的连接上的 `CONNECT` 没有 URL，是 `null`；
-- `statusCode`：答给客户端的状态码；引擎自己答的拒绝页（`REJECT` 一族开着 `show-error-page-for-reject` 时是 403）与错误页（502、504）是它答的码；没答就把连接关了的（页关着的拒绝与失败）是 `null`。
+- `url`：去掉 userinfo、**留着查询串**（总设计 Q1 的临时做法），源站形式的请求由 `Host` 头重建（`http://主机[:端口]/路径`），绝对形式的就是请求行里的那个，主机是 fake 地址时先换成它的名字；源站形式的请求没有 `Host` 头（或读不懂）时，用连接的目标拼（`crates/rurge-http/src/engine.rs` 的 `form_of` 最后一支）；嗅探到的连接上的 `CONNECT` 没有 URL，是 `null`；
+- `statusCode`：答给客户端的状态码，按拒绝的种类分开（`crates/rurge-http/src/engine.rs` 的 `answer`）：`REJECT` 与 `REJECT-NO-DROP` 开着 `show-error-page-for-reject` 时是 403 页，关着时不答就关、是 `null`；`REJECT-TINYGIF` 不看开关，答那一像素的 GIF、记 200；`REJECT-DROP` 停一会儿再关、是 `null`；失败与等应答头超时的错误页（502、504）要 `show-error-page` 开着，关着时不答就关、是 `null`。
 
 不是 HTTP 请求的会话，三项都是 `null`。用例 `a_request_record_has_its_method_url_and_status`（200、403 与一个被关连接而 `statusCode` 为 `null` 的请求）、`a_url_with_userinfo_is_recorded_without_it`，以及 `crates/rurge-api/tests/api.rs` 的 `requests_carry_the_method_the_url_and_the_status_code`（键序与 `null`）。
 
@@ -91,11 +97,12 @@
 - `remoteAddr`：借来的连接是那条连接拨号时记下的地址（设计第 8.4 节），所以经引擎的 HTTP 请求**借来的连接也有**——这是 `docs/api/phase1.md`「`remoteAddr`」一条里“复用已有连接的会话没有”在 HTTP 上的那一半；用例 `a_borrowed_connection_records_where_it_went`。
 - `connectMs`：借来的连接是从请求开始到借到为止；真拨号照旧。`firstByteMs`：从就绪（自己拨好或借到）到读到第一个应答字节。
 - `up` / `down`：这个请求在所用上游连接上写出与读到的字节（请求头与正文、应答头与正文，升级之后的转发也算），与按原样转发的会话一样**只数上游一侧**；客户端一侧的头不计入任何一条（设计第 13 节第 5 条）。用例 `each_request_counts_its_own_bytes`（两个应答 100 与 5000 字节、借同一条连接）。
-- `notes`、`rule`、`policy`、`dst`、`pid`、`processPath`、`listenPort`、`dnsMs` 照旧；`notes` 的四种写法没有新的。
+
+别的字段没有变：`notes`、`rule`、`policy`、`dst`、`pid`、`processPath`、`listenPort`、`dnsMs` 照旧，`notes` 的四种写法也没有新的。
 
 ### 承载连接的记录
 
-进引擎的客户端连接自己那个句柄建好时不登记（不在活动列表里，结束时不自动写日志与记录）：连接结束时**一个请求也没有走到选路**才补一条记录——发半个头就关、读不懂、请求头超时、fake 地址反查不到这几种，结局是失败、原因照实写（如 `client closed the connection`、`fake address not known`），会话日志的级别照旧（失败在 INFO，不带路径）。走到过选路的连接不另记：它的请求各有记录。所以 `requests` 为零的连接不一定没有记录。用例 `a_connection_that_never_reaches_the_rules_leaves_one_failed_record`、`a_connection_whose_requests_were_routed_leaves_no_record_of_its_own`、`the_carrier_connection_is_recorded_only_when_nothing_was_routed`。
+进引擎的客户端连接自己那个句柄建好时不登记（不在活动列表里，结束时不自动写日志与记录）：连接结束时**一个请求也没有走到选路**才补一条记录——发半个头就关、读不懂、请求头超时，以及连接的目的地是反查不到名字的 fake 地址（这一种在读请求之前就结束）——结局是失败、原因照实写（如 `client closed the connection`、`fake address not known`），会话日志的级别照旧（失败在 INFO，不带路径）。走到过选路的连接不另记：它的请求各有记录。所以 `requests` 为零的连接不一定没有记录。HTTP 监听器上绝对形式的请求里反查不到名字的 fake 地址**不在此列**：它有自己的记录（见上面 `requests` 一节）。用例 `a_connection_that_never_reaches_the_rules_leaves_one_failed_record`、`a_connection_whose_requests_were_routed_leaves_no_record_of_its_own`、`the_carrier_connection_is_recorded_only_when_nothing_was_routed`。
 
 ### 日志
 
