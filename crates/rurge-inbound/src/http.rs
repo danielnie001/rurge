@@ -37,10 +37,10 @@ struct Ctx {
     here: Option<SocketAddr>,
     peer: SocketAddr,
     tracker: TaskTracker,
-    /// The connection's `Conn::abort`, built by the HTTP engine's object for
-    /// this connection: cancelled when it needs the connection gone at once,
-    /// and raced against the connection below (`phase 4 M1 design 8.10`,
-    /// 8.11).
+    /// The connection's `Conn::abort`: made here, once for every accepted
+    /// connection, and handed to the engine with `ClientConn`. The engine
+    /// cancels it when the connection has to go at once; the listener races
+    /// the connection against it below (`phase 4 M1 design 8.10`, 8.11).
     abort: CancellationToken,
     /// The engine's requests of this connection, asked for when its first
     /// absolute-form request arrives (`P12`): a connection that only ever

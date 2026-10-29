@@ -848,7 +848,7 @@ async fn the_listener_rewrites_a_plain_request_for_the_origin() {
     origin.set_header("/hello", "x-down", "leaked");
     let port = origin_addr(&origin).port();
     let h = harness(Profile {
-        rules: "URL-REGEX,ad\\.gif$,REJECT-TINYGIF\nFINAL,DIRECT",
+        rules: "URL-REGEX,ad\\.gif$,REJECT-TINYGIF",
         ..Profile::default()
     })
     .await;
@@ -891,6 +891,10 @@ async fn the_listener_rewrites_a_plain_request_for_the_origin() {
                 .to_ascii_lowercase()
                 .contains("content-type: image/gif"),
         "{second}"
+    );
+    assert!(
+        second.to_ascii_lowercase().contains("content-length: 43"),
+        "the one-pixel gif, whole: {second}"
     );
     drop(s);
 
@@ -1001,8 +1005,12 @@ async fn a_plain_request_is_killable() {
     )
     .await
     .unwrap();
-    wait_until("the request to reach its upstream", || {
-        !h.engine.request_log().active().is_empty()
+    // The origin notes the request before it waits out the delay: this waits
+    // for the answer to be held back, not merely for the record to exist —
+    // that one is there before the dial, and the kill has to land on a
+    // request whose upstream is waiting.
+    wait_until("the origin to hold the answer back", || {
+        origin.requests().len() == 1
     })
     .await;
     let id = h.engine.request_log().active()[0].id;
@@ -1025,8 +1033,13 @@ async fn a_plain_request_is_killable() {
 
 /// A client that leaves in the middle of its upload is no failure of
 /// upstream's (design 8.6): the record says the client left, and the `smart`
-/// member the request went through is not counted as failing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// member the request went through is not counted as failing. One thread, on
+/// purpose: `SessionHandle::finish` runs every hook before it returns — the
+/// record's, hung when the session was made, and `smart::watch`'s, hung at
+/// the dial — so a record the test can see means the member has been told
+/// too. On several threads the test could read between the two and stay
+/// green even if the client's own error were counted.
+#[tokio::test]
 async fn a_client_leaving_mid_upload_is_no_upstream_failure() {
     // an HTTP proxy that reads the request and never answers
     let rude = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1069,8 +1082,8 @@ async fn a_client_leaving_mid_upload_is_no_upstream_failure() {
     let records = the_records(&h, 1).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
-    // the record is finished before the member's watchdog looks, so the
-    // client's own error must not be there: the member is not at fault
+    // every hook has run before the record was there (see the test's
+    // comment); the client's own error must not be among them
     let registry = h.engine.registry();
     let failed = registry
         .auto()
@@ -1146,13 +1159,16 @@ async fn an_ipv4_mapped_url_host_is_dialed_as_ipv4() {
 /// The fake address of a name, named in a listener request's URL and `Host`,
 /// is the name before anything else sees it: the rules, the record and the
 /// origin's `Host`, and a lease holds the address until the request ends
-/// (design 9, R27).
+/// (design 9, R27). The rules are the proxy port's own (plan P24): were the
+/// address not turned back, the `FINAL,DIRECT` after them must not take it to
+/// a dial outside the loopback. No `guarded` is needed: the request comes in
+/// at the listener, from the loopback, not from the app's address.
 #[tokio::test]
 async fn a_fake_address_in_a_plain_request_is_turned_back_into_its_name() {
     let origin = TestServer::spawn().await;
     origin.set("/x", "a body");
     let port = origin_addr(&origin).port();
-    let rig = Rig::new(profile(&guarded("DOMAIN,target.test,DIRECT"))).await;
+    let rig = Rig::new(profile(&listener_rules(port))).await;
     let (fake, _) = rig.fakes("target.test");
 
     let answer = plain_get(
@@ -1189,13 +1205,16 @@ async fn a_fake_address_in_a_plain_request_is_turned_back_into_its_name() {
 /// An address of rurge's space with no name behind it fails the listener's
 /// request, which says so and dials nothing (design 9). Unlike a `CONNECT`,
 /// the rules see the request first — they are asked before the address is
-/// known to be nameless — so the record carries whatever rule matched it.
+/// known to be nameless — so the record carries the rule that matched it.
+/// That rule refuses the address, but a REJECT is a refusal of the dial
+/// (`route_session` does not refuse it), and the namelessness is decided
+/// after the rules and before the dial: hence the 502, and no dial.
 #[tokio::test]
 async fn an_unknown_fake_address_in_a_plain_request_is_a_502() {
     let origin = TestServer::spawn().await;
     origin.set("/x", "a body");
     let port = origin_addr(&origin).port();
-    let rig = Rig::new(profile("DOMAIN,target.test,DIRECT")).await;
+    let rig = Rig::new(profile(&listener_rules(port))).await;
 
     let answer = plain_get(
         rig.h.http(),
@@ -1220,11 +1239,17 @@ async fn an_unknown_fake_address_in_a_plain_request_is_a_502() {
         "{records:?}"
     );
     assert!(records[0].remote_addr.is_none(), "nothing was dialed");
+    assert_eq!(
+        records[0].rule.as_deref(),
+        Some("IP-CIDR,198.18.0.0/15,REJECT,no-resolve"),
+        "the rules saw the request before the address was found nameless: {records:?}"
+    );
 }
 
-/// An origin that answers 200 with a body of `total` bytes and keeps writing
-/// until the client goes: `TestServer` serves a body whole, which a client
-/// that never reads would take at once.
+/// An origin that answers 200 with a body of `total` bytes and writes them,
+/// stopping at whatever the client's buffers will not take, then reads until
+/// the client goes: `TestServer` serves a body whole, which a client that
+/// never reads would take at once.
 async fn streaming_origin(total: usize) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1271,7 +1296,13 @@ async fn streaming_origin(total: usize) -> SocketAddr {
 /// killed one.
 #[tokio::test]
 async fn a_killed_plain_request_whose_client_does_not_read_is_closed() {
-    let origin = streaming_origin(4 * 1024 * 1024).await;
+    // 256 MiB: more than both sides' socket buffers can take on any host (the
+    // Linux loopback's `tcp_rmem`/`tcp_wmem` maxima are 6 and 4 MiB by default,
+    // 16 to 32 MiB on a tuned one; macOS about 4 MiB each). Were the body to
+    // fit, the request would complete instead of waiting on the client. The
+    // origin writes only while the client's buffers take it, so the size costs
+    // no memory.
+    let origin = streaming_origin(256 * 1024 * 1024).await;
     let port = origin.port();
     let h = harness(Profile::default()).await;
     let mut s = TcpStream::connect(h.http()).await.unwrap();

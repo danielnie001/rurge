@@ -39,6 +39,15 @@ pub fn profile(rules: &str) -> Profile<'_> {
     }
 }
 
+/// The rules for what comes in at a proxy port: the name `target.test` goes to
+/// `DIRECT`, and after that all of rurge's space and the port of the upstream
+/// are refused (plan P24).
+pub fn listener_rules(upstream_port: u16) -> String {
+    format!(
+        "DOMAIN,target.test,DIRECT\nIP-CIDR,198.18.0.0/15,REJECT,no-resolve\nDEST-PORT,{upstream_port},REJECT"
+    )
+}
+
 /// An engine with a TUN on a memory device, the app's stack on the other end
 /// of it, and the pinger the TUN was started with.
 pub struct Rig {

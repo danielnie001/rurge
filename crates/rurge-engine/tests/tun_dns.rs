@@ -110,15 +110,6 @@ async fn quiet(udp: &mut UnboundedReceiver<Vec<u8>>) {
     );
 }
 
-/// The rules for what comes in at a proxy port: the name `target.test` goes to
-/// `DIRECT`, and after that all of rurge's space and the port of the upstream
-/// are refused (plan P24).
-fn listener_rules(upstream_port: u16) -> String {
-    format!(
-        "DOMAIN,target.test,DIRECT\nIP-CIDR,198.18.0.0/15,REJECT,no-resolve\nDEST-PORT,{upstream_port},REJECT"
-    )
-}
-
 /// `CONNECT authority` to the proxy at `proxy`, and the start of the answer,
 /// `HTTP/1.1 502` for one; an error where the proxy closes without one.
 async fn connect_answer(proxy: SocketAddr, authority: &str) -> io::Result<String> {
