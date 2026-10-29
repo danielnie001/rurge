@@ -21,7 +21,7 @@ pub use listener::{HttpAuth, ListenerOpts, Running};
 pub use process::ProcessSlot;
 pub use responses::{BoxError, ResponseBody};
 pub use session::{
-    Counting, DialError, Dialed, Dialer, FailKind, ServeOpts, SessionHandle, SessionOutcome,
+    Close, Counting, DialError, Dialed, Dialer, FailKind, ServeOpts, SessionHandle, SessionOutcome,
     UdpAdmission, UdpClient,
 };
 pub use socks5::Socks5Listener;

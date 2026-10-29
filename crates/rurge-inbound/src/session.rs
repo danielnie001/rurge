@@ -7,6 +7,7 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, Target};
 use rurge_net::trail::Trail;
 use rurge_proto::RejectKind;
+use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,6 +23,20 @@ pub enum SessionOutcome {
     Rejected(RejectKind),
     Failed(String),
 }
+
+/// Returned from a request handler to make hyper close the connection without
+/// answering it: the request was rejected or failed with no page to show, or
+/// it was dropped and its hold is over (`phase 4 M1 design 8.8`, `P13`).
+#[derive(Debug)]
+pub struct Close;
+
+impl fmt::Display for Close {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("connection closed by policy")
+    }
+}
+
+impl std::error::Error for Close {}
 
 type FinishHook = Box<dyn FnOnce(&SessionHandle, &SessionOutcome) + Send>;
 type FirstByteHook = Box<dyn FnOnce(&SessionHandle) + Send>;
