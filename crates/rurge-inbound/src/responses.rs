@@ -6,7 +6,13 @@ use http::{Response, StatusCode, header};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 
-pub type ResponseBody = BoxBody<Bytes, hyper::Error>;
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// What rurge answers with: bytes, and an error of any kind. The pages and
+/// the 1×1 gif below have no error to report; the engine's own bodies (the
+/// idle timeout of a request, say) do, which is why the error is not
+/// `hyper::Error` alone (`phase 4 M1 design 8.7`).
+pub type ResponseBody = BoxBody<Bytes, BoxError>;
 
 /// A 1×1 transparent GIF (43 bytes).
 pub const TINY_GIF: [u8; 43] = [

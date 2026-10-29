@@ -2,7 +2,7 @@
 //! absolute-URI plain requests, Basic authentication, per-request dialing.
 
 use crate::listener::{HttpAuth, ListenerOpts, Running, bind, canonical_peer, serve};
-use crate::responses::{self, ResponseBody};
+use crate::responses::{self, BoxError, ResponseBody};
 use crate::session::{
     Counting, DialError, Dialed, Dialer, FailKind, ServeOpts, SessionHandle, SessionOutcome,
 };
@@ -559,7 +559,7 @@ async fn forward(
                 );
             }
             strip_hop_by_hop(resp.headers_mut());
-            Ok(resp.map(|body| body.boxed()))
+            Ok(resp.map(|body| body.map_err(BoxError::from).boxed()))
         }
         Err(e) => {
             // no response head: upstream gave up while the client waits —

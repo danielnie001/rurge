@@ -45,6 +45,11 @@ pub struct SessionHandle {
     connected: OnceLock<Duration>,
     /// Since `started`: when the first byte came back from upstream.
     first_byte: OnceLock<Duration>,
+    /// The method of the HTTP request this session is a request of, and the
+    /// status rurge answered it with (`phase 4 M1 design 8.3, 10.1`). Only the
+    /// first of each counts; a session that is no HTTP request has neither.
+    method: OnceLock<String>,
+    status: OnceLock<u16>,
     on_first_byte: Mutex<Vec<FirstByteHook>>,
     /// Upstream ended, before sending anything, while the client was still
     /// there (`mark_upstream_failed`).
@@ -100,6 +105,8 @@ impl SessionHandle {
             down: AtomicU64::new(0),
             connected: OnceLock::new(),
             first_byte: OnceLock::new(),
+            method: OnceLock::new(),
+            status: OnceLock::new(),
             on_first_byte: Mutex::new(Vec::new()),
             upstream_failed: AtomicBool::new(false),
             client_gone: AtomicBool::new(false),
@@ -203,6 +210,34 @@ impl SessionHandle {
     }
     pub fn protocol(&self) -> Option<ProtocolKind> {
         *self.protocol.lock().expect("session protocol")
+    }
+
+    /// The method of the HTTP request this session is a request of: it goes
+    /// into the request record and the session log (`phase 4 M1 design 8.3,
+    /// 10.1`). Only the first call counts; a session that is no HTTP request
+    /// has none.
+    pub fn set_method(&self, method: &str) {
+        let _ = self.method.set(method.to_string());
+    }
+
+    /// The method, or `None` when it is not set (a session that is no HTTP
+    /// request).
+    pub fn method(&self) -> Option<String> {
+        self.method.get().cloned()
+    }
+
+    /// The status the request was answered with — the upstream's, or rurge's
+    /// own for a refusal or an error page: it goes into the record and the
+    /// session log (`phase 4 M1 design 8.3, 10.1`). Only the first call
+    /// counts; a session that is no HTTP request has none.
+    pub fn set_status(&self, code: u16) {
+        let _ = self.status.set(code);
+    }
+
+    /// The status, or `None` when it is not set (a session that is no HTTP
+    /// request, or one that has no answer).
+    pub fn status(&self) -> Option<u16> {
+        self.status.get().copied()
     }
 
     pub fn add_up(&self, n: u64) {
@@ -648,6 +683,20 @@ mod tests {
         let mut buf2 = [0u8; 2];
         counted.read_exact(&mut buf2).await.unwrap();
         assert!(h.first_byte_time().is_some());
+    }
+
+    /// The method and the status of an HTTP request are kept once: the first
+    /// set stands, and a session that is no HTTP request has neither.
+    #[test]
+    fn the_method_and_the_status_are_kept_once() {
+        let h = SessionHandle::new(4, SessionInfo::tcp(HostName::parse("a.test"), 80));
+        assert_eq!((h.method(), h.status()), (None, None));
+        h.set_method("GET");
+        h.set_status(204);
+        h.set_method("POST");
+        h.set_status(502);
+        assert_eq!(h.method().as_deref(), Some("GET"));
+        assert_eq!(h.status(), Some(204));
     }
 
     /// Every hook runs, once, in the order they came (M3c design 4.3: the

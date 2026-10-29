@@ -59,6 +59,9 @@ struct Route {
 struct State {
     routes: HashMap<String, Route>,
     requests: Vec<RecordedRequest>,
+    /// TCP connections accepted since the server started. `requests` counts
+    /// requests, this counts the connections they came in on.
+    connections: usize,
 }
 
 pub struct TestServer {
@@ -96,6 +99,10 @@ impl TestServer {
                     _ = &mut rx => break,
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
+                        // Counted before the connection is handed to its task,
+                        // and for TLS too: the handshake may never finish, the
+                        // connection was still made.
+                        st.lock().unwrap().connections += 1;
                         let st = st.clone();
                         let acceptor = acceptor.clone();
                         tokio::spawn(async move {
@@ -180,6 +187,13 @@ impl TestServer {
             .iter()
             .filter(|r| r.path == path)
             .count()
+    }
+
+    /// How many TCP connections were accepted, requests aside: one connection
+    /// may carry several requests (`hits` counts those), and a connection that
+    /// never sent one still counts.
+    pub fn connections(&self) -> usize {
+        self.state.lock().unwrap().connections
     }
 }
 
@@ -419,4 +433,81 @@ fn tls_acceptor() -> TlsAcceptor {
         .expect("server config");
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     TlsAcceptor::from(Arc::new(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TestServer;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// Sends `request` in one write and reads one response whole: its head
+    /// and as much body as its `Content-Length` names.
+    async fn exchange(stream: &mut TcpStream, request: &str) -> String {
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut got: Vec<u8> = Vec::new();
+        loop {
+            if let Some(want) = response_end(&got).filter(|want| got.len() >= *want) {
+                got.truncate(want);
+                return String::from_utf8(got).expect("utf-8");
+            }
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).await.expect("read");
+            assert!(
+                n > 0,
+                "the server closed the connection early:\n{}",
+                String::from_utf8_lossy(&got)
+            );
+            got.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// Where the response in `got` ends once its head is there: the head and
+    /// the body its `Content-Length` names.
+    fn response_end(got: &[u8]) -> Option<usize> {
+        let end = got.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map(|n| n.trim().parse::<usize>().expect("content length"))
+            .unwrap_or(0);
+        Some(end + length)
+    }
+
+    /// What the count is of is the TCP connection, not the request: two
+    /// connections carrying three requests between them are two.
+    #[tokio::test]
+    async fn it_counts_every_accepted_connection() {
+        let server = TestServer::spawn().await;
+        server.set("/a", "one");
+        server.set("/b", "two");
+        let port = server.url("/a").port().expect("port");
+        let talk = async {
+            let mut first = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            exchange(&mut first, "GET /a HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+            exchange(
+                &mut first,
+                "GET /b HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            let mut second = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            exchange(
+                &mut second,
+                "GET /a HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+        };
+        tokio::time::timeout(Duration::from_secs(5), talk)
+            .await
+            .expect("the two connections in time");
+        assert_eq!(server.connections(), 2);
+        assert_eq!(server.hits("/a"), 2);
+        assert_eq!(server.hits("/b"), 1);
+    }
 }

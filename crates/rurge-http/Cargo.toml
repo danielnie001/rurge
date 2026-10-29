@@ -8,9 +8,21 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rurge-config.workspace = true
+rurge-net.workspace = true
+rurge-inbound.workspace = true
+rurge-proto.workspace = true
 tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+rurge-net = { workspace = true, features = ["testing"] }
 rustls.workspace = true
 
 [lints]

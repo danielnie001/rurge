@@ -51,6 +51,16 @@ impl Trail {
         self.left().peer = None;
     }
 
+    /// Notes `addr` as the address this trail's connection went to, without a
+    /// scope: the engine calls it for a request that borrowed a pooled
+    /// connection, whose dial ran under another trail, and the record of the
+    /// request takes the address of the dial that made the connection
+    /// (`phase 4 M1 design 8.4`). An IPv4-mapped address is noted as the
+    /// IPv4 address it is, as `connected` notes one.
+    pub fn set_peer(&self, addr: SocketAddr) {
+        self.left().peer = Some(canonical(addr));
+    }
+
     /// The time spent on name lookups; `None` when none was made.
     pub fn dns(&self) -> Option<Duration> {
         self.left().dns
@@ -65,12 +75,18 @@ impl Trail {
 /// (`::ffff:a.b.c.d`) is noted as the IPv4 address it is, as the project
 /// reads it at every door. Does nothing outside a `follow`.
 pub fn connected(addr: SocketAddr) {
-    let addr = match addr.ip().to_canonical() {
-        IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
-        // as it is, scope and all
-        IpAddr::V6(_) => addr,
-    };
+    let addr = canonical(addr);
     let _ = CURRENT.try_with(|trail| trail.left().peer = Some(addr));
+}
+
+/// The address as this project notes one: an IPv4-mapped address
+/// (`::ffff:a.b.c.d`) is the IPv4 address it names; every other address is
+/// kept as it is, scope and all.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr.ip().to_canonical() {
+        IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
+        IpAddr::V6(_) => addr,
+    }
 }
 
 /// A name lookup that took `spent` ended. Does nothing outside a `follow`.
@@ -230,6 +246,21 @@ mod tests {
             })
             .await;
         assert_eq!((trail.peer(), trail.dns()), (None, None));
+    }
+
+    /// `set_peer` writes this trail's own state, from no scope at all: the
+    /// engine notes there the address of the connection a request borrowed,
+    /// whose dial ran under another trail. The mapped form is the IPv4 one,
+    /// and `clear_peer` takes it away again.
+    #[test]
+    fn set_peer_notes_the_address_on_this_trail() {
+        let trail = Trail::new();
+        trail.set_peer(addr("[::ffff:192.0.2.1]:80"));
+        assert_eq!(trail.peer(), Some(addr("192.0.2.1:80")));
+        trail.set_peer(addr("[2001:db8::1]:443"));
+        assert_eq!(trail.peer(), Some(addr("[2001:db8::1]:443")));
+        trail.clear_peer();
+        assert_eq!(trail.peer(), None);
     }
 
     /// Nothing noted is no lookup; a lookup that took no time is one.

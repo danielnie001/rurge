@@ -19,6 +19,7 @@ pub use hold::hold_dropped;
 pub use http::HttpListener;
 pub use listener::{HttpAuth, ListenerOpts, Running};
 pub use process::ProcessSlot;
+pub use responses::{BoxError, ResponseBody};
 pub use session::{
     Counting, DialError, Dialed, Dialer, FailKind, ServeOpts, SessionHandle, SessionOutcome,
     UdpAdmission, UdpClient,
