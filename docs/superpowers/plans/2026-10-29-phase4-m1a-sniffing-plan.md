@@ -367,7 +367,7 @@
    `judge` 的规则：
    - 空的前缀：`NeedMore(1)`。
    - 第一个字节是 `0x16`：TLS 一支。
-     1. 逐个记录看头（5 个字节）。头没到齐时，已到的头字节都合格就 `NeedMore`，否则 `Other`。合格是指：第 2 个字节是 `0x03`，第 3 个字节不大于 `0x04`。
+     1. 逐个记录看头（5 个字节）。头没到齐时，已到的头字节都合格就是 `NeedMore(这个记录的开头 + 5)`，否则 `Other`。合格是指：第 2 个字节是 `0x03`，第 3 个字节不大于 `0x04`。
      2. 头齐了，下面任何一条成立就是 `Other`：类型不是 `0x16`；版本不合格；长度是 0 或大于 16384。
      3. 各记录的负载依次接起来就是握手的字节；负载只到了一部分的，到的那部分也接上。
      4. 握手的字节够 4 个时：类型不是 1，`Other`；`4 + 长度` 大于 `MAX_PREFIX`，`Other`。
@@ -416,7 +416,11 @@
     - 记录版本 `0x03 0x05`；
     - 握手类型 2。
   - `no_damaged_hello_panics`：真 ClientHello 的每个字节逐个换成 `0x00`、`0xff` 与它异或 `0x80` 的值，每种都判一次，不 panic、结果不论。
-  - `a_slow_drip_is_not_judged_again_until_it_can_be`：一个记录的头加上一个负载字节 → `NeedMore` 给的是这个记录的末尾（记录不比消息长时）。
+  - `a_slow_drip_is_not_judged_again_until_it_can_be`：用真 ClientHello 的单个记录（记录不比消息长）。
+    - 记录的头的 3 个字节 → `NeedMore(5)`；
+    - 头加上一个负载字节 → `NeedMore(9)`（握手的头在这个记录里凑齐的位置）；
+    - 头加上握手的头 → `NeedMore(5 + 记录长度)`，即这个记录的末尾。
+    - `sniff` 不到这个数不再判，由评审读代码看，不另加只为数次数的东西。
 - HTTP 开头：
   - `method_tokens_are_http`：`GET `、`POST `、`M-SEARCH `、`PROPFIND `、`X_CUSTOM `，以及 20 个字符的记号加空格。
   - `pri_is_other`：`PRI * HTTP/2.0\r\n`。
