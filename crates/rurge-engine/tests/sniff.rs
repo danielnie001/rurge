@@ -328,6 +328,9 @@ async fn extended_matching_rules_a_tls_session_by_its_sni_on_every_entry() {
     // through the HTTP listener's CONNECT
     let tunnel = connect_via_http(h.http(), "target.test:443").await;
     ping_over(tunnel).await;
+    // its record is written before the adapter's session opens, so that the
+    // two records come in this order
+    the_records(&h, 1).await;
 
     // and through the adapter, whose app opens the fake address of the name
     let rig = Rig::on(h).await;
@@ -597,6 +600,7 @@ async fn force_http_engine_hosts_sniff_another_port() {
         .await
         .expect("the failed dial ends the tunnel within the bound")
         .unwrap();
+    assert!(back.is_empty(), "nothing was echoed: {back:?}");
 
     // a name without a port is port 80, so 8080 is not sniffed
     let h = harness("force-http-engine-hosts = target.test").await;
@@ -659,6 +663,7 @@ async fn pre_matching_still_refuses_before_the_answer() {
         .await
         .expect("the refusal ends the tunnel within the bound")
         .unwrap();
+    assert!(back.is_empty(), "the refusal answers nothing: {back:?}");
 }
 
 /// A paused engine refuses its sessions before it answers them, exactly as it
