@@ -11,6 +11,8 @@ use serde::Serialize;
 #[derive(Serialize)]
 pub struct HttpJson {
     pub sniffed: SniffedJson,
+    /// The requests that reached the rules, refused ones included.
+    pub requests: u64,
 }
 
 /// The outcomes of the sniffs since the engine started, in the order the
@@ -37,5 +39,6 @@ pub async fn http(State(app): State<App>) -> Json<HttpJson> {
             timeout: counts.sniffed.timeout,
             closed: counts.sniffed.closed,
         },
+        requests: counts.requests,
     })
 }

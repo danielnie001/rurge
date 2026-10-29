@@ -14,6 +14,7 @@ use rurge_inbound::{Close, ProcessSlot, ResponseBody, SessionHandle};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, Route, Target};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -117,7 +118,11 @@ impl Upstreams for ConnUpstreams {
     ) -> BoxFuture<'a, Routed<Way, PoolKey>> {
         Box::pin(async move {
             let (rt, registry) = self.engine.snapshot();
-            // phase 4 M1 design 11: counted here (task 8)
+            // Every request of every entry reaches the rules through here, the
+            // refused ones too (phase 4 M1 design 11, the phase 4 / M1b plan's
+            // P19). A connection whose requests none of them reached has no
+            // request at all, and is recorded as the connection it was.
+            self.engine.request_count.fetch_add(1, Ordering::Relaxed);
             let routed = handle
                 .trail()
                 .follow(

@@ -74,10 +74,13 @@ pub struct SniffedCounts {
 }
 
 /// The HTTP engine's counters (phase 4 M1 design 11), as `GET /v1/rurge/http`
-/// reads them. M1a has the sniffs; M1b adds the requests.
+/// reads them: the sniffs of M1a, and the requests that reached the rules
+/// since M1b.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HttpCounts {
     pub sniffed: SniffedCounts,
+    /// The requests that reached the rules, refused ones included.
+    pub requests: u64,
 }
 
 impl Engine {

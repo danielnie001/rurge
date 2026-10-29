@@ -963,6 +963,7 @@ async fn the_sniffs_are_counted() {
                 timeout: 1,
                 closed: 1,
             },
+            requests: 1,
         }
     );
 }

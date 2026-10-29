@@ -202,6 +202,10 @@ pub struct Engine {
     /// How the sniffs of this engine ended (phase 4 M1 design 7.5), what
     /// `http_counts` reads. As `fake_pool`, it outlives a reload.
     pub(crate) sniff_counts: crate::serve::SniffCounts,
+    /// The requests that reached the rules (phase 4 M1 design 11): counted by
+    /// `ConnUpstreams::route`, which every entry of the engine's requests
+    /// shares, and read by `http_counts`.
+    pub(crate) request_count: AtomicU64,
     state: OnceLock<Arc<StateStore>>,
     shared: EngineShared,
     /// Held while a registry or a whole generation is published, and while
@@ -265,6 +269,7 @@ impl Engine {
             global_warned: AtomicBool::new(false),
             fake_pool: ArcSwapOption::empty(),
             sniff_counts: crate::serve::SniffCounts::default(),
+            request_count: AtomicU64::new(0),
             state: OnceLock::new(),
             shared,
             generation: std::sync::Mutex::new(()),
@@ -1406,6 +1411,7 @@ impl Engine {
     pub fn http_counts(&self) -> crate::serve::HttpCounts {
         crate::serve::HttpCounts {
             sniffed: self.sniff_counts.snapshot(),
+            requests: self.request_count.load(Ordering::Relaxed),
         }
     }
     /// Kills an in-flight session by id (M4 `POST /v1/requests/{id}/kill`).

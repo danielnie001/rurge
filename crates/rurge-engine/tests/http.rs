@@ -2719,3 +2719,50 @@ async fn an_idempotent_request_cut_off_is_sent_again_through_the_engine() {
         "the cut-off request was sent again on a connection of its own"
     );
 }
+
+/// Every request that reaches the rules is counted, on every entry and
+/// whether it was served or refused (phase 4 M1 design 11, the phase 4 / M1b
+/// plan's P19): two on a sniffed connection, one refused on the listener.
+#[tokio::test]
+async fn the_requests_are_counted() {
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    origin.set("/b", "second");
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            // the refused name is pinned home too, so that a request which
+            // escaped the rules could not leave the loopback
+            general: "show-error-page-for-reject = true",
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            hosts: "target.test = 127.0.0.1\nads.test = 127.0.0.1",
+            rules: "DOMAIN,target.test,A\nDOMAIN,ads.test,REJECT",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+    let counts = || h.engine.http_counts().requests;
+    assert_eq!(counts(), 0, "nothing is counted yet");
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    let first = request(&mut tunnel, "target.test", "/a").await;
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    let second = request(&mut tunnel, "target.test", "/b").await;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    drop(tunnel);
+
+    // a refused request on the listener reaches the rules as well: the
+    // refusal of `REJECT` is the dial's (plan P3), after the route
+    let refused = listener_get(&h, "http://ads.test/", "ads.test").await;
+    assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+
+    let records = the_records(&h, 3).await;
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(counts(), 3, "two served requests and one refused");
+}

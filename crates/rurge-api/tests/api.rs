@@ -1117,7 +1117,8 @@ async fn rurge_http_counts_start_at_zero() {
         (
             200,
             json!({
-                "sniffed": {"tls": 0, "http": 0, "other": 0, "timeout": 0, "closed": 0}
+                "sniffed": {"tls": 0, "http": 0, "other": 0, "timeout": 0, "closed": 0},
+                "requests": 0
             })
         )
     );
@@ -1125,7 +1126,8 @@ async fn rurge_http_counts_start_at_zero() {
     assert_eq!(status, 200);
     assert_eq!(
         bytes.as_ref(),
-        br#"{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0}}"#.as_slice()
+        br#"{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0},"requests":0}"#
+            .as_slice()
     );
     assert_eq!(
         call(api.addr, "GET", "/v1/rurge/http", None, None).await,
