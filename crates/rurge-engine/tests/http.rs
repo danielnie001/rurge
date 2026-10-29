@@ -706,10 +706,11 @@ async fn the_carrier_connection_is_recorded_only_when_nothing_was_routed() {
     assert_eq!(records.len(), 3, "{records:?}");
     assert_eq!(records[1].status, RecordStatus::Completed, "{records:?}");
     assert_eq!(records[2].status, RecordStatus::Completed, "{records:?}");
-    // The only fixed wait here is for a record of the connection that came
-    // late; the connection ended well before (`the_records` saw both of its
-    // requests finish), and 300 ms is far more than the end needs to make
-    // one.
+    // The only fixed wait here is for the end of the connection the client
+    // has just closed: the two requests' records are made when their answers
+    // are sent, and the connection is ended by the engine once it reads the
+    // client's EOF. Were it to leave a record of its own, that record is made
+    // then. On the loopback that step is far shorter than the 300 ms waited.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         h.engine.request_log().recent(10).len(),
@@ -1661,10 +1662,12 @@ async fn every_entry_brings_its_requests_into_the_engine() {
     );
 }
 
-/// One upstream connection is lent to every request of its key, and the pool
-/// keeps it out of the way of a request with another key (phase 4 M1 design
-/// 8.5, `P16`): three requests of one connection reach the origin over one
-/// TCP connection, dialed once through the fake SOCKS5.
+/// One upstream connection is lent to every request of its key (phase 4 M1
+/// design 8.5, `P16`): three requests of one connection reach the origin over
+/// one TCP connection, dialed once through the fake SOCKS5. What a key that
+/// differs does is `two_requests_of_one_connection_follow_their_own_rules`,
+/// `a_reload_or_a_new_egress_table_lends_no_old_connection` and
+/// `a_select_switch_lends_no_old_connection`.
 #[tokio::test]
 async fn the_upstream_connection_is_lent_and_counted() {
     let origin = TestServer::spawn().await;
@@ -2016,7 +2019,7 @@ async fn listener_close(h: &Harness, url: &str, host: &str) -> Vec<u8> {
 /// or a close when pages are off.
 #[tokio::test]
 async fn refusals_are_answered_on_every_entry() {
-    let rules = "URL-REGEX,^http://target\\.test/r,REJECT\nURL-REGEX,^http://target\\.test/t,REJECT-TINYGIF\nIP-CIDR,10.0.0.0/8,DIRECT";
+    let rules = "URL-REGEX,^http://target\\.test/r,REJECT\nURL-REGEX,^http://target\\.test/t,REJECT-TINYGIF\nIP-CIDR,10.0.0.0/8,REJECT";
     let answered_with = |answer: &str, status: &str| {
         assert!(answer.starts_with(status), "{answer}");
     };
@@ -2614,7 +2617,11 @@ async fn expect_100_continue_is_answered() {
         "a 100 came after the refusal: {:?}",
         String::from_utf8_lossy(&rest)
     );
-    assert!(seen.lock().unwrap().len() == 1, "nothing was uploaded");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the refused request uploaded nothing: only the first request is in the origin's list"
+    );
 }
 
 /// A loopback origin that answers the first request of its first connection,
