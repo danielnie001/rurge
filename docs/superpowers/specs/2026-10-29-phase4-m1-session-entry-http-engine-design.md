@@ -547,3 +547,13 @@ M1b 的计划（`docs/superpowers/plans/2026-10-29-phase4-m1b-http-engine-plan.m
 2. **第 4.3 节与第 13 节第 1 条：探询时没有会话的进程**（协调者的裁定 R1；M1a 记录第 10 行）：`sniffable` 的预匹配探询手里没有会话的进程（求规则时的 `pre_pass` 有）。能带 `pre-matching` 的规则自己都不是 `PROCESS-NAME`，但带这个标志的 `RULE-SET` 引用的集合里可以有：这样的会话探询时不拒，照可嗅探的路先答“成功”，求规则时才被拒，客户端看到的是一个随即关闭的隧道。第 13 节第 1 条的登记因此以这一条为准——“预匹配会拒时不嗅探”说的是探询看得见的那些拒绝。
 
 3. 任务 4 ～ 8 的修正记录里没有改了本文正文意思的行（M1a 记录第 24 ～ 35 行逐行看过：都是做法、名字、注释与用例的事，或第 20 节已经写下的订正），所以这一节只有上面两条。
+
+M1b 执行时又改了下面几处。以这里为准，理由在 M1b 计划（`docs/superpowers/plans/2026-10-29-phase4-m1b-http-engine-plan.md`）「执行期修正记录」的对应行；第 20 节各条的订正照旧有效。
+
+4. **第 8.4 节：选路也在句柄的 `Trail` 之下跑**（M1b 记录第 8 行，第 21 行订正它的前提）：不只 `dial_route`，`route_session` 也在 `handle.trail().follow(…)` 里，所以选路时规则触发的解析也记进那个请求的 `dns_ms`（第 8.4 节原先只把 `Trail` 写在拨号之下；`crates/rurge-engine/tests/pipeline.rs` 的 `a_rejected_session_has_no_remote_address_but_the_lookups_of_the_rules` 断言规则触发的那次解析记在 `dns_ms` 上）。
+5. **第 8.9 节：隧道里的 `CONNECT` 与没要升级的 101**（M1b 记录第 32 行）：所述“照原样转给连接的目标”的两处具体化——`CONNECT` 的 2xx 去掉 `Content-Length`（留着它 hyper 会把整个应答作废、客户端读不到头），没要升级而答 101 的按第 8.6 节的“其余”答 502（记录 `Failed("upstream answered 101 Switching Protocols unasked")`）。
+6. **第 8.10 节：等应答头的时限从请求正文的进展起算**（M1b 记录第 28、32 行）：`Idle` 的时限在请求正文第一次被 `poll_frame` 时才起表，每交出一帧或读到末尾重新起算；重发之前 `Progress::restart` 再起一次。新拨号与重拨的时间因此不算成上传停住或应答迟到，慢慢上传的请求不会在正文发完之前拿到 504。
+7. **第 8.10、8.11 节与第 3 节的接口：客户端不再读应答时的看门狗**（M1b 记录第 28、36、50 行）：第 8.11 节只写了“被终止的、停止的、其余失败”三种结局，没有说客户端不读时谁来结束连接。实现里 `Conn` 多一个 `abort`（不是令牌的孩子，由持有连接的一方建）：看得见的三件事同时等（`biased`）——`Tail` 的退出令牌、请求的令牌、以及“上游不再给字节且距上一次进展满 `idle_timeout`”；后一件到时句柄记 `Failed("client stopped reading")` 再 `abort.cancel()`。`serve_connection` 与监听器的 `serve_connection` 都与 `abort.cancelled()` 竞速，先到就丢掉连接；`ClientConn`（第 9 节）因此多一个 `pub abort: CancellationToken`，由监听器建、随它交给引擎。
+8. **第 8.11 节：停止时第一个请求头还没读完的连接当场结束**（M1b 记录第 44 行）：hyper 1.11.1 的新连接从 `KA::Busy` 开始，`graceful_shutdown()` 只在读缓冲空着时当场关，否则只关 `KA::Idle` 的连接——半个请求头的连接会一直读到 `header_read_timeout`（嗅探到的连接是 `idle_timeout`，缺省 600 秒）。所以连接令牌先到、而这一条连接上一个请求也没走到选路（`routed() == 0`）时当场结束，不 `graceful_shutdown`；走到过选路的照第 8.11 节优雅关闭。
+9. **第 9 节与 R27：fake 地址的租约比“这个请求结束”长**（M1b 记录第 37 行）：租约不挂在监听器的局部变量里，而挂在 `ConnUpstreams` 上，因此活到这条客户端连接真正结束（升级之后转发的任务还握着它）。第 9 节写的“租约握到这个请求结束”以这一条为准。
+10. **第 9 节：反查不到名字的 fake 地址先求规则、再答 502**（M1b 记录第 56、60 行）：`rurge-http` 先 `route` 再看反查的结果，所以绝对形式的请求先求过规则（规则的命中数加一、记录带着命中的规则）再答 `fake address not known`；`CONNECT` 那一路（`Dialer::dial` 的 `Turned::Unknown`）在求规则之前就失败，记录没有规则。两路的次序不同，本里程碑没有统一。

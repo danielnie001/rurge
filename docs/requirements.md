@@ -528,6 +528,7 @@ flowchart LR
 - **范围**：FR-HTTP-01 ～ 09、10（完整）、11、13、14；FR-RULE-14。
 - **交付物**：HTTP 引擎、MITM 与 CA 工具、四种重写、Map Local、抓包存储。
 - **验收标准**：手册中每个重写示例有对应测试；主流站点 MITM 解密成功且证书固定站点给出提示；Body Rewrite 与 jq 用例通过；大小限制行为与手册一致；抓包可通过 API 读取。
+- **状态（2026-10-30）**：里程碑 M1（会话入口与明文 HTTP 引擎）分两份计划做完了：M1a（嗅探与规则之前的 SNI，2026-10-29）与 M1b（明文 HTTP 引擎，2026-10-30）——嗅探判为 HTTP 的连接与 `force-http-engine-hosts` 强制进来的非 TLS 连接进一个 hyper 写的 HTTP/1.1 引擎，每个请求各自求规则、选策略、借或拨上游连接、各有一条记录；HTTP 监听器的绝对形式请求也交给同一个引擎；记录多 `method`、`url`、`statusCode`，`GET /v1/rurge/http` 多 `requests`。**验收没有做**：M1a 与 M1b 的提交都在本地，CI 没有见过（最近一次被 CI 见过的运行仍是 `41c35d4` 上的 40824893108）；所有用例只在一台 Windows 11 x86-64 开发机上跑过（一台机器上的一次运行，不是 CI）；手工验收清单从 M2 起建，M1 的行为随它写进去；上面四条验收标准一项也没有验过（它们要的 MITM、重写、Map Local 与抓包还没有做，在 M2 ～ M6）。设计见 [`docs/superpowers/specs/2026-10-29-phase4-http-engine-design.md`](superpowers/specs/2026-10-29-phase4-http-engine-design.md) 与 M1 的细化设计 [`docs/superpowers/specs/2026-10-29-phase4-m1-session-entry-http-engine-design.md`](superpowers/specs/2026-10-29-phase4-m1-session-entry-http-engine-design.md)，计划见 [`docs/superpowers/plans/2026-10-29-phase4-m1a-sniffing-plan.md`](superpowers/plans/2026-10-29-phase4-m1a-sniffing-plan.md) 与 [`docs/superpowers/plans/2026-10-29-phase4-m1b-http-engine-plan.md`](superpowers/plans/2026-10-29-phase4-m1b-http-engine-plan.md)；交接见 [`docs/status.md`](status.md) 的阶段 4。下一步是 M2（MITM）。
 
 ### 阶段 5：脚本与模块
 
