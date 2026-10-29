@@ -321,4 +321,4 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 
 六、**计时用例提交前单独循环二十次以上**：`[IP Rewrite]` 的两组（`tests::rewrite` 与引擎的 `ip_rewrite_in_the_profile`）、写任务的两组（`tests::writer` 与 `writer_queue: 1` 的那几条）、带名字的 DNS 会话的五条（M5 记录第 49、54 行），各单独跑过二十次（M5 记录第 34、40、45、49、54 行）；日志在工作区（git 忽略）。
 
-七、**M5 没有平台代码**（设计第 1 节）：不用 `RURGE_TEST_PRIVILEGED` 与 `RURGE_TEST_WINTUN_DLL`，缺省的 `cargo test` 不建网卡、不改系统设置；全部用例只在一台 Windows 11 x86-64 的开发机上跑过，M5 的提交 CI 一个也没有见过（2026-10-28）。三个基准是唯一用 `-p` 的地方，读数在命令一节 M5 那一条注释里。
+七、**M5 没有平台代码**（设计第 1 节）：不用 `RURGE_TEST_PRIVILEGED` 与 `RURGE_TEST_WINTUN_DLL`，缺省的 `cargo test` 不建网卡、不改系统设置；M5 的用例在一台 Windows 11 x86-64 的开发机上跑过，CI 运行 40798658216（`32238be`，2026-10-29）在三个平台上跑过并通过（那一次运行在 macOS 上失败的是一条阶段 2 的互操作用例，见 `docs/status.md`「M6 推送之后的 CI」）。三个基准是唯一用 `-p` 的地方，读数在命令一节 M5 那一条注释里。

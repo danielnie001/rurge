@@ -6,9 +6,9 @@
 
 读的是一个助手：它读代码、读用例的断言、补用例；每个任务由协调者随机抽五行，照同样的三样东西（手册原句、代码、用例的断言）重读一遍。读的代码是 `7c5753e`（阶段 3 / M5 的最后一个提交）；读的过程中补的三条用例在其后的三个提交里，表里逐行写明提交（`5e00564`、`fcf9464`、`37616a0`）。
 
-CI：`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），CI 运行 40611702392 在它们编译得到的平台上都跑过并通过；M5 与 M6 加的用例（上面三个提交与 M5 自己的用例）CI 没有见过。
+CI：`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），CI 运行 40611702392 在它们编译得到的平台上都跑过并通过；M5 与 M6 加的用例（上面三个提交与 M5 自己的用例）由运行 40798658216（`32238be`，2026-10-29）第一次跑到，在它们编译得到的平台上都通过；那一次运行没有全绿，见第二部分第 8 条。
 
-没有覆盖什么：手工验收一项也没有做——第 14 节八条要真机与 CI，本文只写现有的证据；L2 特权用例（`tests/privileged/tests/linux_netns.rs` 的三条与 `crates/rurge-platform/src/tun/windows/wintun.rs` 的 `a_real_wintun_dll_passes`）写好没有运行过；M5 与 M6 的提交 CI 没有见过。判为「做了」的句子指到一条断言了这一句的用例，这不等于别处没有缺口。
+没有覆盖什么：手工验收一项也没有做——第 14 节八条要真机与 CI，本文只写现有的证据；L2 特权用例（`tests/privileged/tests/linux_netns.rs` 的三条与 `crates/rurge-platform/src/tun/windows/wintun.rs` 的 `a_real_wintun_dll_passes`）写好没有运行过；M5 与 M6 推送之后的第一次 CI 运行没有全绿（第二部分第 8 条）。判为「做了」的句子指到一条断言了这一句的用例，这不等于别处没有缺口。
 
 ### 六列（M6 设计第 4.2 节）
 
@@ -72,7 +72,7 @@ CI：`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），CI 运行 406
 5. `PROCESS-NAME` 在三个平台命中：L1 与 CI 是三个平台上查测试进程自己的用例（`crates/rurge-platform/src/procinfo/` 下 Windows / Linux / macOS 各一条 `this_process_owns_its_loopback_sockets`；Windows 另有 `the_system_process_has_no_path`（`describe(4)` 是 `("System", None)`）、`a_process_that_does_not_exist_is_not_described`（`describe(u32::MAX)` 是 `None`）、`the_addresses_of_the_machine_include_its_loopback_address` 与读连接表的四条（见第二部分第 5 条）；macOS 另有 `a_process_that_does_not_exist_is_not_described`（`u32::MAX` 与 `i32::MAX` 都是 `None`））与起真实二进制的 `crates/rurge/tests/cli.rs` 的 `a_process_rule_matches_the_test_process`（文件名、完整路径与目录前缀三种写法各命中一次，记录里的 `pid` 是本进程、`processPath` 是本二进制），CI 运行 40611702392 在三个平台上都跑过；L3 是 W11、W12、W15、M9、M11、M13、L10、L11、L13 与 P17，没有做。
 6. 性能基准达到 NFR-01 目标的 70% 以上：阶段 3 / M5 重跑的 B1、B2、b3（内存设备，一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；数字照 M5 计划「执行期修正记录」第 61 ～ 63 行）：B1 八个量出来的行都过 0.7 Gbit/s 的线，最低 4.065 Gbit/s；B2 门槛读数 403.7 MB 在 429 MB 的线内、保守读数 445.3 MB 超线 16.3 MB（归项目所有者）；b3 中位数 0.9 µs、p99 2.9 µs 在 200 µs 的线内，最大 4542.2 µs 是线的 22.7 倍。真实设备上的数没有量（总设计 Q7）。
 7. 需求逐句对照过代码、三个数照实写：就是本文第一部分（141 行、十张表），三个数与第四个数见上面的表；没有做完的五句照实写。
-8. 三平台 CI 绿：最近一次被 CI 见过的运行是 40611702392（`3a76b80`，2026-10-28，三个平台的 `check` 与 `bench` 都通过）；`3a76b80` 之后的提交（含 M5 与 M6）CI 没有见过，所以这一条要等那一次推送之后的运行。
+8. 三平台 CI 绿：M5 与 M6 推送之后的运行 40798658216（`32238be`，2026-10-29）**没有全绿**——`bench` 与 Linux、Windows 的 `check` 通过，macOS 的 `check` 只失败一条阶段 2 的互操作用例（测试夹具取端口的竞争，不是 M5、M6 的代码）；夹具修在 `41c35d4`，CI 还没有见过它，所以这一条要等 `41c35d4` 推送之后的运行。上一次全绿是 40611702392（`3a76b80`，2026-10-28）。
 
 ## 第一部分：需求逐句对照代码
 
@@ -407,8 +407,8 @@ CI：`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），CI 运行 406
 - **L1**：不适用。
 - **L2**：不适用。
 - **L3**：不适用（清单里这一行写的就是一次推送之后的 CI 运行）。
-- **CI**：最近一次被 CI 见过的运行是 40611702392（`3a76b80`，2026-10-28，三个平台的 `check` 与 `bench` 都通过）。`origin/main` 仍是 `3a76b80`，所以 **M5 与 M6 的提交 CI 没有见过**，这一条不能按现在的仓库状态算满足。
-- **还缺什么**：项目所有者推送 M5 与 M6 的提交之后的那一次运行；失败就修，再重读。
+- **CI**：M5 与 M6 的提交推送了（`32238be`，2026-10-29）。运行 40798658216 的四个任务里 `bench` 与 Linux、Windows 的 `check` 成功，**macOS 的 `check` 失败**：`cargo fmt --all --check` 与 clippy 都过，测试一步只失败一条——`-p rurge-interop --test tuic :: v5_tcp_against_sing_box`，sing-box 起来就退出（`listen udp 127.0.0.1:55875: bind: address already in use`）。照源码读出的原因在测试夹具：`tests/interop/src/lib.rs` 取参照服务端的端口时先绑 0 号端口、读号、放掉，再把号写进参照服务端的配置，号在放掉之后、sing-box 绑上之前被别的套接字拿走（测试约定不许这样取号）；不是 M5、M6 的代码，这次推送的提交没有动 `tests/`，竞争从阶段 2 起就在。夹具修在 `41c35d4`（四个取号函数改为从 20000–29999 取号、交出去之前现场试绑），**CI 还没有见过它**，所以这一条不能按现在的仓库状态算满足。上一次全绿是 40611702392（`3a76b80`，2026-10-28，三个平台的 `check` 与 `bench` 都通过）。
+- **还缺什么**：项目所有者推送 `41c35d4` 之后，那一次运行三个平台都绿；再失败就修，再重读。
 
 ## 靠手工验收的
 
@@ -440,14 +440,14 @@ CI：`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），CI 运行 406
 
 **L2 特权用例**（写好、没有运行过；要不要在 CI 上启用是总设计 Q4，归项目所有者）：`tests/privileged/tests/linux_netns.rs` 的 `a_tcp_round_trip_and_a_ping_go_through_the_adapter_and_out_direct`、`rurges_own_dns_queries_do_not_enter_the_adapter`、`a_killed_run_is_undone_by_the_next_start`，与 `crates/rurge-platform/src/tun/windows/wintun.rs` 的 `a_real_wintun_dll_passes`（要 `RURGE_TEST_WINTUN_DLL` 与一份 WireGuard LLC 签名的 `wintun.dll`）。
 
-**CI 见过的与没有见过的**：最近一次被 CI 见过的运行是 40611702392（`3a76b80`，2026-10-28，三个平台的 `check` 与 `bench` 都通过）。`3a76b80` 上就在的用例（带 `#[ignore]` 的除外），那一次运行在它们编译得到的平台上都跑过并通过；`origin/main` 仍是 `3a76b80`，所以 **`3a76b80` 之后的提交都在本地、CI 没有见过**——读 M4 的 CI 的两个文档提交、M5 与 M6 的全部；这两个时期加的用例（含本文补的三条 `5e00564`、`fcf9464`、`37616a0` 与 M5 自己的用例）也没有被它跑过。CI 的测试一步是 `cargo test --workspace --no-fail-fast`（三个平台），带 `#[ignore]` 的用例不跑（全工作区 13 条，与阶段 3 有关的是三条基准与 Windows 的 `a_lookup_with_many_connections_open`）；`bench` 任务只在 Linux 上 `cargo bench --no-run` 编 `rurge-rules` 与 `rurge-dns` 的基准，三条基准用例不在其中。
+**CI 见过的与没有见过的**：最近一次运行是 40798658216（`32238be`，2026-10-29，M5 与 M6 推送之后），**没有全绿**：`bench` 与 Linux、Windows 的 `check` 成功，macOS 的 `check` 失败一条阶段 2 的互操作用例（见第二部分第 8 条）。`32238be` 上的用例（带 `#[ignore]` 的除外；含本文补的三条 `5e00564`、`fcf9464`、`37616a0` 与 M5 自己的用例）那一次运行在它们编译得到的平台上都跑过，除那一条之外都通过，上面列的只在 Linux 或 macOS 上编译的用例也在其中——这由测试一步的结论与失败摘要推出，逐条的结果在要登录才能读的任务日志里。**`32238be` 之后的提交（修那一条用例的测试夹具的 `41c35d4`，与其后的文档提交）CI 还没有见过**。上一次全绿是 40611702392（`3a76b80`，2026-10-28）。CI 的测试一步是 `cargo test --workspace --no-fail-fast`（三个平台），带 `#[ignore]` 的用例不跑（全工作区 13 条，与阶段 3 有关的是三条基准与 Windows 的 `a_lookup_with_many_connections_open`）；`bench` 任务只在 Linux 上 `cargo bench --no-run` 编 `rurge-rules` 与 `rurge-dns` 的基准，三条基准用例不在其中。
 
 ## 留给项目所有者的
 
 下面各事的去向都是项目所有者；后来的会话不要自己定。
 
 1. **手工验收**：阶段 1（`docs/acceptance/phase1-manual.md`）、阶段 2（`docs/acceptance/phase2-manual.md`）、阶段 3（`docs/acceptance/phase3-manual.md`，172 项：W 50、M 39、L 42、P 41，按节 M1 37、M2 23、M3 19、M4 55、M5 19、M6 19）三份清单，一项也没有做过。阶段 3 的清单里被本文“真机上”一列点到 133 项（见「靠手工验收的」），L2 的四条特权用例也没有运行过。
-2. **推送与读回 CI**：`3a76b80` 之后的提交（读 M4 的 CI 的两个文档提交、M5 与 M6 的全部）都在本地，`origin/main` 仍是 `3a76b80`。推送之后要读那次运行的注解与任务摘要，把本文、「靠 CI 的」与 `docs/status.md` 里写着“CI 没有见过”的每一处改成读到的结果。
+2. **推送与读回 CI**：M5 与 M6 推送了（`32238be`），推送之后的运行 40798658216 读回了（macOS 一条互操作用例失败，见第二部分第 8 条）；修那一条的 `41c35d4` 与其后的提交还在本地。推送之后要读那次运行的注解与任务摘要，把本文第 8 条、「靠 CI 的」与 `docs/status.md`「M6 推送之后的 CI」里写着“CI 还没有见过”的几处改成读到的结果。
 3. **总设计 Q1 ～ Q8**，尤其：Q3（Wintun 的再分发要不要先向 WireGuard LLC 书面确认、发行包附不附带官方签名的 `wintun.dll`——NFR-11 的“确认”就是 #141）、Q4（L2 特权用例要不要在 CI 上启用、macOS 与 Windows 的冒烟）、Q7（NFR-01 在真实设备上怎样量、由谁量——#132、#133）、Q8（需求文档要不要为 `[IP Rewrite]` 另立一行；FR-IN-10 的 `suspend` 与 FR-OUT-11 的“UDP 443”改不改字面——#99、#104 与「有意不同的」里 `suspend` 那一行）。
 4. **对照查出的**：
    - 「需求文字的问题」4 句（#20、#32、#99、#104）：各句的需求文字或阶段栏怎么改。
