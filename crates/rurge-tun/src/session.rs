@@ -179,9 +179,9 @@ async fn dial_and_relay(
             drop_hold: serving.holds.drop_hold,
             linger: serving.holds.linger,
         };
-        // Not raced with the stop here: `serve` races its dial and its relay
-        // with `opts.stop` itself, and the relay's end is what finishes the
-        // session's handle.
+        // Not raced with the stop here: `serve` races the relay with
+        // `opts.stop` itself (the engine its sniff as well) and, as below,
+        // not the dial; the relay's end is what finishes the session's handle.
         dialer.serve(session, Box::new(stream), opts).await;
         return;
     }
