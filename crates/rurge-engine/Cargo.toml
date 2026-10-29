@@ -18,6 +18,7 @@ rurge-proto-ssh.workspace = true
 rurge-proto-wireguard.workspace = true
 rurge-policy.workspace = true
 rurge-inbound.workspace = true
+rurge-http.workspace = true
 rurge-tun.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

@@ -151,9 +151,11 @@ async fn a_rejected_tcp_connection_is_reset() {
     let rules = guarded("DOMAIN,rej.test,REJECT");
     let rig = Rig::new(profile(&rules)).await;
     let (fake, _) = rig.fakes("rej.test");
+    // 8080 is not sniffed (phase 4 M1 design 4.1): the refusal still comes
+    // before the answer
     let mut tcp = rig
         .app
-        .connect(SocketAddr::new(fake, 80))
+        .connect(SocketAddr::new(fake, 8080))
         .await
         .expect("the handshake completes");
     let mut byte = [0u8; 1];

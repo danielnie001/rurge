@@ -175,8 +175,10 @@ async fn a_refusing_upstream_is_a_502_that_quotes_the_proxy() {
     })
     .await;
     let mut s = TcpStream::connect(h.http()).await.unwrap();
+    // 8443 is not sniffed (phase 4 M1 design 4.1): the answer still waits for
+    // the dial
     s.write_all(
-        b"CONNECT target.test:443 HTTP/1.1\r\nHost: target.test:443\r\nConnection: close\r\n\r\n",
+        b"CONNECT target.test:8443 HTTP/1.1\r\nHost: target.test:8443\r\nConnection: close\r\n\r\n",
     )
     .await
     .unwrap();
@@ -437,8 +439,10 @@ async fn a_broken_hop_is_named_in_the_error() {
     })
     .await;
     let mut s = TcpStream::connect(h.http()).await.unwrap();
+    // 8443 is not sniffed (phase 4 M1 design 4.1): the answer still waits for
+    // the dial
     s.write_all(
-        b"CONNECT target.test:443 HTTP/1.1\r\nHost: target.test:443\r\nConnection: close\r\n\r\n",
+        b"CONNECT target.test:8443 HTTP/1.1\r\nHost: target.test:8443\r\nConnection: close\r\n\r\n",
     )
     .await
     .unwrap();

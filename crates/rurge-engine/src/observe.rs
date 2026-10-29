@@ -118,7 +118,11 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         },
         rule: h.rule(),
         policy: h.policy_chain(),
-        sni: h.sni(),
+        // The SNI a sniff read out of a whole ClientHello is on the session,
+        // and the one `relay` writes into the handle's slot comes from the
+        // first 8 KiB of a session that was not sniffed: the session's is the
+        // fuller of the two (phase 4 M1 design 7.2).
+        sni: s.sni.clone().or_else(|| h.sni()),
         protocol: h.protocol().or(s.protocol),
         up,
         down,

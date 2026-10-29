@@ -20,7 +20,7 @@ use rurge_config::spec::{PolicySpec, ProtoSpec};
 use rurge_dns::fakeip::FakeIpPool;
 use rurge_inbound::{
     DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts, ProcessSlot,
-    Running, SessionHandle, SessionOutcome, Socks5Listener, UdpAdmission, UdpClient,
+    Running, ServeOpts, SessionHandle, SessionOutcome, Socks5Listener, UdpAdmission, UdpClient,
 };
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedDatagram, BoxedStream, ConnectOpts, Connector, Target};
@@ -198,6 +198,9 @@ pub struct Engine {
     /// at them back into names with it (`turn_back`). Set by `start_tun` and
     /// cleared when the TUN has ended and its pool is saved.
     pub(crate) fake_pool: ArcSwapOption<FakeIpPool>,
+    /// How the sniffs of this engine ended (phase 4 M1 design 7.5), what
+    /// `http_counts` reads. As `fake_pool`, it outlives a reload.
+    pub(crate) sniff_counts: crate::serve::SniffCounts,
     state: OnceLock<Arc<StateStore>>,
     shared: EngineShared,
     /// Held while a registry or a whole generation is published, and while
@@ -260,6 +263,7 @@ impl Engine {
             suspended: ArcSwap::from_pointee(None),
             global_warned: AtomicBool::new(false),
             fake_pool: ArcSwapOption::empty(),
+            sniff_counts: crate::serve::SniffCounts::default(),
             state: OnceLock::new(),
             shared,
             generation: std::sync::Mutex::new(()),
@@ -541,6 +545,12 @@ impl Engine {
     /// engine must have been built with them.
     pub fn shared(&self) -> EngineShared {
         self.shared.clone()
+    }
+
+    /// How long a sniffable session's first bytes are waited for
+    /// (`EngineShared::sniff_wait`, phase 4 M1 design 6.3).
+    pub(crate) fn sniff_wait(&self) -> Duration {
+        self.shared.sniff_wait
     }
 
     /// Stops every `external` program still running, whatever generation
@@ -1362,6 +1372,12 @@ impl Engine {
     pub fn traffic(&self) -> &TrafficStats {
         &self.observe.traffic
     }
+    /// The HTTP engine's counters (phase 4 M1 `GET /v1/rurge/http`).
+    pub fn http_counts(&self) -> crate::serve::HttpCounts {
+        crate::serve::HttpCounts {
+            sniffed: self.sniff_counts.snapshot(),
+        }
+    }
     /// Kills an in-flight session by id (M4 `POST /v1/requests/{id}/kill`).
     pub fn kill(&self, id: u64) -> bool {
         self.observe.log.kill(id)
@@ -1698,6 +1714,19 @@ impl Dialer for Engine {
     ) -> BoxFuture<'a, ()> {
         let idle = self.runtime().idle_timeout;
         Box::pin(crate::relay::pump(client, upstream, handle, idle))
+    }
+
+    fn sniffable(&self, session: &SessionInfo) -> bool {
+        self.sniffable_session(session)
+    }
+
+    fn serve<'a>(
+        &'a self,
+        session: SessionInfo,
+        client: BoxedStream,
+        opts: ServeOpts,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.serve_sniffed(session, client, opts))
     }
 
     fn admit_udp(&self) -> UdpAdmission {

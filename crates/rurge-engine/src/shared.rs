@@ -14,6 +14,7 @@ use rustls::RootCertStore;
 use std::io;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 /// Where an outbound's connectors find the current generation's resolver.
 /// Every reload builds a new resolver (`[Host]`, the upstreams and the cache
@@ -202,6 +203,9 @@ pub struct EngineShared {
     /// what every test that is not about processes uses; `rurge run` puts
     /// the platform's here.
     pub owners: Option<Arc<dyn OwnerLookup>>,
+    /// How long a sniffable session's first bytes are waited for (phase 4 M1
+    /// design 6.3): `rurge_http::sniff::SNIFF_WAIT`. Only tests shorten it.
+    pub sniff_wait: Duration,
 }
 
 impl EngineShared {
@@ -217,6 +221,7 @@ impl EngineShared {
             externals: Arc::new(ExternalPrograms::default()),
             network: Arc::new(NetworkCell::new(NetworkFacts::default())),
             owners: None,
+            sniff_wait: rurge_http::sniff::SNIFF_WAIT,
         }
     }
 }

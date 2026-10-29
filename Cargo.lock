@@ -3307,6 +3307,7 @@ dependencies = [
  "criterion",
  "rurge-config",
  "rurge-dns",
+ "rurge-http",
  "rurge-inbound",
  "rurge-net",
  "rurge-policy",

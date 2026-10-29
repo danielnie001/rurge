@@ -596,7 +596,9 @@ async fn a_record_shows_a_process_found_after_the_session_ended() {
     // a rule that has no use for the process
     let h = engine("DOMAIN,ads.test,REJECT", &fake).await;
     let mut s = TcpStream::connect(h.http()).await.unwrap();
-    s.write_all(b"CONNECT ads.test:443 HTTP/1.1\r\nHost: ads.test:443\r\n\r\n")
+    // 8443 is not sniffed (phase 4 M1 design 4.1): the refusal still comes
+    // before the answer
+    s.write_all(b"CONNECT ads.test:8443 HTTP/1.1\r\nHost: ads.test:8443\r\n\r\n")
         .await
         .unwrap();
     let mut answer = Vec::new();

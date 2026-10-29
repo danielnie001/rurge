@@ -434,7 +434,9 @@ async fn reject_rules_close_serve_gifs_or_render_pages() {
         "unsupported policy closes like REJECT: {head}"
     );
     let mut s = TcpStream::connect(h.http()).await.unwrap();
-    let (head, _) = http_exchange(&mut s, "CONNECT ads.test:443 HTTP/1.1\r\n\r\n").await;
+    // 8443 is not sniffed (phase 4 M1 design 4.1): the answer still waits for
+    // the dial
+    let (head, _) = http_exchange(&mut s, "CONNECT ads.test:8443 HTTP/1.1\r\n\r\n").await;
     assert!(head.is_empty(), "CONNECT reject closes: {head}");
     let mut s = TcpStream::connect(h.socks()).await.unwrap();
     s.write_all(&[5, 1, 0]).await.unwrap();
@@ -442,7 +444,7 @@ async fn reject_rules_close_serve_gifs_or_render_pages() {
     s.read_exact(&mut r).await.unwrap();
     let mut req = vec![5, 1, 0, 3, 8];
     req.extend_from_slice(b"ads.test");
-    req.extend_from_slice(&443u16.to_be_bytes());
+    req.extend_from_slice(&8443u16.to_be_bytes());
     s.write_all(&req).await.unwrap();
     let mut reply = [0u8; 10];
     s.read_exact(&mut reply).await.unwrap();
@@ -1078,7 +1080,9 @@ async fn dns_failure_and_ip_rules() {
 
     // CONNECT to a name that fails DNS → 502 error page (M3b)
     let mut s = TcpStream::connect(h.http()).await.unwrap();
-    let (head, body) = http_exchange(&mut s, "CONNECT nx.test:443 HTTP/1.1\r\n\r\n").await;
+    // 8443 is not sniffed (phase 4 M1 design 4.1): the answer still waits for
+    // the dial
+    let (head, body) = http_exchange(&mut s, "CONNECT nx.test:8443 HTTP/1.1\r\n\r\n").await;
     assert!(head.starts_with("HTTP/1.1 502"), "{head}");
     assert!(String::from_utf8_lossy(&body).contains("DNS lookup failed"));
 }
