@@ -3019,3 +3019,69 @@ async fn serve_stops_waiting_for_a_connection_that_never_closes_when_the_lingeri
     );
     drop(client);
 }
+
+/// The records of HTTP requests name the method, the URL and the status the
+/// client was answered with (phase 4 M1 design 10.1, 11); the three keys come
+/// right after `protocol`, in that order. `/v1/requests/recent` is read as
+/// text for that, as `rurge_http_counts_start_at_zero` does for its keys.
+#[tokio::test]
+async fn requests_carry_the_method_the_url_and_the_status_code() {
+    let api = api().await;
+    let (head, _) = get_via_proxy(api.http(), &api.target_url()).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    // `ads.test` is REJECTed by the profile, and a reject shows no page here:
+    // the connection is closed without an answer
+    let (head, body) = get_via_proxy(api.http(), "http://ads.test/").await;
+    assert!(head.is_empty(), "{head}");
+    assert!(body.is_empty(), "{body:?}");
+
+    let mut recent = Vec::new();
+    wait_until(async || {
+        recent = get(&api, "/v1/requests/recent").await.1["requests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        recent.iter().any(|r| r["url"] == api.target_url())
+            && recent.iter().any(|r| r["url"] == "http://ads.test/")
+    })
+    .await;
+
+    let done = recent
+        .iter()
+        .find(|r| r["url"] == api.target_url())
+        .expect("the request's record");
+    assert_eq!(done["method"], "GET", "{done}");
+    assert_eq!(done["url"], api.target_url(), "{done}");
+    assert_eq!(done["statusCode"], 200, "{done}");
+    assert_eq!(done["status"], "completed", "{done}");
+
+    let refused = recent
+        .iter()
+        .find(|r| r["url"] == "http://ads.test/")
+        .expect("the refused request's record");
+    assert_eq!(refused["method"], "GET", "{refused}");
+    assert_eq!(refused["status"], "rejected", "{refused}");
+    assert_eq!(
+        refused["statusCode"],
+        Value::Null,
+        "a refusal that answered nothing has no status: {refused}"
+    );
+
+    // the three keys sit right after `protocol` in the order `RequestJson`
+    // declares them
+    let (status, _, bytes) =
+        call_raw(api.addr, "GET", "/v1/requests/recent", Some(KEY), None).await;
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(
+        text.contains(&format!(
+            "\"protocol\":\"http\",\"method\":\"GET\",\"url\":\"{}\",\"statusCode\":200",
+            api.target_url()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"method\":\"GET\",\"url\":\"http://ads.test/\",\"statusCode\":null"),
+        "{text}"
+    );
+}

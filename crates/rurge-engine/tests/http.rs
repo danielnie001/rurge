@@ -58,7 +58,10 @@ async fn request(s: &mut TcpStream, host: &str, path: &str) -> String {
 }
 
 /// The response head that starts at `s`, up to and including the blank line.
-async fn read_head(s: &mut TcpStream) -> String {
+async fn read_head<S>(s: &mut S) -> String
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -232,7 +235,8 @@ async fn a_connection_whose_requests_were_routed_leaves_no_record_of_its_own() {
 
 /// Two requests on one connection, each matched by its own URL: each takes the
 /// policy its rule names, and each dials its own upstream connection (phase 4
-/// M1 design 8.3).
+/// M1 design 8.3). Every entry does this: the sniffed connection, the HTTP
+/// listener's absolute form, and the virtual adapter.
 #[tokio::test]
 async fn two_requests_of_one_connection_follow_their_own_rules() {
     let origin = TestServer::spawn().await;
@@ -249,15 +253,21 @@ async fn two_requests_of_one_connection_follow_their_own_rules() {
         a.addr().port(),
         b.addr().port()
     );
-    let h = harness_with(
-        Profile {
-            proxies: &proxies,
-            rules: "URL-REGEX,^http://target\\.test/a,A\nURL-REGEX,^http://target\\.test/b,B",
-            ..Profile::default()
-        },
-        sniffing(),
+    let rig = Rig::on(
+        harness_with(
+            Profile {
+                proxies: &proxies,
+                rules: &guarded(
+                    "URL-REGEX,^http://target\\.test/a,A\nURL-REGEX,^http://target\\.test/b,B",
+                ),
+                ..Profile::default()
+            },
+            sniffing(),
+        )
+        .await,
     )
     .await;
+    let h = &rig.h;
 
     let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
     assert_eq!(reply[1], 0x00, "{reply:?}");
@@ -273,20 +283,81 @@ async fn two_requests_of_one_connection_follow_their_own_rules() {
     );
     drop(tunnel);
 
-    let records = the_records(&h, 2).await;
+    let rules = |records: &[rurge_engine::RequestRecord], at: usize| {
+        assert_eq!(
+            records[at].policy,
+            ["A"],
+            "the first request: {:?}",
+            records[at]
+        );
+        assert_eq!(
+            records[at + 1].policy,
+            ["B"],
+            "the second: {:?}",
+            records[at + 1]
+        );
+        assert_eq!(
+            records[at].rule.as_deref(),
+            Some("URL-REGEX,^http://target\\.test/a,A")
+        );
+        assert_eq!(
+            records[at + 1].rule.as_deref(),
+            Some("URL-REGEX,^http://target\\.test/b,B")
+        );
+    };
+    let records = the_records(h, 2).await;
     assert_eq!(records.len(), 2, "{records:?}");
-    assert_eq!(records[0].policy, ["A"], "{records:?}");
-    assert_eq!(records[1].policy, ["B"], "{records:?}");
-    assert_eq!(
-        records[0].rule.as_deref(),
-        Some("URL-REGEX,^http://target\\.test/a,A")
-    );
-    assert_eq!(
-        records[1].rule.as_deref(),
-        Some("URL-REGEX,^http://target\\.test/b,B")
-    );
+    rules(&records, 0);
     assert_eq!(a.requests().len(), 1, "`A` is dialed by the first request");
     assert_eq!(b.requests().len(), 1, "`B` is dialed by the second");
+
+    // the HTTP listener's absolute form, the two requests on one connection
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    for path in ["/a", "/b"] {
+        s.write_all(
+            format!("GET http://target.test{path} HTTP/1.1\r\nHost: target.test\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert!(read_response(&mut s).await.starts_with("HTTP/1.1 200"));
+    }
+    drop(s);
+    let records = the_records(h, 4).await;
+    assert_eq!(records.len(), 4, "{records:?}");
+    rules(&records, 2);
+    assert_eq!(
+        a.requests().len(),
+        2,
+        "the listener's first request dials `A`"
+    );
+    assert_eq!(b.requests().len(), 2, "and the second `B`");
+
+    // the virtual adapter
+    let (fake, _) = rig.fakes("target.test");
+    let mut tcp = rig
+        .app
+        .connect(SocketAddr::new(fake, 80))
+        .await
+        .expect("the handshake completes");
+    for (path, body) in [("/a", "first"), ("/b", "second")] {
+        tcp.write_all(format!("GET {path} HTTP/1.1\r\nHost: target.test\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(read_head(&mut tcp).await.starts_with("HTTP/1.1 200"));
+        let mut back = vec![0u8; body.len()];
+        tokio::time::timeout(WITHIN, tcp.read_exact(&mut back))
+            .await
+            .expect("the body comes within the bound")
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&back), body);
+    }
+    drop(tcp);
+    let records = the_records(h, 6).await;
+    assert_eq!(records.len(), 6, "{records:?}");
+    rules(&records, 4);
+    assert_eq!(a.requests().len(), 3, "the app's first request dials `A`");
+    assert_eq!(b.requests().len(), 3, "and the second `B`");
 }
 
 /// A TLS connection is relayed as it is: one record, with the SNI its
@@ -507,8 +578,12 @@ async fn stopping_the_adapter_ends_its_http_connections() {
     tcp.write_all(b"GET /slow HTTP/1.1\r\nHost: target.test\r\n\r\n")
         .await
         .unwrap();
-    wait_until("the request to reach the rules", || {
-        !rig.h.engine.request_log().active().is_empty()
+    // The origin notes the request before it waits out the delay: this waits
+    // for the request to have reached the upstream, not merely for the record
+    // to exist — that one is there before the dial, and the stop is to land
+    // on a request whose answer is being waited for.
+    wait_until("the origin to hold the answer back", || {
+        origin.requests().len() == 1
     })
     .await;
 
@@ -525,6 +600,123 @@ async fn stopping_the_adapter_ends_its_http_connections() {
     let records = tun_records(&rig.h, 1).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].status, RecordStatus::Completed, "{records:?}");
+
+    // an idle keep-alive connection, its request done: the stop ends it too
+    let origin = TestServer::spawn().await;
+    origin.set("/done", "ok");
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let rig = Rig::new(Profile {
+        proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+        rules: &guarded("DOMAIN,target.test,A"),
+        ..Profile::default()
+    })
+    .await;
+    let (fake, _) = rig.fakes("target.test");
+    let mut tcp = rig
+        .app
+        .connect(SocketAddr::new(fake, 80))
+        .await
+        .expect("the handshake completes");
+    tcp.write_all(b"GET /done HTTP/1.1\r\nHost: target.test\r\n\r\n")
+        .await
+        .unwrap();
+    let head = read_head(&mut tcp).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let mut body = [0u8; 2];
+    tokio::time::timeout(WITHIN, tcp.read_exact(&mut body))
+        .await
+        .expect("the body comes within the bound")
+        .unwrap();
+    assert_eq!(&body, b"ok");
+    // the exchange is over: the connection is idle, waiting for a request
+    let records = tun_records(&rig.h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Completed, "{records:?}");
+
+    rig.tun.stop();
+    let read = tokio::time::timeout(WITHIN, tcp.read(&mut byte))
+        .await
+        .expect("the stop ends the idle connection at once");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "the app is let go: {read:?}"
+    );
+}
+
+/// A connection's own record is made only when none of its requests reached
+/// the rules (phase 4 M1 design 10.2, `P10`): half a request head and a close
+/// leave one failed record, and a connection whose two requests were routed
+/// leaves nothing beside their two records.
+#[tokio::test]
+async fn the_carrier_connection_is_recorded_only_when_nothing_was_routed() {
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    origin.set("/b", "second");
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    // half a request head: judged HTTP, but no request hyper can read, so
+    // nothing reaches the rules
+    let (reply, mut s) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    s.write_all(b"GET /half HTTP/1.1\r\nHost: target.test")
+        .await
+        .unwrap();
+    drop(s);
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(records[0].protocol, Some(ProtocolKind::Http), "{records:?}");
+    assert!(
+        records[0].method.is_none(),
+        "no request was read: {records:?}"
+    );
+    assert!(a.requests().is_empty(), "nothing was dialed");
+
+    // two requests that were routed: their two records, and no third
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    for path in ["/a", "/b"] {
+        assert!(
+            request(&mut tunnel, "target.test", path)
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+    }
+    drop(tunnel);
+
+    let records = the_records(&h, 3).await;
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(records[1].status, RecordStatus::Completed, "{records:?}");
+    assert_eq!(records[2].status, RecordStatus::Completed, "{records:?}");
+    // The only fixed wait here is for a record of the connection that came
+    // late; the connection ended well before (`the_records` saw both of its
+    // requests finish), and 300 ms is far more than the end needs to make
+    // one.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.engine.request_log().recent(10).len(),
+        3,
+        "the connection left a record of its own beside its requests'"
+    );
+    assert!(h.engine.request_log().active().is_empty());
 }
 
 /// A stop ends the relay of an upgraded exchange too, which outlives the
@@ -1351,4 +1543,1172 @@ async fn a_killed_plain_request_whose_client_does_not_read_is_closed() {
     let mut sink = Vec::new();
     let read = tokio::time::timeout(WITHIN, s.read_to_end(&mut sink)).await;
     assert!(read.is_ok(), "the connection ends within the bound");
+}
+
+// ---- every entry into the engine
+
+/// The four ways a request reaches the engine — a sniffed SOCKS5 tunnel, a
+/// `CONNECT`, the virtual adapter, the HTTP listener's absolute form — each
+/// bring their requests into it: two requests on one client connection leave
+/// two records, with the entry's own listener, and the method, the URL and
+/// the status the client was answered with (phase 4 M1 design 7, 10.1).
+#[tokio::test]
+async fn every_entry_brings_its_requests_into_the_engine() {
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    origin.set("/b", "second");
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let rig = Rig::on(
+        harness_with(
+            Profile {
+                proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+                rules: &guarded("DOMAIN,target.test,A"),
+                ..Profile::default()
+            },
+            sniffing(),
+        )
+        .await,
+    )
+    .await;
+
+    // what one entry's two records must say
+    let two = |records: &[rurge_engine::RequestRecord], at: usize, listener, first: &str| {
+        for (i, path) in [first, "/b"].iter().enumerate() {
+            let record = &records[at + i];
+            assert_eq!(record.listener, listener, "{record:?}");
+            assert_eq!(record.protocol, Some(ProtocolKind::Http), "{record:?}");
+            assert_eq!(record.method.as_deref(), Some("GET"), "{record:?}");
+            assert_eq!(
+                record.url.as_deref(),
+                Some(format!("http://target.test{path}").as_str()),
+                "{record:?}"
+            );
+            assert_eq!(record.status_code, Some(200), "{record:?}");
+            assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+        }
+    };
+
+    // a sniffed SOCKS5 tunnel to port 80
+    let (reply, mut tunnel) = socks5_connect(rig.h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    for path in ["/a", "/b"] {
+        assert!(
+            request(&mut tunnel, "target.test", path)
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+    }
+    drop(tunnel);
+    two(&the_records(&rig.h, 2).await, 0, ListenerKind::Socks5, "/a");
+
+    // a `CONNECT` tunnel through the HTTP listener, sniffed for HTTP
+    let mut tunnel = connect_via_http(rig.h.http(), "target.test:80").await;
+    for path in ["/a", "/b"] {
+        assert!(
+            request(&mut tunnel, "target.test", path)
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+    }
+    drop(tunnel);
+    two(&the_records(&rig.h, 4).await, 2, ListenerKind::Http, "/a");
+
+    // the virtual adapter
+    let (fake, _) = rig.fakes("target.test");
+    let mut tcp = rig
+        .app
+        .connect(SocketAddr::new(fake, 80))
+        .await
+        .expect("the handshake completes");
+    for (path, body) in [("/a", "first"), ("/b", "second")] {
+        tcp.write_all(format!("GET {path} HTTP/1.1\r\nHost: target.test\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let head = read_head(&mut tcp).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let mut back = vec![0u8; body.len()];
+        tokio::time::timeout(WITHIN, tcp.read_exact(&mut back))
+            .await
+            .expect("the body comes within the bound")
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&back), body);
+    }
+    drop(tcp);
+    two(&the_records(&rig.h, 6).await, 4, ListenerKind::Tun, "/a");
+
+    // the HTTP listener's absolute form
+    let mut s = TcpStream::connect(rig.h.http()).await.unwrap();
+    for path in ["/a", "/b"] {
+        s.write_all(
+            format!("GET http://target.test{path} HTTP/1.1\r\nHost: target.test\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert!(read_response(&mut s).await.starts_with("HTTP/1.1 200"));
+    }
+    drop(s);
+    two(&the_records(&rig.h, 8).await, 6, ListenerKind::Http, "/a");
+
+    assert_eq!(
+        a.requests().len(),
+        4,
+        "each client connection dials its own upstream connection"
+    );
+}
+
+/// One upstream connection is lent to every request of its key, and the pool
+/// keeps it out of the way of a request with another key (phase 4 M1 design
+/// 8.5, `P16`): three requests of one connection reach the origin over one
+/// TCP connection, dialed once through the fake SOCKS5.
+#[tokio::test]
+async fn the_upstream_connection_is_lent_and_counted() {
+    let origin = TestServer::spawn().await;
+    for path in ["/a", "/b", "/c"] {
+        origin.set(path, "body");
+    }
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    for path in ["/a", "/b", "/c"] {
+        assert!(
+            request(&mut tunnel, "target.test", path)
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+    }
+    drop(tunnel);
+
+    let records = the_records(&h, 3).await;
+    assert_eq!(records.len(), 3, "{records:?}");
+    for record in &records {
+        assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+        assert_eq!(record.remote_addr, Some(a.addr()), "{record:?}");
+    }
+    assert_eq!(a.requests().len(), 1, "one dial for the three requests");
+    assert_eq!(
+        origin.connections(),
+        1,
+        "the three requests went over one upstream connection"
+    );
+}
+
+/// A socket hook whose egress table is the table it holds now: the test
+/// changes it by putting another `Arc` in its place, which is what the
+/// manager does when the enhanced mode writes a new table (phase 3 M4 design
+/// 7.2, phase 4 M1 design 8.5).
+struct MovingEgress {
+    table: std::sync::Mutex<Arc<()>>,
+}
+
+impl MovingEgress {
+    fn new() -> Arc<MovingEgress> {
+        Arc::new(MovingEgress {
+            table: std::sync::Mutex::new(Arc::new(())),
+        })
+    }
+
+    fn new_table(&self) {
+        *self.table.lock().unwrap() = Arc::new(());
+    }
+}
+
+impl rurge_net::socket::SocketHook for MovingEgress {
+    fn bind_interface(
+        &self,
+        _: &socket2::Socket,
+        _: &str,
+        _: rurge_net::socket::Family,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn set_tos(
+        &self,
+        _: &socket2::Socket,
+        _: rurge_net::socket::Family,
+        _: u8,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn egress_route(&self) -> Option<rurge_net::connector::Route> {
+        Some(rurge_net::connector::Route::egress(
+            &*self.table.lock().unwrap(),
+        ))
+    }
+}
+
+/// A connection dialed under one generation or one egress table is not lent
+/// to a request of another: a reload (another generation) and a new egress
+/// table both make the next request dial its own connection (phase 4 M1
+/// design 8.5).
+#[tokio::test]
+async fn a_reload_or_a_new_egress_table_lends_no_old_connection() {
+    // a reload, between two requests of one sniffed connection
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    origin.set("/b", "second");
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    assert!(
+        request(&mut tunnel, "target.test", "/a")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &text, h.engine.shared()).await);
+    assert!(
+        request(&mut tunnel, "target.test", "/b")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    drop(tunnel);
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(
+        a.requests().len(),
+        2,
+        "the request after the reload dialed its own connection"
+    );
+
+    // a new egress table, between two requests of one listener connection
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    origin.set("/b", "second");
+    let port = origin_addr(&origin).port();
+    let hook = MovingEgress::new();
+    let h = harness_hooked(profile(&listener_rules(port)), hook.clone()).await;
+
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(
+        format!("GET http://target.test:{port}/a HTTP/1.1\r\nHost: target.test:{port}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    assert!(read_response(&mut s).await.starts_with("HTTP/1.1 200"));
+    assert_eq!(origin.connections(), 1, "the first request dialed once");
+
+    hook.new_table();
+    s.write_all(
+        format!("GET http://target.test:{port}/b HTTP/1.1\r\nHost: target.test:{port}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    assert!(read_response(&mut s).await.starts_with("HTTP/1.1 200"));
+    drop(s);
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(
+        origin.connections(),
+        2,
+        "the request after the new table dialed its own connection"
+    );
+}
+
+/// A `select` group that switched members between two requests: the second
+/// request does not take the connection dialed for the first member, but
+/// dials its own through the new one (phase 4 M1 design 8.5).
+#[tokio::test]
+async fn a_select_switch_lends_no_old_connection() {
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    origin.set("/b", "second");
+    let script = || Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    };
+    let a = FakeSocks5::spawn(script()).await;
+    let b = FakeSocks5::spawn(script()).await;
+    let proxies = format!(
+        "A = socks5, 127.0.0.1, {}\nB = socks5, 127.0.0.1, {}",
+        a.addr().port(),
+        b.addr().port()
+    );
+    let h = harness_with(
+        Profile {
+            proxies: &proxies,
+            groups: "S = select, A, B",
+            rules: "DOMAIN,target.test,S",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    assert!(
+        request(&mut tunnel, "target.test", "/a")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert_eq!(
+        (a.requests().len(), b.requests().len()),
+        (1, 0),
+        "the first request dialed the first member"
+    );
+
+    h.engine.select_group("S", "B").await.unwrap();
+    assert!(
+        request(&mut tunnel, "target.test", "/b")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    drop(tunnel);
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].policy, ["S", "A"], "{records:?}");
+    assert_eq!(records[1].policy, ["S", "B"], "{records:?}");
+    assert_eq!(records[0].remote_addr, Some(a.addr()), "{records:?}");
+    assert_eq!(
+        records[1].remote_addr,
+        Some(b.addr()),
+        "the request after the switch went through the new member: {records:?}"
+    );
+    assert_eq!(
+        (a.requests().len(), b.requests().len()),
+        (1, 1),
+        "the second request dialed its own connection through `B`"
+    );
+}
+
+/// The bytes of a borrowed connection are counted onto the request that has
+/// it now, not onto the request that dialed it (phase 4 M1 design 8.5, `P7`):
+/// two requests over one upstream connection, answered with 100 and 5000
+/// bytes, count their own sizes.
+#[tokio::test]
+async fn each_request_counts_its_own_bytes() {
+    let origin = TestServer::spawn().await;
+    origin.set("/small", "x".repeat(100));
+    origin.set("/big", "y".repeat(5000));
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    let small = request(&mut tunnel, "target.test", "/small").await;
+    assert!(small.starts_with("HTTP/1.1 200"), "{small}");
+    let big = request(&mut tunnel, "target.test", "/big").await;
+    assert!(big.starts_with("HTTP/1.1 200"), "{big}");
+    drop(tunnel);
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(a.requests().len(), 1, "the second request borrowed it");
+    assert_eq!(origin.connections(), 1, "one upstream connection");
+    assert!(
+        records[0].down < 5000,
+        "the first record counted the 5000 bytes that belong to the second: {records:?}"
+    );
+    assert!(
+        records[1].down >= 5000,
+        "the second record did not count its own body: {records:?}"
+    );
+    for record in &records {
+        assert!(record.up > 0, "no request bytes counted: {record:?}");
+    }
+}
+
+/// One request over a fresh sniffed SOCKS5 tunnel to `host`, and the whole
+/// response.
+async fn sniffed_get(h: &Harness, host: &str, path: &str) -> String {
+    let (reply, mut tunnel) = socks5_connect(h.socks(), host, 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    request(&mut tunnel, host, path).await
+}
+
+/// As `sniffed_get`, for an answer that closes the connection: what the
+/// client reads up to the close.
+async fn sniffed_close(h: &Harness, host: &str, path: &str) -> Vec<u8> {
+    let (reply, mut tunnel) = socks5_connect(h.socks(), host, 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    tunnel
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut back = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut back))
+        .await
+        .expect("the connection is closed within the bound")
+        .unwrap();
+    back
+}
+
+/// One listener request in absolute form, and the whole response.
+async fn listener_get(h: &Harness, url: &str, host: &str) -> String {
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(format!("GET {url} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    read_response(&mut s).await
+}
+
+/// As `listener_get`, for an answer that closes the connection.
+async fn listener_close(h: &Harness, url: &str, host: &str) -> Vec<u8> {
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(format!("GET {url} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut back = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut back))
+        .await
+        .expect("the connection is closed within the bound")
+        .unwrap();
+    back
+}
+
+/// A refusal or a failure is answered as the profile says on every entry
+/// (phase 4 M1 design 8.8, 9): a REJECT closes the connection or shows its
+/// page, `REJECT-TINYGIF` shows its pixel, and a name the rules need the
+/// addresses of, which the DNS has none of, fails the lookup: the 502 page,
+/// or a close when pages are off.
+#[tokio::test]
+async fn refusals_are_answered_on_every_entry() {
+    let rules = "URL-REGEX,^http://target\\.test/r,REJECT\nURL-REGEX,^http://target\\.test/t,REJECT-TINYGIF\nIP-CIDR,10.0.0.0/8,DIRECT";
+    let answered_with = |answer: &str, status: &str| {
+        assert!(answer.starts_with(status), "{answer}");
+    };
+
+    // the REJECT page on; the failure page on (the default)
+    let h = harness_with(
+        Profile {
+            general: "show-error-page-for-reject = true",
+            rules,
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+    answered_with(&sniffed_get(&h, "target.test", "/r").await, "HTTP/1.1 403");
+    let tiny = sniffed_get(&h, "target.test", "/t").await;
+    assert!(tiny.starts_with("HTTP/1.1 200"), "{tiny}");
+    assert!(tiny.to_ascii_lowercase().contains("image/gif"), "{tiny}");
+    let failed = sniffed_get(&h, "bad.test", "/").await;
+    assert!(failed.starts_with("HTTP/1.1 502"), "{failed}");
+    assert!(failed.contains("DNS lookup failed"), "{failed}");
+
+    answered_with(
+        &listener_get(&h, "http://target.test/r", "target.test").await,
+        "HTTP/1.1 403",
+    );
+    let tiny = listener_get(&h, "http://target.test/t", "target.test").await;
+    assert!(tiny.starts_with("HTTP/1.1 200"), "{tiny}");
+    assert!(tiny.to_ascii_lowercase().contains("image/gif"), "{tiny}");
+    let failed = listener_get(&h, "http://bad.test/", "bad.test").await;
+    assert!(failed.starts_with("HTTP/1.1 502"), "{failed}");
+    assert!(failed.contains("DNS lookup failed"), "{failed}");
+
+    // both pages off: a refusal and a failure close without an answer, the
+    // pixel still goes
+    let h = harness_with(
+        Profile {
+            general: "show-error-page = false\nshow-error-page-for-reject = false",
+            rules,
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+    assert!(sniffed_close(&h, "target.test", "/r").await.is_empty());
+    let tiny = sniffed_get(&h, "target.test", "/t").await;
+    assert!(tiny.starts_with("HTTP/1.1 200"), "{tiny}");
+    assert!(sniffed_close(&h, "bad.test", "/").await.is_empty());
+
+    assert!(
+        listener_close(&h, "http://target.test/r", "target.test")
+            .await
+            .is_empty()
+    );
+    let tiny = listener_get(&h, "http://target.test/t", "target.test").await;
+    assert!(tiny.starts_with("HTTP/1.1 200"), "{tiny}");
+    assert!(
+        listener_close(&h, "http://bad.test/", "bad.test")
+            .await
+            .is_empty()
+    );
+}
+
+/// An origin that has read the request and does not answer it in time is a
+/// 504 (phase 4 M1 design 8.10): the record is the failed one, with the
+/// status the client was answered with; with the error page off, the
+/// connection is closed instead.
+#[tokio::test]
+async fn a_late_response_head_is_a_504() {
+    let origin = TestServer::spawn().await;
+    origin.set("/late", "late");
+    // the wait for the response head is `idle_timeout`; the test ends far
+    // sooner than the origin's delay
+    origin.set_delay("/late", Duration::from_secs(600));
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_timed(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+        Duration::from_millis(300),
+    )
+    .await;
+
+    let answer = sniffed_get(&h, "target.test", "/late").await;
+    assert!(answer.starts_with("HTTP/1.1 504"), "{answer}");
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(records[0].status_code, Some(504), "{records:?}");
+
+    // with the error page off, the client is let go rather than answered
+    let h = harness_timed(
+        Profile {
+            general: "show-error-page = false",
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+        Duration::from_millis(300),
+    )
+    .await;
+    assert!(sniffed_close(&h, "target.test", "/late").await.is_empty());
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(records[0].status_code, None, "{records:?}");
+}
+
+/// A client that goes away in the middle of a response leaves no record open
+/// (phase 4 M1 design 8.11, `P18`): the request is failed with the client's
+/// own going as its error, and it is out of the active list.
+#[tokio::test]
+async fn a_client_that_leaves_mid_response_leaves_no_open_record() {
+    // 256 MiB: more than both sides' buffers take (see `streaming_origin`),
+    // so the response is still coming when the client leaves; the origin
+    // writes only while the client's buffers take it, so the size costs no
+    // memory
+    let origin = streaming_origin(256 * 1024 * 1024).await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    tunnel
+        .write_all(b"GET /big HTTP/1.1\r\nHost: target.test\r\n\r\n")
+        .await
+        .unwrap();
+    let head = read_head(&mut tunnel).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let mut some = [0u8; 4096];
+    tokio::time::timeout(WITHIN, tunnel.read_exact(&mut some))
+        .await
+        .expect("the body starts coming within the bound")
+        .unwrap();
+    // the client leaves while the download is still going
+    drop(tunnel);
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some("client closed the connection"),
+        "{records:?}"
+    );
+    wait_until("the record to leave the active list", || {
+        h.engine.request_log().active().is_empty()
+    })
+    .await;
+}
+
+/// A request of a sniffed connection is a session like any other: `kill` ends
+/// it, the client is let go rather than answered, and the record says why
+/// (phase 4 M1 design 8.11).
+#[tokio::test]
+async fn a_request_killed_through_the_engine_closes_its_connection() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hang", "late");
+    // the origin holds the answer back, so the request is waiting when the
+    // kill comes; the test ends far sooner than this
+    origin.set_delay("/hang", Duration::from_secs(600));
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    tunnel
+        .write_all(b"GET /hang HTTP/1.1\r\nHost: target.test\r\n\r\n")
+        .await
+        .unwrap();
+    // the origin notes the request before it waits out the delay: this waits
+    // for the request to have reached the upstream, not merely for the record
+    // to exist — that one is there before the dial
+    wait_until("the origin to hold the answer back", || {
+        origin.requests().len() == 1
+    })
+    .await;
+    let id = h.engine.request_log().active()[0].id;
+    assert!(h.engine.kill(id));
+
+    let mut back = Vec::new();
+    let read = tokio::time::timeout(WITHIN, tunnel.read_to_end(&mut back)).await;
+    assert!(read.is_ok(), "the kill ends the connection at once");
+    assert!(
+        back.is_empty(),
+        "the client is let go, not answered: {:?}",
+        String::from_utf8_lossy(&back)
+    );
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(records[0].error.as_deref(), Some("killed"), "{records:?}");
+    assert!(h.engine.request_log().active().is_empty());
+}
+
+/// An upgrade goes through every entry and is counted once (phase 4 M1 design
+/// 8.9): after the switch, what is written and read is echoed, and the record
+/// counts each byte once rather than twice.
+#[tokio::test]
+async fn a_websocket_goes_through_every_entry() {
+    const PAYLOAD: usize = 8192;
+    let origin = switching_echo().await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    // the sniffed connection
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    tunnel
+        .write_all(
+            b"GET /ws HTTP/1.1\r\nHost: target.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let head = read_head(&mut tunnel).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    let sent = vec![b'w'; PAYLOAD];
+    tunnel.write_all(&sent).await.unwrap();
+    let mut back = vec![0u8; PAYLOAD];
+    tokio::time::timeout(WITHIN, tunnel.read_exact(&mut back))
+        .await
+        .expect("the echo comes back within the bound")
+        .unwrap();
+    assert_eq!(back, sent);
+    drop(tunnel);
+
+    // the listener's absolute form
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(
+        b"GET http://target.test/ws HTTP/1.1\r\nHost: target.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let head = read_head(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    s.write_all(&sent).await.unwrap();
+    let mut back = vec![0u8; PAYLOAD];
+    tokio::time::timeout(WITHIN, s.read_exact(&mut back))
+        .await
+        .expect("the echo comes back within the bound")
+        .unwrap();
+    assert_eq!(back, sent);
+    drop(s);
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].listener, ListenerKind::Socks5, "{records:?}");
+    assert_eq!(records[1].listener, ListenerKind::Http, "{records:?}");
+    for record in &records {
+        assert_eq!(record.status_code, Some(101), "{record:?}");
+        assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+        // the head is small beside the payload, so a count made twice is at
+        // least twice the payload
+        assert!(
+            record.up >= PAYLOAD as u64 && record.up < 2 * PAYLOAD as u64,
+            "the bytes up were counted twice: {record:?}"
+        );
+        assert!(
+            record.down >= PAYLOAD as u64 && record.down < 2 * PAYLOAD as u64,
+            "the bytes down were counted twice: {record:?}"
+        );
+    }
+}
+
+/// One line of a chunked body, without its CRLF.
+async fn chunk_line<R>(s: &mut R) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        let n = s.read(&mut byte).await.expect("a readable stream");
+        assert!(n > 0, "closed in the middle of a chunked body");
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+    }
+    String::from_utf8_lossy(&line)
+        .trim_end_matches('\r')
+        .to_string()
+}
+
+/// A chunked body, whole, from the chunk sizes and the chunks that follow.
+async fn read_chunked<R>(s: &mut R) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut body = Vec::new();
+    loop {
+        let line = chunk_line(s).await;
+        let size = usize::from_str_radix(line.split(';').next().unwrap().trim(), 16)
+            .unwrap_or_else(|_| panic!("no chunk size in {line:?}"));
+        if size == 0 {
+            // the trailer section ends with an empty line
+            while !chunk_line(s).await.is_empty() {}
+            return body;
+        }
+        let mut data = vec![0u8; size];
+        s.read_exact(&mut data).await.expect("the chunk, whole");
+        body.extend_from_slice(&data);
+        assert_eq!(chunk_line(s).await, "", "the CRLF after a chunk");
+    }
+}
+
+/// A loopback origin that reads a chunked request body and answers with the
+/// same bytes in a chunked body of its own; it keeps every body it read.
+async fn chunked_echo() -> (SocketAddr, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let seen: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let log = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                break;
+            };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match s.read(&mut byte).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => head.push(byte[0]),
+                    }
+                }
+                let body = read_chunked(&mut s).await;
+                log.lock().unwrap().push(body.clone());
+                if s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                for piece in body.chunks(500) {
+                    let head = format!("{:x}\r\n", piece.len());
+                    if s.write_all(head.as_bytes()).await.is_err()
+                        || s.write_all(piece).await.is_err()
+                        || s.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = s.write_all(b"0\r\n\r\n").await;
+                let mut sink = [0u8; 1024];
+                while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
+            });
+        }
+    });
+    (addr, seen)
+}
+
+/// A chunked body goes both ways unchanged (phase 4 M1 design 8.6): the
+/// origin receives the bytes the client sent, and the client the bytes the
+/// origin answered with.
+#[tokio::test]
+async fn chunked_bodies_go_both_ways() {
+    let (origin, seen) = chunked_echo().await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let body: Vec<u8> = (0..2049u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    // head and body in one write (`CLAUDE.md`); the body in chunks of its own
+    let mut sent =
+        b"POST /echo HTTP/1.1\r\nHost: target.test\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    for piece in body.chunks(313) {
+        sent.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+        sent.extend_from_slice(piece);
+        sent.extend_from_slice(b"\r\n");
+    }
+    sent.extend_from_slice(b"0\r\n\r\n");
+    tunnel.write_all(&sent).await.unwrap();
+
+    let head = read_head(&mut tunnel).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("transfer-encoding: chunked"),
+        "{head}"
+    );
+    let back = read_chunked(&mut tunnel).await;
+    assert_eq!(back, body, "the client got its own bytes back, whole");
+    drop(tunnel);
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Completed, "{records:?}");
+    assert_eq!(records[0].status_code, Some(200), "{records:?}");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0], body, "the origin got the client's bytes, whole");
+}
+
+/// What an origin that reads an upload keeps of it: its request head's
+/// fields, and the body.
+type SeenUpload = (Vec<(String, String)>, Vec<u8>);
+
+/// A loopback origin that reads a request with `Content-Length` and answers
+/// 200, keeping every request body and head it read.
+async fn upload_sink() -> (SocketAddr, Arc<std::sync::Mutex<Vec<SeenUpload>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let seen: Arc<std::sync::Mutex<Vec<SeenUpload>>> = Arc::default();
+    let log = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                break;
+            };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match s.read(&mut byte).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => head.push(byte[0]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let mut fields = Vec::new();
+                for line in head.lines().skip(1) {
+                    if let Some((name, value)) = line.split_once(':') {
+                        fields.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+                    }
+                }
+                let length: usize = fields
+                    .iter()
+                    .find(|(name, _)| name == "content-length")
+                    .and_then(|(_, value)| value.parse().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; length];
+                if s.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                log.lock().unwrap().push((fields, body));
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+                let mut sink = [0u8; 1024];
+                while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
+            });
+        }
+    });
+    (addr, seen)
+}
+
+/// `Expect: 100-continue` is answered by the engine itself (phase 4 M1 design
+/// 8.6, `P23`): the client writes the head, reads the 100, then writes the
+/// body, and the origin gets both the body and the `Expect` field. Of the
+/// tests here, only this one writes a head before its body: `CLAUDE.md`'s and
+/// `docs/testing.md`'s "one write" rule asks for a whole request in one write,
+/// and this request is split on purpose, as the `a_late_body_does_not_cost_…`
+/// group of `crates/rurge-api/tests/api.rs` splits one. A request the rules
+/// refuse is answered before its body is read, so no 100 goes out first.
+#[tokio::test]
+async fn expect_100_continue_is_answered() {
+    let (origin, seen) = upload_sink().await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            general: "show-error-page-for-reject = true",
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "URL-REGEX,^http://target\\.test/no,REJECT\nDOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let body = b"the body that waits for the go-ahead";
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    tunnel
+        .write_all(
+            format!(
+                "POST /up HTTP/1.1\r\nHost: target.test\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let head = read_head(&mut tunnel).await;
+    assert!(head.starts_with("HTTP/1.1 100 Continue"), "{head}");
+    tunnel.write_all(body).await.unwrap();
+    let answer = read_response(&mut tunnel).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    drop(tunnel);
+
+    let uploads = seen.lock().unwrap().clone();
+    assert_eq!(uploads.len(), 1, "{uploads:?}");
+    assert_eq!(uploads[0].1, body, "the body arrived whole");
+    assert_eq!(
+        uploads[0]
+            .0
+            .iter()
+            .find(|(name, _)| name == "expect")
+            .map(|(_, value)| value.as_str()),
+        Some("100-continue"),
+        "the `Expect` field was forwarded: {:?}",
+        uploads[0].0
+    );
+
+    // a refusal is decided before the body is read: the 403 comes first, and
+    // no 100 with it
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    tunnel
+        .write_all(
+            format!(
+                "POST /no HTTP/1.1\r\nHost: target.test\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let head = read_head(&mut tunnel).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(!head.contains("100 Continue"), "{head}");
+    let mut rest = Vec::new();
+    let _ = tokio::time::timeout(WITHIN, tunnel.read_to_end(&mut rest)).await;
+    assert!(
+        !String::from_utf8_lossy(&rest).contains("100 Continue"),
+        "a 100 came after the refusal: {:?}",
+        String::from_utf8_lossy(&rest)
+    );
+    assert!(seen.lock().unwrap().len() == 1, "nothing was uploaded");
+}
+
+/// A loopback origin that answers the first request of its first connection,
+/// reads the next request and goes without answering it, and answers every
+/// request of its later connections; it counts the connections it accepted.
+async fn cut_off_origin() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                break;
+            };
+            let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+            tokio::spawn(async move {
+                let mut heads = 0;
+                loop {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match s.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => head.push(byte[0]),
+                        }
+                    }
+                    heads += 1;
+                    if n == 1 && heads == 2 {
+                        // the request was read and no answer comes: the
+                        // connection goes
+                        return;
+                    }
+                    let answer = if n == 1 {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo"
+                    };
+                    if s.write_all(answer.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, accepted)
+}
+
+/// A `GET` cut off after it was written, on a connection that had answered a
+/// request before, is sent once more on a new connection (phase 4 M1 design
+/// 8.6): the client gets its 200, and the origin accepted two connections.
+#[tokio::test]
+async fn an_idempotent_request_cut_off_is_sent_again_through_the_engine() {
+    let (origin, accepted) = cut_off_origin().await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    let first = request(&mut tunnel, "target.test", "/a").await;
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    assert!(first.ends_with("one"), "{first}");
+
+    // the second request goes out on the borrowed connection, which the
+    // origin closes after reading it
+    let second = request(&mut tunnel, "target.test", "/b").await;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    assert!(second.ends_with("two"), "{second}");
+    drop(tunnel);
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    for record in &records {
+        assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+        assert_eq!(record.status_code, Some(200), "{record:?}");
+    }
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the cut-off request was sent again on a connection of its own"
+    );
 }
