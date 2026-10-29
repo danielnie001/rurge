@@ -599,7 +599,7 @@ M6 做完了（2026-10-29；计划 `docs/superpowers/plans/2026-10-28-phase3-m6-
 
 **`41c35d4` 推送之后（任务 8 的后一半）**：项目所有者 2026-10-29 推送了 `41c35d4`（只这一个提交；任务 8 文档部分的 `87342ff`、`db5ac0a` 那时还在本地）。运行 40824893108（第 15 次运行）的四个任务都成功，**三个平台全绿**，是 CI 第三次全绿（第一次见「CI 在 `ac0a98a` 上第一次全绿」一节，第二次见「M4 推送之后的 CI」一节）。上面几条写于这次运行之前，不改；与下面几条不同的，以下面为准：
 
-- **各任务**：`bench` 的两步（`cargo bench -p rurge-rules --no-run` 与 `-p rurge-dns --no-run`）都成功；三个 `check` 的 fmt、clippy 与测试一步都成功，`Report the failed tests` 都跳过（它只在测试一步失败时跑）。测试一步的时长：Linux 9 分 6 秒、macOS 9 分 3 秒、Windows 13 分 2 秒。安装参照服务端的各步与第 14 次相同（Linux 十一步都成功；macOS 跳过 snell-server、tuic 0.8.5、masque-server 三步；Windows 跳过这三步与 TrustTunnel、指向 `sshd` 的两步）。
+- **各任务**：`bench` 的两步（`cargo bench -p rurge-rules --no-run` 与 `-p rurge-dns --no-run`）都成功；三个 `check` 的 fmt、clippy 与测试一步都成功，`Report the failed tests` 都跳过（它只在测试一步失败时跑）。测试一步的时长：Linux 9 分 6 秒、macOS 9 分 3 秒、Windows 13 分 2 秒。安装参照服务端的各步与第 14 次相同（Linux 十一步都成功；macOS 跳过 snell-server、tuic 0.8.5、masque-server 三步；Windows 跳过五步：这三步，加上 TrustTunnel 的安装与指向 `sshd` 的那一步）。
 - **修正这一次管用**：第 14 次在 macOS 上失败的 `v5_tcp_against_sing_box` 这一次对真实的 sing-box 通过；取号改到 20000–29999 之后，装了参照服务端的平台上用到它们的互操作用例都通过（由测试一步的结论推出，测试一步带 `--no-fail-fast`；逐条的结果在要登录才能读的任务日志里）。一次全绿不证明竞争不会再出现：它是偶发的，旧的夹具在第 12、13 次运行里也没有撞上；修正的依据是源码——号不再来自系统分临时端口的区间（M6 记录第 111 行）。
 - **第 14 节第 8 条（三平台 CI 绿）满足了**，以 `41c35d4` 为准（它之后的提交只改文档，CI 没有见过）；上面「没有变的」一条里“第 8 条（三平台 CI 绿）这一次也没有满足”以这一句为准，其余几句照旧：三个平台的设备与系统改动都没有真的运行过、没有在真机上验证，L2 的四条没有运行过，`[IP Rewrite]` 只在内存设备上证明过，`udp-priority` 的效果没有观察过，三份手工验收清单一项也没有做，其余七条没有一条能写成「通过」。
 - **注解**只有平台的，与第 13、14 次相同（四个任务各一条 Node.js 20 弃用的警告，`bench` 与 `check (ubuntu-latest)` 各一条迁到 Ubuntu 26 的通知，`check (macos-latest)` 一条 arm64 排队的通知）；照 R26、R27 不改 CI。
