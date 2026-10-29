@@ -169,13 +169,22 @@ async fn extended_matching_rules_a_tls_session_by_its_sni() {
     let s = connect_via_socks5(h.socks(), "target.test", 443).await;
     let config = rurge_net::http::tls_client_config(true).unwrap();
     let name = rustls::pki_types::ServerName::try_from("sni.test".to_string()).unwrap();
-    let mut tls = tokio_rustls::TlsConnector::from(config)
-        .connect(name, s)
+    let mut tls = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_rustls::TlsConnector::from(config).connect(name, s),
+    )
+    .await
+    .expect("the handshake ends within the bound")
+    .expect("the tunnel carries the handshake");
+    tokio::time::timeout(Duration::from_secs(5), tls.write_all(b"ping"))
         .await
-        .expect("the tunnel carries the handshake");
-    tls.write_all(b"ping").await.unwrap();
+        .expect("the echo is written within the bound")
+        .unwrap();
     let mut back = [0u8; 4];
-    tls.read_exact(&mut back).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut back))
+        .await
+        .expect("the echo comes back within the bound")
+        .unwrap();
     assert_eq!(&back, b"ping");
     drop(tls);
 

@@ -129,7 +129,7 @@ impl Engine {
         if general.always_raw_tcp_hosts.matches(host, port) == Some(true) {
             return false;
         }
-        // design 4.1 (5) and 4.2: an IP literal is not a hostname, so no
+        // design 4.1 (4) and 4.2: an IP literal is not a hostname, so no
         // keyword is looked for in one; the name is lowercase already
         if let HostName::Domain(name) = host
             && general
