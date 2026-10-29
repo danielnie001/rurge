@@ -668,6 +668,9 @@ const SESSION_FIELDS: &[&str] = &[
     "up",
     "down",
     "elapsed_ms",
+    "method",
+    "status",
+    "url",
     "error",
 ];
 
@@ -690,7 +693,7 @@ fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
 fn a_field_of_a_log_line_is_read_whole() {
     let completed = "DEBUG session completed session=123 listener=Http src=127.0.0.1:50000 \
         dst=a.test:80 rule=RULE-SET,C:/some dir/a.list,DIRECT policy=DIRECT > Proxy up=1 \
-        down=2 elapsed_ms=3";
+        down=2 elapsed_ms=3 method=GET status=200 url=http://a.test/x";
     assert_eq!(field(completed, "policy"), Some("DIRECT > Proxy"));
     assert_eq!(field(completed, "session"), Some("123"));
     assert_ne!(field(completed, "session"), Some("12"));
@@ -698,16 +701,26 @@ fn a_field_of_a_log_line_is_read_whole() {
         field(completed, "rule"),
         Some("RULE-SET,C:/some dir/a.list,DIRECT")
     );
+    // the policy is not the last field of a line and holds no prefix of a
+    // later one: it is read up to the next field
+    assert_eq!(field(completed, "method"), Some("GET"));
+    assert_eq!(field(completed, "status"), Some("200"));
+    assert_eq!(field(completed, "url"), Some("http://a.test/x"));
     assert_eq!(field(completed, "error"), None);
     // the last field of a line runs to the end of it
     let failed = "INFO session failed session=7 listener=Socks5 src=127.0.0.1:50001 \
-        dst=a.test:9 rule=FINAL,DIRECT policy=DIRECT up=0 down=0 elapsed_ms=2 \
-        error=connection refused (os error 111)";
+        dst=a.test:9 rule=FINAL,DIRECT policy=DIRECT up=0 down=0 elapsed_ms=2 method= \
+        status= error=connection refused (os error 111)";
     assert_eq!(
         field(failed, "error"),
         Some("connection refused (os error 111)")
     );
     assert_eq!(field(failed, "elapsed_ms"), Some("2"));
+    // a session that is no HTTP request has neither a method nor a status, and
+    // an empty value is read as an empty one rather than swallowing the next
+    // field
+    assert_eq!(field(failed, "method"), Some(""));
+    assert_eq!(field(failed, "status"), Some(""));
 }
 
 /// The line a finished session leaves in the log has the id of the session's

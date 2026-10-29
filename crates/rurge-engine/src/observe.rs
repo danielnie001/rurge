@@ -49,6 +49,19 @@ pub struct RequestRecord {
     pub policy: Vec<String>,
     pub sni: Option<String>,
     pub protocol: Option<ProtocolKind>,
+    /// The method of the HTTP request this session is: `None` for a session
+    /// that is no HTTP request (`phase 4 M1 design 10.1`).
+    pub method: Option<String>,
+    /// The URL of an HTTP request: the one the client asked for, without the
+    /// userinfo it may have carried and with the query string it had
+    /// (`phase 4 M1 design 10.1`). `None` for a session that is no HTTP
+    /// request. `rurge-http` forms it; nothing here rewrites it.
+    pub url: Option<String>,
+    /// The status the client was answered with: the upstream's, or the one
+    /// rurge's own refusal or error page carries. `None` when the request got
+    /// no answer (a refusal that closes the connection) or is no HTTP request
+    /// (`phase 4 M1 design 10.1`).
+    pub status_code: Option<u16>,
     pub up: u64,
     pub down: u64,
     pub started_ms: u64,
@@ -124,6 +137,12 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         // fuller of the two (phase 4 M1 design 7.2).
         sni: s.sni.clone().or_else(|| h.sni()),
         protocol: h.protocol().or(s.protocol),
+        // the method and the status are the two side slots `rurge-http` sets on
+        // the handle as the request goes; the URL comes from the request the
+        // engine was handed (`phase 4 M1 design 10.1`, `P5`)
+        method: h.method(),
+        url: s.url.clone(),
+        status_code: h.status(),
         up,
         down,
         started_ms: unix_millis().saturating_sub(elapsed_ms),

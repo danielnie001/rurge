@@ -1431,6 +1431,18 @@ impl Engine {
     }
 }
 
+/// The URL of a request as the session log names it: the part before its
+/// query string and its fragment. A log line keeps the path, which names the
+/// request, not what follows it — a query string often carries a token
+/// (`phase 4 M1 design 12`, `phase 4 design P4-D25`). A session that is no
+/// HTTP request has no URL, and none is written.
+fn logged_url(url: Option<&str>) -> String {
+    let Some(url) = url else {
+        return String::new();
+    };
+    url.split(['?', '#']).next().unwrap_or(url).to_string()
+}
+
 fn log_session(h: &SessionHandle, outcome: &SessionOutcome) {
     let s = h.session();
     let (up, down) = h.bytes();
@@ -1438,18 +1450,27 @@ fn log_session(h: &SessionHandle, outcome: &SessionOutcome) {
     let rule = h.rule().unwrap_or_default();
     let policy = h.policy_chain().join(" > ");
     let elapsed_ms = h.elapsed().as_millis() as u64;
+    // a session that is no HTTP request has neither, and an empty value is
+    // written as `rule` is when no rule decided the session
+    let method = h.method().unwrap_or_default();
+    let status = h.status().map(|code| code.to_string()).unwrap_or_default();
     match outcome {
-        SessionOutcome::Completed => tracing::debug!(
-            session = h.id(), listener = ?s.listener, src = %s.src, dst = %dst, rule = %rule, policy = %policy,
-            up, down, elapsed_ms, "session completed"
-        ),
+        SessionOutcome::Completed => {
+            // the path is DEBUG-only, as the processes and the addresses of
+            // the sessions are
+            let url = logged_url(s.url.as_deref());
+            tracing::debug!(
+                session = h.id(), listener = ?s.listener, src = %s.src, dst = %dst, rule = %rule, policy = %policy,
+                up, down, elapsed_ms, method = %method, status = %status, url = %url, "session completed"
+            )
+        }
         SessionOutcome::Rejected(kind) => tracing::info!(
             session = h.id(), listener = ?s.listener, src = %s.src, dst = %dst, rule = %rule, policy = %policy,
-            elapsed_ms, error = ?h.error(), "session rejected by {}", kind.name()
+            elapsed_ms, method = %method, status = %status, error = ?h.error(), "session rejected by {}", kind.name()
         ),
         SessionOutcome::Failed(error) => tracing::info!(
             session = h.id(), listener = ?s.listener, src = %s.src, dst = %dst, rule = %rule, policy = %policy,
-            up, down, elapsed_ms, error = %error, "session failed"
+            up, down, elapsed_ms, method = %method, status = %status, error = %error, "session failed"
         ),
     }
 }

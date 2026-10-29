@@ -59,6 +59,15 @@ pub struct RequestJson {
     pub policy: Vec<String>,
     pub sni: Option<String>,
     pub protocol: Option<&'static str>,
+    /// The method of an HTTP request; `null` for a session that is no HTTP
+    /// request.
+    pub method: Option<String>,
+    /// The URL of an HTTP request, without userinfo and with its query
+    /// string; `null` for a session that is no HTTP request.
+    pub url: Option<String>,
+    /// The status the client was answered with; `null` when the request got
+    /// no answer or is no HTTP request.
+    pub status_code: Option<u16>,
     pub up: u64,
     pub down: u64,
     pub started_ms: u64,
@@ -102,6 +111,9 @@ impl From<&RequestRecord> for RequestJson {
             policy: r.policy.clone(),
             sni: r.sni.clone(),
             protocol: r.protocol.map(protocol_name),
+            method: r.method.clone(),
+            url: r.url.clone(),
+            status_code: r.status_code,
             up: r.up,
             down: r.down,
             started_ms: r.started_ms,
@@ -212,6 +224,9 @@ mod tests {
             policy: vec![],
             sni: None,
             protocol: None,
+            method: None,
+            url: None,
+            status_code: None,
             up: 0,
             down: 0,
             started_ms: 0,
@@ -247,6 +262,9 @@ mod tests {
             policy: vec!["Proxy".into(), "HK".into()],
             sni: Some("example.com".into()),
             protocol: Some(ProtocolKind::Https),
+            method: Some("POST".into()),
+            url: Some("https://example.com/a?b=1".into()),
+            status_code: Some(201),
             up: 1234,
             down: 56789,
             started_ms: 1_757_200_000_000,
@@ -274,6 +292,9 @@ mod tests {
                 "policy": ["Proxy", "HK"],
                 "sni": "example.com",
                 "protocol": "https",
+                "method": "POST",
+                "url": "https://example.com/a?b=1",
+                "statusCode": 201,
                 "up": 1234,
                 "down": 56789,
                 "startedMs": 1_757_200_000_000_u64,

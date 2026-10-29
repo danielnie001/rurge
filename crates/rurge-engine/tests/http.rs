@@ -582,7 +582,250 @@ async fn stopping_the_adapter_ends_an_upgraded_relay() {
 
     let records = tun_records(&rig.h, 1).await;
     assert_eq!(records.len(), 1, "{records:?}");
-    // the status of the answer (101) is one of the fields task 5 adds to the
-    // record; what the record says today is that the upgrade completed
     assert_eq!(records[0].status, RecordStatus::Completed, "{records:?}");
+    assert_eq!(records[0].status_code, Some(101), "{records:?}");
+}
+
+/// A request's record names the method, the URL and the status the client was
+/// answered with: the upstream's own, or the one rurge's refusal or error page
+/// carries (phase 4 M1 design 10.1, `P5`).
+#[tokio::test]
+async fn a_request_record_has_its_method_url_and_status() {
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            general: "show-error-page-for-reject = true",
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "URL-REGEX,^http://target\\.test/r,REJECT\nURL-REGEX,^http://target\\.test/t,REJECT-TINYGIF\nDOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    // the first three requests go over one connection: a refusal answered with
+    // its error page keeps the connection as an answered request does
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    let first = request(&mut tunnel, "target.test", "/a?x=1").await;
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    let refused = request(&mut tunnel, "target.test", "/r").await;
+    assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+    let tiny = request(&mut tunnel, "target.test", "/t").await;
+    assert!(tiny.starts_with("HTTP/1.1 200"), "{tiny}");
+    drop(tunnel);
+
+    let records = the_records(&h, 3).await;
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(records[0].method.as_deref(), Some("GET"), "{records:?}");
+    assert_eq!(
+        records[0].url.as_deref(),
+        Some("http://target.test/a?x=1"),
+        "{records:?}"
+    );
+    assert_eq!(records[0].status_code, Some(200), "{records:?}");
+    assert_eq!(records[1].method.as_deref(), Some("GET"), "{records:?}");
+    assert_eq!(
+        records[1].url.as_deref(),
+        Some("http://target.test/r"),
+        "{records:?}"
+    );
+    assert_eq!(records[1].status_code, Some(403), "{records:?}");
+    assert_eq!(records[1].status, RecordStatus::Rejected("REJECT".into()));
+    assert_eq!(records[2].status_code, Some(200), "{records:?}");
+    assert_eq!(
+        records[2].status,
+        RecordStatus::Rejected("REJECT-TINYGIF".into()),
+        "{records:?}"
+    );
+
+    // with `show-error-page-for-reject` off, a refusal closes without an
+    // answer, and no status is recorded
+    let silent = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "URL-REGEX,^http://target\\.test/r,REJECT\nDOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+    let (reply, mut tunnel) = socks5_connect(silent.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    tunnel
+        .write_all(b"GET /r HTTP/1.1\r\nHost: target.test\r\n\r\n")
+        .await
+        .unwrap();
+    let mut back = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut back))
+        .await
+        .expect("the connection is closed within the bound")
+        .unwrap();
+    assert!(
+        back.is_empty(),
+        "a refusal with no page answers nothing: {:?}",
+        String::from_utf8_lossy(&back)
+    );
+
+    let records = the_records(&silent, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].method.as_deref(), Some("GET"), "{records:?}");
+    assert_eq!(records[0].status_code, None, "{records:?}");
+}
+
+/// The URL of a request that came in absolute form with userinfo is recorded
+/// without it: credentials do not go into the records (design 12, `P4-D25`).
+#[tokio::test]
+async fn a_url_with_userinfo_is_recorded_without_it() {
+    let origin = TestServer::spawn().await;
+    origin.set("/x", "a body");
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    tunnel
+        .write_all(b"GET http://u:p@target.test/x HTTP/1.1\r\nHost: target.test\r\n\r\n")
+        .await
+        .unwrap();
+    let answer = read_response(&mut tunnel).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    drop(tunnel);
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0].url.as_deref(),
+        Some("http://target.test/x"),
+        "{records:?}"
+    );
+}
+
+/// The record of a request carried by a borrowed connection says where that
+/// connection went, and that it was ready when the request took it (design
+/// 10.1): both requests name the fake SOCKS5 the one dial went to.
+#[tokio::test]
+async fn a_borrowed_connection_records_where_it_went() {
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    origin.set("/b", "second");
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    assert!(
+        request(&mut tunnel, "target.test", "/a")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    assert!(
+        request(&mut tunnel, "target.test", "/b")
+            .await
+            .starts_with("HTTP/1.1 200")
+    );
+    drop(tunnel);
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(a.requests().len(), 1, "the second request borrowed it");
+    for record in &records {
+        assert_eq!(record.remote_addr, Some(a.addr()), "{record:?}");
+        assert!(record.connect_ms.is_some(), "{record:?}");
+    }
+}
+
+/// The line a finished request leaves has its method and status; the one that
+/// completed has its path, without the query string and without userinfo
+/// (design 12, `P20`): a query string often carries a token.
+#[tokio::test]
+async fn the_request_log_line_shows_no_query_and_no_userinfo() {
+    let log = LogCapture::start();
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            general: "show-error-page-for-reject = true",
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "URL-REGEX,^http://target\\.test/r,REJECT\nDOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    // absolute form, with userinfo and a query string: neither is to survive
+    // in the line
+    tunnel
+        .write_all(b"GET http://u:p@target.test/a?x=1 HTTP/1.1\r\nHost: target.test\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(read_response(&mut tunnel).await.starts_with("HTTP/1.1 200"));
+    assert!(
+        request(&mut tunnel, "target.test", "/r")
+            .await
+            .starts_with("HTTP/1.1 403")
+    );
+    drop(tunnel);
+
+    let _ = the_records(&h, 2).await;
+    let lines = log.lines();
+    let completed: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("session completed"))
+        .collect();
+    assert_eq!(completed.len(), 1, "{lines:?}");
+    let line = completed[0];
+    assert!(line.contains(" method=GET"), "{line}");
+    assert!(line.contains(" status=200"), "{line}");
+    assert!(line.contains(" url=http://target.test/a"), "{line}");
+    assert!(!line.contains("x=1"), "{line}");
+    assert!(!line.contains("u:p"), "{line}");
+
+    let refused: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("session rejected by REJECT"))
+        .collect();
+    assert_eq!(refused.len(), 1, "{lines:?}");
+    let line = refused[0];
+    assert!(line.contains(" method=GET"), "{line}");
+    assert!(line.contains(" status=403"), "{line}");
+    assert!(!line.contains("url="), "the path is DEBUG only: {line}");
 }
