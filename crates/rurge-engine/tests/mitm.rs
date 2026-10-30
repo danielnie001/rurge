@@ -11,6 +11,7 @@ mod common;
 use common::tun::*;
 use common::*;
 use rurge_config::rule::ProtocolKind;
+use rurge_engine::MitmCounts;
 use std::sync::Arc;
 
 /// The `[MITM]` section of a profile: the hosts to decrypt, and the CA rurge
@@ -558,11 +559,11 @@ fn client_hello(config: Arc<rustls::ClientConfig>, name: &str) -> Vec<u8> {
     hello
 }
 
-/// A stop that lands while the handshake with the client is under way leaves
-/// no record: the connection had no handle to finish (`phase 4 M2 design
-/// 8.2`).
-#[tokio::test]
-async fn a_stop_during_the_handshake_leaves_no_record() {
+/// A stop that lands while the handshake with the client is under way: the
+/// engine has signed a leaf and answered the hello, and then the virtual
+/// interface is stopped and the client let go (`phase 4 M2 design 8.2`). The
+/// rig is left for the test to judge what the stop left behind.
+async fn a_stop_in_the_middle_of_the_handshake() -> Rig {
     let origin = TlsFixture::new(&["origin.test"]);
     let mitm = mitm_ca();
     let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
@@ -618,6 +619,15 @@ async fn a_stop_during_the_handshake_leaves_no_record() {
     tokio::time::timeout(WITHIN, drain)
         .await
         .expect("the stop ends the handshake at once");
+    rig
+}
+
+/// A stop that lands while the handshake with the client is under way leaves
+/// no record: the connection had no handle to finish (`phase 4 M2 design
+/// 8.2`).
+#[tokio::test]
+async fn a_stop_during_the_handshake_leaves_no_record() {
+    let rig = a_stop_in_the_middle_of_the_handshake().await;
 
     // waits for a record that must not come: the stop's branch returns at
     // once, so a record it wrote would be there before it returned — 300 ms is
@@ -625,6 +635,409 @@ async fn a_stop_during_the_handshake_leaves_no_record() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let records = rig.h.engine.request_log().recent(1000);
     assert!(records.is_empty(), "{records:?}");
+}
+
+/// The same stop counts nothing either: a handshake the stop ended is neither
+/// decrypted, nor failed, nor a hint about the host (`phase 4 M2 design 8.5`,
+/// the plan's P21).
+#[tokio::test]
+async fn a_stop_during_the_handshake_counts_nothing() {
+    let rig = a_stop_in_the_middle_of_the_handshake().await;
+
+    // the same wait as the record's: a count the stop's branch wrote would be
+    // there before it returned, and 300 ms is a wide margin on that
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        rig.h.engine.http_counts().mitm,
+        MitmCounts::default(),
+        "a stop's handshake is neither decrypted nor failed"
+    );
+}
+
+/// A client that does not trust the certificate rurge issued is refused and
+/// counted every time, and warned about once an hour: the second connection's
+/// line is DEBUG only (`phase 4 M2 design 8.2`, `8.4`; the plan's P21, `P22`).
+#[tokio::test]
+async fn an_untrusting_client_is_warned_once_an_hour_and_counted_each_time() {
+    let log = LogCapture::start();
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let ca = mitm.ca_p12_base64("pw");
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    // the client trusts the origin's CA only: the leaf rurge signed with the
+    // MITM CA is an unknown issuer to it
+    let untrusting = client_config(origin.roots(), &[], true);
+    for _ in 0..2 {
+        let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+        let Err(error) = handshake(tunnel, untrusting.clone(), "origin.test").await else {
+            panic!("rurge signs its leaf with the MITM CA");
+        };
+        assert!(error.to_string().contains("UnknownIssuer"), "{error}");
+    }
+    let records = the_records(&h, 2).await;
+    for record in &records {
+        assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+        assert_eq!(
+            record.error.as_deref(),
+            Some("the client does not trust the certificate rurge issued (alert unknown_ca)"),
+            "{record:?}"
+        );
+    }
+
+    let lines = log.lines();
+    let warned: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("WARN") && line.contains("does not trust"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{lines:?}");
+    assert!(warned[0].contains("origin.test"), "{warned:?}");
+    assert!(warned[0].contains("port=443"), "{warned:?}");
+    assert!(warned[0].contains("alert=unknown_ca"), "{warned:?}");
+    // the second time the same words are at DEBUG, and they name the host
+    let named = "the client does not trust the certificate rurge issued for origin.test";
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("DEBUG") && line.contains(named))
+            .count(),
+        1,
+        "{lines:?}"
+    );
+    let counts = h.engine.http_counts().mitm;
+    assert_eq!(counts.untrusted, 2, "{counts:?}");
+    assert_eq!(counts.decrypted, 0, "{counts:?}");
+}
+
+/// A client that finishes the handshake and closes without a request is what
+/// a host behind certificate pinning looks like: a WARN once an hour, a count
+/// every time, and the record says so (`phase 4 M2 design 8.3`, `8.4`).
+#[tokio::test]
+async fn a_client_that_closes_after_the_handshake_gets_the_pinning_hint() {
+    let log = LogCapture::start();
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    for _ in 0..2 {
+        let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+        let mut tls = handshake(
+            tunnel,
+            client_config(mitm_roots.clone(), &[], true),
+            "origin.test",
+        )
+        .await
+        .expect("the client trusts the MITM CA");
+        // the handshake is done and no request follows: what a client that
+        // pins its host's certificate does
+        tls.shutdown().await.expect("the close_notify goes out");
+        let mut rest = Vec::new();
+        tokio::time::timeout(WITHIN, tls.read_to_end(&mut rest))
+            .await
+            .expect("the engine lets go within the bound")
+            .expect("the stream ends cleanly");
+    }
+    let records = the_records(&h, 2).await;
+    for record in &records {
+        assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+        assert_eq!(
+            record.error.as_deref(),
+            Some("no request after the TLS handshake (likely certificate pinning)"),
+            "{record:?}"
+        );
+    }
+
+    let hint = "origin.test is likely protected by certificate pinning";
+    let lines = log.lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("WARN") && line.contains(hint))
+            .count(),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("DEBUG") && line.contains(hint))
+            .count(),
+        1,
+        "the second hint about the same host is DEBUG only"
+    );
+    let counts = h.engine.http_counts().mitm;
+    assert_eq!(counts.decrypted, 2, "{counts:?}");
+    assert_eq!(counts.no_request, 2, "{counts:?}");
+}
+
+/// A client that finishes the handshake and then says nothing at all is not a
+/// client that pins: the wait for the request head runs out, and that is no
+/// hint (`phase 4 M2 design 8.3`).
+#[tokio::test]
+async fn a_request_head_that_times_out_is_no_pinning_hint() {
+    let log = LogCapture::start();
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let h = harness_timed(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        EngineShared {
+            roots: Some(origin.roots()),
+            sniff_wait: Duration::from_millis(300),
+            ..EngineShared::default()
+        },
+        Duration::from_millis(300),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let tls = handshake(tunnel, client_config(mitm_roots, &[], true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    // nothing is sent and nothing is closed: the wait for the request head is
+    // what ends the connection, and the stream is held until it does
+    let record = the_records(&h, 1).await.remove(0);
+    assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+    let reason = record.error.as_deref().unwrap_or_default();
+    assert!(
+        !reason.is_empty(),
+        "hyper says why the connection ended: {record:?}"
+    );
+    assert_ne!(
+        reason, "no request after the TLS handshake (likely certificate pinning)",
+        "a head that timed out is no pinning hint"
+    );
+    assert_eq!(h.engine.http_counts().mitm.no_request, 0);
+    let lines = log.lines();
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("WARN") && line.contains("certificate pinning")),
+        "{lines:?}"
+    );
+    drop(tls);
+}
+
+/// A client that sends a hello and then leaves is a failed handshake, said at
+/// INFO and counted as such (`phase 4 M2 design 8.2`, the plan's P21).
+#[tokio::test]
+async fn a_handshake_the_client_abandons_is_failed_at_info() {
+    let log = LogCapture::start();
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    // a hello and then the end of the stream: the engine is left waiting for
+    // the client's next step of the handshake
+    let mut stream = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    stream
+        .write_all(&client_hello(
+            client_config(mitm_roots, &[], true),
+            "origin.test",
+        ))
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+
+    let record = the_records(&h, 1).await.remove(0);
+    assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+    assert!(
+        record
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("TLS handshake with the client failed: "),
+        "{record:?}"
+    );
+    let info = "the TLS handshake with the client failed for origin.test: ";
+    let lines = log.lines();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("INFO") && line.contains(info)),
+        "{lines:?}"
+    );
+    assert_eq!(h.engine.http_counts().mitm.failed, 1);
+}
+
+/// The alert a client that does not trust the server's certificate ends its
+/// handshake with: fatal (2), `unknown_ca` (`0x30`). The test writes it
+/// itself — when verification fails, tokio-rustls writes the alert it queued
+/// once and drops it if the socket will not take it at once, and an app
+/// socket dropped with the alert still in it resets the session, so the
+/// engine would see a reset rather than the client's `unknown_ca`.
+const UNKNOWN_CA_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x30];
+
+/// Through the virtual interface the lines of WARN and INFO name neither the
+/// host nor its port: the host is in a line of DEBUG after each of them, and
+/// the records keep it (`phase 4 M2 design 8.2`, `15`; stage 3 `M3-D26`).
+#[tokio::test]
+async fn through_the_virtual_interface_the_warnings_name_no_host() {
+    let log = LogCapture::start();
+    let origin = TlsFixture::new(&["origin.test"]);
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let section = mitm_section("origin.test", &ca);
+    let rig = Rig::on(
+        harness_mitm(
+            Profile {
+                rules: &guarded("DOMAIN,origin.test,DIRECT"),
+                sections: &section,
+                ..Profile::default()
+            },
+            origin.roots(),
+        )
+        .await,
+    )
+    .await;
+
+    // a client that does not trust the MITM CA. Its alert must reach the
+    // engine before its socket goes: an app socket that closes with data
+    // still unsent resets the session
+    let (fake, _) = rig.fakes("origin.test");
+    let tcp = rig
+        .app
+        .connect(SocketAddr::new(fake, 443))
+        .await
+        .expect("the session is accepted");
+    let name = rustls::pki_types::ServerName::try_from("origin.test".to_string()).unwrap();
+    let failed = tokio::time::timeout(
+        WITHIN,
+        tokio_rustls::TlsConnector::from(client_config(origin.roots(), &[], true))
+            .connect(name, tcp)
+            .into_fallible(),
+    )
+    .await
+    .expect("the handshake ends within the bound");
+    let (error, mut stream) = failed.expect_err("rurge signs its leaf with the MITM CA");
+    assert!(error.to_string().contains("UnknownIssuer"), "{error}");
+    // the alert the client's handshake ended with, written by the test: see
+    // `UNKNOWN_CA_ALERT`
+    stream.write_all(&UNKNOWN_CA_ALERT).await.unwrap();
+    let first = the_records(&rig.h, 1).await;
+    assert_eq!(first[0].status, RecordStatus::Failed, "{first:?}");
+    assert_eq!(
+        first[0].error.as_deref(),
+        Some("the client does not trust the certificate rurge issued (alert unknown_ca)"),
+        "{first:?}"
+    );
+    drop(stream);
+
+    // and one that trusts it and leaves without a request
+    let (fake, _) = rig.fakes("origin.test");
+    let tcp = rig
+        .app
+        .connect(SocketAddr::new(fake, 443))
+        .await
+        .expect("the session is accepted");
+    let mut tls = handshake(tcp, client_config(mitm_roots, &[], true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    tls.shutdown().await.expect("the close_notify goes out");
+    let mut rest = Vec::new();
+    tokio::time::timeout(WITHIN, tls.read_to_end(&mut rest))
+        .await
+        .expect("the engine lets go within the bound")
+        .expect("the stream ends cleanly");
+
+    let records = the_records(&rig.h, 2).await;
+    for record in &records {
+        assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+        assert!(record.dst.contains("origin.test"), "{record:?}");
+    }
+    let lines = log.lines();
+    let warns: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("WARN") && line.contains("virtual interface"))
+        .collect();
+    assert_eq!(warns.len(), 2, "{lines:?}");
+    for line in &warns {
+        assert!(!line.contains("origin.test"), "{line}");
+        assert!(!line.contains("port="), "{line}");
+    }
+    let untrusted = "the client does not trust the certificate rurge issued for origin.test";
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("DEBUG") && line.contains(untrusted))
+            .count(),
+        1,
+        "{lines:?}"
+    );
+    let pinning = "origin.test is likely protected by certificate pinning";
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("DEBUG") && line.contains(pinning))
+            .count(),
+        1,
+        "{lines:?}"
+    );
+    let counts = rig.h.engine.http_counts().mitm;
+    assert_eq!(counts.untrusted, 1, "{counts:?}");
+    assert_eq!(counts.no_request, 1, "{counts:?}");
 }
 
 /// A reload with the same material keeps the authority, and with it the
@@ -677,6 +1090,51 @@ async fn a_reload_with_the_same_material_keeps_the_leaves() {
 
     let second = leaf_of(&h, &mitm_roots).await;
     assert_eq!(first, second, "the authority's cached leaf is the same one");
+}
+
+/// The MITM counts stand across a reload: they belong to the engine, not to a
+/// generation (`phase 4 M2 design 8.5`, the plan's P23).
+#[tokio::test]
+async fn the_mitm_counts_survive_a_reload() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(tunnel, client_config(mitm_roots, &[], true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    let response = get(&mut tls, "origin.test", "/a").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    the_records(&h, 1).await;
+    assert_eq!(h.engine.http_counts().mitm.decrypted, 1);
+
+    let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &text, h.engine.shared()).await);
+    assert_eq!(
+        h.engine.http_counts().mitm.decrypted,
+        1,
+        "a reload does not clear the counts"
+    );
 }
 
 /// The switch is kept in `state.json` as a second-version file, and a start

@@ -207,6 +207,10 @@ pub struct Engine {
     /// How the sniffs of this engine ended (phase 4 M1 design 7.5), what
     /// `http_counts` reads. As `fake_pool`, it outlives a reload.
     pub(crate) sniff_counts: crate::serve::SniffCounts,
+    /// How the decrypted connections of this engine ended (`phase 4 M2 design
+    /// 8.5`), what `http_counts` reads as `mitm`: as `sniff_counts`, a reload
+    /// does not clear them, so they live here and not in a generation.
+    pub(crate) mitm_counts: crate::mitm::MitmCounters,
     /// The requests that reached the rules (phase 4 M1 design 11): counted by
     /// `ConnUpstreams::route`, which every entry of the engine's requests
     /// shares, and read by `http_counts`.
@@ -281,6 +285,7 @@ impl Engine {
             mitm_on: AtomicBool::new(true),
             fake_pool: ArcSwapOption::empty(),
             sniff_counts: crate::serve::SniffCounts::default(),
+            mitm_counts: crate::mitm::MitmCounters::default(),
             request_count: AtomicU64::new(0),
             state: OnceLock::new(),
             shared,
@@ -1467,6 +1472,7 @@ impl Engine {
         crate::serve::HttpCounts {
             sniffed: self.sniff_counts.snapshot(),
             requests: self.request_count.load(Ordering::Relaxed),
+            mitm: self.mitm_counts.snapshot(),
         }
     }
     /// Kills an in-flight session by id (M4 `POST /v1/requests/{id}/kill`).

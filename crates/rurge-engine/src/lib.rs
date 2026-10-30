@@ -36,7 +36,7 @@ pub use engine::{
     UnknownPolicy,
 };
 pub use external_resources::{ExternalResource, UnusedLines};
-pub use mitm::MitmShared;
+pub use mitm::{MitmCounts, MitmShared};
 pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, TrafficTotals};
 pub use outbounds::{EngineFactory, dry_build, load_checked};
 pub use owner::{OwnerLookup, OwnerQuery};

@@ -11,11 +11,12 @@ use crate::FAKE_ADDRESS_NOT_KNOWN;
 use crate::control::Mode;
 use crate::engine::{Engine, HANDSHAKE_TIMEOUT, policy_known};
 use crate::fake_address::Turned;
+use crate::mitm::Hint;
 use rurge_config::HostName;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_dns::fakeip::{Lease, in_space};
-use rurge_http::mitm::{HandshakeFailure, Mitm, OriginTls, source_of};
+use rurge_http::mitm::{HandshakeFailure, Mitm, OriginTls, Watch, source_of};
 use rurge_http::{ClientHello, Prefixed, Sniffed};
 use rurge_inbound::{
     DialError, Dialer, ProcessSlot, ServeOpts, SessionHandle, SessionOutcome, hold_dropped,
@@ -78,13 +79,15 @@ pub struct SniffedCounts {
 }
 
 /// The HTTP engine's counters (phase 4 M1 design 11), as `GET /v1/rurge/http`
-/// reads them: the sniffs of M1a, and the requests that reached the rules
-/// since M1b.
+/// reads them: the sniffs of M1a, the requests that reached the rules since
+/// M1b, and what the decrypted connections did (`phase 4 M2 design 8.5`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HttpCounts {
     pub sniffed: SniffedCounts,
     /// The requests that reached the rules, refused ones included.
     pub requests: u64,
+    /// The MITM counts of the engine (`phase 4 M2 design 12.3`).
+    pub mitm: crate::mitm::MitmCounts,
 }
 
 /// The parts of one client connection that `serve_http` and `serve_mitm` set
@@ -100,6 +103,15 @@ struct Carried {
     lease: Option<Lease>,
     carrier: Arc<SessionHandle>,
     opts: ServeOpts,
+}
+
+/// What judging certificate pinning needs of a decrypted connection (`phase 4
+/// M2 design 8.3`): the name the leaf was issued for, which the hint names,
+/// and the count of what the client sent and whether it closed — both counted
+/// outside the TLS stream, which the HTTP engine has by then.
+struct Pinning {
+    name: HostName,
+    watch: Arc<Watch>,
 }
 
 impl Engine {
@@ -374,6 +386,7 @@ impl Engine {
             },
             Box::new(client),
             None,
+            None,
         )
         .await;
     }
@@ -432,13 +445,25 @@ impl Engine {
             Err(failure) => {
                 // the connection's own record, as a connection whose requests
                 // never reached the rules gets one (`phase 4 M2 design 8.2`,
-                // the plan's P21). The log lines, the counts and the rate
-                // limit are the next task's.
+                // the plan's P21) — with the line and the count the failure
+                // has, and both of those limited to one WARN per host and
+                // hour by `8.4`
                 let reason = match failure {
-                    HandshakeFailure::Untrusted { alert } => format!(
-                        "the client does not trust the certificate rurge issued (alert {alert})"
-                    ),
+                    HandshakeFailure::Untrusted { alert } => {
+                        self.mitm_counts.untrusted();
+                        self.log_untrusted(session.listener, &name, session.dst_port, alert);
+                        format!(
+                            "the client does not trust the certificate rurge issued (alert {alert})"
+                        )
+                    }
                     HandshakeFailure::Failed { reason } => {
+                        self.mitm_counts.failed();
+                        self.log_handshake_failed(
+                            session.listener,
+                            &name,
+                            session.dst_port,
+                            &reason,
+                        );
                         format!("TLS handshake with the client failed: {reason}")
                     }
                 };
@@ -447,6 +472,7 @@ impl Engine {
                 return;
             }
         };
+        self.mitm_counts.decrypted();
         self.serve_requests(
             Carried {
                 engine,
@@ -459,6 +485,10 @@ impl Engine {
             },
             accepted.stream,
             Some(accepted.origin),
+            Some(Pinning {
+                name,
+                watch: accepted.watch,
+            }),
         )
         .await;
     }
@@ -468,12 +498,15 @@ impl Engine {
     /// dialed on its own (`ConnUpstreams`), and the connection itself gets a
     /// record only when none of them reached the rules. A decrypted connection
     /// (`origin` is `Some`, `phase 4 M2 design 9`) is the same in everything
-    /// but the TLS to the origin and the URL each request is named by.
+    /// but the TLS to the origin and the URL each request is named by, and it
+    /// is `pinning` that tells the one ending of it that is a hint about the
+    /// host (`phase 4 M2 design 8.3`).
     async fn serve_requests(
         &self,
         carried: Carried,
         client: BoxedStream,
         origin: Option<OriginTls>,
+        pinning: Option<Pinning>,
     ) {
         let Carried {
             engine,
@@ -484,6 +517,9 @@ impl Engine {
             carrier,
             opts,
         } = carried;
+        // what a line about the connection says of it, taken before the
+        // connection takes the session (`phase 4 M2 design 15`)
+        let (listener, port) = (session.listener, session.dst_port);
         let runtime = self.runtime();
         let conn = rurge_http::Conn {
             session,
@@ -525,12 +561,106 @@ impl Engine {
         };
         if served.routed == 0 {
             // nothing of the connection reached the rules: it gets a record of
-            // its own, and the reason hyper had for ending it (the next task
-            // adds the hint of certificate pinning to these)
+            // its own. A decrypted connection whose client finished the
+            // handshake and closed without sending a byte is what certificate
+            // pinning looks like (`phase 4 M2 design 8.3`, the plan's P21);
+            // anything else is hyper's reason for ending the connection.
+            let pinned = pinning.filter(|pinning| {
+                pinning.watch.read() == 0
+                    && pinning.watch.closed_by_client()
+                    && !token.is_cancelled()
+                    && opts.stop.as_ref().is_none_or(|stop| !stop.is_cancelled())
+            });
+            let reason = match pinned {
+                Some(pinning) => {
+                    self.mitm_counts.no_request();
+                    self.log_pinning(listener, &pinning.name, port);
+                    "no request after the TLS handshake (likely certificate pinning)".to_string()
+                }
+                None => served.error.unwrap_or_else(|| "no request".to_string()),
+            };
             self.attach_observers(&carrier);
-            carrier.finish(SessionOutcome::Failed(
-                served.error.unwrap_or_else(|| "no request".to_string()),
-            ));
+            carrier.finish(SessionOutcome::Failed(reason));
+        }
+    }
+
+    /// The line about a client that does not trust the certificate rurge
+    /// issued (`phase 4 M2 design 8.2`, the plan's P21). A session through a
+    /// listener names the host and its port; one through the virtual
+    /// interface names neither, and the host follows in a line of DEBUG
+    /// (`phase 4 M2 design 15`, stage 3 `M3-D26`). A second hint about the same
+    /// host within the hour is the DEBUG line alone (`8.4`).
+    fn log_untrusted(&self, listener: ListenerKind, name: &HostName, port: u16, alert: &str) {
+        let named = format!(
+            "the client does not trust the certificate rurge issued for {name}: trust rurge's MITM CA on the client, or exclude the host with -{name} in [MITM] hostname"
+        );
+        let quiet =
+            !self
+                .shared()
+                .mitm
+                .warn_now(Hint::Untrusted, &name.to_string(), Instant::now());
+        if matches!(listener, ListenerKind::Tun) {
+            if !quiet {
+                tracing::warn!(
+                    "the client does not trust the certificate rurge issued for a host reached through the virtual interface (the name is in the DEBUG log and the request record): trust rurge's MITM CA on the client, or exclude the host in [MITM] hostname"
+                );
+            }
+            tracing::debug!("{}", named);
+        } else if quiet {
+            tracing::debug!(port = %port, alert = %alert, "{}", named);
+        } else {
+            tracing::warn!(port = %port, alert = %alert, "{}", named);
+        }
+    }
+
+    /// The hint that a host is likely protected by certificate pinning
+    /// (`phase 4 M2 design 8.3`, the plan's P21): the client finished the
+    /// handshake and closed without a request. A session through the virtual
+    /// interface leaves the host and the port out, and the host follows in a
+    /// line of DEBUG (`phase 4 M2 design 15`); a second hint about the same
+    /// host within the hour is DEBUG alone (`8.4`).
+    fn log_pinning(&self, listener: ListenerKind, name: &HostName, port: u16) {
+        let named = format!(
+            "{name} is likely protected by certificate pinning: the client finished the TLS handshake and closed without a request; exclude it with -{name} in [MITM] hostname"
+        );
+        let quiet = !self
+            .shared()
+            .mitm
+            .warn_now(Hint::Pinning, &name.to_string(), Instant::now());
+        if matches!(listener, ListenerKind::Tun) {
+            if !quiet {
+                tracing::warn!(
+                    "a host reached through the virtual interface is likely protected by certificate pinning (the name is in the DEBUG log and the request record): the client finished the TLS handshake and closed without a request"
+                );
+            }
+            tracing::debug!("{}", named);
+        } else if quiet {
+            tracing::debug!(port = %port, "{}", named);
+        } else {
+            tracing::warn!(port = %port, "{}", named);
+        }
+    }
+
+    /// The line about a handshake that failed for any reason but the client's
+    /// trust (`phase 4 M2 design 8.2`, the plan's P21). It is not limited: the
+    /// reasons differ from one another, and a repeat is a new fact. A session
+    /// through the virtual interface leaves the host and the port out, and the
+    /// host follows in a line of DEBUG (`phase 4 M2 design 15`).
+    fn log_handshake_failed(
+        &self,
+        listener: ListenerKind,
+        name: &HostName,
+        port: u16,
+        reason: &str,
+    ) {
+        let named = format!("the TLS handshake with the client failed for {name}: {reason}");
+        if matches!(listener, ListenerKind::Tun) {
+            tracing::info!(
+                "the TLS handshake with the client failed for a host reached through the virtual interface: {reason}"
+            );
+            tracing::debug!("{}", named);
+        } else {
+            tracing::info!(port = %port, "{}", named);
         }
     }
 
