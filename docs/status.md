@@ -809,7 +809,7 @@ M2c 做完了（2026-10-31；计划 `docs/superpowers/plans/2026-10-31-phase4-m2
 - **任务 7**（`c8c1fca`、修正轮 1 `113dc44`、修正轮 2 `eedd9b1`）：阶段 4 的手工验收清单，只改文档。
 - **任务 8**（本节的提交）：文档收尾（设计第 22 节与第 23 节第 28、29 条、兼容性清单、`docs/api/phase4.md`、`docs/testing.md`、本节与依赖附录、`requirements.md`、两份 README、`CLAUDE.md`、`docs/README.md`），只改文档，0 条用例（91 / 5036）。
 
-门禁：除任务 7 外，每个任务各跑了一次全量（任务 7 与它的两轮修正只改文档，没有跑，修正记录第 41、43、45 行）。任务 4 的第一次全量里 `--test http` 的测试二进制以 `STATUS_HEAP_CORRUPTION` 退出，整个门禁重跑全绿；任务 1 与任务 2 各有一次测试二进制同样退出，单独重跑那一个全过。新写的计时用例单独循环跑了 20 次，全过，五圈各属于谁：任务 1 改了等待之后的 `crates/rurge-engine/tests/pipeline.rs` 那一条（`a_dns_session_is_labelled_by_its_scheme_whatever_the_port`，M2b 延后第 1 行，`task-1-loop-pipeline.log`）、任务 5 的五条握手用例（`task-5-loop-tls.log`）、任务 5 的 `--test api` 两条（`task-5-loop-api.log`）、任务 5 修正轮 1 那五条又一圈（`task-5-fix-1-loop-tls.log`）、任务 6 的 `run::mitm` 两条（`task-6-loop-mitm.log`）。这些都是一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；需要参照服务端的互操作用例在本机立刻返回、算在通过的数里。
+门禁：除任务 7 外，每个任务各跑了一次全量（任务 7 与它的两轮修正只改文档，没有跑，修正记录第 41、43、45 行）。任务 4 的第一次全量里 `--test http` 的测试二进制以 `STATUS_HEAP_CORRUPTION` 退出，整个门禁重跑全绿；任务 1 与任务 2 各有一次测试二进制同样退出，单独重跑那一个全过。带等待的用例单独循环跑了 20 次（四圈是新写的用例，任务 1 那一圈是改了等待的旧用例），全过，五圈各属于谁：任务 1 改了等待之后的 `crates/rurge-engine/tests/pipeline.rs` 那一条（`a_dns_session_is_labelled_by_its_scheme_whatever_the_port`，M2b 延后第 1 行，`task-1-loop-pipeline.log`）、任务 5 的五条握手用例（`task-5-loop-tls.log`）、任务 5 的 `--test api` 两条（`task-5-loop-api.log`）、任务 5 修正轮 1 那五条又一圈（`task-5-fix-1-loop-tls.log`）、任务 6 的 `run::mitm` 两条（`task-6-loop-mitm.log`）。这些都是一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；需要参照服务端的互操作用例在本机立刻返回、算在通过的数里。
 
 没做的，与不要当成已经有的：
 
