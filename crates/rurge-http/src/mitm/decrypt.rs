@@ -35,10 +35,6 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
 
-/// How long the TLS handshake with the origin may take (`phase 4 M2 design
-/// 9.2`, the same as the one with the client).
-const ORIGIN_WAIT: Duration = Duration::from_secs(30);
-
 /// What the engine does with a sniffed TLS session (`phase 4 M2 design 7.1`):
 /// decrypt it, pass it through, or pass it through because the client offers
 /// no protocol rurge decrypts.
@@ -52,7 +48,8 @@ pub enum Decision {
 /// The TLS of the origin side of a decrypted connection (`phase 4 M2 design
 /// 9.2`): the client configuration, the name it is verified against (the
 /// client's SNI, or the target when there is none), and how long the
-/// handshake may take.
+/// handshake may take — as long as the client's own handshake was given
+/// (`phase 4 M2 design 9.2`, the same 30 seconds as `8.2`).
 pub struct OriginTls {
     pub config: Arc<ClientConfig>,
     pub name: ServerName<'static>,
@@ -187,7 +184,7 @@ impl Mitm {
     ) -> Result<Accepted, HandshakeFailure> {
         // the certificate, the handshake and everything it says count as one
         // wait: a client that stalls while the CA signs is stalled too
-        match tokio::time::timeout(wait, self.handshake(client, name)).await {
+        match tokio::time::timeout(wait, self.handshake(client, name, wait)).await {
             Ok(result) => result,
             Err(_) => Err(HandshakeFailure::Failed {
                 reason: "timed out".into(),
@@ -206,6 +203,7 @@ impl Mitm {
         &self,
         client: Prefixed<BoxedStream>,
         name: &HostName,
+        wait: Duration,
     ) -> Result<Accepted, HandshakeFailure> {
         let leaf = self
             .authority
@@ -234,7 +232,7 @@ impl Mitm {
             origin: OriginTls {
                 config: Arc::clone(&self.origin),
                 name: origin,
-                wait: ORIGIN_WAIT,
+                wait,
             },
         })
     }
@@ -555,6 +553,34 @@ mod tests {
                 .decides(local, Some(&ok), &ok, 443, &[b"h2".to_vec()]),
             Decision::AlpnMismatch
         );
+
+        // the ALPN is asked last: a session an earlier step passes is passed
+        // without saying that the client offers no protocol rurge decrypts
+        let rig = rig_of(cfg("ok.test"));
+        let other = HostName::parse("other.test");
+        assert_eq!(
+            rig.mitm
+                .decides(local, Some(&other), &other, 443, &[b"h2".to_vec()]),
+            Decision::Pass,
+            "not listed"
+        );
+        let mut blocked = cfg("ok.test");
+        blocked.client_source_address = Some(SourceList::parse("10.0.0.0/8").0);
+        let rig = rig_of(blocked);
+        assert_eq!(
+            rig.mitm
+                .decides(local, Some(&ok), &ok, 443, &[b"h2".to_vec()]),
+            Decision::Pass,
+            "source not allowed"
+        );
+        let odd = HostName::parse(&format!("{}.test", "a".repeat(64)));
+        let rig = rig_of(cfg(&odd.to_string()));
+        assert_eq!(
+            rig.mitm
+                .decides(local, Some(&odd), &odd, 443, &[b"h2".to_vec()]),
+            Decision::Pass,
+            "no server name"
+        );
     }
 
     /// Sniffing widens to the ports the list writes down and to the targets
@@ -638,7 +664,13 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        accepted.expect("the handshake completes without ALPN");
+        let accepted = accepted.expect("the handshake completes without ALPN");
+        assert_eq!(
+            accepted.origin.name,
+            ServerName::try_from("ok.test").expect("a name")
+        );
+        // the origin side gets the wait the client's handshake was given
+        assert_eq!(accepted.origin.wait, Duration::from_secs(5));
         let client = client.expect("the client completes");
         assert_eq!(client.get_ref().1.alpn_protocol(), None);
 
@@ -669,7 +701,11 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        accepted.expect("the handshake completes");
+        let accepted = accepted.expect("the handshake completes");
+        assert_eq!(
+            accepted.origin.name,
+            ServerName::IpAddress(IpAddr::from(Ipv4Addr::LOCALHOST).into())
+        );
         client.expect("the client verifies the certificate of the address");
     }
 
@@ -745,7 +781,8 @@ mod tests {
 
     /// A client that sends its ClientHello and leaves is a failed handshake,
     /// not a client that does not trust the certificate (`phase 4 M2 design
-    /// 8.2`).
+    /// 8.2`) — and it fails when the client leaves, rather than waiting out
+    /// the handshake's own limit.
     #[tokio::test]
     async fn a_client_that_leaves_mid_handshake_is_failed() {
         let rig = rig_of(cfg("ok.test"));
@@ -760,6 +797,7 @@ mod tests {
         let (mut client, server) = duplex(64 * 1024);
         client.write_all(&hello).await.expect("the ClientHello");
         drop(client);
+        let started = std::time::Instant::now();
         let result = rig
             .mitm
             .accept(
@@ -768,11 +806,16 @@ mod tests {
                 Duration::from_secs(5),
             )
             .await;
+        let took = started.elapsed();
         match result {
-            Err(HandshakeFailure::Failed { reason }) => assert!(!reason.is_empty(), "a reason"),
+            Err(HandshakeFailure::Failed { reason }) => {
+                assert!(!reason.is_empty(), "a reason");
+                assert_ne!(reason, "timed out", "the client left, it did not stall");
+            }
             Err(other) => panic!("expected a failure, got {other:?}"),
             Ok(_) => panic!("the handshake completes although the client left"),
         }
+        assert!(took < Duration::from_secs(2), "took {took:?}");
     }
 
     /// A handshake that stalls ends when its wait does, and says so (`phase 4
@@ -857,6 +900,29 @@ mod tests {
         assert_eq!(&got, b"GET");
         assert_eq!(accepted.watch.read(), 3);
         assert!(!accepted.watch.closed_by_client());
+
+        // a client that closes without a `close_notify`: the stream ends
+        // with an error, and that is the client closing too
+        let roots = Arc::clone(&rig.roots);
+        let (accepted, client) = handshake(
+            &rig,
+            &name,
+            client_config(roots, &[]),
+            Duration::from_secs(5),
+        )
+        .await;
+        let mut accepted = accepted.expect("the handshake completes");
+        let client = client.expect("the client completes");
+        drop(client);
+        let mut buf = [0u8; 64];
+        let error = accepted
+            .stream
+            .read(&mut buf)
+            .await
+            .expect_err("the end of the stream is an error");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
+        assert_eq!(accepted.watch.read(), 0);
+        assert!(accepted.watch.closed_by_client());
     }
 
     /// Two connections of one authority, one name and one client
