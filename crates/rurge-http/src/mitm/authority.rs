@@ -13,7 +13,15 @@
 //! No message repeats a credential (`phase 4 M2 design 15`): the Base64, the
 //! passphrase and the private key never appear in one, and `Debug` shows the
 //! certificate's subject and the first bytes of its fingerprint.
+//!
+//! `Authority::leaf` is what a decrypted connection is served from: one
+//! certificate per name, signed on a blocking thread and cached, so that the
+//! connections a browser opens at once for one host sign once (`phase 4 M2
+//! design 6`). The TLS sessions of the connections this authority serves are
+//! cached here too, so that they resume across connections (`phase 4 M2
+//! design 8.1`).
 
+use lru::LruCache;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SanType, SerialNumber,
@@ -27,11 +35,17 @@ use rurge_proto::keystore::{base64_bytes, decode_pkcs12};
 use rustls::RootCertStore;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::ServerCertVerifier as _;
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::server::ServerSessionMemoryCache;
+use rustls::sign::CertifiedKey;
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::num::NonZeroUsize;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use time::OffsetDateTime;
+use tokio::sync::OnceCell;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::parse_x509_certificate;
 
@@ -39,10 +53,17 @@ use x509_parser::parse_x509_certificate;
 /// never be a real host (`phase 4 M2 design 5.2` item 6).
 const CHECK_NAME: &str = "rurge-ca-check.invalid";
 
-/// How far the validity of an issued certificate reaches back and forward
-/// (`phase 4 M2 design 6`).
-const BACKDATE_DAYS: i64 = 2;
-const LIFETIME_DAYS: i64 = 47;
+/// How many names keep their certificate (`phase 4 M2 design 6`).
+pub const LEAF_SLOTS: usize = 1000;
+
+/// How many TLS sessions the connections of one authority resume from
+/// (`phase 4 M2 design 6`, `8.1`).
+pub const SESSION_SLOTS: usize = 1024;
+
+/// How long an issued certificate lives, and how far back it reaches before
+/// now (`phase 4 M2 design 6`).
+pub const LEAF_DAYS: i64 = 47;
+pub const BACKDATE_DAYS: i64 = 2;
 
 /// What `[MITM]` has to say when it lists hosts and sets no CA (`P5` item 1).
 const NO_CA: &str =
@@ -100,6 +121,15 @@ pub struct Authority {
     /// SHA-256 of the material as written (`P8`): compared, never shown.
     material: [u8; 32],
     clock: RwLock<Clock>,
+    /// One slot per name, least recently used last (`phase 4 M2 design 6`).
+    /// The lock is held to pick or replace a slot and never across an await.
+    leaves: Mutex<LruCache<HostName, Arc<Slot>>>,
+    /// The TLS sessions of the connections this authority serves.
+    sessions: Arc<ServerSessionMemoryCache>,
+    /// How many certificates were really signed: the trial issue of the load
+    /// is not one (`P7`).
+    #[cfg(test)]
+    signatures: AtomicUsize,
 }
 
 impl Authority {
@@ -289,6 +319,12 @@ impl Authority {
             ca,
             material,
             clock: RwLock::new(clock),
+            leaves: Mutex::new(LruCache::new(
+                NonZeroUsize::new(LEAF_SLOTS).expect("a cache with slots"),
+            )),
+            sessions: ServerSessionMemoryCache::new(SESSION_SLOTS),
+            #[cfg(test)]
+            signatures: AtomicUsize::new(0),
         };
         authority.trial_issue(&src, span)?;
         Ok(Some(authority))
@@ -322,6 +358,80 @@ impl Authority {
         (*self.clock.read().expect("the clock is not poisoned"))()
     }
 
+    /// One certificate for `name`, signed on a blocking thread unless another
+    /// connection for the same name is already at it (`phase 4 M2 design 6`,
+    /// `M2-D7`). A name keeps its certificate until a third of its life is
+    /// left; a failed signature leaves the slot empty, and the next
+    /// connection tries again.
+    pub async fn leaf(self: &Arc<Self>, name: &HostName) -> Result<Arc<CertifiedKey>, LeafError> {
+        let now = self.now();
+        let slot = {
+            let mut leaves = self.leaves.lock().expect("the leaf cache is not poisoned");
+            // a slot with a certificate near its end is dropped, so that the
+            // connections that come next sign a new one; the ones that already
+            // hold the old certificate keep it, it is not expired yet
+            let stale = leaves
+                .get(name)
+                .is_some_and(|slot| slot.get().is_some_and(|leaf| leaf.is_due(now)));
+            if stale {
+                leaves.pop(name);
+            }
+            match leaves.get(name) {
+                Some(slot) => Arc::clone(slot),
+                None => {
+                    let slot = Arc::new(Slot::default());
+                    leaves.put(name.clone(), Arc::clone(&slot));
+                    slot
+                }
+            }
+        };
+        let authority = Arc::clone(self);
+        let signed = name.clone();
+        let leaf = slot
+            .get_or_try_init(|| async move {
+                let signing = Arc::clone(&authority);
+                let fallback = signed.clone();
+                match tokio::task::spawn_blocking(move || signing.sign(&signed, now)).await {
+                    Ok(result) => result.map(Arc::new),
+                    Err(e) => Err(LeafError::new(fallback, e.to_string())),
+                }
+            })
+            .await?;
+        Ok(Arc::clone(&leaf.key))
+    }
+
+    /// The session cache the server configuration of every decrypted
+    /// connection shares (`phase 4 M2 design 8.1`).
+    pub(crate) fn sessions(&self) -> Arc<ServerSessionMemoryCache> {
+        Arc::clone(&self.sessions)
+    }
+
+    /// Signs one certificate for `name` and makes it a `CertifiedKey` with the
+    /// whole PKCS#12 chain behind it (`phase 4 M2 design 5.5`). This runs on a
+    /// blocking thread.
+    fn sign(&self, name: &HostName, now: OffsetDateTime) -> Result<Leaf, LeafError> {
+        let issued = self
+            .issue(name, now)
+            .map_err(|e| LeafError::new(name.clone(), e.to_string()))?;
+        #[cfg(test)]
+        self.signatures.fetch_add(1, Ordering::Relaxed);
+        let key = rustls::crypto::ring::sign::any_ecdsa_type(&PrivateKeyDer::Pkcs8(issued.key))
+            .map_err(|e| LeafError::new(name.clone(), e.to_string()))?;
+        let mut chain = Vec::with_capacity(self.chain.len() + 1);
+        chain.push(issued.cert);
+        chain.extend(self.chain.iter().cloned());
+        Ok(Leaf {
+            key: Arc::new(CertifiedKey::new(chain, key)),
+            not_before: issued.not_before,
+            not_after: issued.not_after,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signature_count(&self) -> usize {
+        self.signatures.load(Ordering::Relaxed)
+    }
+
     /// One certificate for `name`, and a fresh P-256 key for it
     /// (`phase 4 M2 design 6`, `P9`). The caller signs on a blocking thread
     /// (`M2-D7`); this is also what the trial issue of the load uses.
@@ -329,7 +439,7 @@ impl Authority {
         &self,
         name: &HostName,
         now: OffsetDateTime,
-    ) -> Result<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>), rcgen::Error> {
+    ) -> Result<Issued, rcgen::Error> {
         let key = KeyPair::generate()?;
         let mut params = CertificateParams::default();
         // `CertificateParams::default` writes a common name of its own
@@ -357,13 +467,16 @@ impl Authority {
         params.serial_number = Some(SerialNumber::from_slice(&serial));
         // the leaf does not reach outside what the CA covers
         let not_before = (now - time::Duration::days(BACKDATE_DAYS)).max(self.not_before);
+        let not_after = (not_before + time::Duration::days(LEAF_DAYS)).min(self.not_after);
         params.not_before = not_before;
-        params.not_after = (not_before + time::Duration::days(LIFETIME_DAYS)).min(self.not_after);
+        params.not_after = not_after;
         let cert = params.signed_by(&key, &self.issuer)?;
-        Ok((
-            cert.der().clone(),
-            PrivatePkcs8KeyDer::from(key.serialize_der()),
-        ))
+        Ok(Issued {
+            cert: cert.der().clone(),
+            key: PrivatePkcs8KeyDer::from(key.serialize_der()),
+            not_before,
+            not_after,
+        })
     }
 
     /// Signs one certificate for the reserved name and verifies it against
@@ -382,6 +495,7 @@ impl Authority {
         };
         let (leaf, _key) = self
             .issue(&HostName::parse(CHECK_NAME), self.now())
+            .map(|issued| (issued.cert, issued.key))
             .map_err(|e| fails(e.to_string()))?;
         let mut roots = RootCertStore::empty();
         roots
@@ -404,6 +518,61 @@ impl Authority {
         Ok(())
     }
 }
+
+/// Why an authority has no certificate for a name: what a failed handshake
+/// says (`phase 4 M2 design 8.2`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafError {
+    name: HostName,
+    why: String,
+}
+
+impl LeafError {
+    fn new(name: HostName, why: String) -> LeafError {
+        LeafError { name, why }
+    }
+}
+
+impl fmt::Display for LeafError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cannot issue a certificate for {}: {}",
+            self.name, self.why
+        )
+    }
+}
+
+impl std::error::Error for LeafError {}
+
+/// What `issue` signed: the certificate, its key, and the validity it was
+/// given, which tells a cache when to sign a new one.
+pub(crate) struct Issued {
+    cert: CertificateDer<'static>,
+    key: PrivatePkcs8KeyDer<'static>,
+    not_before: OffsetDateTime,
+    not_after: OffsetDateTime,
+}
+
+/// One name's certificate, as the connections of that name use it.
+pub(crate) struct Leaf {
+    key: Arc<CertifiedKey>,
+    not_before: OffsetDateTime,
+    not_after: OffsetDateTime,
+}
+
+impl Leaf {
+    /// Whether a third of the certificate's life is left, or less: the
+    /// connection that comes next signs a new one (`phase 4 M2 design 6`).
+    fn is_due(&self, now: OffsetDateTime) -> bool {
+        let life = self.not_after - self.not_before;
+        now >= self.not_after - life / 3_i32
+    }
+}
+
+/// One name's place in the leaf cache: the first connection for the name
+/// signs, and the ones that arrive meanwhile wait for it (`M2-D7`).
+type Slot = OnceCell<Arc<Leaf>>;
 
 /// Where the certificate authority comes from, and nothing read off the
 /// certificate yet.
@@ -541,80 +710,22 @@ fn check_with(config: &Config, clock: Clock) -> Diagnostics {
 mod tests {
     use super::*;
     use crate::mitm::fixtures;
-    use rcgen::{BasicConstraints, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
+    use crate::mitm::testing::{
+        DAY, NOW, TestCa, at, ca_p12, ca_params, cfg_with_ca, clock_at, fixture_key, generated,
+        make_ca,
+    };
+    use rcgen::{CustomExtension, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
     use rurge_config::config::{LoadOptions, from_text};
     use rurge_config::diagnostic::Severity;
     use rurge_proto::testing::{p12_base64, p12_cert_base64};
-    use rustls::pki_types::PrivateKeyDer;
     use std::path::Path;
-
-    /// 2027-01-01T00:00:00Z: the instant every case that uses the OpenSSL
-    /// fixtures pins (`P7`).
-    const NOW: i64 = 1_798_761_600;
-    const DAY: i64 = 86_400;
-
-    fn at(ts: i64) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(ts).expect("a timestamp")
-    }
-
-    fn clock_at(ts: i64) -> Clock {
-        Arc::new(move || at(ts))
-    }
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::oid_registry::{
+        OID_PKCS1_SHA256WITHRSA, OID_SIG_ECDSA_WITH_SHA384, OID_SIG_ED25519,
+    };
 
     fn date(ts: i64) -> String {
         at(ts).date().to_string()
-    }
-
-    /// A certificate authority made by rcgen, and its key.
-    struct TestCa {
-        cert: CertificateDer<'static>,
-        key: KeyPair,
-    }
-
-    fn ca_params(cn: &str) -> CertificateParams {
-        let mut params = CertificateParams::default();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        params.distinguished_name.push(DnType::CommonName, cn);
-        params
-    }
-
-    fn make_ca(params: CertificateParams, key: KeyPair) -> TestCa {
-        let cert = params.self_signed(&key).expect("a CA certificate");
-        TestCa {
-            cert: cert.der().clone(),
-            key,
-        }
-    }
-
-    fn generated(algorithm: &'static rcgen::SignatureAlgorithm, cn: &str) -> TestCa {
-        make_ca(
-            ca_params(cn),
-            KeyPair::generate_for(algorithm).expect("a CA key"),
-        )
-    }
-
-    /// A key of the OpenSSL fixtures (`P6`), as rcgen takes it.
-    fn fixture_key(base64: &str) -> KeyPair {
-        let der = base64_bytes(base64).expect("the fixture is Base64");
-        KeyPair::try_from(&PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)))
-            .expect("a usable fixture key")
-    }
-
-    fn ca_p12(ca: &TestCa, password: &str) -> String {
-        p12_base64(
-            &[ca.cert.as_ref().to_vec()],
-            &ca.key.serialize_der(),
-            password,
-        )
-    }
-
-    fn cfg_with_ca(base64: &str, passphrase: &str) -> MitmConfig {
-        MitmConfig {
-            ca_p12: Some(base64.into()),
-            ca_passphrase: Some(passphrase.into()),
-            ..MitmConfig::default()
-        }
     }
 
     fn cfg_with_item(name: &str) -> MitmConfig {
@@ -1135,5 +1246,287 @@ mod tests {
             Some(2),
             "the ca-keystore-name line"
         );
+    }
+
+    /// One certificate for `name`, signed by `ca`.
+    async fn leaf_of(ca: &TestCa, name: &str) -> Arc<CertifiedKey> {
+        let authority = Arc::new(
+            Authority::load_at(&cfg_with_ca(&ca_p12(ca, "pw"), "pw"), &[], clock_at(NOW))
+                .expect("a usable CA")
+                .expect("a CA was named"),
+        );
+        authority
+            .leaf(&HostName::parse(name))
+            .await
+            .expect("a leaf")
+    }
+
+    /// The extension an issued certificate has of `kind`, as raw bytes.
+    fn extension(
+        cert: &x509_parser::certificate::X509Certificate<'_>,
+        which: &str,
+    ) -> Option<Vec<u8>> {
+        cert.iter_extensions()
+            .find_map(|e| match (which, e.parsed_extension()) {
+                ("ski", ParsedExtension::SubjectKeyIdentifier(key)) => Some(key.0.to_vec()),
+                ("aki", ParsedExtension::AuthorityKeyIdentifier(key)) => {
+                    key.key_identifier.as_ref().map(|k| k.0.to_vec())
+                }
+                _ => None,
+            })
+    }
+
+    /// Every item `phase 4 M2 design 6` writes into an issued certificate,
+    /// read back with x509-parser (`P9`).
+    #[tokio::test]
+    async fn a_leaf_says_what_the_design_says() {
+        let ca = generated(&PKCS_ECDSA_P256_SHA256, "rurge test leaf CA");
+
+        let leaf = leaf_of(&ca, "site.test").await;
+        let (_, cert) = parse_x509_certificate(leaf.cert[0].as_ref()).expect("a certificate");
+
+        let san = cert
+            .subject_alternative_name()
+            .expect("the extensions parse")
+            .expect("a subject alternative name");
+        assert_eq!(san.value.general_names.len(), 1, "one name");
+        assert!(
+            matches!(san.value.general_names[0], GeneralName::DNSName(name) if name == "site.test"),
+            "{:?}",
+            san.value.general_names
+        );
+
+        let common: Vec<String> = cert
+            .subject()
+            .iter_common_name()
+            .map(|cn| cn.as_str().expect("a string").to_string())
+            .collect();
+        assert_eq!(common, ["site.test"]);
+
+        let eku = cert
+            .extended_key_usage()
+            .expect("the extensions parse")
+            .expect("an extended key usage");
+        assert!(eku.value.server_auth, "serverAuth");
+        assert!(!eku.value.client_auth && !eku.value.any, "serverAuth alone");
+
+        let ku = cert
+            .key_usage()
+            .expect("the extensions parse")
+            .expect("a key usage");
+        assert!(ku.value.digital_signature(), "digitalSignature");
+        assert!(
+            !ku.value.key_cert_sign() && !ku.value.key_encipherment() && !ku.value.crl_sign(),
+            "digitalSignature alone"
+        );
+
+        // the authority key identifier is the CA's subject key identifier
+        let (_, ca_cert) = parse_x509_certificate(ca.cert.as_ref()).expect("the CA certificate");
+        let ca_ski = extension(&ca_cert, "ski").expect("the CA has a subject key identifier");
+        assert_eq!(extension(&cert, "aki"), Some(ca_ski));
+
+        // a leaf carries neither a subject key identifier nor basic constraints
+        assert_eq!(extension(&cert, "ski"), None);
+        assert!(
+            cert.basic_constraints()
+                .expect("the extensions parse")
+                .is_none(),
+            "no basic constraints"
+        );
+
+        // a positive serial number of 16 bytes
+        let serial = cert.raw_serial();
+        assert_eq!(serial.len(), 16);
+        assert_eq!(serial[0] & 0x80, 0, "a positive serial number");
+
+        // an address is an address
+        let leaf = leaf_of(&ca, "127.0.0.1").await;
+        let (_, cert) = parse_x509_certificate(leaf.cert[0].as_ref()).expect("a certificate");
+        let san = cert
+            .subject_alternative_name()
+            .expect("the extensions parse")
+            .expect("a subject alternative name");
+        assert!(
+            matches!(san.value.general_names[0], GeneralName::IPAddress(_)),
+            "{:?}",
+            san.value.general_names
+        );
+
+        // a name of more than 64 characters has no common name
+        let long = format!("{}.test", "a".repeat(60));
+        assert_eq!(long.chars().count(), 65);
+        let leaf = leaf_of(&ca, &long).await;
+        let (_, cert) = parse_x509_certificate(leaf.cert[0].as_ref()).expect("a certificate");
+        assert_eq!(cert.subject().iter_common_name().count(), 0);
+
+        // the signature is the CA's own
+        let p384 = generated(&PKCS_ECDSA_P384_SHA384, "rurge test p384 leaf CA");
+        let rsa = make_ca(
+            ca_params("rurge test rsa leaf CA"),
+            fixture_key(fixtures::RSA_2048_KEY),
+        );
+        let ed25519 = generated(&PKCS_ED25519, "rurge test ed25519 leaf CA");
+        for (ca, signature) in [
+            (&p384, OID_SIG_ECDSA_WITH_SHA384),
+            (&rsa, OID_PKCS1_SHA256WITHRSA),
+            (&ed25519, OID_SIG_ED25519),
+        ] {
+            let leaf = leaf_of(ca, "site.test").await;
+            let (_, cert) = parse_x509_certificate(leaf.cert[0].as_ref()).expect("a certificate");
+            assert_eq!(
+                cert.signature_algorithm.algorithm.to_id_string(),
+                signature.to_id_string()
+            );
+        }
+    }
+
+    /// An issued certificate starts two days before now and lives 47 days,
+    /// and never reaches outside the CA's own validity (`phase 4 M2 design
+    /// 6`).
+    #[tokio::test]
+    async fn a_leaf_lives_47_days_within_its_ca() {
+        let flimsy =
+            |params: CertificateParams| make_ca(params, KeyPair::generate().expect("a key"));
+
+        // a CA that covers both ends: two days back, 47 days on
+        let ca = generated(&PKCS_ECDSA_P256_SHA256, "rurge test dated leaf CA");
+        let leaf = leaf_of(&ca, "site.test").await;
+        let (_, cert) = parse_x509_certificate(leaf.cert[0].as_ref()).expect("a certificate");
+        assert_eq!(cert.validity().not_before.timestamp(), NOW - 2 * DAY);
+        assert_eq!(
+            cert.validity().not_after.timestamp(),
+            NOW - 2 * DAY + LEAF_DAYS * DAY
+        );
+
+        // a CA that begins yesterday: the leaf begins with it
+        let mut params = ca_params("rurge test recent leaf CA");
+        params.not_before = at(NOW - DAY);
+        params.not_after = at(NOW + 40 * DAY);
+        let ca = flimsy(params);
+        let leaf = leaf_of(&ca, "site.test").await;
+        let (_, cert) = parse_x509_certificate(leaf.cert[0].as_ref()).expect("a certificate");
+        assert_eq!(cert.validity().not_before.timestamp(), NOW - DAY);
+
+        // a CA that ends in ten days: the leaf ends with it
+        let mut params = ca_params("rurge test short leaf CA");
+        params.not_after = at(NOW + 10 * DAY);
+        let ca = flimsy(params);
+        let leaf = leaf_of(&ca, "site.test").await;
+        let (_, cert) = parse_x509_certificate(leaf.cert[0].as_ref()).expect("a certificate");
+        assert_eq!(cert.validity().not_after.timestamp(), NOW + 10 * DAY);
+    }
+
+    /// Without a subject key identifier on the CA the leaf carries no
+    /// authority key identifier (`phase 4 M2 design 6`, `M2-D6`).
+    #[tokio::test]
+    async fn a_ca_without_a_subject_key_identifier_gives_leaves_without_an_authority_key_identifier()
+     {
+        // rcgen writes a subject key identifier for `IsCa::Ca` and never for
+        // `IsCa::NoCa`, so the CA flag comes from an extension of our own
+        let mut params = ca_params("rurge test no-SKI CA");
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let mut basic =
+            CustomExtension::from_oid_content(&[2, 5, 29, 19], vec![0x30, 0x03, 0x01, 0x01, 0xff]);
+        basic.set_criticality(true);
+        params.custom_extensions = vec![basic];
+        let ca = make_ca(params, KeyPair::generate().expect("a key"));
+
+        let (_, ca_cert) = parse_x509_certificate(ca.cert.as_ref()).expect("the CA certificate");
+        assert_eq!(extension(&ca_cert, "ski"), None, "a CA without an SKI");
+
+        let leaf = leaf_of(&ca, "site.test").await;
+        let (_, cert) = parse_x509_certificate(leaf.cert[0].as_ref()).expect("a certificate");
+        assert_eq!(extension(&cert, "aki"), None);
+    }
+
+    /// One name keeps one certificate until a third of its life is left; then
+    /// the next connection signs a new one (`phase 4 M2 design 6`).
+    #[tokio::test]
+    async fn one_name_one_leaf_until_a_third_of_its_life_is_left() {
+        let ca = generated(&PKCS_ECDSA_P256_SHA256, "rurge test cache CA");
+        let authority = Arc::new(
+            Authority::load_at(&cfg_with_ca(&ca_p12(&ca, "pw"), "pw"), &[], clock_at(NOW))
+                .expect("a usable CA")
+                .expect("a CA was named"),
+        );
+        let name = HostName::parse("cache.test");
+
+        let first = authority.leaf(&name).await.expect("a leaf");
+        let again = authority.leaf(&name).await.expect("a leaf");
+        assert!(Arc::ptr_eq(&first, &again), "the same certificate");
+        assert_eq!(authority.signature_count(), 1, "signed once");
+
+        // the instant a third of the life is left: one second earlier is
+        // still the same certificate
+        let (_, cert) = parse_x509_certificate(first.cert[0].as_ref()).expect("a certificate");
+        let not_before = cert.validity().not_before.timestamp();
+        let not_after = cert.validity().not_after.timestamp();
+        let due = not_after - (not_after - not_before) / 3;
+        authority.set_clock(clock_at(due - 1));
+        let still = authority.leaf(&name).await.expect("a leaf");
+        assert!(Arc::ptr_eq(&first, &still), "still the same certificate");
+        assert_eq!(authority.signature_count(), 1);
+
+        authority.set_clock(clock_at(due));
+        let second = authority.leaf(&name).await.expect("a leaf");
+        assert!(!Arc::ptr_eq(&first, &second), "a new certificate");
+        assert_eq!(authority.signature_count(), 2);
+    }
+
+    /// The cache holds a thousand names; the next one pushes the oldest out
+    /// (`phase 4 M2 design 6`).
+    #[tokio::test]
+    async fn the_thousand_and_first_name_pushes_out_the_oldest() {
+        let ca = generated(&PKCS_ECDSA_P256_SHA256, "rurge test slots CA");
+        let authority = Arc::new(
+            Authority::load_at(&cfg_with_ca(&ca_p12(&ca, "pw"), "pw"), &[], clock_at(NOW))
+                .expect("a usable CA")
+                .expect("a CA was named"),
+        );
+
+        let oldest = authority
+            .leaf(&HostName::parse("n0.test"))
+            .await
+            .expect("a leaf");
+        for i in 1..=LEAF_SLOTS {
+            let name = HostName::parse(&format!("n{i}.test"));
+            authority.leaf(&name).await.expect("a leaf");
+        }
+        assert_eq!(authority.signature_count(), LEAF_SLOTS + 1);
+
+        let again = authority
+            .leaf(&HostName::parse("n0.test"))
+            .await
+            .expect("a leaf");
+        assert_eq!(authority.signature_count(), LEAF_SLOTS + 2);
+        assert!(!Arc::ptr_eq(&oldest, &again), "the oldest slot was reused");
+    }
+
+    /// Connections that arrive together for one name sign once and share the
+    /// certificate (`phase 4 M2 design 6`, `M2-D7`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_for_one_name_sign_once() {
+        let ca = generated(&PKCS_ECDSA_P256_SHA256, "rurge test concurrent CA");
+        let authority = Arc::new(
+            Authority::load_at(&cfg_with_ca(&ca_p12(&ca, "pw"), "pw"), &[], clock_at(NOW))
+                .expect("a usable CA")
+                .expect("a CA was named"),
+        );
+        let name = HostName::parse("concurrent.test");
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let authority = Arc::clone(&authority);
+            let name = name.clone();
+            tasks.push(tokio::spawn(async move { authority.leaf(&name).await }));
+        }
+        let mut leaves = Vec::new();
+        for task in tasks {
+            leaves.push(task.await.expect("a task").expect("a leaf"));
+        }
+        assert_eq!(authority.signature_count(), 1, "signed once");
+        for leaf in &leaves {
+            assert!(Arc::ptr_eq(&leaves[0], leaf), "one certificate");
+        }
     }
 }
