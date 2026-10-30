@@ -257,7 +257,7 @@ HTTP/2 上的 `CONNECT`（RFC 9113 第 8.5 节的隧道）不转发：答 `501`�
 
 ### 上游的连接与字节
 
-- **共享**：上游选了 `h2` 时，同一个键（scheme、主机、端口、源站校验的根、TLS 参数）在**一条客户端连接**里至多一条 HTTP/2 连接，`SendRequest` 克隆着用、共享给并发的请求；`is_closed()` 或收到源站的 GOAWAY 之后不再借出。不跨客户端连接共享，也不进 M1b 的池。用例 `requests_of_one_key_share_one_h2_connection`、`another_key_gets_another_h2_connection`、`an_h2_connection_that_went_away_is_not_lent_again`，经引擎的 `concurrent_h2_streams_share_one_upstream_connection`。
+- **共享**：上游选了 `h2` 时，同一个键在**一条客户端连接**里至多一条 HTTP/2 连接（键就是 M1b 的池键 `PoolKey`：这一代的配置与策略注册表、选到的策略与链、目标、能不能以绝对形式交给 HTTP 代理、拨号时的出口表；TLS 的参数不进键，M2-D12），`SendRequest` 克隆着用、共享给并发的请求；`is_closed()` 或收到源站的 GOAWAY 之后不再借出。不跨客户端连接共享，也不进 M1b 的池。用例 `requests_of_one_key_share_one_h2_connection`、`another_key_gets_another_h2_connection`、`an_h2_connection_that_went_away_is_not_lent_again`，经引擎的 `concurrent_h2_streams_share_one_upstream_connection`。
 - **客户端 HTTP/2 而源站只讲 HTTP/1.1 时，并发的请求各占一条上游连接，数目不另设上限**（登记，设计第 10.2 节）。
 - **升级与隧道只拨 HTTP/1.1**：带 `Upgrade` 的请求与 `CONNECT` 用只给 `http/1.1` 的那份客户端配置拨号，源站讲 h2 时也这样（设计第 10.4 节）。用例 `an_upgrade_dials_http1_where_the_origin_speaks_h2`、`a_websocket_from_an_http1_client_goes_over_http1_where_the_origin_speaks_h2`。
 - **字节**：HTTP/1.1 的上游照 M1b（换连接的计量，记线上的字节）。共享的 HTTP/2 上游换不了连接一层的计量，所以设成不记之后连接一层什么也不记，**每条记录的 `up` / `down` 只算它自己的正文**（请求正文与应答正文，trailers 不计）。例外是**拨这条连接的那一个请求**：计量是在握手之后才关掉的，在那之前走过的字节都算在它头上——TLS 握手与 HTTP/2 的前言，可能还有 SETTINGS 的交换与 TLS 1.3 的会话票据，**不是准确的数**（设计第 16 节第 10 条、第 23 节第 21 条）。用例 `the_bytes_of_requests_on_a_shared_h2_connection_are_their_bodies`（拨号那个请求只断言 `down` 至少 5）。
@@ -272,7 +272,7 @@ HTTP/2 上的 `CONNECT`（RFC 9113 第 8.5 节的隧道）不转发：答 `501`�
 
 ### 终止、看门狗与拒绝：只重置这个流
 
-HTTP/2 上一条连接承载许多请求，所以 M1b 里“关掉这条连接”的做法在这里都改成“重置这个流”，同一条连接上别的流与之后的请求照常（设计第 10.5 节，M2-D17）。**重置的原因码一律是 `INTERNAL_ERROR`**：终止（`POST /v1/requests/kill` 与请求的令牌，记录的结局是 `killed`）、看门狗到时（`client stopped reading`）、没有错误页的 `REJECT`、`REJECT-DROP`，以及上游正文出错——上游的原因码不转给客户端（hyper 按错误链里的原因码重置客户端的流，而 `REFUSED_STREAM` 那样的原因码会让客户端以为请求没有处理过、可以重发；见设计第 23 节第 20 条）。Go 的 `httputil.ReverseProxy` 也是这样。
+HTTP/2 上一条连接承载许多请求，所以 M1b 里“关掉这条连接”的做法在这里都改成“重置这个流”，同一条连接上别的流与之后的请求照常（设计第 10.5 节，M2-D17）。**重置的原因码一律是 `INTERNAL_ERROR`**：终止（`POST /v1/requests/kill` 与请求的令牌，记录的结局是 `killed`）、看门狗到时（`client stopped reading`）、没有错误页的 `REJECT`、`REJECT-DROP`，以及上游正文出错——上游的原因码不转给客户端（hyper 按错误链里的原因码重置客户端的流，而 `REFUSED_STREAM` 那样的原因码会让客户端以为请求没有处理过、可以重发；见设计第 23 节第 20 条）。
 
 用例（`crates/rurge-http/src/engine.rs` 的测试模块）：`a_killed_h2_stream_is_reset_and_the_others_go_on`、`a_killed_h2_stream_whose_body_flows_is_reset_and_its_upstream_let_go`、`an_h2_client_that_stops_reading_one_stream_fails_only_that_request`、`a_rejected_h2_request_without_a_page_resets_only_its_stream`、`a_dropped_h2_request_is_held_then_reset`、`an_upstream_h2_stream_reset_mid_body_reaches_the_client_as_internal_error`。`REJECT` 有错误页时照答在那个流上。
 
