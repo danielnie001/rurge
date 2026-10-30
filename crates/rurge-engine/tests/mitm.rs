@@ -1349,3 +1349,805 @@ async fn the_switch_is_restored_from_state_json() {
     let after = std::fs::read(&path).unwrap();
     assert_eq!(before, after, "a start does not write state.json");
 }
+
+// ---- end to end through every entry
+
+/// Two requests on one decrypted connection, each answered 200.
+async fn two_200s<S>(s: &mut S, host: &str, paths: [&str; 2])
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    for path in paths {
+        let response = get(s, host, path).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+    }
+}
+
+/// A TLS origin that answers a request head with 101 and then echoes every
+/// byte it is sent: the server side of a WebSocket upgrade, which `TestServer`
+/// does not do (`crates/rurge-engine/tests/http.rs`'s `switching_echo`, over
+/// TLS).
+async fn switching_echo_over_tls(origin: &Arc<TlsFixture>) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let acceptor = origin.acceptor(false);
+    let fixture = origin.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let (acceptor, fixture) = (acceptor.clone(), fixture.clone());
+            tokio::spawn(async move {
+                let Ok(mut s) = fixture.accept(&acceptor, tcp).await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if s.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let switched = b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\n\
+                                 upgrade: websocket\r\n\r\n";
+                if s.write_all(switched).await.is_err() || s.flush().await.is_err() {
+                    return;
+                }
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if s.write_all(&buf[..n]).await.is_err() || s.flush().await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Every entry into the engine decrypts a listed host: a SOCKS5 tunnel, a
+/// `CONNECT` through the HTTP listener and the virtual interface each bring
+/// two requests of one connection in, and each request is a record of its own
+/// with the entry's listener, `https`, and the method, URL and status the
+/// client saw (`phase 4 M2 design 7.1`, `9.1`, `17`).
+#[tokio::test]
+async fn every_entry_decrypts_a_listed_host() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "first");
+    server.set("/b", "second");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let rig = Rig::on(
+        harness_mitm(
+            Profile {
+                proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+                hosts: "origin.test = 127.0.0.1",
+                rules: &guarded("DOMAIN,origin.test,A"),
+                sections: &mitm_section("origin.test", &ca),
+                ..Profile::default()
+            },
+            origin.roots(),
+        )
+        .await,
+    )
+    .await;
+    let h = &rig.h;
+
+    // what one entry's two records must say
+    let two = |records: &[rurge_engine::RequestRecord], at: usize, listener, first: &str| {
+        for (i, path) in [first, "/b"].iter().enumerate() {
+            let record = &records[at + i];
+            assert_eq!(record.listener, listener, "{record:?}");
+            assert_eq!(record.protocol, Some(ProtocolKind::Https), "{record:?}");
+            assert_eq!(record.sni.as_deref(), Some("origin.test"), "{record:?}");
+            assert_eq!(record.method.as_deref(), Some("GET"), "{record:?}");
+            assert_eq!(
+                record.url.as_deref(),
+                Some(format!("https://origin.test{path}").as_str()),
+                "{record:?}"
+            );
+            assert_eq!(record.status_code, Some(200), "{record:?}");
+            assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+        }
+    };
+
+    // a sniffed SOCKS5 tunnel to 443
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(
+        tunnel,
+        client_config(roots.clone(), &[], true),
+        "origin.test",
+    )
+    .await
+    .expect("the client trusts the MITM CA");
+    two_200s(&mut tls, "origin.test", ["/a", "/b"]).await;
+    drop(tls);
+    two(&the_records(h, 2).await, 0, ListenerKind::Socks5, "/a");
+
+    // a `CONNECT` through the HTTP listener, sniffed after its answer
+    let tunnel = connect_via_http(h.http(), "origin.test:443").await;
+    let mut tls = handshake(
+        tunnel,
+        client_config(roots.clone(), &[], true),
+        "origin.test",
+    )
+    .await
+    .expect("the client trusts the MITM CA");
+    two_200s(&mut tls, "origin.test", ["/a", "/b"]).await;
+    drop(tls);
+    two(&the_records(h, 4).await, 2, ListenerKind::Http, "/a");
+
+    // the virtual interface: the app's own TLS runs on the decrypted stream
+    let (fake, _) = rig.fakes("origin.test");
+    let tcp = rig
+        .app
+        .connect(SocketAddr::new(fake, 443))
+        .await
+        .expect("the handshake completes");
+    let mut tls = handshake(tcp, client_config(roots, &[], true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    two_200s(&mut tls, "origin.test", ["/a", "/b"]).await;
+    // the app ends the session from its own side, without a reset
+    tls.shutdown().await.expect("the close_notify goes out");
+    let mut rest = Vec::new();
+    tokio::time::timeout(WITHIN, tls.read_to_end(&mut rest))
+        .await
+        .expect("the engine lets go within the bound")
+        .expect("the stream ends cleanly");
+    two(&the_records(h, 6).await, 4, ListenerKind::Tun, "/a");
+}
+
+/// The two requests of one decrypted connection are routed one by one: the
+/// first is refused by its `URL-REGEX` and answered in TLS with the reject
+/// page, the second goes to the origin (`phase 4 M2 design 9.1`).
+#[tokio::test]
+async fn two_requests_of_one_decrypted_connection_follow_their_own_rules() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/ok", "from the origin");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let h = harness_mitm(
+        Profile {
+            general: "show-error-page-for-reject = true",
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "URL-REGEX,^https://origin\\.test/blocked,REJECT\nDOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(tunnel, client_config(roots, &[], true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    let blocked = get(&mut tls, "origin.test", "/blocked").await;
+    assert!(blocked.starts_with("HTTP/1.1 403"), "{blocked}");
+    assert!(
+        blocked.contains("DOMAIN") || blocked.contains("REJECT"),
+        "the reject page is rurge's own: {blocked}"
+    );
+    let ok = get(&mut tls, "origin.test", "/ok").await;
+    assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+    assert!(ok.ends_with("from the origin"), "{ok}");
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(
+        records[0].rule.as_deref(),
+        Some("URL-REGEX,^https://origin\\.test/blocked,REJECT"),
+        "{records:?}"
+    );
+    assert_eq!(records[0].status_code, Some(403), "{records:?}");
+    assert_eq!(
+        records[1].rule.as_deref(),
+        Some("DOMAIN,origin.test,A"),
+        "{records:?}"
+    );
+    assert_eq!(records[1].status_code, Some(200), "{records:?}");
+    assert_eq!(records[1].status, RecordStatus::Completed, "{records:?}");
+}
+
+/// An origin whose CA the engine was not given is a 502, and the record says
+/// why; `skip-server-cert-verify = true` lets the same request through
+/// (`phase 4 M2 design 9.2`, `9.3`).
+#[tokio::test]
+async fn an_untrusted_origin_is_a_502_and_skip_server_cert_verify_lets_it_through() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!("A = socks5, 127.0.0.1, {}", upstream.addr().port());
+    let mitm = mitm_ca();
+    let (ca, roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    // the engine is given no roots: the origin's CA is not one the operating
+    // system's store or the built-in list holds
+    let h = harness_with(
+        Profile {
+            proxies: &proxies,
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        EngineShared {
+            sniff_wait: Duration::from_millis(300),
+            ..EngineShared::default()
+        },
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(
+        tunnel,
+        client_config(roots.clone(), &[], true),
+        "origin.test",
+    )
+    .await
+    .expect("the client trusts the MITM CA");
+    let failed = get(&mut tls, "origin.test", "/a").await;
+    assert!(failed.starts_with("HTTP/1.1 502"), "{failed}");
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(records[0].status_code, Some(502), "{records:?}");
+    assert!(
+        records[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("UnknownIssuer"),
+        "the reason is the certificate's: {records:?}"
+    );
+
+    // the same request with the origin's chain and name left unchecked
+    let section = format!(
+        "{}\nskip-server-cert-verify = true",
+        mitm_section("origin.test", &ca)
+    );
+    let h = harness_with(
+        Profile {
+            proxies: &proxies,
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &section,
+            ..Profile::default()
+        },
+        EngineShared {
+            sniff_wait: Duration::from_millis(300),
+            ..EngineShared::default()
+        },
+    )
+    .await;
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(tunnel, client_config(roots, &[], true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    let passed = get(&mut tls, "origin.test", "/a").await;
+    assert!(passed.starts_with("HTTP/1.1 200"), "{passed}");
+    assert!(passed.ends_with("from the origin"), "{passed}");
+}
+
+/// Three ways a listed host is still not decrypted — an exclusion, a disabled
+/// entry, and a source the list does not take — and in each the client sees
+/// the origin's own certificate (`phase 4 M2 design 4.2`, `4.3`, `7.1`).
+#[tokio::test]
+async fn exclusions_disabled_entries_and_sources_pass_through() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!("A = socks5, 127.0.0.1, {}", upstream.addr().port());
+    let mitm = mitm_ca();
+    let ca = mitm.ca_p12_base64("pw");
+    // each case is named rather than printed: the section carries the CA's
+    // PKCS#12, private key and all
+    let cases = [
+        (
+            "an exclusion",
+            format!("[MITM]\nhostname = -origin.test, *.test\nca-p12 = {ca}\nca-passphrase = pw"),
+        ),
+        (
+            "a disabled entry",
+            format!(
+                "[MITM]\nhostname = origin.test\nhostname-disabled = origin.test\nca-p12 = {ca}\nca-passphrase = pw"
+            ),
+        ),
+        (
+            "a source the list does not take",
+            format!(
+                "[MITM]\nhostname = origin.test\nclient-source-address = 10.0.0.0/8\nca-p12 = {ca}\nca-passphrase = pw"
+            ),
+        ),
+    ];
+    for (case, section) in &cases {
+        let h = harness_mitm(
+            Profile {
+                proxies: &proxies,
+                hosts: "origin.test = 127.0.0.1",
+                rules: "DOMAIN,origin.test,A",
+                sections: section.as_str(),
+                ..Profile::default()
+            },
+            origin.roots(),
+        )
+        .await;
+        assert!(
+            h.engine.mitm_ca_der().is_some(),
+            "the CA is usable; {case} is what passes this one through"
+        );
+
+        let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+        let mut tls = handshake(
+            tunnel,
+            client_config(origin.roots(), &[], true),
+            "origin.test",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{case}: the origin's own certificate is served: {e}"));
+        let response = get(&mut tls, "origin.test", "/a").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{case}: {response}");
+        assert!(response.ends_with("from the origin"), "{case}: {response}");
+    }
+}
+
+/// This machine's own sessions are compared as `127.0.0.1` whether they come
+/// through a listener or through the virtual interface, so a source list of
+/// `127.0.0.1` decrypts both and a list of `::1` neither (`phase 4 M2 design
+/// 7.2`).
+#[tokio::test]
+async fn the_local_machine_is_compared_as_127_0_0_1() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    server.set("/b", "from the origin again");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let proxies = format!("A = socks5, 127.0.0.1, {}", upstream.addr().port());
+    let mitm = mitm_ca();
+    let (ca, roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let section = |source: &str| {
+        format!(
+            "[MITM]\nhostname = origin.test\nclient-source-address = {source}\nca-p12 = {ca}\nca-passphrase = pw"
+        )
+    };
+
+    // `127.0.0.1` takes both entries
+    let local = section("127.0.0.1");
+    let rig = Rig::on(
+        harness_mitm(
+            Profile {
+                proxies: &proxies,
+                hosts: "origin.test = 127.0.0.1",
+                rules: &guarded("DOMAIN,origin.test,A"),
+                sections: &local,
+                ..Profile::default()
+            },
+            origin.roots(),
+        )
+        .await,
+    )
+    .await;
+    let tunnel = connect_via_socks5(rig.h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(
+        tunnel,
+        client_config(roots.clone(), &[], true),
+        "origin.test",
+    )
+    .await
+    .expect("the local machine is 127.0.0.1 through the SOCKS5 listener");
+    two_200s(&mut tls, "origin.test", ["/a", "/b"]).await;
+    drop(tls);
+
+    let (fake, _) = rig.fakes("origin.test");
+    let tcp = rig
+        .app
+        .connect(SocketAddr::new(fake, 443))
+        .await
+        .expect("the session is accepted");
+    let mut tls = handshake(tcp, client_config(roots, &[], true), "origin.test")
+        .await
+        .expect("the local machine is 127.0.0.1 through the virtual interface too");
+    two_200s(&mut tls, "origin.test", ["/a", "/b"]).await;
+    tls.shutdown().await.expect("the close_notify goes out");
+    let mut rest = Vec::new();
+    tokio::time::timeout(WITHIN, tls.read_to_end(&mut rest))
+        .await
+        .expect("the engine lets go within the bound")
+        .expect("the stream ends cleanly");
+    assert_eq!(
+        rig.h.engine.http_counts().mitm,
+        MitmCounts {
+            decrypted: 2,
+            ..MitmCounts::default()
+        },
+        "both entries were decrypted"
+    );
+
+    // `::1` is not what this machine's sessions are compared as: neither
+    // entry is decrypted, and the client sees the origin's certificate
+    let nowhere = section("::1");
+    let rig = Rig::on(
+        harness_mitm(
+            Profile {
+                proxies: &proxies,
+                hosts: "origin.test = 127.0.0.1",
+                rules: &guarded("DOMAIN,origin.test,A"),
+                sections: &nowhere,
+                ..Profile::default()
+            },
+            origin.roots(),
+        )
+        .await,
+    )
+    .await;
+    let tunnel = connect_via_socks5(rig.h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(
+        tunnel,
+        client_config(origin.roots(), &[], true),
+        "origin.test",
+    )
+    .await
+    .expect("a source list of ::1 does not take 127.0.0.1");
+    two_200s(&mut tls, "origin.test", ["/a", "/b"]).await;
+    drop(tls);
+
+    let (fake, _) = rig.fakes("origin.test");
+    let tcp = rig
+        .app
+        .connect(SocketAddr::new(fake, 443))
+        .await
+        .expect("the session is accepted");
+    let mut tls = handshake(tcp, client_config(origin.roots(), &[], true), "origin.test")
+        .await
+        .expect("the virtual interface is 127.0.0.1 as well");
+    two_200s(&mut tls, "origin.test", ["/a", "/b"]).await;
+    tls.shutdown().await.expect("the close_notify goes out");
+    let mut rest = Vec::new();
+    tokio::time::timeout(WITHIN, tls.read_to_end(&mut rest))
+        .await
+        .expect("the engine lets go within the bound")
+        .expect("the stream ends cleanly");
+    assert_eq!(
+        rig.h.engine.http_counts().mitm,
+        MitmCounts::default(),
+        "nothing was decrypted"
+    );
+}
+
+/// Another generation built from `new_text` over the same data directory, as
+/// a reload does.
+async fn swap_to(h: &Harness, new_text: String) {
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &new_text, h.engine.shared()).await);
+}
+
+/// A reload with another CA signs with it: a client trusting only the new CA
+/// completes the handshake, one trusting only the old CA is refused
+/// (`phase 4 M2 design 5.4`).
+#[tokio::test]
+async fn a_reload_with_another_ca_issues_from_it() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    server.set("/b", "from the origin again");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let old = mitm_ca();
+    // a second CA, written differently from the first one: webpki takes a
+    // certificate with the same subject for the issuer and fails on the
+    // signature instead (`UnknownIssuer` is what a missing trust anchor says)
+    let new = TlsFixture::with_ca_name("rurge test MITM CA 2", &[]);
+    let (old_ca, old_roots) = (old.ca_p12_base64("pw"), old.roots());
+    let (new_ca, new_roots) = (new.ca_p12_base64("pw"), new.roots());
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &old_ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(tunnel, client_config(old_roots, &[], true), "origin.test")
+        .await
+        .expect("the first CA signs the first connection's leaf");
+    two_200s(&mut tls, "origin.test", ["/a", "/b"]).await;
+    drop(tls);
+
+    let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
+    swap_to(&h, text.replace(&old_ca, &new_ca)).await;
+
+    // the new CA is the one this generation signs with
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(tunnel, client_config(new_roots, &[], true), "origin.test")
+        .await
+        .expect("the second CA signs the new connection's leaf");
+    two_200s(&mut tls, "origin.test", ["/a", "/b"]).await;
+    drop(tls);
+
+    // and the old one's leaves are gone with it
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let Err(error) = handshake(tunnel, client_config(old.roots(), &[], true), "origin.test").await
+    else {
+        panic!("the old CA signs nothing after the reload");
+    };
+    assert!(error.to_string().contains("UnknownIssuer"), "{error}");
+}
+
+/// A reload whose `ca-p12` cannot be opened leaves the connections already
+/// decrypted alone, and the next connection sees the origin's certificate
+/// (`phase 4 M2 design 5.4`, `7.1`).
+#[tokio::test]
+async fn a_reload_that_breaks_the_ca_leaves_open_connections_decrypted() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    server.set("/b", "from the origin again");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    // A: decrypted, its first request answered
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut a = handshake(
+        tunnel,
+        client_config(roots.clone(), &[], true),
+        "origin.test",
+    )
+    .await
+    .expect("the client trusts the MITM CA");
+    let first = get(&mut a, "origin.test", "/a").await;
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    the_records(&h, 1).await;
+
+    // the CA this generation would load cannot be opened at all: the second
+    // version of the plan, `AAAA` is not a PKCS#12
+    let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
+    let broken = text.replace(&format!("ca-p12 = {ca}"), "ca-p12 = AAAA");
+    swap_to(&h, broken).await;
+    assert!(
+        h.engine.mitm_ca_der().is_none(),
+        "a CA rurge cannot open leaves this generation without one"
+    );
+
+    // A's second request goes on the connection it was decrypted on
+    let second = get(&mut a, "origin.test", "/b").await;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    assert!(second.ends_with("from the origin again"), "{second}");
+    drop(a);
+
+    // a new connection is passed through: the origin's own certificate
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut b = handshake(
+        tunnel,
+        client_config(origin.roots(), &[], true),
+        "origin.test",
+    )
+    .await
+    .expect("the origin's own certificate is served");
+    let third = get(&mut b, "origin.test", "/a").await;
+    assert!(third.starts_with("HTTP/1.1 200"), "{third}");
+    assert!(third.ends_with("from the origin"), "{third}");
+}
+
+/// A WebSocket upgrade crosses a decrypted connection: the 101 is relayed,
+/// and the bytes after it pass both ways untouched (`phase 4 M2 design 9.5`).
+#[tokio::test]
+async fn a_websocket_echoes_through_a_decrypted_connection() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = switching_echo_over_tls(&origin).await;
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(server),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(tunnel, client_config(roots, &[], true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    tls.write_all(
+        b"GET /ws HTTP/1.1\r\nHost: origin.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let head = read_head(&mut tls).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("upgrade: websocket"),
+        "{head}"
+    );
+
+    // far from the handshake and the headers, so a byte out of place shows
+    let payload: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
+    tls.write_all(&payload).await.unwrap();
+    let mut back = vec![0u8; payload.len()];
+    tokio::time::timeout(WITHIN, tls.read_exact(&mut back))
+        .await
+        .expect("the echo comes within the bound")
+        .expect("the echo reaches the client");
+    assert_eq!(back, payload, "every byte comes back in its place");
+
+    // An upgraded connection has no TLS ending of its own on rurge's side:
+    // the bytes are relayed as they come, and the tunnel is closed with the
+    // origin's. The client's close_notify goes out; whether an EOF or an
+    // alert comes back is the relay's business, not this test's.
+    let _ = tls.shutdown().await;
+    drop(tls);
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status_code, Some(101), "{records:?}");
+    assert_eq!(
+        records[0].url.as_deref(),
+        Some("https://origin.test/ws"),
+        "{records:?}"
+    );
+}
+
+/// `[MITM] hostname = *` does not reach plain HTTP: the request to port 80 is
+/// the engine's as it always was, and its record says `http`
+/// (`phase 4 M2 design 7.1`, `9.1`).
+#[tokio::test]
+async fn plain_http_is_untouched_by_mitm() {
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "from the origin");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&origin)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: "[MITM]\nhostname = *",
+            ..Profile::default()
+        },
+        // nothing upstream here is decrypted or verified: the request is plain
+        // HTTP, and the `[MITM]` list reaches no such session
+        Arc::new(rustls::RootCertStore::empty()),
+    )
+    .await;
+
+    let mut tunnel = connect_via_socks5(h.socks(), "origin.test", 80).await;
+    tunnel
+        .write_all(b"GET /a HTTP/1.1\r\nHost: origin.test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut back = Vec::new();
+    tokio::time::timeout(WITHIN, tunnel.read_to_end(&mut back))
+        .await
+        .expect("the answer comes within the bound")
+        .unwrap();
+    let response = String::from_utf8_lossy(&back).into_owned();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("from the origin"), "{response}");
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].protocol, Some(ProtocolKind::Http), "{records:?}");
+    assert_eq!(
+        records[0].url.as_deref(),
+        Some("http://origin.test/a"),
+        "{records:?}"
+    );
+    assert_eq!(records[0].status_code, Some(200), "{records:?}");
+}
+
+/// A decrypted request to an HTTP proxy policy is tunnelled: rurge sends the
+/// proxy a `CONNECT` for the origin's name and port, and the TLS to the origin
+/// happens inside the tunnel (`phase 4 M2 design 9.1`).
+#[tokio::test]
+async fn a_decrypted_request_tunnels_through_an_http_proxy() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let upstream = FakeHttpProxy::spawn(HttpProxyScript {
+        connect_to: Some(origin_addr(&server)),
+        ..HttpProxyScript::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = http, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(tunnel, client_config(roots, &[], true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    let response = get(&mut tls, "origin.test", "/a").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        response.ends_with("from the origin"),
+        "the origin answered, not the proxy's own `forwarded`: {response}"
+    );
+
+    let heads = upstream.heads();
+    assert_eq!(heads.len(), 1, "{heads:?}");
+    assert!(
+        heads[0].request_line.starts_with("CONNECT origin.test:443"),
+        "{heads:?}"
+    );
+}
