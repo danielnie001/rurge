@@ -9,9 +9,12 @@
 //! `decrypt` is when a connection is decrypted at all, the server-side
 //! configuration, and the handshake with the client (`phase 4 M2 design 7`,
 //! `8`).
+//! `generate` is the four files of a new CA, which `rurge mitm ca generate`
+//! writes (`phase 4 M2 design 13`).
 
 pub mod authority;
 pub mod decrypt;
+pub mod generate;
 
 #[cfg(test)]
 mod fixtures;
@@ -24,3 +27,4 @@ pub use authority::{
     SESSION_SLOTS, check,
 };
 pub use decrypt::{Accepted, Decision, HandshakeFailure, Mitm, OriginTls, Watch, source_of};
+pub use generate::{CA_DAYS, GenerateError, Generated, certificate_pem, generate};
