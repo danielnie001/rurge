@@ -8,7 +8,9 @@
 //! are read, the key is handed to rcgen, and one certificate for a reserved
 //! name is issued and verified with rustls' own verifier against this CA
 //! alone. `check` turns a problem into `W0039` for the places a profile is
-//! loaded (`phase 4 M2 design 5.3`).
+//! loaded (`phase 4 M2 design 5.3`), and names `W0040` when `http-api-tls`
+//! would have the API serve HTTPS with a profile that has no usable CA
+//! (`phase 4 M2 design 14.1`).
 //!
 //! No message repeats a credential (`phase 4 M2 design 15`): the Base64, the
 //! passphrase and the private key never appear in one, and `Debug` shows the
@@ -68,6 +70,12 @@ pub const BACKDATE_DAYS: i64 = 2;
 /// What `[MITM]` has to say when it lists hosts and sets no CA (`P5` item 1).
 const NO_CA: &str =
     "`hostname` lists hosts to decrypt but `[MITM]` sets no CA (`ca-p12` or `ca-keystore-name`)";
+
+/// The message of `W0040`, and of `rurge status` / `reload` / `stop` when
+/// they cannot read the CA the API serves HTTPS with (phase 4 M2 design
+/// 14.1, the phase 4 / M2c plan's P2).
+pub const API_TLS_NO_CA: &str =
+    "http-api-tls is on but there is no usable MITM CA: the API does not start with this profile";
 
 /// What tells an `Authority` the time: `OffsetDateTime::now_utc` in
 /// production, a pinned instant in tests (`phase 4 / M2a plan P7`). There is
@@ -681,14 +689,20 @@ impl fmt::Debug for Authority {
 }
 
 /// The one thing `[MITM]` has to say about its CA when a profile is loaded:
-/// `W0039`, once (`phase 4 M2 design 5.3`).
+/// `W0039`, once; and `W0040` when `http-api-tls` is on, so that the API is
+/// to serve HTTPS with this profile, and the profile has no CA it could use
+/// (`phase 4 M2 design 5.3`, `14.1`).
 pub fn check(config: &Config) -> Diagnostics {
     check_with(config, default_clock())
 }
 
 fn check_with(config: &Config, clock: Clock) -> Diagnostics {
     let mut diags = Diagnostics::default();
-    let problems = match Authority::load_with(&config.mitm, &config.keystore, clock) {
+    // one load answers both: `W0039` says why the CA is unusable and `W0040`
+    // that the API has none
+    let loaded = Authority::load_with(&config.mitm, &config.keystore, clock);
+    let usable = matches!(loaded, Ok(Some(_)));
+    let problems = match loaded {
         Err(p) => (!p.reported).then_some(p),
         Ok(None) if !config.mitm.effective.is_empty() => Some(CaProblem::new(
             NO_CA.into(),
@@ -702,6 +716,9 @@ fn check_with(config: &Config, clock: Clock) -> Diagnostics {
             d = d.at(span);
         }
         diags.push(d);
+    }
+    if config.general.http_api_tls && config.general.http_api.is_some() && !usable {
+        diags.push(Diagnostic::warning(codes::W_API_TLS_NO_CA, API_TLS_NO_CA));
     }
     diags
 }
@@ -1246,6 +1263,109 @@ mod tests {
             Some(2),
             "the ca-keystore-name line"
         );
+    }
+
+    /// `W0040`: `http-api-tls` is on and `http-api` names an address, but the
+    /// profile has no CA that the API could serve HTTPS with — the API does
+    /// not start with it (`phase 4 M2 design 14.1`, `the phase 4 / M2c plan's
+    /// P2`). It is one more warning than `W0039` when the CA cannot be read,
+    /// and it carries no line: `[General]` does not record where
+    /// `http-api-tls` stands.
+    #[test]
+    fn an_api_that_cannot_start_is_named() {
+        let clock = clock_at(NOW);
+        let general = "[General]\nhttp-api = k@127.0.0.1:6171\nhttp-api-tls = true\n";
+        let rule = "[Rule]\nFINAL,DIRECT\n";
+
+        // no `[MITM]` at all: one warning, the message and the hint of the
+        // code, and no line
+        let text = format!("{general}{rule}");
+        let loaded = from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
+        let diags = check_with(&loaded.config, clock.clone());
+        let said: Vec<&Diagnostic> = diags.iter().collect();
+        assert_eq!(said.len(), 1, "{text}: {said:?}");
+        assert_eq!(said[0].code, codes::W_API_TLS_NO_CA, "{text}");
+        assert_eq!(said[0].severity, Severity::Warning, "{text}");
+        assert_eq!(
+            said[0].message,
+            "http-api-tls is on but there is no usable MITM CA: the API does not start with this profile",
+            "{text}"
+        );
+        assert_eq!(said[0].message, API_TLS_NO_CA, "{text}");
+        assert_eq!(said[0].span, None, "{text}");
+        assert_eq!(
+            said[0].hint,
+            Some("configure a usable MITM CA, or turn http-api-tls off"),
+            "{text}"
+        );
+
+        // a CA that cannot be read: `W0039` at its line first, then this one,
+        // and neither quotes the material or the passphrase
+        let text = format!("{general}[MITM]\nca-p12 = QUJDRA\nca-passphrase = pw-7d1f\n{rule}");
+        let loaded = from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
+        let diags = check_with(&loaded.config, clock.clone());
+        let said: Vec<&str> = diags.iter().map(|d| d.code).collect();
+        assert_eq!(
+            said,
+            [codes::W_MITM_CA_UNUSABLE, codes::W_API_TLS_NO_CA],
+            "{text}"
+        );
+        for d in diags.iter() {
+            for secret in ["QUJDRA", "pw-7d1f"] {
+                assert!(!d.message.contains(secret), "{text}: {}", d.message);
+                assert!(d.hint.is_none_or(|h| !h.contains(secret)), "{text}: {d}");
+            }
+        }
+
+        // a CA the load has already named (`E0021`): this one alone
+        let text = format!(
+            "{general}[Keystore]\nca = type=p12, base64=@@@, password=pw\n\
+             [MITM]\nca-keystore-name = ca\n{rule}"
+        );
+        let loaded = from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert_eq!(
+            loaded
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == codes::E_KEYSTORE_BASE64)
+                .count(),
+            1,
+            "{text}"
+        );
+        let diags = check_with(&loaded.config, clock.clone());
+        let said: Vec<&str> = diags.iter().map(|d| d.code).collect();
+        assert_eq!(said, [codes::W_API_TLS_NO_CA], "{text}");
+
+        // a CA that loads: the API has one to serve HTTPS with
+        let ca = generated(&PKCS_ECDSA_P256_SHA256, "rurge test API CA");
+        let p12 = ca_p12(&ca, "pw-7d1f");
+        let text = format!("{general}[MITM]\nca-p12 = {p12}\nca-passphrase = pw-7d1f\n{rule}");
+        let loaded = from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(
+            check_with(&loaded.config, clock.clone()).is_empty(),
+            "a profile whose CA loads warns about nothing"
+        );
+
+        // no `http-api`: no API is to start, so there is nothing to warn of
+        let text = format!("[General]\nhttp-api-tls = true\n{rule}");
+        let loaded = from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
+        assert!(
+            check_with(&loaded.config, clock.clone()).is_empty(),
+            "{text}"
+        );
+
+        // `http-api-tls` off, or not written: the API speaks plain HTTP
+        for general in [
+            "[General]\nhttp-api = k@127.0.0.1:6171\nhttp-api-tls = false\n",
+            "[General]\nhttp-api = k@127.0.0.1:6171\n",
+        ] {
+            let text = format!("{general}{rule}");
+            let loaded = from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
+            assert!(
+                check_with(&loaded.config, clock.clone()).is_empty(),
+                "{text}"
+            );
+        }
     }
 
     /// One certificate for `name`, signed by `ca`.

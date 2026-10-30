@@ -277,6 +277,42 @@ fn check_names_an_unusable_mitm_ca() {
     );
 }
 
+/// `http-api-tls` is on and the profile has no CA the API could serve HTTPS
+/// with: `rurge check` names it (`W0040`) and says what to do about it, and
+/// the exit code stays 0 — checking runs nothing (`phase 4 M2 design 14.1`,
+/// `the phase 4 / M2c plan's P2`).
+#[test]
+fn check_says_the_api_does_not_start_without_a_usable_ca() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = write(
+        &dir,
+        "api-tls.conf",
+        "[General]\nhttp-api = k@127.0.0.1:0\nhttp-api-tls = true\n[Rule]\nFINAL,DIRECT\n",
+    );
+    let out = rurge_command()
+        .args(["check", "-c"])
+        .arg(&profile)
+        .args(["--data-dir"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let printed = String::from_utf8_lossy(&out);
+    assert!(printed.contains("W0040"), "{printed}");
+    assert!(
+        printed.contains(
+            "http-api-tls is on but there is no usable MITM CA: the API does not start with this profile"
+        ),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("  hint: configure a usable MITM CA, or turn http-api-tls off"),
+        "{printed}"
+    );
+}
+
 /// A problem is reported with what to do about it: in the text the hint is
 /// the line after its diagnostic, in the JSON it is a field of it, and a
 /// code that has no hint has `null`.

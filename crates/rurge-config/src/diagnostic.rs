@@ -276,6 +276,9 @@ pub mod codes {
     /// `[MITM]` names a CA that cannot be used, or lists hosts with no CA:
     /// MITM is off (phase 4 M2 design 5.2).
     pub const W_MITM_CA_UNUSABLE: &str = "W0039";
+    /// `http-api-tls` is on and `http-api` is set, but `[MITM]` has no usable
+    /// CA: the API does not start with this profile (phase 4 M2 design 14.1).
+    pub const W_API_TLS_NO_CA: &str = "W0040";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.
@@ -401,6 +404,7 @@ pub mod codes {
             W_FORCE_SYSLIB => {
                 "use `server:system` to keep real addresses while the enhanced mode is on"
             }
+            W_API_TLS_NO_CA => "configure a usable MITM CA, or turn http-api-tls off",
             _ => return None,
         })
     }
@@ -455,6 +459,7 @@ mod tests {
         codes::W_INCLUDED_PRIVATE_RANGE,
         codes::W_EXCLUDED_RURGE_SPACE,
         codes::W_FORCE_SYSLIB,
+        codes::W_API_TLS_NO_CA,
     ];
 
     /// The codes whose every site carries a hint of its own.
