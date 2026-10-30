@@ -55,7 +55,7 @@ const PATTERNS: [&str; 15] = [
 /// function that makes a second socket of the same kind has a row of its own.
 ///
 /// Adding a row means changing this list; so does removing one.
-const LISTED: [(&str, &str, &str); 25] = [
+const LISTED: [(&str, &str, &str); 26] = [
     (
         "crates/rurge-api/src/lib.rs",
         "TcpListener::bind(",
@@ -165,6 +165,11 @@ const LISTED: [(&str, &str, &str); 25] = [
         "crates/rurge-tun/src/tcp/shard.rs",
         "Socket::new(",
         "smoltcp's sockets, not the system's",
+    ),
+    (
+        "crates/rurge/src/cli/api_client.rs",
+        "TcpStream::connect",
+        "the process of `rurge status` / `reload` / `stop` over `http-api-tls`, not the daemon",
     ),
     (
         "crates/rurge/src/cli/api_client.rs",

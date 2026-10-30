@@ -470,11 +470,72 @@ struct Daemon<'a> {
     rt: &'a super::runtime::Runtime,
     run_opts: &'a RunOptions,
     outbound_mode: &'a OutboundMode,
-    http_api: &'a Option<ControllerAccess>,
+    api: &'a ApiAtBoot,
     overrides: &'a Overrides,
     /// The downloaded sources of the generation in use, which a reload hands
     /// the sources of the next one.
     sources: &'a ProfileSources,
+}
+
+/// What the profile said at boot about the API: whether it named one, whether
+/// that API was to speak TLS, and whether it really started. `running` is
+/// false in two cases: the profile names no `http-api`, and `http-api-tls` is
+/// on with no usable MITM CA, which keeps the API from starting at all
+/// (`the phase 4 / M2c plan's P12`).
+struct ApiAtBoot {
+    access: Option<ControllerAccess>,
+    tls: bool,
+    running: bool,
+}
+
+/// The API's part of what a reload says (`the phase 4 / M2c plan's P13`): the
+/// daemon exits when a configured API cannot bind and never starts one that
+/// `http-api-tls` left without a CA, so an API that is up keeps the address,
+/// the key and the TLS it had until rurge restarts.
+fn api_changes(
+    boot: &ApiAtBoot,
+    access: &Option<ControllerAccess>,
+    tls: bool,
+) -> Vec<&'static str> {
+    let mut messages = Vec::new();
+    if &boot.access != access {
+        messages.push(if boot.running {
+            "http-api changed in the profile; the API keeps its current address and key until rurge restarts"
+        } else if boot.access.is_some() {
+            "http-api changed in the profile; the API is not started until rurge restarts"
+        } else {
+            "http-api was added to the profile; the API is not started until rurge restarts"
+        });
+    }
+    // at boot there was no API, so its TLS says nothing about one
+    if boot.access.is_some() && boot.tls != tls {
+        messages.push(if !boot.running {
+            "http-api-tls changed in the profile; the API is not started until rurge restarts"
+        } else if boot.tls {
+            "http-api-tls changed in the profile; the API keeps serving HTTPS until rurge restarts"
+        } else {
+            "http-api-tls changed in the profile; the API keeps serving plain HTTP until rurge restarts"
+        });
+    }
+    messages
+}
+
+/// What a reload says about the CA the API would sign with
+/// (`the phase 4 / M2c plan's P13`): a running API goes on with the last CA it
+/// had when the new generation has none, and one that never started starts
+/// once there is one.
+fn api_ca_note(boot: &ApiAtBoot, has_ca: bool) -> Option<&'static str> {
+    if boot.running && boot.tls && !has_ca {
+        Some(
+            "http-api-tls is on but this profile has no usable MITM CA: the API goes on with the last CA it had",
+        )
+    } else if !boot.running && boot.access.is_some() && boot.tls && has_ca {
+        Some(
+            "the profile has a usable MITM CA now: the API that http-api-tls kept from starting starts when rurge restarts",
+        )
+    } else {
+        None
+    }
 }
 
 fn count(diags: &rurge_config::Diagnostics, severity: rurge_config::Severity) -> usize {
@@ -530,15 +591,15 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
         };
     }
     print_diagnostics(&loaded.diagnostics.sorted());
-    if &loaded.config.general.http_api != d.http_api {
-        // `d.http_api` is the profile as it was at boot, and the daemon exits
-        // when a configured API cannot bind, so `is_some()` means an API is
-        // actually running; otherwise there is nothing to keep.
-        let message = if d.http_api.is_some() {
-            "http-api changed in the profile; the API keeps its current address and key until rurge restarts"
-        } else {
-            "http-api was added to the profile; the API is not started until rurge restarts"
-        };
+    // `d.api` is the profile as it was at boot. `running` says whether an API
+    // is there to keep: the daemon exits when a configured API cannot bind,
+    // and does not start one that `http-api-tls` left without a CA
+    // (`the phase 4 / M2c plan's P12`).
+    for message in api_changes(
+        d.api,
+        &loaded.config.general.http_api,
+        loaded.config.general.http_api_tls,
+    ) {
         tracing::warn!("{message}");
     }
     if let Err(e) = apply(&mut loaded.config, d.overrides) {
@@ -569,6 +630,11 @@ async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) ->
     };
     print_diagnostics(next.diagnostics());
     let surface_changed = d.engine.swap_runtime(next);
+    // after the swap: the API signs with the generation the next connection
+    // finds, not the one that was in use while this profile was read
+    if let Some(note) = api_ca_note(d.api, d.engine.mitm_ca_der().is_some()) {
+        tracing::warn!("{note}");
+    }
     // The generation in use is the one whose sources are followed. A reload
     // that failed above keeps the configuration and the tracking it had, with
     // the sources its load named that nobody had downloaded added to it; the
@@ -1646,6 +1712,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         request_log_size: args.request_log_size.unwrap_or(1000).max(1),
     };
     let http_api = cfg.general.http_api.clone();
+    let http_api_tls = cfg.general.http_api_tls;
     // `cfg` is moved into the runtime below, so collect the watch list first.
     // It is the files the user wrote: what is downloaded is kept in the data
     // directory and followed by the sources. The list is made now, so a file
@@ -1817,6 +1884,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         // line, so `api on` is the third startup line (the CLI tests and
         // `rurge status` users read it there).
         let api_token = CancellationToken::new();
+        let mut api_running = false;
         if let Some(api) = http_api.clone() {
             let ctx = ApiContext {
                 engine: engine.clone(),
@@ -1824,18 +1892,37 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
                 load_options: opts.clone(),
                 sources: Some(sources.clone()),
             };
-            match rurge_api::serve(api.addr, api.key.clone(), ctx, api_token.clone()).await {
-                Ok((addr, server)) => {
-                    engine.tracker().spawn(server);
-                    println!("api on http://{addr}");
-                    tracing::info!(%addr, "http-api listening");
-                }
-                Err(e) => {
-                    eprintln!("error: cannot bind http-api on {}: {e}", api.addr);
-                    return Ok(ExitCode::from(1));
+            if http_api_tls && engine.api_tls().is_none() {
+                // Never plain HTTP in its place: a command line that expects
+                // HTTPS would be talking to nothing it could trust
+                // (`the phase 4 / M2c plan's P12`).
+                tracing::warn!("http-api-tls is on but there is no usable MITM CA: the API is not started (it never falls back to plain HTTP)");
+            } else {
+                let served = if http_api_tls {
+                    rurge_api::serve_tls(api.addr, api.key.clone(), ctx, api_token.clone()).await
+                } else {
+                    rurge_api::serve(api.addr, api.key.clone(), ctx, api_token.clone()).await
+                };
+                match served {
+                    Ok((addr, server)) => {
+                        engine.tracker().spawn(server);
+                        let scheme = if http_api_tls { "https" } else { "http" };
+                        println!("api on {scheme}://{addr}");
+                        tracing::info!(%addr, tls = http_api_tls, "http-api listening");
+                        api_running = true;
+                    }
+                    Err(e) => {
+                        eprintln!("error: cannot bind http-api on {}: {e}", api.addr);
+                        return Ok(ExitCode::from(1));
+                    }
                 }
             }
         }
+        let api_at_boot = ApiAtBoot {
+            access: http_api.clone(),
+            tls: http_api_tls,
+            running: api_running,
+        };
         // Reload triggers. `reload_tx` stays alive here on purpose: were every
         // sender dropped, `recv()` would return `None` at once and the loop
         // below would spin reloading.
@@ -1917,7 +2004,7 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             rt: &rt,
             run_opts: &run_opts,
             outbound_mode: &outbound_mode,
-            http_api: &http_api,
+            api: &api_at_boot,
             overrides: &overrides,
             sources: &sources,
         };
@@ -2525,6 +2612,67 @@ mod tests {
             None
         );
         assert_eq!(suspended_at_start(None, false, None), None);
+    }
+
+    /// What a reload says about the API, sentence by sentence
+    /// (`the phase 4 / M2c plan's P13`).
+    #[test]
+    fn what_a_reload_says_about_the_api() {
+        let a: Option<ControllerAccess> = Some(ControllerAccess {
+            key: "k".to_string(),
+            addr: "127.0.0.1:6171".parse().unwrap(),
+        });
+        let b: Option<ControllerAccess> = Some(ControllerAccess {
+            key: "k".to_string(),
+            addr: "127.0.0.1:6172".parse().unwrap(),
+        });
+        let none: Option<ControllerAccess> = None;
+        let boot = |access: &Option<ControllerAccess>, tls: bool, running: bool| ApiAtBoot {
+            access: access.clone(),
+            tls,
+            running,
+        };
+        let nothing: [&str; 0] = [];
+        const KEEPS: &str = "http-api changed in the profile; the API keeps its current address and key until rurge restarts";
+        const NOT_STARTED: &str =
+            "http-api changed in the profile; the API is not started until rurge restarts";
+        const ADDED: &str =
+            "http-api was added to the profile; the API is not started until rurge restarts";
+        const KEEPS_HTTPS: &str =
+            "http-api-tls changed in the profile; the API keeps serving HTTPS until rurge restarts";
+        const KEEPS_PLAIN: &str = "http-api-tls changed in the profile; the API keeps serving plain HTTP until rurge restarts";
+        const TLS_NOT_STARTED: &str =
+            "http-api-tls changed in the profile; the API is not started until rurge restarts";
+
+        assert_eq!(api_changes(&boot(&a, false, true), &a, false), nothing);
+        assert_eq!(api_changes(&boot(&a, false, true), &b, false), [KEEPS]);
+        assert_eq!(api_changes(&boot(&a, false, true), &none, false), [KEEPS]);
+        // nothing is running, so a new address changes nothing to keep
+        assert_eq!(api_changes(&boot(&a, true, false), &b, true), [NOT_STARTED]);
+        assert_eq!(api_changes(&boot(&none, false, false), &a, false), [ADDED]);
+        // at boot there was no API, so its TLS is not a change of its own
+        assert_eq!(api_changes(&boot(&none, false, false), &a, true), [ADDED]);
+        assert_eq!(api_changes(&boot(&a, true, true), &a, false), [KEEPS_HTTPS]);
+        assert_eq!(api_changes(&boot(&a, false, true), &a, true), [KEEPS_PLAIN]);
+        assert_eq!(
+            api_changes(&boot(&a, true, false), &a, false),
+            [TLS_NOT_STARTED]
+        );
+        // both changed: the address is the first thing said
+        assert_eq!(
+            api_changes(&boot(&a, true, true), &b, false),
+            [KEEPS, KEEPS_HTTPS]
+        );
+
+        const LAST_CA: &str = "http-api-tls is on but this profile has no usable MITM CA: the API goes on with the last CA it had";
+        const CA_NOW: &str = "the profile has a usable MITM CA now: the API that http-api-tls kept from starting starts when rurge restarts";
+
+        assert_eq!(api_ca_note(&boot(&a, true, true), false), Some(LAST_CA));
+        assert_eq!(api_ca_note(&boot(&a, true, true), true), None);
+        assert_eq!(api_ca_note(&boot(&a, false, true), false), None);
+        assert_eq!(api_ca_note(&boot(&a, true, false), true), Some(CA_NOW));
+        assert_eq!(api_ca_note(&boot(&a, true, false), false), None);
+        assert_eq!(api_ca_note(&boot(&none, false, false), true), None);
     }
 
     #[test]

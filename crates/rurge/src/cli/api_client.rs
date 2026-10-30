@@ -1,23 +1,39 @@
-//! A small HTTP client for the daemon's API (M4 design §7): plain HTTP, 5 s
-//! per request, `X-Key` header, JSON in and out.
+//! A small HTTP client for the daemon's API (M4 design §7): plain HTTP, or
+//! HTTPS when `http-api-tls` is on, 5 s per request, `X-Key` header, JSON in
+//! and out.
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::pki_types::ServerName;
 use serde_json::Value;
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
+use tokio_rustls::TlsConnector;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How the client reaches the API: plain HTTP, or HTTPS with the profile's
+/// MITM CA as the only root (`phase 4 M2 design 14.2`). The plain client is
+/// boxed: it is much larger than the TLS one, and one of these exists for as
+/// long as a command runs.
+enum Transport {
+    Plain(Box<Client<HttpConnector, Full<Bytes>>>),
+    Tls {
+        addr: SocketAddr,
+        connector: TlsConnector,
+        name: ServerName<'static>,
+    },
+}
 
 pub struct ApiClient {
     base: String,
     key: String,
-    client: Client<HttpConnector, Full<Bytes>>,
+    transport: Transport,
 }
 
 #[derive(Debug)]
@@ -56,8 +72,29 @@ impl ApiClient {
         ApiClient {
             base: format!("http://{addr}"),
             key,
-            client: Client::builder(TokioExecutor::new()).build_http(),
+            transport: Transport::Plain(Box::new(
+                Client::builder(TokioExecutor::new()).build_http(),
+            )),
         }
+    }
+
+    /// HTTPS to `addr`, trusting `ca_der` alone and checking the
+    /// certificate against the IP of `addr`.
+    pub fn with_tls(addr: SocketAddr, key: String, ca_der: &[u8]) -> anyhow::Result<ApiClient> {
+        let config = rurge_http::mitm::api::client_config(ca_der)?;
+        Ok(ApiClient {
+            base: format!("https://{addr}"),
+            key,
+            transport: Transport::Tls {
+                addr,
+                connector: TlsConnector::from(config),
+                // rustls sends no SNI for an IP address, and the API signs for
+                // the local address of the connection then (phase 4 M2 design
+                // 14.1), so the address is what the certificate is checked
+                // against.
+                name: ServerName::IpAddress(addr.ip().into()),
+            },
+        })
     }
 
     pub fn base(&self) -> &str {
@@ -78,10 +115,20 @@ impl ApiClient {
         path: &str,
         body: Option<Value>,
     ) -> Result<(u16, Value), ClientError> {
+        // `http` names the request's target: absolute for plain HTTP, which
+        // hyper's legacy client writes as it is, and origin form for TLS,
+        // where the connection names the host.
+        let (uri, host) = match &self.transport {
+            Transport::Plain(_) => (format!("{}{path}", self.base), None),
+            Transport::Tls { addr, .. } => (path.to_string(), Some(addr.to_string())),
+        };
         let mut req = Request::builder()
             .method(method)
-            .uri(format!("{}{path}", self.base))
+            .uri(uri)
             .header("x-key", &self.key);
+        if let Some(host) = host {
+            req = req.header("host", host);
+        }
         let body = match body {
             Some(v) => {
                 req = req.header("content-type", "application/json");
@@ -97,11 +144,37 @@ impl ApiClient {
         // still reported as `BodyLost` rather than a bare `Timeout`.
         let mut seen_status: Option<u16> = None;
         let exchange = async {
-            let resp = self
-                .client
-                .request(req)
-                .await
-                .map_err(|e| ClientError::Unreachable(e.to_string()))?;
+            let resp = match &self.transport {
+                Transport::Plain(client) => client
+                    .request(req)
+                    .await
+                    .map_err(|e| ClientError::Unreachable(e.to_string()))?,
+                // one connection per call: a command makes a handful of
+                // requests, and a pool would keep each of them for five
+                // seconds at least (`the phase 4 / M2c plan's P14`)
+                Transport::Tls {
+                    addr,
+                    connector,
+                    name,
+                } => {
+                    let tcp = tokio::net::TcpStream::connect(addr)
+                        .await
+                        .map_err(|e| ClientError::Unreachable(e.to_string()))?;
+                    let tls = connector
+                        .connect(name.clone(), tcp)
+                        .await
+                        .map_err(|e| ClientError::Unreachable(e.to_string()))?;
+                    let (mut sender, connection) =
+                        hyper::client::conn::http1::handshake(TokioIo::new(tls))
+                            .await
+                            .map_err(|e| ClientError::Unreachable(e.to_string()))?;
+                    tokio::spawn(connection);
+                    sender
+                        .send_request(req)
+                        .await
+                        .map_err(|e| ClientError::Unreachable(e.to_string()))?
+                }
+            };
             let status = resp.status().as_u16();
             seen_status = Some(status);
             let bytes = resp

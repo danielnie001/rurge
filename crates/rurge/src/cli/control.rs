@@ -87,31 +87,65 @@ pub(crate) fn load_profile(
     load(config, &opts).with_context(|| format!("cannot read {}", config.display()))
 }
 
+/// Where the daemon's API is and how to reach it.
+pub struct Endpoint {
+    pub addr: SocketAddr,
+    pub key: String,
+    /// The MITM CA's certificate (DER) when `http-api-tls` is on: the one
+    /// root the API's certificate is checked against (phase 4 M2 design 14.2).
+    pub ca: Option<Vec<u8>>,
+}
+
 /// `--remote` + `--key` → profile `http-api` (only parsed) → `NOT_CONFIGURED`.
-pub fn resolve_endpoint(args: &ControlArgs) -> anyhow::Result<(SocketAddr, String)> {
+///
+/// `ca` is the profile's MITM CA when `http-api-tls` is on
+/// (`the phase 4 / M2c plan's P14`): the root the API's certificate is checked
+/// against, read from the profile the daemon runs on (through `load_profile`,
+/// so the copy in the data directory of a managed profile too). `--remote`
+/// names no profile and gets none (phase 4 M2 design 14.3).
+pub fn resolve_endpoint(args: &ControlArgs) -> anyhow::Result<Endpoint> {
     if let Some(remote) = args.remote {
         let key = args
             .key
             .clone()
             .ok_or_else(|| anyhow!("--remote needs --key (or RURGE_API_KEY)"))?;
-        return Ok((connect_addr(remote), key));
+        return Ok(Endpoint {
+            addr: connect_addr(remote),
+            key,
+            ca: None,
+        });
     }
     let Some(config) = &args.config else {
         return Err(anyhow!("{NOT_CONFIGURED}"));
     };
     let loaded = load_profile(config, args.platform, args.data_dir.as_deref())?;
-    match &loaded.config.general.http_api {
-        Some(api) => Ok((
-            connect_addr(api.addr),
-            args.key.clone().unwrap_or_else(|| api.key.clone()),
-        )),
-        None => Err(anyhow!("{NOT_CONFIGURED}")),
-    }
+    let Some(api) = &loaded.config.general.http_api else {
+        return Err(anyhow!("{NOT_CONFIGURED}"));
+    };
+    let ca = if loaded.config.general.http_api_tls {
+        // the same CA the daemon signs with, and the same message `W0040`
+        // gives when this profile cannot start the API
+        match rurge_http::mitm::Authority::load(&loaded.config.mitm, &loaded.config.keystore) {
+            Ok(Some(authority)) => Some(authority.ca_der().to_vec()),
+            Ok(None) => return Err(anyhow!("{}", rurge_http::mitm::API_TLS_NO_CA)),
+            Err(problem) => return Err(anyhow!("{}", problem.message)),
+        }
+    } else {
+        None
+    };
+    Ok(Endpoint {
+        addr: connect_addr(api.addr),
+        key: args.key.clone().unwrap_or_else(|| api.key.clone()),
+        ca,
+    })
 }
 
 fn client(args: &ControlArgs) -> anyhow::Result<ApiClient> {
-    let (addr, key) = resolve_endpoint(args)?;
-    Ok(ApiClient::new(addr, key))
+    let endpoint = resolve_endpoint(args)?;
+    match &endpoint.ca {
+        Some(ca) => ApiClient::with_tls(endpoint.addr, endpoint.key, ca),
+        None => Ok(ApiClient::new(endpoint.addr, endpoint.key)),
+    }
 }
 
 /// Maps transport failures and non-2xx answers to the exit codes of §7;
@@ -325,34 +359,112 @@ mod tests {
                 data_dir: None,
             }
         };
-        let (addr, key) = resolve_endpoint(&args(None, Some("10.0.0.2:1"), Some("k"))).unwrap();
+        // an `Endpoint` is not `Debug` (it carries the API's key), so an
+        // error is taken with `err`
+        let e = resolve_endpoint(&args(None, Some("10.0.0.2:1"), Some("k"))).unwrap();
         assert_eq!(
-            (addr.to_string().as_str(), key.as_str()),
+            (e.addr.to_string().as_str(), e.key.as_str()),
             ("10.0.0.2:1", "k")
         );
         assert!(
             resolve_endpoint(&args(None, Some("10.0.0.2:1"), None))
-                .unwrap_err()
+                .err()
+                .expect("--remote without --key is an error")
                 .to_string()
                 .contains("--key")
         );
-        let (addr, key) = resolve_endpoint(&args(Some(&with), None, None)).unwrap();
+        let e = resolve_endpoint(&args(Some(&with), None, None)).unwrap();
         assert_eq!(
-            (addr.to_string().as_str(), key.as_str()),
+            (e.addr.to_string().as_str(), e.key.as_str()),
             ("127.0.0.1:6171", "abc")
         );
-        let (_, key) = resolve_endpoint(&args(Some(&with), None, Some("override"))).unwrap();
-        assert_eq!(key, "override");
+        // a profile without `http-api-tls` has nothing to check the API's
+        // certificate against
+        assert_eq!(e.ca, None);
+        let e = resolve_endpoint(&args(Some(&with), None, Some("override"))).unwrap();
+        assert_eq!(e.key, "override");
         let e = resolve_endpoint(&args(Some(&without), None, None))
-            .unwrap_err()
+            .err()
+            .expect("a profile without http-api is an error")
             .to_string();
         assert_eq!(e, NOT_CONFIGURED);
         assert_eq!(
             resolve_endpoint(&args(None, None, None))
-                .unwrap_err()
+                .err()
+                .expect("nothing to reach is an error")
                 .to_string(),
             NOT_CONFIGURED
         );
+    }
+
+    /// `http-api-tls` puts the profile's MITM CA's certificate in the
+    /// endpoint, and a profile whose CA cannot be used is an error before any
+    /// request goes out (`the phase 4 / M2c plan's P14`): the message names
+    /// the problem and never the material.
+    #[test]
+    fn an_https_endpoint_needs_a_usable_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let g = rurge_http::mitm::generate().unwrap();
+        let profile = |name: &str, tls: bool, mitm: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "[General]\nhttp-api = abc@127.0.0.1:6171\nhttp-api-tls = {tls}\n[Rule]\nFINAL,DIRECT\n{mitm}"
+                ),
+            )
+            .unwrap();
+            path
+        };
+        let args = |config: &std::path::Path| ControlArgs {
+            config: Some(config.to_path_buf()),
+            remote: None,
+            key: None,
+            platform: None,
+            data_dir: Some(data.clone()),
+        };
+
+        let with_ca = profile("with.conf", true, &g.conf);
+        let e = resolve_endpoint(&args(&with_ca)).unwrap();
+        assert_eq!(e.ca.as_deref(), Some(g.der.as_slice()));
+
+        let plain = profile("plain.conf", false, &g.conf);
+        assert_eq!(resolve_endpoint(&args(&plain)).unwrap().ca, None);
+
+        let no_ca = profile("none.conf", true, "");
+        assert_eq!(
+            resolve_endpoint(&args(&no_ca))
+                .err()
+                .expect("no CA is an error")
+                .to_string(),
+            rurge_http::mitm::API_TLS_NO_CA
+        );
+
+        let broken = profile(
+            "broken.conf",
+            true,
+            "[MITM]\nca-p12 = QUJDRA\nca-passphrase = pw-7d1f\n",
+        );
+        let message = resolve_endpoint(&args(&broken))
+            .err()
+            .expect("a broken CA is an error")
+            .to_string();
+        assert!(message.contains("MITM is off"), "{message}");
+        assert!(!message.contains("QUJDRA"), "the message carries ca-p12");
+        assert!(
+            !message.contains("pw-7d1f"),
+            "the message carries the passphrase"
+        );
+
+        let remote = ControlArgs {
+            config: None,
+            remote: Some("127.0.0.1:6171".parse().unwrap()),
+            key: Some("k".to_string()),
+            platform: None,
+            data_dir: None,
+        };
+        assert_eq!(resolve_endpoint(&remote).unwrap().ca, None);
     }
 
     /// A managed profile names its API in the downloaded copy, which is in
@@ -378,14 +490,17 @@ mod tests {
             platform: None,
             data_dir: Some(data_dir.to_path_buf()),
         };
-        let (addr, key) = resolve_endpoint(&args(&data)).unwrap();
+        let e = resolve_endpoint(&args(&data)).unwrap();
         assert_eq!(
-            (addr.to_string().as_str(), key.as_str()),
+            (e.addr.to_string().as_str(), e.key.as_str()),
             ("127.0.0.1:6171", "abc")
         );
         let nothing = dir.path().join("nothing");
         assert_eq!(
-            resolve_endpoint(&args(&nothing)).unwrap_err().to_string(),
+            resolve_endpoint(&args(&nothing))
+                .err()
+                .expect("nothing to reach is an error")
+                .to_string(),
             NOT_CONFIGURED
         );
         assert!(!nothing.exists(), "reading the cache creates nothing");

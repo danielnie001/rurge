@@ -2887,6 +2887,9 @@ mod run {
     /// The enhanced mode's start-up and recovery, end to end (M4a task 7):
     /// everything there is to see of it before it can be turned on.
     mod enhanced_mode;
+    /// `http-api-tls` end to end (M2c): the API over HTTPS, and what a start
+    /// with no usable CA does.
+    mod mitm;
 
     struct Daemon {
         child: Child,
