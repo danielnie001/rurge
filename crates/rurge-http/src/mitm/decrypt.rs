@@ -61,10 +61,14 @@ pub struct OriginTls {
 }
 
 /// A decrypted connection: the TLS stream the HTTP engine serves, the count
-/// of what the client sent and whether it closed, and the TLS to the origin.
+/// of what the client sent and whether it closed, the protocol the handshake
+/// settled on, and the TLS to the origin.
 pub struct Accepted {
     pub stream: BoxedStream,
     pub watch: Arc<Watch>,
+    /// Whether the client and rurge settled on HTTP/2 (`phase 4 M2 design
+    /// 10.1`, `the phase 4 / M2b plan's P15`).
+    pub h2: bool,
     pub origin: OriginTls,
 }
 
@@ -106,6 +110,7 @@ pub struct Mitm {
     server: Arc<ServerConfig>,
     origin: Arc<ClientConfig>,
     h1: Arc<ClientConfig>,
+    h2: bool,
 }
 
 impl Mitm {
@@ -116,12 +121,23 @@ impl Mitm {
         authority: Arc<Authority>,
         roots: Arc<RootCertStore>,
     ) -> Result<Mitm, BuildError> {
-        let server = server_config(&authority)?;
-        let origin = origin_client_config(roots, cfg.skip_server_cert_verify, &[b"http/1.1"])?;
-        // `h2` is off in this milestone: what an upgrade gets is what every
-        // request gets (`the phase 4 / M2b plan's P15` leaves the widening to
-        // task 4)
-        let h1 = Arc::clone(&origin);
+        let server = server_config(&authority, cfg.h2)?;
+        // what the origin is offered with: `h2` beside `http/1.1` when this
+        // generation decrypts HTTP/2, `http/1.1` alone otherwise
+        let alpn: &[&[u8]] = if cfg.h2 {
+            &[b"h2", b"http/1.1"]
+        } else {
+            &[b"http/1.1"]
+        };
+        let origin = origin_client_config(roots.clone(), cfg.skip_server_cert_verify, alpn)?;
+        // an upgrade or a tunnel dials with this one, which offers
+        // `http/1.1` alone (`the phase 4 / M2b plan's P12`); with `h2` off it
+        // is the configuration every request gets
+        let h1 = if cfg.h2 {
+            origin_client_config(roots, cfg.skip_server_cert_verify, &[b"http/1.1"])?
+        } else {
+            Arc::clone(&origin)
+        };
         Ok(Mitm {
             authority,
             effective: cfg.effective.clone(),
@@ -130,6 +146,7 @@ impl Mitm {
             server,
             origin,
             h1,
+            h2: cfg.h2,
         })
     }
 
@@ -169,7 +186,15 @@ impl Mitm {
         {
             return Decision::Pass;
         }
-        if !alpn.is_empty() && !alpn.iter().any(|p| p.as_slice() == b"http/1.1") {
+        // a client that offers no ALPN is decrypted; a client offering one is
+        // decrypted only if rurge serves it — `h2` counts when this
+        // generation turns it on (`phase 4 M2 design 10`, `the phase 4 /
+        // M2b plan's P15`)
+        if !alpn.is_empty()
+            && !alpn
+                .iter()
+                .any(|p| p.as_slice() == b"http/1.1" || (self.h2 && p.as_slice() == b"h2"))
+        {
             return Decision::AlpnMismatch;
         }
         Decision::Decrypt
@@ -231,6 +256,10 @@ impl Mitm {
             .accept(client)
             .await
             .map_err(|e| classify(&e))?;
+        // what the handshake settled on, read before the stream is wrapped:
+        // the wrapper counts and does not look at the protocols (`phase 4 M2
+        // design 10.1`, `the phase 4 / M2b plan's P15`)
+        let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
         let watch = Arc::new(Watch::default());
         let stream = Watched {
             inner: stream,
@@ -239,6 +268,7 @@ impl Mitm {
         Ok(Accepted {
             stream: Box::new(stream) as BoxedStream,
             watch,
+            h2,
             origin: OriginTls {
                 config: Arc::clone(&self.origin),
                 h1: Arc::clone(&self.h1),
@@ -304,14 +334,21 @@ fn server_name(name: &HostName) -> Result<ServerName<'static>, HandshakeFailure>
 }
 
 /// The template every decrypted connection clones (`phase 4 M2 design 8.1`).
-fn server_config(authority: &Arc<Authority>) -> Result<Arc<ServerConfig>, BuildError> {
+/// `h2` decides what the client may negotiate: rustls picks by its own list's
+/// order, so a client offering both gets `h2` (`the phase 4 / M2b plan's
+/// P15`).
+fn server_config(authority: &Arc<Authority>, h2: bool) -> Result<Arc<ServerConfig>, BuildError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|e| BuildError::new(format!("cannot set up TLS: {e}")))?
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(NoCertificate));
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.alpn_protocols = if h2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
     config.session_storage = authority.sessions();
     // no 0-RTT: a request is replayed only when the client sends it again
     config.max_early_data_size = 0;
@@ -684,6 +721,7 @@ mod tests {
         assert_eq!(accepted.origin.wait, Duration::from_secs(5));
         let client = client.expect("the client completes");
         assert_eq!(client.get_ref().1.alpn_protocol(), None);
+        assert!(!accepted.h2);
 
         let roots = Arc::clone(&rig.roots);
         let (accepted, client) = handshake(
@@ -693,9 +731,141 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        accepted.expect("the handshake completes with ALPN");
+        let accepted = accepted.expect("the handshake completes with ALPN");
+        assert!(!accepted.h2);
         let client = client.expect("the client completes");
         assert_eq!(client.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+    }
+
+    /// With `h2` on, a client that offers only `h2` is decrypted, and so is
+    /// one that offers it beside `http/1.1`; a client that offers neither is
+    /// passed through as it is without `h2` (`phase 4 M2 design 10`, `the
+    /// phase 4 / M2b plan's P15`).
+    #[test]
+    fn with_h2_an_h2_only_client_is_decrypted() {
+        let local = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let name = HostName::parse("ok.test");
+        let mut with_h2 = cfg("ok.test");
+        with_h2.h2 = true;
+        let rig = rig_of(with_h2);
+
+        for alpn in [
+            vec![b"h2".to_vec()],
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            vec![b"http/1.1".to_vec()],
+            vec![],
+        ] {
+            assert_eq!(
+                rig.mitm.decides(local, Some(&name), &name, 443, &alpn),
+                Decision::Decrypt,
+                "{alpn:?}"
+            );
+        }
+        assert_eq!(
+            rig.mitm
+                .decides(local, Some(&name), &name, 443, &[b"spdy/3".to_vec()]),
+            Decision::AlpnMismatch
+        );
+
+        // without `h2` the same client is still passed through
+        let rig = rig_of(cfg("ok.test"));
+        assert_eq!(
+            rig.mitm
+                .decides(local, Some(&name), &name, 443, &[b"h2".to_vec()]),
+            Decision::AlpnMismatch
+        );
+    }
+
+    /// With `h2` on the server offers both protocols and picks by its own
+    /// order, so a client that offers both gets `h2`; the protocol the
+    /// handshake settled on is handed out with the connection (`phase 4 M2
+    /// design 10.1`, `the phase 4 / M2b plan's P15`).
+    #[tokio::test]
+    async fn with_h2_the_client_gets_h2_when_it_offers_it() {
+        let mut with_h2 = cfg("ok.test");
+        with_h2.h2 = true;
+        let rig = rig_of(with_h2);
+        let name = HostName::parse("ok.test");
+
+        let cases = [
+            (vec![&b"h2"[..], &b"http/1.1"[..]], Some(&b"h2"[..]), true),
+            (vec![&b"http/1.1"[..]], Some(&b"http/1.1"[..]), false),
+            (vec![], None, false),
+        ];
+        for (offered, expected, h2) in cases {
+            let roots = Arc::clone(&rig.roots);
+            let (accepted, client) = handshake(
+                &rig,
+                &name,
+                client_config(roots, &offered),
+                Duration::from_secs(5),
+            )
+            .await;
+            let accepted = accepted.expect("the handshake completes");
+            let client = client.expect("the client completes");
+            assert_eq!(
+                client.get_ref().1.alpn_protocol(),
+                expected,
+                "the client offered {offered:?}"
+            );
+            assert_eq!(accepted.h2, h2, "the client offered {offered:?}");
+        }
+    }
+
+    /// The origin side is offered `h2` only when `h2` is on, and a connection
+    /// that upgrades or tunnels finds an `http/1.1`-only configuration either
+    /// way; with `h2` off the two are one configuration (`phase 4 M2 design
+    /// 10.2`, `the phase 4 / M2b plan's P12`, `P15`).
+    #[tokio::test]
+    async fn the_origin_side_offers_h2_only_when_h2_is_on() {
+        let name = HostName::parse("ok.test");
+
+        let mut with_h2 = cfg("ok.test");
+        with_h2.h2 = true;
+        let rig = rig_of(with_h2);
+        let roots = Arc::clone(&rig.roots);
+        let (accepted, client) = handshake(
+            &rig,
+            &name,
+            client_config(roots, &[b"http/1.1"]),
+            Duration::from_secs(5),
+        )
+        .await;
+        let accepted = accepted.expect("the handshake completes");
+        client.expect("the client completes");
+        assert_eq!(
+            accepted.origin.config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            accepted.origin.h1.alpn_protocols,
+            vec![b"http/1.1".to_vec()]
+        );
+
+        // `h2` off: both offer `http/1.1` alone, and are the same one
+        let rig = rig_of(cfg("ok.test"));
+        let roots = Arc::clone(&rig.roots);
+        let (accepted, client) = handshake(
+            &rig,
+            &name,
+            client_config(roots, &[b"http/1.1"]),
+            Duration::from_secs(5),
+        )
+        .await;
+        let accepted = accepted.expect("the handshake completes");
+        client.expect("the client completes");
+        assert_eq!(
+            accepted.origin.config.alpn_protocols,
+            vec![b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            accepted.origin.h1.alpn_protocols,
+            vec![b"http/1.1".to_vec()]
+        );
+        assert!(
+            Arc::ptr_eq(&accepted.origin.config, &accepted.origin.h1),
+            "one configuration when h2 is off"
+        );
     }
 
     /// Without an SNI the certificate names the target, here an address: the

@@ -387,6 +387,10 @@ impl Engine {
             Box::new(client),
             None,
             None,
+            // a session the engine judges HTTP from its bytes speaks
+            // HTTP/1.1: cleartext HTTP/2 is not served (`phase 4 M2 design
+            // 1`)
+            false,
         )
         .await;
     }
@@ -475,6 +479,7 @@ impl Engine {
             }
         };
         self.mitm_counts.decrypted();
+        let h2 = accepted.h2;
         self.serve_requests(
             Carried {
                 engine,
@@ -491,6 +496,7 @@ impl Engine {
                 name,
                 watch: accepted.watch,
             }),
+            h2,
         )
         .await;
     }
@@ -502,13 +508,16 @@ impl Engine {
     /// (`origin` is `Some`, `phase 4 M2 design 9`) is the same in everything
     /// but the TLS to the origin and the URL each request is named by, and it
     /// is `pinning` that tells the one ending of it that is a hint about the
-    /// host (`phase 4 M2 design 8.3`).
+    /// host (`phase 4 M2 design 8.3`). `h2` is what the handshake with the
+    /// client settled on: it decides how the connection is served (`phase 4
+    /// M2 design 10.1`, `the phase 4 / M2b plan's P15`).
     async fn serve_requests(
         &self,
         carried: Carried,
         client: BoxedStream,
         origin: Option<OriginTls>,
         pinning: Option<Pinning>,
+        h2: bool,
     ) {
         let Carried {
             engine,
@@ -535,9 +544,9 @@ impl Engine {
             abort: CancellationToken::new(),
             token: token.clone(),
             tracker: self.tracker().clone(),
-            // the client's ALPN is read from the handshake in task 4; until
-            // then every decrypted connection is served as HTTP/1.1
-            h2: false,
+            // what the TLS handshake with the client settled on; a cleartext
+            // connection is HTTP/1.1
+            h2,
         };
         let upstreams = crate::http::ConnUpstreams::new(
             engine,
