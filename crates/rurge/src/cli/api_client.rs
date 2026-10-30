@@ -115,9 +115,11 @@ impl ApiClient {
         path: &str,
         body: Option<Value>,
     ) -> Result<(u16, Value), ClientError> {
-        // `http` names the request's target: absolute for plain HTTP, which
-        // hyper's legacy client writes as it is, and origin form for TLS,
-        // where the connection names the host.
+        // What each client is given, not what goes on the wire. The plain
+        // client gets an absolute URI: it takes the address to dial and the
+        // `Host` header from it, and then writes the URI as origin form.
+        // `client::conn` has no such step — it writes the URI it is given — so
+        // the TLS branch hands it the origin form and adds `Host` itself.
         let (uri, host) = match &self.transport {
             Transport::Plain(_) => (format!("{}{path}", self.base), None),
             Transport::Tls { addr, .. } => (path.to_string(), Some(addr.to_string())),
@@ -149,9 +151,9 @@ impl ApiClient {
                     .request(req)
                     .await
                     .map_err(|e| ClientError::Unreachable(e.to_string()))?,
-                // one connection per call: a command makes a handful of
-                // requests, and a pool would keep each of them for five
-                // seconds at least (`the phase 4 / M2c plan's P14`)
+                // one connection per call: a command makes only a handful of
+                // requests, which is not worth reusing a connection for
+                // (`the phase 4 / M2c plan's P14`)
                 Transport::Tls {
                     addr,
                     connector,
