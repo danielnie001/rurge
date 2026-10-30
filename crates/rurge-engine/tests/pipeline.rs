@@ -2232,9 +2232,13 @@ async fn a_dns_session_is_labelled_by_its_scheme_whatever_the_port() {
         let lookup = tokio::spawn(async move { lookup_outcome(&asking).await });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let seen = loop {
+            // the session is recorded when it appears, with the rule and the
+            // policy it went to written into the record after it: wait for
+            // all three, not for the protocol alone (the phase 4 / M2b
+            // plan's deferred row 1)
             let found = internal_sessions(&engine)
                 .into_iter()
-                .find(|r| r.protocol == Some(protocol));
+                .find(|r| r.protocol == Some(protocol) && r.rule.is_some() && !r.policy.is_empty());
             if let Some(found) = found {
                 break found;
             }
