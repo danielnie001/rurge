@@ -49,7 +49,8 @@ impl Form {
 /// To HTTP/1.1: the target becomes origin form, `Host` is the authority the
 /// request names (RFC 9113 §8.3.1: a middlebox writes the `:authority` there),
 /// several `cookie` fields become one joined with `; ` (RFC 9113 §8.2.3), and
-/// `TE` is dropped: `trailers` is a promise only HTTP/2 asks for.
+/// `TE` is dropped: an HTTP/1.1 sender of `TE` must name it in `Connection`
+/// too (RFC 9110 §10.1.4), and rurge does not carry it over.
 ///
 /// To HTTP/2: the target becomes an absolute `https://` one, which hyper's
 /// HTTP/2 client writes as `:scheme` and `:authority`; `Host` and

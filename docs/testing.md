@@ -181,6 +181,11 @@ cargo test -j 8 --workspace --lib -- state::tests   # 阶段 4 / M2a，`rurge-en
 cargo test -j 8 --workspace --test mitm   # 阶段 4 / M2a，经引擎的 MITM 端到端（29 条）：三种入口的解密与记录、同一条连接上的两个请求、不受信的源站与 `skip-server-cert-verify`、排除项与名单与来源、SOCKS5 上的 `127.0.0.1`、重载（同材料 / 另一张 CA / 坏了的 CA）、开关关着与只给 `h2` 的客户端、可嗅探的扩大、停止落在握手里与握手之后、不信任与证书固定的日志与限频、经虚拟网卡的行、证书固定与停止、WebSocket、明文不受影响、解密的请求经 HTTP 代理隧道
 cargo test -j 8 --workspace --test api -- the_mitm   # 阶段 4 / M2a，`rurge-api` 的三条（3 条）：开关的读 / 切 / 写进 `state.json`、`GET /v1/mitm/ca` 的头与 DER 与 `?x-key=`、没有可用的 CA 时 404
 cargo test -j 8 --workspace --test cli -- a_daemon_restores_the_mitm_switch_from_state_json   # 阶段 4 / M2a，可执行文件的一条（1 条）：起守护进程之后 `GET /v1/features/mitm` 读得到 `state.json` 里记着的值
+cargo test -j 8 --workspace --lib -- version::   # 阶段 4 / M2b，`rurge-http` 的版本转换（5 条）：`:authority` 与 `Host`、拆开的 `cookie` 合成一个、`TE: trailers` 的去留、连接专用的头、转过去再转回来的幂等
+cargo test -j 8 --workspace --lib -- responses::   # 阶段 4 / M2b，`rurge-inbound` 的三种应答的形状（3 条；M2b 加的是 `not_implemented_is_a_501_with_the_message`，HTTP/2 的 `CONNECT` 答 501 用的那一个）
+cargo test -j 8 --workspace --lib -- engine::tests::   # 阶段 4 / M2b 之后这个过滤词一共选中 133 条（一台机器上的一次运行）：`rurge-http` 61 条（M1b 的引擎本体与 M2b 的 HTTP/2：客户端的服务端与执行器、在途与空闲、`CONNECT` 的 501、共享的上游、字节、被拒的流、终止与看门狗、GOAWAY 之后的一秒）、`rurge-engine` 9 条、`rurge-rules` 63 条（`engine::tests` 51 条、`engine::tests::pre_match` 12 条）
+cargo test -j 8 --workspace --lib -- mitm   # 阶段 4 / M2b 之后这个过滤词一共选中 48 条：`rurge-config` 12 条、`rurge-http` 33 条（`mitm::authority::tests::` 19 条、`mitm::decrypt::tests::` 14 条，M2b 加了三条 `h2` 的）、`rurge-engine` 3 条
+cargo test -j 8 --workspace --test mitm   # 阶段 4 / M2b 之后 36 条（M2a 的 29 条 + M2b 的 7 条端到端）：四种版本组合、`h2 = true` 下只给 `h2` 的客户端、每条流各目己的规则、并发的流共用一条上游连接、`cookie` 到 HTTP/1.1 源站、HTTP/1.1 客户端的 WebSocket 对讲 h2 的源站、`CONNECT` 的 501 与一条记录
 # 阶段 3 / M5 重跑的基准读数（一台机器上的一次运行、**不是 CI**；release，`TUN_BENCH_FAR=memory`；命令仍是上面 B1 / B2 / b3 那三条）：B1 八个量出来的行都过 0.7 Gbit/s 的线（最低的一行 4.065，是线的 5.8 倍），四个计数都是 0，中位数上行 8.03、下行 4.84 Gbit/s（两个 MTU 混在一起，只作量级）；同设置（MTU 1500、`tx_max` 256 KiB）的 5.717 / 5.172 是上一次的 79.7% 与 94.7%。B2 门槛读数（峰值减去全部测试一侧的项）403,671,140 字节（403.7 MB / 385.0 MiB），在线 429,000,000 字节以内、余量 25.3 MB；保守读数（只减去准的应用端套接字缓冲）445,333,604 字节（445.3 MB），超线 16.3 MB——这个读数照旧归项目所有者，这里只记数。b3 中位数 0.9 微秒、p99 2.9 微秒，最大 4542.2 微秒（4.5 ms，落在第 28,673 个查询上，是线的 22.7 倍，两处都是池的 `HashMap` 的翻倍处，读代码与算术得出）。细节与上一次不同的原因见计划「执行期修正记录」第 61 ～ 63 行
 cargo insta test -p rurge-config --review       # 语料库快照有变化时审阅
 cargo clippy --all-targets -- -D warnings       # 零警告（CI 设 RUSTUP_TOOLCHAIN=1.89.0，与本机的 MSRV 工具链一致；更新的 clippy 会多出 lint）
@@ -402,3 +407,25 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 十二、**经虚拟网卡的 `AppTcp` 没有 `shutdown()` 就丢掉会给会话发重置**；“不信任”的客户端经虚拟网卡时，警报由用例自己写明文 `unknown_ca`（rustls 0.23.43 在 TLS 1.3 里还没解密过对端任何消息时收明文警报；tokio-rustls 0.26.4 只把排好的警报写一次）（M2a 记录第 47、48 行）。真的 rustls 客户端经虚拟网卡发来的警报这条路没有用例（M2a 延后第 4 行）。
 
 十三、**限频的两个边界**（一小时、1024 个键）只有 `crates/rurge-engine/src/mitm.rs` 的两条单元用例（M2a 记录第 45 行），集成用例碰不到（M2a 延后第 5 行）。
+
+### 阶段 4 / M2b 起：MITM 的 HTTP/2
+
+阶段 4 / M2b 起另有几条（计划 `docs/superpowers/plans/2026-10-30-phase4-m2b-mitm-http2-plan.md`，下面写“M2b 记录第 N 行”指它末尾的「执行期修正记录」；M1a、M1b、M2a 与 M2b 的提交都在本地，CI 都没有见过）：
+
+一、**客户端一侧的 HTTP/2 不经 TLS，在 `tokio::io::duplex` 上用先验知识讲**（计划 P18）：`serve_connection` 拿到的已经是解密之后的流，所以用例无需证书就能讲 HTTP/2。客户端的构造在 `crates/rurge-http/src/engine.rs` 的测试模块里：`rig_h2`（`Conn` 的 `h2` 为真，目标是一个 `TestServer` 或自己的源站）、`h2_client`（`hyper::client::conn::http2::Builder::new(TokioExecutor::new())` 的握手，连接的 future 用 `tokio::spawn` 驱动）、`h2_request`（`Full<Bytes>` 的空正文）与 `served_within`（给服务任务一个时限）。
+
+二、**要读服务端的 SETTINGS 时才用 h2 的客户端**（计划 P18）：`the_h2_server_offers_100_streams_and_no_extended_connect` 用 `h2::client::handshake`，因为要断言的是“服务端宣告了什么”（`max_concurrent_send_streams() == 100`、`is_extended_connect_protocol_enabled()` 为假），hyper 的客户端不把它交出来。
+
+三、**会 GOAWAY、会拒绝流、会中途重置的源站用 h2 的服务端**（计划 P18；`crates/rurge-proto/src/testing/h2proxy.rs` 是现成的写法）：`OriginScript::{GoAwayAfterOne, RefuseAfterOne, ResetMidBody}`、`H2Origin { addr, connections, ended, reset }` 与 `h2_origin(&fixture, script)`，TLS 用 `fixture.acceptor_with_alpn(false, &[b"h2"])`，`h2::server::handshake` 之后 `accept()` 一直跑到 `None`（它同时驱动连接）才放手并 `notify_one`。用 `notify_one` 而不是 `notify_waiters`：通知可能早于用例来等，前者存一个许可。应答要带 `content-length`，否则 `h2` 的 `Client::response()` 读不到正文。别的源站用 `TestServer`（它经 TLS 时按协商到的 ALPN 讲；`RecordedRequest.version` 把它记成 `"HTTP/2.0"`）。
+
+四、**窗口调到只停住一个流**（计划 P7、M2b 记录第 23 行）：`an_h2_client_that_stops_reading_one_stream_fails_only_that_request` 把客户端的流窗口调成 1 MiB、连接窗口 16 MiB：第一个流不读、占着那 1 MiB 不释放，第二个流的 4 MiB 还放得下，所以停住的只有那一个，看门狗只结束它。
+
+五、**“先有数据、再重置”的用例要用信号排先后，不能靠固定等待**（M2b 记录第 50、52 行）：h2 0.4.19 的 `send_reset` 会把这条流还排在队列里的帧（HEADERS 与 DATA）丢掉（`h2-0.4.19/src/proto/streams/send.rs:254-268`）；而 hyper 的 `PipeToSendStream` 交出一段 DATA 之后会在同一次 poll 里接着读正文（`hyper-1.11.1/src/proto/h2/mod.rs:142-258`），上游的重置这时如果已经到了，读到的就是 `Failed`，hyper 随即以 `INTERNAL_ERROR` 重置客户端一侧的流、客户端一个字节都读不到。所以 `OriginScript::ResetMidBody` 驱动到用例告诉它“那一段已经读到了”（`H2Origin.reset`）才 `send_reset`，用例那边用 `tokio::select!` 等这个信号或 `conn.accept()`，不固定等多少毫秒。
+
+六、**`TestServer::set_delay` 只对 `set` 过的路径起作用**（M2b 记录第 29、45 行）：没 `set` 的路径立刻答 404。要让一个请求停住，先 `set(路径, 正文)` 再 `set_delay`，否则用例等的是“源站立刻答完了”。`TestServer` 也不读请求正文，先答完的话 hyper 会以 `NO_ERROR` 重置请求一侧，数 `up` 的用例要先把源站按住。
+
+七、**丢掉 hyper 客户端一个请求的应答 future 会发 `RST_STREAM(CANCEL)`**（M2b 记录第 30 行），不论请求有没有正文：h2 的 `StreamRef` 的 `drop` 走 `drop_stream_ref` → `maybe_cancel`（`h2-0.4.19/src/proto/streams/streams.rs:1631`、`:1687-1705`）。“客户端重置一个流”的用例靠这一条。
+
+八、**判原因码用 `h2_reason_of`，不要假定它有**（M2b 记录第 52 行）：它顺着 `std::error::Error::source()` 找 `h2::Error`，返回 `reason()`；`h2::Error` 也装 I/O 错误，那样的 `reason()` 是 `None`，写成“没有原因码就当作 `INTERNAL_ERROR`”会让用完错误的理由通过。钉住原因码的六条用例：`a_killed_h2_stream_is_reset_and_the_others_go_on`、`a_killed_h2_stream_whose_body_flows_is_reset_and_its_upstream_let_go`、`an_h2_client_that_stops_reading_one_stream_fails_only_that_request`、`a_rejected_h2_request_without_a_page_resets_only_its_stream`、`a_dropped_h2_request_is_held_then_reset`、`an_upstream_h2_stream_reset_mid_body_reaches_the_client_as_internal_error`。
+
+九、**带等待的 HTTP/2 用例提交前各自单独循环跑二十次以上**（全过才算数）：任务 1 ～ 3 的新用例各一圈、`engine::tests` 整个一圈，任务 5 的七条各一圈外又整个 `--test mitm` 一圈；日志在工作区（git 忽略），命令行见 M2b 记录第 31、32、46、47、51、52、56 行。

@@ -229,3 +229,61 @@ enabled=false mitm switched via http-api
 - 没有把 CA 装进任何信任库、没有解密过真实的站点、没有经真浏览器试过：全部证据是回环上的用例。
 - `auto-quic-block` 读进来、不生效（M5）。
 - 证书固定判断里两项“没有被停止”的条件没有能红的用例（M2a 记录第 50 行、M2a 延后第 3 行）。
+
+## M2b　MITM（HTTP/2）
+
+`[MITM] h2 = true` 生效了：解密的连接上，客户端用 ALPN 选了 `h2` 的，rurge 用 hyper 的 HTTP/2 服务端讲它的请求；对上游的 TLS 同时给 `h2` 与 `http/1.1`，选了 `h2` 的上游连接在同一条客户端连接的同一个键下共享给并发的请求。两侧的版本可以不同，请求在两种形式之间转换（设计第 10 节，计划 P1 ～ P18）。**HTTP/1.1 上“关掉整条连接”的终止、看门狗、拒绝与停止，在 HTTP/2 上改成“重置这个流”。** 没有新的端点，也没有新的计数：`/v1/rurge/http`、`/v1/features/mitm`、`GET /v1/mitm/ca` 与 `state.json` 的形状都照「M2a」。
+
+**这一节写的是本地提交的行为：M2b 的提交也在本地，M1a、M1b、M2a 与 M2b 的提交 CI 都没有见过。**「M2a」一节「没有覆盖的」里有一条写着“HTTP/2 的解密（M2b）：只给 `h2` 的客户端照原样转发，`h2 = true` 不生效”——那是 M2a 收尾时的状态，M2b 之后以本节为准。
+
+### 什么时候讲 HTTP/2
+
+- **客户端一侧**：「M2a」的五条都对得上，并且 `[MITM] h2 = true`（缺省 false，见兼容性清单 7.2 节那一行）。这时服务端的 ALPN 是 `[h2, http/1.1]`，两种都给的客户端拿到 `h2`（rustls 按服务端列表的次序选）；`h2 = false` 时仍是 `[http/1.1]`，只给 `h2` 的客户端照原样转发（`a_client_offering_only_h2_is_passed_through`）。
+- **上游一侧各自协商**：解密的连接（不论客户端一侧是哪个版本）对上游的 ALPN 是 `[h2, http/1.1]`，源站选哪个就讲哪个；`h2 = false` 时对上游也只给 `http/1.1`。所以四种组合都可能：客户端 h2 而上游 h1、客户端 h1 而上游 h2 都在用例里（`four_combinations_of_http1_and_h2_are_decrypted`，`crates/rurge-engine/tests/mitm.rs`）。
+- **明文的连接只讲 HTTP/1.1**：h2c（不论升级还是先验知识）没有做；`h2 = true` 不影响经 HTTP / SOCKS5 监听器与虚拟网卡来的明文会话（设计第 1 节）。
+- 客户端一侧的上限：一条连接至多 100 个并发流，不发 keep-alive 的 PING，不宣告扩展 `CONNECT`（总设计 P4-D11）。用例 `the_h2_server_offers_100_streams_and_no_extended_connect`。
+
+### 请求记录
+
+解密的连接上每个请求一条记录，形状与规矩同「M2a」（`protocol` 是 `https`、`url` 以 `https://` 开头、`sni` 是 ClientHello 里那个名字）。HTTP/2 加的三件事：
+
+- **URL 与规则看 `:authority`**：会话的 `http_host` 与记录的 `url` 取 `:authority`（FR-HTTP-02，设计第 10.3 节），规则看到的主机名也是它；转到 HTTP/1.1 的上游时按 RFC 9113 第 8.3.1 节把 `:authority` 写进 `Host`、请求目标改成源站形式。用例 `the_authority_of_an_h2_request_names_it_and_becomes_host`、`an_h2_request_keeps_its_authority_and_te_trailers_to_an_h2_origin`。
+- **客户端取消一个流**：原因写 `client cancelled the request`（HTTP/1.1 上是 `client closed the connection`）。客户端重置这个流、或者整条连接关了，都是它；同一条连接上别的流照常。用例 `a_stream_the_client_resets_is_cancelled_and_the_connection_stays`。
+- **`cookie` 与连接专用的头**：HTTP/2 拆开的多个 `cookie` 字段转到 HTTP/1.1 时合成一个（用 `; ` 连接，RFC 9113 第 8.2.3 节）；转到 HTTP/2 的那一侧去掉 `Host`、`Transfer-Encoding` 与其余连接专用的头，`TE` 只留 `trailers`，原来声明过才留。用例 `the_cookies_of_an_h2_request_are_joined_for_an_http1_upstream` 与 `crates/rurge-http/src/version.rs` 的四条单元用例，经引擎的那一条是 `the_cookies_of_an_h2_client_reach_an_http1_origin_as_one_field`。
+
+### `CONNECT` 的 501
+
+HTTP/2 上的 `CONNECT`（RFC 9113 第 8.5 节的隧道）不转发：答 `501`，正文是 `CONNECT over HTTP/2 is not supported`（不是错误页），**这个请求有自己的记录**（结局失败、原因就是那一句），不选路、不拨号（计划 P6）。承载连接的记录照 M2a 的规矩（这个请求走到了选路，所以连接不另记）。用例 `a_connect_over_h2_is_a_501_with_a_record`（`crates/rurge-http/src/engine.rs`）与 `a_connect_over_h2_has_one_record_and_a_501`（`crates/rurge-engine/tests/mitm.rs`）。**带非零 `content-length` 的 `CONNECT` 没有记录**：hyper 在服务它之前就把那个流重置了。
+
+### 上游的连接与字节
+
+- **共享**：上游选了 `h2` 时，同一个键（scheme、主机、端口、源站校验的根、TLS 参数）在**一条客户端连接**里至多一条 HTTP/2 连接，`SendRequest` 克隆着用、共享给并发的请求；`is_closed()` 或收到源站的 GOAWAY 之后不再借出。不跨客户端连接共享，也不进 M1b 的池。用例 `requests_of_one_key_share_one_h2_connection`、`another_key_gets_another_h2_connection`、`an_h2_connection_that_went_away_is_not_lent_again`，经引擎的 `concurrent_h2_streams_share_one_upstream_connection`。
+- **客户端 HTTP/2 而源站只讲 HTTP/1.1 时，并发的请求各占一条上游连接，数目不另设上限**（登记，设计第 10.2 节）。
+- **升级与隧道只拨 HTTP/1.1**：带 `Upgrade` 的请求与 `CONNECT` 用只给 `http/1.1` 的那份客户端配置拨号，源站讲 h2 时也这样（设计第 10.4 节）。用例 `an_upgrade_dials_http1_where_the_origin_speaks_h2`、`a_websocket_from_an_http1_client_goes_over_http1_where_the_origin_speaks_h2`。
+- **字节**：HTTP/1.1 的上游照 M1b（换连接的计量，记线上的字节）。共享的 HTTP/2 上游换不了连接一层的计量，所以设成不记之后连接一层什么也不记，**每条记录的 `up` / `down` 只算它自己的正文**（请求正文与应答正文，trailers 不计）。例外是**拨这条连接的那一个请求**：计量是在握手之后才关掉的，在那之前走过的字节都算在它头上——TLS 握手与 HTTP/2 的前言，可能还有 SETTINGS 的交换与 TLS 1.3 的会话票据，**不是准确的数**（设计第 16 节第 10 条、第 23 节第 21 条）。用例 `the_bytes_of_requests_on_a_shared_h2_connection_are_their_bodies`（拨号那个请求只断言 `down` 至少 5）。
+- **被源站拒绝的流再发一次**：源站以 `REFUSED_STREAM` 拒绝、或以 GOAWAY 说没有处理过的流（RFC 9113 第 8.7 节），**借来的连接上、幂等且没有正文**的请求在新拨的连接上再发一次，另写一行 DEBUG：`an upstream refused the request; sending it again on a new connection`。别的照 M1b 答 502。用例 `a_request_the_origin_refuses_is_sent_again_once`。
+
+### 空闲、停止与 GOAWAY 之后的一秒
+
+- **空闲**：客户端一侧的 HTTP/2 连接在**没有请求在途**、且过了 `Conn::idle`（运行时的空闲时限，同「M1b」的 `idle_timeout`）时发 GOAWAY（`graceful_shutdown`）；之后从没有请求在途时算起，至多再等一秒（`GOAWAY_GRACE`，照 Go 的 `net/http` HTTP/2 服务端发 GOAWAY 之后的 `goAwayTimeout`），没关的连接就丢掉，另写一行 DEBUG：`an HTTP/2 client did not close its connection within a second of GOAWAY; dropping it`。HTTP/1.1 的 keep-alive 照 M1b（`head_wait`），所以**两种版本“空闲”的口径不同**：HTTP/1.1 等的是下一次请求头，HTTP/2 等的是“没有请求在途”。用例 `an_idle_h2_connection_is_sent_goaway`、`a_silent_h2_client_is_dropped_after_idle_and_the_grace`（什么都不发、不回 PING 的客户端）。
+- **代价**：很慢的机器上，一个规矩的客户端也可能在那一秒里没走完平静关而被切——那时它的流已经关了，被切的只是连接（任务 1 报告的顾虑 3）。
+- **停止**：`graceful_shutdown`（GOAWAY），在途的流等它们自己的令牌；一个也不在途、或不读的那个流让停止迟迟不结束的连接，至多一秒之后被丢掉（`a_stop_ends_an_h2_connection_with_goaway`、`a_stop_while_an_h2_client_does_not_read_ends_the_connection`）。
+- 在途的计数是守卫加一、丢掉减一；“客户端不读”与“终止一个客户端不读的流”之后，在途数要等 hyper 下一次 poll 那个流、或者连接关掉才减——这不是缺陷，连接因此在那一小段里不会被判为空闲（设计第 10.5 节的登记）。
+
+### 终止、看门狗与拒绝：只重置这个流
+
+HTTP/2 上一条连接承载许多请求，所以 M1b 里“关掉这条连接”的做法在这里都改成“重置这个流”，同一条连接上别的流与之后的请求照常（设计第 10.5 节，M2-D17）。**重置的原因码一律是 `INTERNAL_ERROR`**：终止（`POST /v1/requests/kill` 与请求的令牌，记录的结局是 `killed`）、看门狗到时（`client stopped reading`）、没有错误页的 `REJECT`、`REJECT-DROP`，以及上游正文出错——上游的原因码不转给客户端（hyper 按错误链里的原因码重置客户端的流，而 `REFUSED_STREAM` 那样的原因码会让客户端以为请求没有处理过、可以重发；见设计第 23 节第 20 条）。Go 的 `httputil.ReverseProxy` 也是这样。
+
+用例（`crates/rurge-http/src/engine.rs` 的测试模块）：`a_killed_h2_stream_is_reset_and_the_others_go_on`、`a_killed_h2_stream_whose_body_flows_is_reset_and_its_upstream_let_go`、`an_h2_client_that_stops_reading_one_stream_fails_only_that_request`、`a_rejected_h2_request_without_a_page_resets_only_its_stream`、`a_dropped_h2_request_is_held_then_reset`、`an_upstream_h2_stream_reset_mid_body_reaches_the_client_as_internal_error`。`REJECT` 有错误页时照答在那个流上。
+
+### 已知限制
+
+**上游在应答的 END_STREAM 之前以 `RST_STREAM(NO_ERROR)` 结束这个流时，rurge 记的是完成。** hyper 把这样结束的应答正文当成正常读完（它按 RFC 7540 第 8.1 节“提前应答”的读法处理），引擎因此 `complete`、记 `Completed`；应答**不带 `content-length`** 时，客户端看到的是一个被截断却正常结尾的正文（带的话客户端能从长度不符看出来）。RFC 9113 第 8.1 节只许服务端在完整的应答之后这样做，所以这是对端不合规时的行为。M2b 不识别它（计划的「延后事项」第 2 行；协调者的裁定）。
+
+### 没有覆盖的
+
+- **h2c**（明文的 HTTP/2，不论升级还是先验知识）：明文的连接只讲 HTTP/1.1。
+- **扩展 `CONNECT`**（RFC 8441，HTTP/2 上的 WebSocket）：不宣告，所以浏览器为 WebSocket 另开一条只给 `http/1.1` 的连接。
+- **HTTP/2 的服务端推送与优先级**、**对上游的 PING 保活**，以及**跨客户端连接共享上游的 HTTP/2 连接**。
+- `rurge mitm ca generate` / `export`、`http-api-tls` 与阶段 4 的手工验收清单（M2c）；`README.md`、`README_en.md` 与 `docs/requirements.md` 也在 M2c 收尾时改。
+- 没有手工验收；**M2b 的提交都在本地，M1a、M1b、M2a 与 M2b 的提交 CI 都没有见过**，上面每一条只在一台机器上的一次运行里证明过（M2b 没有平台代码）。
