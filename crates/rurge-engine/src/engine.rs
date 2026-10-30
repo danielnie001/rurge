@@ -18,6 +18,7 @@ use rurge_config::rule::PolicyRef;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_config::spec::{PolicySpec, ProtoSpec};
 use rurge_dns::fakeip::FakeIpPool;
+use rurge_http::mitm::ApiTls;
 use rurge_inbound::{
     ClientConn, DialError, Dialed, Dialer, FailKind, HttpAuth, HttpListener, ListenerOpts,
     PlainRequests, ProcessSlot, Running, ServeOpts, SessionHandle, SessionOutcome, Socks5Listener,
@@ -772,6 +773,22 @@ impl Engine {
             .mitm
             .as_ref()
             .map(|mitm| mitm.authority().ca_der().to_vec())
+    }
+
+    /// The TLS of the API: the authority of the last published generation
+    /// that had one (`MitmShared::last_live`), or `None` when none had. It is
+    /// asked once per new connection, so that a reload that brought another
+    /// CA signs the connections after it with that one (the phase 4 / M2c
+    /// plan's P9).
+    pub fn api_tls(&self) -> Option<ApiTls> {
+        let authority = self.shared.mitm.last_live()?;
+        match ApiTls::new(authority) {
+            Ok(tls) => Some(tls),
+            Err(e) => {
+                tracing::debug!("the TLS of the API cannot be set up: {e}");
+                None
+            }
+        }
     }
 
     /// Refuses the sessions that begin from now on (`Some(why)`), or ends the

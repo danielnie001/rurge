@@ -41,6 +41,7 @@ pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, Traffic
 pub use outbounds::{EngineFactory, dry_build, load_checked};
 pub use owner::{OwnerLookup, OwnerQuery};
 pub use runtime::{Runtime, RuntimeOptions};
+pub use rurge_http::mitm::ApiTls;
 pub use rurge_inbound::{ProcessSlot, Running};
 pub use rurge_policy::EmptyGroup;
 pub use rurge_policy::testbook::TestResult;

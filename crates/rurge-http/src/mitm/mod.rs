@@ -11,7 +11,10 @@
 //! `8`).
 //! `generate` is the four files of a new CA, which `rurge mitm ca generate`
 //! writes (`phase 4 M2 design 13`).
+//! `api` is the TLS of the API, which serves HTTPS with the same authority's
+//! certificates (`phase 4 M2 design 14.1`).
 
+pub mod api;
 pub mod authority;
 pub mod decrypt;
 pub mod generate;
@@ -22,6 +25,7 @@ mod fixtures;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use api::ApiTls;
 pub use authority::{
     API_TLS_NO_CA, Authority, BACKDATE_DAYS, CaProblem, LEAF_DAYS, LEAF_SLOTS, LeafError,
     SESSION_SLOTS, check,

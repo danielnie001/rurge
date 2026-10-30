@@ -2700,3 +2700,80 @@ async fn a_connect_over_h2_has_one_record_and_a_501() {
     );
     assert!(h.engine.request_log().active().is_empty());
 }
+
+/// The API's TLS follows the last CA a generation had (the phase 4 / M2c
+/// plan's P9): a reload that brings another CA has the API sign its next
+/// connections with it, a reload that leaves the profile without a CA keeps
+/// the CA the API had, and an engine that never had one has no TLS at all.
+#[tokio::test]
+async fn api_tls_is_the_last_ca_a_generation_had() {
+    let a = mitm_ca();
+    let b = TlsFixture::with_ca_name("rurge test MITM CA 2", &[]);
+    let section = mitm_section("origin.test", &a.ca_p12_base64("pw"));
+    let h = harness_mitm(
+        Profile {
+            sections: &section,
+            ..Profile::default()
+        },
+        a.roots(),
+    )
+    .await;
+    assert_eq!(
+        h.engine
+            .api_tls()
+            .map(|tls| tls.ca_der().to_vec())
+            .as_deref(),
+        Some(a.ca_der()),
+        "the API signs with the CA of the generation in use"
+    );
+
+    // a generation without a CA: the API keeps the one it had, while the
+    // generation itself decrypts nothing
+    let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
+    assert_eq!(text.matches(&section).count(), 1, "one [MITM] section");
+    swap_to(&h, text.replace(&section, "")).await;
+    assert_eq!(
+        h.engine.mitm_ca_der(),
+        None,
+        "the generation has no CA to decrypt with"
+    );
+    assert_eq!(
+        h.engine
+            .api_tls()
+            .map(|tls| tls.ca_der().to_vec())
+            .as_deref(),
+        Some(a.ca_der()),
+        "the API goes on with the last CA it had"
+    );
+
+    // a reload with another CA: the API follows it
+    let new_section = mitm_section("origin.test", &b.ca_p12_base64("pw"));
+    swap_to(&h, text.replace(&section, &new_section)).await;
+    assert_eq!(
+        h.engine
+            .api_tls()
+            .map(|tls| tls.ca_der().to_vec())
+            .as_deref(),
+        Some(b.ca_der()),
+        "the API signs with the CA of the new generation"
+    );
+    assert_eq!(
+        h.engine.mitm_ca_der().as_deref(),
+        Some(b.ca_der()),
+        "the generation decrypts with the new CA"
+    );
+
+    // an engine that never had a CA has no TLS to serve the API with
+    let without = harness_mitm(
+        Profile {
+            sections: "",
+            ..Profile::default()
+        },
+        a.roots(),
+    )
+    .await;
+    assert!(
+        without.engine.api_tls().is_none(),
+        "nothing to sign the API's certificates with"
+    );
+}

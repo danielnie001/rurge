@@ -337,7 +337,10 @@ fn server_name(name: &HostName) -> Result<ServerName<'static>, HandshakeFailure>
 /// `h2` decides what the client may negotiate: rustls picks by its own list's
 /// order, so a client offering both gets `h2` (`the phase 4 / M2b plan's
 /// P15`).
-fn server_config(authority: &Arc<Authority>, h2: bool) -> Result<Arc<ServerConfig>, BuildError> {
+pub(crate) fn server_config(
+    authority: &Arc<Authority>,
+    h2: bool,
+) -> Result<Arc<ServerConfig>, BuildError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
