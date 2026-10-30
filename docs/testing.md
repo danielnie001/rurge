@@ -186,6 +186,15 @@ cargo test -j 8 --workspace --lib -- responses::   # 阶段 4 / M2b，`rurge-inb
 cargo test -j 8 --workspace --lib -- engine::tests::   # 阶段 4 / M2b 之后这个过滤词一共选中 133 条（一台机器上的一次运行）：`rurge-http` 61 条（M1b 的引擎本体与 M2b 的 HTTP/2：客户端的服务端与执行器、在途与空闲、`CONNECT` 的 501、共享的上游、字节、被拒的流、终止与看门狗、GOAWAY 之后的一秒）、`rurge-engine` 9 条、`rurge-rules` 63 条（`engine::tests` 51 条、`engine::tests::pre_match` 12 条）
 cargo test -j 8 --workspace --lib -- mitm   # 阶段 4 / M2b 之后这个过滤词一共选中 48 条：`rurge-config` 12 条、`rurge-http` 33 条（`mitm::authority::tests::` 19 条、`mitm::decrypt::tests::` 14 条，M2b 加了三条 `h2` 的）、`rurge-engine` 3 条
 cargo test -j 8 --workspace --test mitm   # 阶段 4 / M2b 之后 36 条（M2a 的 29 条 + M2b 的 7 条端到端）：四种版本组合、`h2 = true` 下只给 `h2` 的客户端、每条流各自己的规则、并发的流共用一条上游连接、`cookie` 到 HTTP/1.1 源站、HTTP/1.1 客户端的 WebSocket 对讲 h2 的源站、`CONNECT` 的 501 与一条记录
+cargo test -j 8 --workspace --lib -- mitm::generate   # 阶段 4 / M2c，`rurge-http` 的新 CA（7 条）：P-256、回拨 2 天、10 年、带 SKI 的 CA；p12 是 3DES 加密、HMAC-SHA1 的 MAC、读得回；`[MITM]` 节能被 `Authority::load` 读进来；用它签一张叶证书、在回环上握一次手；两张 CA 不同；`Generated` 的 `Debug` 里没有材料；PEM 是标准文字（每行 64 个字符）
+cargo test -j 8 --workspace --bins -- cli::mitm   # 阶段 4 / M2c，可执行文件的 `cli::mitm`（1 条）：`write_new` 有一个文件写不成时删掉这一次写出的，本来就有的路径不动
+cargo test -j 8 --workspace --test cli -- mitm_ca_   # 阶段 4 / M2c，`rurge mitm ca generate` / `export` 的端到端（这台机器上 4 条：四个文件与不打印口令、不覆盖也不建目录、`export` 打出证书、`export` 对用不了的 CA 报错；第 5 条 `mitm_ca_generate_keeps_the_secrets_private` 带 `#[cfg(unix)]`，Windows 上不编译，只有 CI 编译与运行）
+cargo test -j 8 --workspace --lib -- mitm::api   # 阶段 4 / M2c，`rurge-http` 的 API 的 TLS（5 条）：叶证书按 SNI 或本地地址签、模板只给 `http/1.1` 且不收 0-RTT、信另一张 CA 的客户端被拒、API 与解密的连接共用叶证书的缓存、`client_config` 给的不是证书时是错误
+cargo test -j 8 --workspace --test mitm -- api_tls   # 阶段 4 / M2c，`rurge-engine` 的一条（1 条）：`Engine::api_tls()` 是最后一个生效过的 CA（重载换 CA、重载让 CA 用不了之后各问一次）
+cargo test -j 8 --workspace --lib -- tls::   # 阶段 4 / M2c，API 的 TLS 监听器的单元用例（8 条，都在 `rurge-api` 的 `tls::tests::` 里）；这个过滤词一共选中 115 条（一台机器上的一次运行）：`rurge-api` 8、`rurge-config` 15、`rurge-http` 10（M1a 的 ClientHello 与两张根存储）、`rurge-net` 2、`rurge-proto` 80（各出站协议的 TLS 传输）
+cargo test -j 8 --workspace --test api -- tls   # 阶段 4 / M2c，`rurge-api` 的两条（2 条）：API 经 TLS 服务时拿到的是 MITM CA 签的证书；`serve_tls` 没有 CA 时照样绑上、什么也不答
+cargo test -j 8 --workspace --test cli -- run::mitm   # 阶段 4 / M2c，`http-api-tls` 的两条端到端（2 条）：`status` 与 `stop` 经 HTTPS 够得到 API（`--remote` 仍是明文、连不上）、没有 CA 时 API 不起而 rurge 照常跑
+cargo test -j 8 --workspace --bins -- an_https_endpoint_needs_a_usable_ca   # 阶段 4 / M2c，命令行的 `Endpoint`（1 条）：`http-api-tls` 把 Profile 里那张 CA 的证书放进 `Endpoint`，CA 用不了时在任何请求之前就报错；`what_a_reload_says_about_the_api` 钉住重载时关于 API 的每一句（`cargo test -j 8 --workspace --bins -- what_a_reload_says_about_the_api`）
 # 阶段 3 / M5 重跑的基准读数（一台机器上的一次运行、**不是 CI**；release，`TUN_BENCH_FAR=memory`；命令仍是上面 B1 / B2 / b3 那三条）：B1 八个量出来的行都过 0.7 Gbit/s 的线（最低的一行 4.065，是线的 5.8 倍），四个计数都是 0，中位数上行 8.03、下行 4.84 Gbit/s（两个 MTU 混在一起，只作量级）；同设置（MTU 1500、`tx_max` 256 KiB）的 5.717 / 5.172 是上一次的 79.7% 与 94.7%。B2 门槛读数（峰值减去全部测试一侧的项）403,671,140 字节（403.7 MB / 385.0 MiB），在线 429,000,000 字节以内、余量 25.3 MB；保守读数（只减去准的应用端套接字缓冲）445,333,604 字节（445.3 MB），超线 16.3 MB——这个读数照旧归项目所有者，这里只记数。b3 中位数 0.9 微秒、p99 2.9 微秒，最大 4542.2 微秒（4.5 ms，落在第 28,673 个查询上，是线的 22.7 倍，两处都是池的 `HashMap` 的翻倍处，读代码与算术得出）。细节与上一次不同的原因见计划「执行期修正记录」第 61 ～ 63 行
 cargo insta test -p rurge-config --review       # 语料库快照有变化时审阅
 cargo clippy --all-targets -- -D warnings       # 零警告（CI 设 RUSTUP_TOOLCHAIN=1.89.0，与本机的 MSRV 工具链一致；更新的 clippy 会多出 lint）
@@ -429,3 +438,23 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 八、**判原因码用 `h2_reason_of`，不要假定它有**（M2b 记录第 52 行）：它顺着 `std::error::Error::source()` 找 `h2::Error`，返回 `reason()`；`h2::Error` 也装 I/O 错误，那样的 `reason()` 是 `None`，写成“没有原因码就当作 `INTERNAL_ERROR`”会让断言因为错的理由通过。钉住原因码的六条用例：`a_killed_h2_stream_is_reset_and_the_others_go_on`、`a_killed_h2_stream_whose_body_flows_is_reset_and_its_upstream_let_go`、`an_h2_client_that_stops_reading_one_stream_fails_only_that_request`、`a_rejected_h2_request_without_a_page_resets_only_its_stream`、`a_dropped_h2_request_is_held_then_reset`、`an_upstream_h2_stream_reset_mid_body_reaches_the_client_as_internal_error`。
 
 九、**带等待的 HTTP/2 用例提交前各自单独循环跑二十次以上**（全过才算数）：任务 1 ～ 3 的新用例各一圈、`engine::tests` 整个一圈，任务 5 的七条各一圈外又整个 `--test mitm` 一圈；日志在工作区（git 忽略），命令行见 M2b 记录第 31、32、46、47、51、52、56 行。
+
+### 阶段 4 / M2c 起：CA 工具、`http-api-tls` 与命令行的 HTTPS
+
+阶段 4 / M2c 起另有几条（计划 `docs/superpowers/plans/2026-10-31-phase4-m2c-ca-tools-api-tls-plan.md`，下面写“M2c 记录第 N 行”指它末尾的「执行期修正记录」；M1a、M1b、M2a、M2b 与 M2c 的提交都在本地，CI 都没有见过）：
+
+一、**CA 只在用例自己的临时目录或内存里生成**（P16）：`rurge mitm ca generate` 的 `--out` 一律指到 `tempfile::tempdir()`；`rurge-http` 的单元用例用 `mitm::testing` 的夹具或 `generate_at`；命令行的用例用 `generate` 写进临时目录（`crates/rurge/tests/run/mitm.rs` 的 `generated_conf`）。它打印的安装命令一个字也不执行。
+
+二、**`rurge-http::mitm::testing::NOW` 是 2027-01-01T00:00:00Z，在今天之后**（M2c 记录第 10 行）：`generate_at(NOW)` 生成的 CA 的 `notBefore` 是 `NOW − 2 天`，用真时钟读回是“还没生效”。所以**用真时钟读回的用例用 `generate()`**（`the_conf_is_a_mitm_section_that_loads`、`a_generated_ca_serves_a_handshake`），钉住日期的用例才用 `generate_at(NOW)`。
+
+三、**两张同名的 CA 不是“不信任”**：webpki 先按 subject 找信任锚、再验签名，所以信的 CA 与签发的 CA 同名时，失败原因是 `BadSignature`（客户端发 `decrypt_error`），不是 `UnknownIssuer`（`unknown_ca`）。`generate` 的 CA 叫 `rurge MITM CA <日期>`，同一天生成的两张也同名；`TlsFixture` 的 CA 都叫 `rurge test CA`。要“另一个 CA”、失败的原因也要对的用例给它另一个名字：`crates/rurge-http/src/mitm/api.rs` 的 `a_client_trusting_another_ca_is_refused` 用 `rurge test other CA`，`TlsFixture` 用 `TlsFixture::with_ca_name`。
+
+四、**API 的 TLS 用例的客户端只信测试的那张 CA**：`crates/rurge-api/src/tls.rs` 的 `Rig` 与 `crates/rurge-api/tests/api.rs` 的 `the_api_is_served_over_tls_with_the_mitm_ca` 都从用例自己的 CA 建 `client_config`，根只有它；`a_client_trusting_another_ca_is_refused` 是反面那一条。`serve_tls` 自己不查有没有 CA（P11）：`serve_tls_without_a_ca_answers_nothing` 证明没有 CA 时它照样绑上、每一次握手都失败、从不讲明文。
+
+五、**握手的名额与时限用 `with_limits` 调小**：`TlsListener::with_limits(inner, source, stop, max, time)` 是给用例的入口，缺省的 `new` 用 `TLS_HANDSHAKES`（64，同 `LINGER_MAX`）与 `TLS_HANDSHAKE_TIME`（30 秒）。`handshakes_beyond_the_limit_are_closed` 把名额调成 1、`a_handshake_that_does_not_finish_in_time_is_closed` 把时限调成 300 毫秒——不要写等 30 秒的用例。
+
+六、**端到端里 `status -c` / `stop -c` 要 Profile 里写着的端口**：`rurge status` 从 Profile 里读 API 的地址，所以用例的 Profile 要写 `free_tcp_port()` 取的端口（`crates/rurge/tests/run/mitm.rs`）；`crates/rurge/tests/cli.rs` 的 `API_GENERAL` 是 `127.0.0.1:0`，那条命令连不上它（M2c 记录第 35 行 ②）。
+
+七、**诊断看流**：`rurge check` 把诊断写在**标准输出**（有位置的带 `<文件>:<行>`，有 `hint` 的下面另起一行 `  hint: …`，按位置排序、没有位置的排在最前），`rurge run` 写在**标准错误**（不带位置，同样排过序），日志行在**标准输出**（M2c 记录第 44 行）。抓 WARN 的用例读标准输出——`crates/rurge/tests/cli.rs` 的 `output_until_it_is_running` 就把标准错误丢掉了。
+
+八、**带等待的 M2c 用例提交前各自单独循环跑二十次以上**（全过才算数）：任务 5 的五条握手用例一圈、`--test api` 的两条一圈、任务 5 修正轮 1 的五条又一圈、`--test cli` 的 `run::mitm` 两条一圈（各 20 次）。日志与命令行在工作区（git 忽略）：`task-5-loop-tls.log`、`task-5-loop-api.log`、`task-5-fix-1-loop-tls.log`、`task-6-loop-mitm.log`。

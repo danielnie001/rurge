@@ -287,3 +287,78 @@ HTTP/2 上一条连接承载许多请求，所以 M1b 里“关掉这条连接�
 - **HTTP/2 的服务端推送与优先级**、**对上游的 PING 保活**，以及**跨客户端连接共享上游的 HTTP/2 连接**。
 - `rurge mitm ca generate` / `export`、`http-api-tls` 与阶段 4 的手工验收清单（M2c）；`README.md`、`README_en.md` 与 `docs/requirements.md` 也在 M2c 收尾时改。
 - 没有手工验收；**M2b 的提交都在本地，M1a、M1b、M2a 与 M2b 的提交 CI 都没有见过**，上面每一条只在一台机器上的一次运行里证明过（M2b 没有平台代码）。
+
+## M2c　CA 工具与 `http-api-tls`
+
+M2 的最后三件事：`rurge mitm ca generate` 与 `rurge mitm ca export` 两个命令、`http-api-tls` 生效（API 讲 HTTPS），与“`http-api-tls` 开着而没有可用的 CA”的那条诊断 `W0040`。没有新的端点；`GET /v1/mitm/ca` 照旧，HTTPS 上也取得到（设计第 13、14 节，计划 P6 ～ P14）。
+
+**这一节写的是本地提交的行为：M2c 的提交也在本地，M1a、M1b、M2a、M2b 与 M2c 的提交 CI 都没有见过。**「M2b」一节「没有覆盖的」里有一条写着“`rurge mitm ca generate` / `export`、`http-api-tls` 与阶段 4 的手工验收清单（M2c）”——那是 M2b 收尾时的状态，M2c 之后以本节为准（手工验收清单仍是 `docs/acceptance/phase4-manual.md`，一项也没有做）。
+
+### `rurge mitm ca generate --out <DIR>`
+
+生成一张新的 CA（ECDSA P-256、10 年、`notBefore` 回拨 2 天、`BasicConstraints CA:TRUE pathLen:0` 与 `KeyUsage keyCertSign,cRLSign` 都关键、带 SKI，CN 是 `rurge MITM CA <生成的日期>`、O 是 `rurge`），往 `<DIR>` 里写四个文件：
+
+| 文件 | 内容 |
+| ---- | ---- |
+| `rurge-ca.pem` | 证书（PEM），给客户端信任用 |
+| `rurge-ca.cer` | 同一张证书（DER），有的导入方要这一种 |
+| `rurge-ca.p12` | 证书与它的私钥（PKCS#12：3DES 加密、HMAC-SHA1 的 MAC，口令 24 个随机的字母与数字） |
+| `rurge-mitm.conf` | 一个 `[MITM]` 节，`ca-p12` 是那份 PKCS#12 的 Base64、`ca-passphrase` 是口令 |
+
+- **`<DIR>` 要已经存在**：不是一个已存在的目录就报 `{dir} is not a directory; rurge does not create it`，以 2 退出，什么也不写。
+- **不覆盖**：四个路径里有任何一个已存在（坏掉的符号链接也算）就报 `{path} already exists; rurge does not overwrite it`，以 2 退出，什么也不写。
+- **次序**：① 查目录 → ② 查四个路径 → ③ 生成 → ④ 依次写 pem、cer、p12、conf（每个都只新建）→ ⑤ 把 `rurge-ca.p12` 读回来交给 `Authority::load`（解码之外还查它是不是 CA、能不能签）→ ⑥ 打印。③ ～ ⑤ 失败以 **1** 退出：先把这一次已经写出的文件删掉，再写 `error: …`（⑤ 的消息是 `{path} does not read back as a CA rurge can sign with: {原因}; the files written are removed`），这一次没有写出的与本来就有的文件不动。
+- **私密文件的权限**：`rurge-ca.p12` 与 `rurge-mitm.conf` 在 Unix 上建文件时就是 `0600`（标准库的 `OpenOptionsExt::mode`）；**Windows 上不设**（M2-D20），输出里提醒把它放在只有自己能读的目录里。`0600` 那一段带 `#[cfg(unix)]`，这台 Windows 开发机上编译不到，第一次编译它的是推送之后的 CI。
+- **输出**：四个文件的路径与用途、把 `rurge-mitm.conf` 的内容贴进 Profile 的说明、各平台装 CA 的步骤（Windows `certutil -user -addstore`、macOS `security add-trusted-cert`、Debian / Fedora / Arch 的系统库、NSS、Firefox、Android、iOS）。**不打印口令、PKCS#12 与私钥**（设计第 13、15 节）。全文（逐字）在计划 P6，这里不重抄；它打印的安装命令 rurge 自己不执行，用例也只断言输出里有这些文字。
+
+### `rurge mitm ca export -c <FILE> [--out <FILE>] [--der] [--platform <P>] [--data-dir <DIR>]`
+
+从 Profile 里读出 CA 的**证书**（不含私钥）。只读 `[MITM]` 与 `[Keystore]`，Profile 别处的错误不管。`--platform` 与 `--data-dir` 同 `rurge status`：托管配置的 `[MITM]` 在数据目录里那份副本里。
+
+- 给 `-c` 读到底：`Ok(Some(ca))` 就用它；`Ok(None)` 报 `the profile's [MITM] names no CA (ca-p12 or ca-keystore-name)`；CA 用不了报 `W0039` 的那一句消息。这三种都以 **2** 退出。
+- 不给 `--out`：把证书的 PEM 打到标准输出，别的什么也不打，以 0 退出。
+- 给 `--out`：先看它是否已存在（是 → `{path} already exists; rurge does not overwrite it`，以 2 退出），再以 `create_new` 写 PEM（或 `--der` 时写 DER），之后打印一行 `wrote the CA certificate to {path}`。写失败以 **1** 退出，并删掉没写完的那个文件。`--der` 只能与 `--out` 一起。
+
+### `W0040`
+
+```
+warning[W0040]: http-api-tls is on but there is no usable MITM CA: the API does not start with this profile
+  hint: configure a usable MITM CA, or turn http-api-tls off
+```
+
+条件：`http-api-tls = true`、Profile 写了 `http-api`，而 `[MITM]` 的 CA 用不了（`Authority::load` 是 `Err` 或 `Ok(None)`，不论 `W0039` 报没报）。没有 `http-api` 就没有要起的 API，不报。**不带位置**。
+
+- **`rurge check`**：写在**标准输出**，每条诊断一行；有位置的带 `<文件>:<行>`，有 `hint` 的下面另起一行 `  hint: …`。诊断按位置排序，没有位置的排在前面，所以 `W0040` 在带位置的 `W0039` 之前。
+- **`rurge run`**：写在**标准错误**，不带位置，同样按位置排过序；它与下面 P12 那一行 WARN 同时出现（起监听器之前打印诊断，起 API 的那一段再报一行 WARN）。`rurge run` 的日志行在**标准输出**。
+- **重载**：重载加载的那一代也带这条诊断，`rurge run` 在重载那一步同样把它打在标准错误上（那时 API 仍在跑，用的还是之前那个 CA，见下面 P13 的 `api_ca_note`）。
+
+### `http-api-tls = true`
+
+API 的监听器外面套一层 TLS：每条连接按客户端的 SNI 签叶证书，没有 SNI 时按这条连接进来的**本地地址**（监听在 `::` 时 IPv4 的客户端连进来是映射地址，证书上还原成 IPv4）。证书由 `[MITM]` 的 CA 当场签，与解密的连接共用同一个叶证书缓存与会话缓存。ALPN **只有 `http/1.1`**，不收 0-RTT，不要客户端证书。
+
+- **握手不占接受连接的循环**：接受之后在跟踪器上的任务里握手，握好的连接经一个通道交给 `axum` 的 `Listener::accept`，所以一个连上不说话的客户端挡不住下一条连接。同时在握手的至多 **64** 个（`TLS_HANDSHAKES`，与 `LINGER_MAX` 同数），多出来的当场关掉（DEBUG 一行 `http-api: too many TLS handshakes at once; a connection is closed`，带来源地址）；每个握手 **30 秒**（`TLS_HANDSHAKE_TIME`，M2-D21），到时关掉（DEBUG `http-api: a TLS handshake did not finish in time`）。握手失败也在 DEBUG（`http-api: a TLS handshake failed`，带原因）。超出的那些连接还要照 `Closing` 的规矩逗留，所以一个反复连接、从不握完手的客户端同时占 `TLS_HANDSHAKES + LINGER_MAX`（128）条——这是监听器这一侧的数，交给 `axum` 的连接不在其中。
+- **没有可用的 CA**：API **不启动**，WARN 一行，rurge 照常跑，**从不退回明文**：
+  `http-api-tls is on but there is no usable MITM CA: the API is not started (it never falls back to plain HTTP)`。
+- **起来了**：标准输出一行 `api on https://{addr}`（明文仍是 `api on http://{addr}`），INFO 的 `http-api listening` 多一个字段 `tls = true`。
+- **用哪个 CA**：每条新连接问一次 `Engine::api_tls()`，它是**最后一个生效过的** `Authority`（`MitmShared::last_live`）。所以重载换了 CA 之后新的连接由新的 CA 签——命令行经 `-c` 读的也正是新的；重载让 CA 用不了时 API 照旧、用的是之前那个。
+- **不发 `close_notify`**：丢掉一条 TLS 流时不写它（登记）；hyper 平静地关一条连接时经 `poll_shutdown` 发它。
+- **重载时关于 API 的告警**（每一句一行 WARN，都在新的一代换上时或之后打）：
+  - `http-api` 变了：API 在跑 → `http-api changed in the profile; the API keeps its current address and key until rurge restarts`；API 没起而启动时有 `http-api` → `http-api changed in the profile; the API is not started until rurge restarts`；启动时没有 `http-api` → `http-api was added to the profile; the API is not started until rurge restarts`。
+  - `http-api-tls` 变了（启动时有 `http-api`）：API 在跑且原来是 HTTPS → `http-api-tls changed in the profile; the API keeps serving HTTPS until rurge restarts`；API 在跑且原来是明文 → `http-api-tls changed in the profile; the API keeps serving plain HTTP until rurge restarts`；API 没起 → `http-api-tls changed in the profile; the API is not started until rurge restarts`。
+  - 换上的这一代**没有**可用的 CA，而 API 在跑、讲的是 HTTPS → `http-api-tls is on but this profile has no usable MITM CA: the API goes on with the last CA it had`。
+  - API 因没有 CA 而没起、启动时 `http-api-tls` 是开的，而换上的这一代**有**可用的 CA → `the profile has a usable MITM CA now: the API that http-api-tls kept from starting starts when rurge restarts`。
+- **`GET /v1/mitm/ca`** 照旧，HTTPS 上也能取（客户端信任那张 CA 就行）。
+
+### 命令行：`rurge status` / `reload` / `stop`
+
+- **带 `-c <FILE>`**（或 `--data-dir` 里托管配置的副本）找到 API 的：`http-api-tls = true` 时走 HTTPS，根**只有** Profile 里那张 CA，按 API 的地址（IP）校验证书（叶证书带那个 IP 的 SAN）。`rurge status` 的第一行因此是 `rurge at https://127.0.0.1:<端口>`。
+- **CA 用不了**：以 **2** 退出，消息是 `W0040` 那一句（`[MITM]` 一个 CA 也没写时）或 `W0039` 的消息（写了一个用不了的）。这与 `NOT_CONFIGURED` 是同一类错误：读不出要连哪里，一个请求也不发。
+- **`--remote <地址> --key`**：不读 Profile、不知道 CA，照旧讲明文。对开着 `http-api-tls` 的实例因此连不上：服务端的握手失败、把连接关掉，命令行报 `error: cannot reach rurge at http://<地址>: …`、以 **1** 退出（M2-D21；没有加指定 CA 文件的参数，登记）。
+
+### 没有覆盖的
+
+- **HTTPS 的 API 只讲 `http/1.1`**：没有 HTTP/2（也没有 ALPN 的 `h2`）。
+- **`--remote` 没有给 CA 文件的参数**：对开了 `http-api-tls` 的实例只能从本机带 `-c` 用。
+- **没有把 CA 装进任何信任库**：`generate` 只打印步骤；测试的客户端一律是 rustls 的、根只有测试自己的 CA，全部证据在回环上。
+- **`0600` 那一段只有 CI 会编译**（这台 Windows 开发机上编译不到）；Windows 上不设权限是登记的取舍。
+- 没有手工验收，也没有经真浏览器试过；**M2c 的提交都在本地，CI 没有见过**。
