@@ -597,3 +597,21 @@ M2 的文档任务把下面各条写进兼容性清单（`docs/surge-compatibili
 另有两件事要项目所有者做：**推送**（M1 与 M2 一起，M2c 做完之后；推送之后读回那次 CI）；**手工验收**（`docs/acceptance/phase4-manual.md` 在 M2c 新建；阶段 1、2、3 的清单照旧一项也没有做）。
 
 所有者可以改的裁定：本文 M2-D1 ～ D25，尤其 M2-D2（不升级 `p12-keystore`）、M2-D4（不回落到 `ca-p12`、不用 `E0020`）、M2-D9（`:0` 只扩它命中的目标、不带端口的项不扩）、M2-D11（提示的限频）、M2-D18（`rewrite`、`capture` 到 M3、M4 才能开）与 M2-D21（`--remote` 不变）。
+
+## 23. 计划与执行期的订正
+
+写计划与执行时对本文正文的改动记在这里，一条一段：改了正文哪一处、以哪一处为准。正文不逐处改，读正文之前先读这一节。
+
+**写 M2a 计划时**（`docs/superpowers/plans/2026-10-30-phase4-m2a-mitm-http1-plan.md`，以它的「计划期决定」为准）：
+
+1. 第 2 节 M2a 的任务表：任务 5 拆成两个。任务 5 是每一代的 `Mitm`、开关与 `state.json`、可嗅探的扩大、解密的分派；任务 6 是握手失败与证书固定提示的日志、限频与计数。API、端到端、文档顺延为任务 7、8、9（计划 P24）。
+2. 第 3 节与第 5.1 节的 `decode_pkcs12(label, base64, password)` → `decode_pkcs12(label, der, password)`，另加 `base64_bytes(text)`：Base64 那一步由各来源自己做，`[Keystore]` 条目今天的两种消息逐字不变（计划 P4）。
+3. 第 3 节的 `Engine::switch` / `set_switch` → `mitm_on` / `set_mitm`：M2a 只有一个能切的开关，按名字写，`rewrite`、`capture` 在 M3、M4 各加自己的（计划 P20）。
+4. 第 5.1 节"没有 CA 而生效的名单不空就告警一次"：这一条也是 `W0039`，同样以 "MITM is off: " 开头，在 `hostname` 那一行（计划 P5 第 1 条）。
+5. 第 5.2 节第 5 条"消息带 ring 给的原因"与第 16 节第 14 条的同一句：做不到。rcgen 0.14.7 的 `KeyPair::try_from` 依次试 Ed25519、P-256、P-384、RSA，全不成时只返回 `CouldNotParseKeyPair`，ring 的原因丢了。消息改为列出 rurge 签得了的几种，并写明"EC 的 PKCS#8 要带公钥"（计划 P1、P5 第 11 条）。
+6. 第 5.2 节第 6 条"试签一次查掉几种坏法"：多值 RDN 在试签之前就被 rcgen 的 `Issuer::from_ca_cert_der` 拒绝（`DistinguishedName::from_name`），是单独的一条消息；重复的属性类型（rcgen 把它们合并，签发者名字因此与 subject 不同）、证书与私钥不配对、签名算法不认，仍在试签时查出（计划 P5 第 12、13 条）。
+7. 第 5.4 节"材料相同就沿用"：另加"且现在仍在 CA 的有效期里"（`Authority::usable_now`）。过期的不沿用，重新载入就得到"过期"的问题（计划 P16）。
+8. 第 9.1 节"URL 以 `https://` 开头"：解密的连接上每个请求的 URL 都是 `https://`，包括客户端在解密的连接里发来的绝对形式请求。请求行里的 scheme 不看，请求照 M1b 去连接的目标（计划 P13）。
+9. 第 17 节第 2 条"多值 RDN 的 CA 用 `yasna` 手写 DER 造"：改为由协调者用本机的 OpenSSL 生成五组夹具——RSA 2048 的私钥、P-521、不带公钥的 EC 私钥、多值 RDN、重复的属性类型——以 Base64 写进 `crates/rurge-http/src/mitm/fixtures.rs`。不带 SKI 的 CA 用 rcgen 造（计划 P6）。
+
+**执行 M2a 时**：由 M2a 的任务 9 补上（计划「执行期修正记录」里改了本文正文意思的行）。
