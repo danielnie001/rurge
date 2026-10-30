@@ -176,6 +176,11 @@ cargo test -j 8 --workspace --lib -- outcomes::serve   # 阶段 4 / M1a，`rurge
 cargo test -j 8 --workspace --test sniff   # 阶段 4 / M1a，经引擎的嗅探端到端（21 条；`EngineShared.sniff_wait` 300 毫秒，只有一条用缺省的 15 秒、不调短（`a_stop_during_the_wait_ends_a_tun_session_at_once`：让停止落在等待之中，不等满））：三种入口上的 SNI 与协议、`PROTOCOL` 在拨号之前、三个设置、预匹配与暂停、服务器先说话、前缀不丢、计数
 cargo test -j 8 --workspace --lib -- engine::tests::   # 阶段 4 / M1b，`rurge-http` 的引擎本体（30 条）：每个请求的流程、守卫、应答正文的包装、逐跳的头、拒绝与失败、504 与两个页开关、借来的连接上的重发、升级与隧道里的 `CONNECT`；这个过滤词一共选中 102 条：除了 `rurge-http` 的 30 条，还连带 `rurge-engine` 的 9 条与 `rurge-rules` 的 63 条（`engine::tests` 51 条，`engine::tests::pre_match` 12 条）
 cargo test -j 8 --workspace --test http   # 阶段 4 / M1b，经引擎的明文 HTTP 端到端（36 条）：四种入口、每条客户端连接的池与借来的连接、字节只数上游一侧、WebSocket、chunked、`Expect: 100-continue`、重发的两种情形、终止与停止、承载连接的记录、记录与会话日志的新字段、`requests` 的计数
+cargo test -j 8 --workspace --lib -- mitm   # 阶段 4 / M2a：这个过滤词一共选中 45 条（`-- --list` 数，一台机器上的一次运行）——`rurge-config` 12 条（`mitm::tests::` 10 条：九个键、两张名单、`W0001` / `W0005` / `W0029` 与 `E0017` 与 `Debug`；另两条名字里有 `mitm`：`config::tests::the_mitm_section_is_typed_and_no_longer_deferred` 与 `hostlist::tests::mitm_hostname_example_and_special_tokens`）、`rurge-http` 30 条（`mitm::authority::tests::` 19 条：六条检查与 `W0039` 的各种坏法、材料指纹、叶证书的参数与换槽、缓存与并存、`Debug`；`mitm::decrypt::tests::` 11 条：何时解密、服务端配置与握手、三种警报、`Watch`、可嗅探的扩大）、`rurge-engine` 3 条（`mitm::tests::` 2 条：限频的两个边界；与 `outbounds::tests::load_checked_reports_an_unusable_mitm_ca`）
+cargo test -j 8 --workspace --lib -- state::tests   # 阶段 4 / M2a，`rurge-engine` 的 `state.json` 第 2 版（9 条）：第 1 版的四个开关读作没设过、第 2 版是阶段 3 读得懂的、原子写与 `.broken`、`enhanced_backup` 的往返
+cargo test -j 8 --workspace --test mitm   # 阶段 4 / M2a，经引擎的 MITM 端到端（29 条）：三种入口的解密与记录、同一条连接上的两个请求、不受信的源站与 `skip-server-cert-verify`、排除项与名单与来源、SOCKS5 上的 `127.0.0.1`、重载（同材料 / 另一张 CA / 坏了的 CA）、开关关着与只给 `h2` 的客户端、可嗅探的扩大、停止落在握手里与握手之后、不信任与证书固定的日志与限频、经虚拟网卡的行、证书固定与停止、WebSocket、明文不受影响、解密的请求经 HTTP 代理隧道
+cargo test -j 8 --workspace --test api -- the_mitm   # 阶段 4 / M2a，`rurge-api` 的三条（3 条）：开关的读 / 切 / 写进 `state.json`、`GET /v1/mitm/ca` 的头与 DER 与 `?x-key=`、没有可用的 CA 时 404
+cargo test -j 8 --workspace --test cli -- a_daemon_restores_the_mitm_switch_from_state_json   # 阶段 4 / M2a，可执行文件的一条（1 条）：起守护进程之后 `GET /v1/features/mitm` 读得到 `state.json` 里记着的值
 # 阶段 3 / M5 重跑的基准读数（一台机器上的一次运行、**不是 CI**；release，`TUN_BENCH_FAR=memory`；命令仍是上面 B1 / B2 / b3 那三条）：B1 八个量出来的行都过 0.7 Gbit/s 的线（最低的一行 4.065，是线的 5.8 倍），四个计数都是 0，中位数上行 8.03、下行 4.84 Gbit/s（两个 MTU 混在一起，只作量级）；同设置（MTU 1500、`tx_max` 256 KiB）的 5.717 / 5.172 是上一次的 79.7% 与 94.7%。B2 门槛读数（峰值减去全部测试一侧的项）403,671,140 字节（403.7 MB / 385.0 MiB），在线 429,000,000 字节以内、余量 25.3 MB；保守读数（只减去准的应用端套接字缓冲）445,333,604 字节（445.3 MB），超线 16.3 MB——这个读数照旧归项目所有者，这里只记数。b3 中位数 0.9 微秒、p99 2.9 微秒，最大 4542.2 微秒（4.5 ms，落在第 28,673 个查询上，是线的 22.7 倍，两处都是池的 `HashMap` 的翻倍处，读代码与算术得出）。细节与上一次不同的原因见计划「执行期修正记录」第 61 ～ 63 行
 cargo insta test -p rurge-config --review       # 语料库快照有变化时审阅
 cargo clippy --all-targets -- -D warnings       # 零警告（CI 设 RUSTUP_TOOLCHAIN=1.89.0，与本机的 MSRV 工具链一致；更新的 clippy 会多出 lint）
@@ -367,3 +372,33 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 八、**规则里回环之外的地址段只写 `REJECT`**（M1b 记录第 79 行）：`IP-CIDR,10.0.0.0/8,REJECT` 逼求值去查地址，但不能写成可能被拨的目标。
 
 九、**带等待的引擎用例提交前各自单独循环跑二十次以上**（全过才算数）：`crates/rurge-engine/tests/http.rs` 整个二进制（36 条）、`--test sniff`、`crates/rurge-http` 的 `engine::tests`（那个过滤词一共选中 102 条：`rurge-http` 30、`rurge-engine` 9、`rurge-rules` 63）与 `pool::tests`；`--test api` 里新加的那一条（`requests_carry_the_method_the_url_and_the_status_code`）也单独循环过。日志在工作区（git 忽略），命令行见 M1b 记录第 23、27、34、35、43、48、59、78 行。
+
+### 阶段 4 / M2a 起：MITM
+
+阶段 4 / M2a 起另有几条（计划 `docs/superpowers/plans/2026-10-30-phase4-m2a-mitm-http1-plan.md`，下面写“M2a 记录第 N 行”指它末尾的「执行期修正记录」；M1a、M1b 与 M2a 的提交都在本地，CI 都没有见过）：
+
+一、**测试从不把任何 CA 装进系统或浏览器的信任库**（总设计 P4-D26、设计第 17 节，M2-D24）：不运行 `certutil`、`security add-trusted-cert` 这类命令，也不写调用它们的代码。测试的客户端是 rustls 的客户端，根只有测试自己的 MITM CA。
+
+二、**测试的 CA 从哪里来**：引擎与 API 的用例用 `TlsFixture::with_ca_name("rurge test MITM CA", &[])` 的 `ca_p12_base64(..)`（`crates/rurge-proto` 的 `testing`），源站的证书来自另一个 `TlsFixture`；PKCS#12 用 `rurge-proto` 的 `testing` 里的 `p12_base64` 与 `p12_cert_base64`（M2a 记录第 25、40 行）。两张 CA 与 PKCS#12 都在内存里生成，不读、不写用例目录之外的证书文件。
+
+三、**期望“不信任”的用例，信的 CA 与签发的 CA 的 subject 要不同**（M2a 记录第 27、40 行）：webpki 先按 subject 找信任锚再验签名，同名时是 `BadSignature`（客户端发 `decrypt_error`），不是 `UnknownIssuer`（`unknown_ca`）。`TlsFixture::new` 的 CA 都叫 `rurge test CA`（`rurge-net` 的 `quic/dial.rs` 有用例靠同名，`new` 不能改），另起名字用 `with_ca_name`。
+
+四、**引擎的 MITM 用例用 `tests/mitm.rs` 的 `harness_mitm(..)`**（计划写的 `harness_trusting` 是 `tests/common/mod.rs` 给出站用例的），源站的根经 `EngineShared.roots` 交给引擎。**根不能是空的存储**：空的存储建不出上游的校验器，`Mitm::build` 失败，那一代没有 `Mitm`，用例会在 MITM 没生效的情况下绿；用不上根的用例也给一份非空的（如 `mitm_ca().roots()`），并断言 `mitm_ca_der().is_some()`（M2a 记录第 55 行 ①，覆盖第 54 行 ④）。
+
+五、**OpenSSL 的五组夹具**（`crates/rurge-http/src/mitm/fixtures.rs`）由协调者用本机的 OpenSSL 3.2.4 生成；以后要新的，照 **M2a 记录第 23 行**的命令（`openssl pkcs8 -topk8 -nocrypt …` 才写出 PKCS#8；计划 P6 原文的 `pkey -outform DER` 与 `genpkey -outform DER` 写的是 SEC1 / PKCS#1，不对）。Pi 不运行 OpenSSL。
+
+六、**时钟**：`Authority` 的时钟可以注入（计划 P7、M2a 记录第 26 行）；夹具与有效期的单元用例把现在钉在 2027-01-01；**与 rustls 客户端握手的用例用真实时钟**（客户端按系统时间校验叶证书，钉了时间会 `CertificateExpired`，M2a 记录第 32 行）。`TlsFixture` 的证书是 rcgen 的缺省有效期。
+
+七、**对端不发 `close_notify` 就关闭时 rustls 报 `UnexpectedEof`**（M2a 记录第 35、39 行，延后第 2 行）：测试的 TLS 源站回显完先 `shutdown()` 再放手。任务 8 的 `switching_echo_over_tls` 起初漏了这一步，客户端读到 `UnexpectedEof`，一度被当成 rurge 不发 `close_notify`（M2a 记录第 54 行 ⑤、第 55 行 ②）。
+
+八、**要一个 rustls 不收的名字，用 64 个字符的标签**（M2a 记录第 33 行）：rustls-pki-types 1.15.1 的 `DnsName` 收下划线。
+
+九、**日志断言一律“以级别开头且含整句”**（`tests/mitm.rs` 的 `lines_with` 与六个句子常量 `UNTRUSTED_NAMED`、`UNTRUSTED_VIRTUAL`、`PINNING_NAMED`、`PINNING_VIRTUAL`、`FAILED_NAMED`、`FAILED_VIRTUAL`），不找“同一行里有两个词”；计数一律与整个 `MitmCounts` 比（M2a 记录第 49 行）。
+
+十、**客户端的 TLS 1.3 握手在它发出 Finished 时就返回**，引擎的 `accept` 可能还没读完（M2a 记录第 49 行 ④）：握手之后要做的停止、重载、数计数，先等 `decrypted == n`。
+
+十一、**要“停在握手里”：先读到引擎回的第一个字节、且是 `0x16`，再停**（M2a 记录第 44 行）：写完 ClientHello 就停可能落在嗅探上（嗅探本来就不留记录），用例遮不住要盖的分支。
+
+十二、**经虚拟网卡的 `AppTcp` 没有 `shutdown()` 就丢掉会给会话发重置**；“不信任”的客户端经虚拟网卡时，警报由用例自己写明文 `unknown_ca`（rustls 0.23.43 在 TLS 1.3 里还没解密过对端任何消息时收明文警报；tokio-rustls 0.26.4 只把排好的警报写一次）（M2a 记录第 47、48 行）。真的 rustls 客户端经虚拟网卡发来的警报这条路没有用例（M2a 延后第 4 行）。
+
+十三、**限频的两个边界**（一小时、1024 个键）只有 `crates/rurge-engine/src/mitm.rs` 的两条单元用例（M2a 记录第 45 行），集成用例碰不到（M2a 延后第 5 行）。

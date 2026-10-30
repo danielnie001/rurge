@@ -15,7 +15,7 @@ pub struct HttpJson {
     /// The requests that reached the rules, refused ones included.
     pub requests: u64,
     /// The TLS sessions `[MITM]` decrypted, and how the ones that did not go
-    /// through ended (`phase 4 M2 design 12.1`).
+    /// through ended (`phase 4 M2 design 12.3`).
     pub mitm: MitmJson,
 }
 

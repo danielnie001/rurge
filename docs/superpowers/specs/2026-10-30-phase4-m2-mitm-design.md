@@ -615,3 +615,9 @@ M2 的文档任务把下面各条写进兼容性清单（`docs/surge-compatibili
 9. 第 17 节第 2 条"多值 RDN 的 CA 用 `yasna` 手写 DER 造"：改为由协调者用本机的 OpenSSL 生成五组夹具——RSA 2048 的私钥、P-521、不带公钥的 EC 私钥、多值 RDN、重复的属性类型——以 Base64 写进 `crates/rurge-http/src/mitm/fixtures.rs`。不带 SKI 的 CA 用 rcgen 造（计划 P6）。
 
 **执行 M2a 时**：由 M2a 的任务 9 补上（计划「执行期修正记录」里改了本文正文意思的行）。
+
+10. 第 3 节 `MitmConfig` 的 `spans`：注释写"各键所在的行"，实际只记三处——`hostname`、`ca-p12`、`ca-keystore-name`，`MitmSpans` 也只有这三个字段。它们是 `W0039` 报在的那三行；其余六个键的行没有一条诊断报在那一行上，记下来只有无人读的字段（执行记录第 20 行）。
+11. 第 5.2 节第 4 条 `notBefore ≤ 现在 < notAfter`：上界含在内。过期是 `now > not_after`，`Authority::usable_now` 是 `not_before ≤ now ≤ not_after`（RFC 5280 4.1.2.5；rustls-webpki 只在 `time > not_after` 时报 `CertExpired`）。到期的那一刻仍可用（执行记录第 28 行 ④）。
+12. 第 3 节 `pub async fn leaf(&self, name: &HostName)`：接收者是 `self: &Arc<Self>`——签名与叶证书密钥的生成在 `spawn_blocking` 里（M2-D7），闭包要 `'static`，借来的 `&self` 进不去（执行记录第 29 行）。
+13. 第 5.4 节"一代配置换上时（`Engine::swap_runtime`），它有 `Mitm` 就记下"：第一代不经过 `swap_runtime`，由 `Engine::new` 在存下注册表与解析器之后自己记，仍是"换上时记，不在建时记"；`publish_generation` 只在 `swap_runtime` 里被调（计划 P17 说它在 `Engine::new` 里也被调，不对）（执行记录第 41 行）。
+14. 第 3 节列的 `rurge-http` 新增正式依赖漏了两个包：`sha2`（材料的指纹，第 5.4 节）与 `ring`（叶证书序列号的随机数，第 6 节），都是锁文件里已有的包、`Cargo.lock` 的包数不变。这一条是写计划时定的，当时没有记进上面"写 M2a 计划时"那一段（计划「全局约束」的依赖一条）。

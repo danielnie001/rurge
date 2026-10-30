@@ -114,3 +114,118 @@
 - 四种重写与 Map Local（M3）、抓包视图与记录里的各段耗时（M4）、HTTPS 的解密与 HTTP/2（M2）都还没有做：本页写的只是明文 HTTP 的那一层。
 - 不改请求头：不加 `Via`、`X-Forwarded-For`（设计第 8.7 节）。
 - 记录里的 `url` 带着查询串出 API 是总设计 Q1 的临时做法（设计第 19 节把最终取法留给项目所有者）。
+
+## M2a　MITM（HTTP/1.1）
+
+`[MITM]` 生效了：判为 TLS 的可嗅探会话在开关开着、有可用的 CA、来源允许、名单命中、ALPN 合得上时，rurge 用 `[MITM]` 的 CA 当场签一张叶证书、与客户端握手，把解密之后的 HTTP/1.1 请求交给 M1b 的引擎（设计第 7.1 节，计划 P18）。这里的每个请求照旧各自求规则、选策略、借或拨上游连接、各有一条记录，只是上游一侧多一层 TLS、URL 以 `https://` 开头、协议是 `HTTPS`（见「M1b」）。HTTP/2 随 M2b，CA 的命令行工具与 `http-api-tls` 随 M2c（见「没有覆盖的」）。
+
+**这一节写的是本地提交的行为：M2a 的提交也在本地，CI 没有见过。**
+
+### `/v1/features/mitm`
+
+`GET` 给 `{"enabled":bool}`——开关的值，不论 CA 能不能用（CA 的状态看 `GET /v1/mitm/ca` 与加载时的 `W0039`）。`POST {"enabled":bool}` 给 `{}`，并把开关写进 `state.json`（`version` 是 2，`features.mitm` 是布尔）；切换立即对新的连接生效，已经解密的连接不因为关掉它而中断（设计第 11.1 节）。
+
+缺省是**开**（没设过时；总设计 P4-D19）。启动时 `state.json` 里记着的值由 `Engine::restore_switches` 装回开关，不写盘：一个第 1 版的文件在一次启动之后仍是它原来的字节（`crates/rurge-engine/src/engine.rs`）。
+
+`POST` 之后有一行 INFO（`crates/rurge-api/src/routes/features.rs`），原文与字段照代码：
+
+```
+enabled=false mitm switched via http-api
+```
+
+即消息 `mitm switched via http-api`，字段 `enabled`（`true` / `false`）。
+
+用例 `the_mitm_switch_is_read_switched_and_kept`（缺省开、切换、`state.json` 的 `version` 2 与 `features.mitm`）、`a_daemon_restores_the_mitm_switch_from_state_json`（`crates/rurge/tests/cli.rs`：起守护进程之后读得到文件里记着的值）。
+
+### `GET /v1/mitm/ca`
+
+这一代的 CA 证书（与私钥配对的那一张）的 DER，不含私钥。两个头照代码逐字（`crates/rurge-api/src/routes/mitm.rs`）：
+
+- `Content-Type: application/x-x509-ca-cert`
+- `Content-Disposition: attachment; filename="rurge-ca.cer"`
+
+**“可用的 CA”是这一代有 `Mitm`**：`[MITM]` 写了 CA、六条检查都过、`Mitm::build` 成功（`Engine::mitm_ca_der` 读的是这一代的 `Runtime.mitm`，`crates/rurge-engine/src/engine.rs`）。没有时是 404，正文同别的 404 的形状：
+
+```json
+{"error":"no usable MITM CA"}
+```
+
+钥匙可以放在查询参数里（`?x-key=`，阶段 1 起就认），浏览器能直接下载。用例 `the_mitm_ca_is_given_in_der`（两个头、正文逐字节是 CA 的 DER、`?x-key=`）、`the_mitm_ca_is_a_404_without_a_usable_ca`。
+
+### `GET /v1/rurge/http` 的 `mitm`
+
+应答在 `requests` 之后多一个对象，键的次序固定（设计第 12.3 节，计划 P23）：
+
+```json
+{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0},"requests":0,"mitm":{"decrypted":0,"untrusted":0,"failed":0,"noRequest":0}}
+```
+
+正文的字节恰好是这一串，用例 `rurge_http_counts_start_at_zero`（`crates/rurge-api/tests/api.rs`）写着它。四个数：
+
+- `decrypted`：与客户端的握手完成时（计划 P23）；
+- `untrusted`：客户端的警报是 `unknown_ca`、`bad_certificate` 或 `certificate_unknown` 之一时（计划 P11 的分类），握手失败时加一；
+- `failed`：别的握手失败（含客户端中途放手、时限到了），按失败的原因记，加一在握手失败时；
+- `noRequest`：握手完成、`serve_connection` 返回、一个请求也没有走到选路、读到的明文字节是 0、客户端关的、没有被停止（计划 P21 与设计第 8.3 节）；
+- 被停止打断的握手不计——它没有结局（设计第 8.2 节）。
+
+自进程启动起累计，**重载不清零**（计数器在 `Engine` 里，不在 `Runtime` 里）。用例 `the_mitm_counts_survive_a_reload`、`a_stop_during_the_handshake_counts_nothing`（`crates/rurge-engine/tests/mitm.rs`）。
+
+### 请求记录
+
+解密的连接上每个请求一条记录，同 M1b 的形状与规矩（见「M1b」的「请求记录」一节）。与明文的三处不同：
+
+- `protocol` 是 `https`；
+- `url` 以 `https://` 开头。**每个请求都是**，包括客户端在解密的连接里发来的绝对形式请求：请求行里的 scheme 不看（计划 P13）；`Host` 写了端口的照写，只有兜底的连接目标在 443 时省略端口（同 M1b 的 `form_of`）；
+- `sni` 是 ClientHello 里那个名字，同 M1a（见「M1a」的「请求记录」）。
+
+用例 `a_listed_host_is_decrypted_through_socks5`（`protocol` 是 `https`、`url` 是 `https://origin.test/a`）、`every_entry_decrypts_a_listed_host`（三种入口，每个的 `url` 都是 `https://`）与 `two_requests_of_one_decrypted_connection_follow_their_own_rules`（两个请求各有记录、各照自己的规则）。
+
+### 承载连接的记录
+
+解密的连接自己那个句柄同 M1b：建好时不登记，走到过选路的请求各有记录、连接不另记。补一条记录的三处（计划 P21，原因照原文）：
+
+- 客户端不信任 rurge 签的证书，握手失败：`the client does not trust the certificate rurge issued (alert <警报的名字>)`；
+- 别的握手失败：`TLS handshake with the client failed: <原因>`；
+- 证书固定的提示（收上四条再加上读到的明文字节是 0 那个连接）：`no request after the TLS handshake (likely certificate pinning)`。
+
+三处的结局都是失败（会话日志照旧在 INFO），另有一个请求也没走到选路但不符合提示的上四条时，原因是 hyper 给的，同 M1b。用例 `a_client_that_closes_after_the_handshake_gets_the_pinning_hint`、`a_handshake_the_client_abandons_is_failed_at_info`、`through_the_virtual_interface_the_warnings_name_no_host`。
+
+### 日志
+
+握手结束的时候有三类行（`crates/rurge-engine/src/serve.rs` 的 `log_untrusted`、`log_pinning`、`log_handshake_failed`）。经监听器来的会话带名字与 `port` 字段，经虚拟网卡来的不带名字与端口、名字另起一行 DEBUG（设计第 8.2、15 节）。句子照代码逐字：
+
+**不信任**（WARN，另带 `alert` 字段）：
+
+- 经监听器：`the client does not trust the certificate rurge issued for <名字>: trust rurge's MITM CA on the client, or exclude the host with -<名字> in [MITM] hostname`；
+- 经虚拟网卡：`the client does not trust the certificate rurge issued for a host reached through the virtual interface (the name is in the DEBUG log and the request record): trust rurge's MITM CA on the client, or exclude the host in [MITM] hostname`，另 DEBUG 一行（经监听器的句子）带名字。
+
+**证书固定的提示**（WARN）：
+
+- 经监听器：`<名字> is likely protected by certificate pinning: the client finished the TLS handshake and closed without a request; exclude it with -<名字> in [MITM] hostname`；
+- 经虚拟网卡：`a host reached through the virtual interface is likely protected by certificate pinning (the name is in the DEBUG log and the request record): the client finished the TLS handshake and closed without a request`，另 DEBUG 一行（经监听器的句子）带名字。
+
+**别的握手失败**（INFO）：
+
+- 经监听器：`the TLS handshake with the client failed for <名字>: <原因>`；
+- 经虚拟网卡：`the TLS handshake with the client failed for a host reached through the virtual interface: <原因>`，另 DEBUG 一行（经监听器的句子）带名字。
+
+**限频**（设计第 8.4 节，计划 P22）：两种 WARN（不信任、证书固定）**每种、每个名字一小时至多一行**；被挡下的那一次写 DEBUG，句子同它顶替的 WARN（经监听器的那一种，带名字），经监听器的还带 `port`、不信任的还带 `alert`；经虚拟网卡的 DEBUG 行这两个字段都不带。表里至多 1024 个键，满了整个清空。INFO 那一行不限频；计数与记录不论限频与否都有。
+
+用例 `an_untrusting_client_is_warned_once_an_hour_and_counted_each_time`（同名字第二回只有 DEBUG、`alert unknown_ca`）、`through_the_virtual_interface_the_warnings_name_no_host`（三条 WARN / INFO 不带名字与端口、三条 DEBUG 各带一个名字且不带 `port`）、`a_request_head_that_times_out_is_no_pinning_hint`、`a_stop_after_the_handshake_is_no_pinning_hint`。限频的两个边界只有单元用例：`a_hint_is_warned_again_only_after_an_hour`、`a_full_table_is_cleared_before_a_new_key`（`crates/rurge-engine/src/mitm.rs`）。
+
+### `state.json` 第 2 版
+
+- `version` 是 2（`STATE_VERSION`）。
+- `[MITM]` 与后面几个阶段的四个开关——`mitm`、`capture`、`rewrite`、`scripting`——是可省的 `bool`：没设过的不写（`skip_serializing_if`）。`system_proxy` 与 `enhanced_mode` 照旧是布尔。
+- 第 1 版文件里的 `"mitm": false` 读作**没设过**（于是 `mitm` 开着）：阶段 1 ～ 3 的代码从来不能把它们设成真，那个 `false` 不是使用者的选择（设计第 11.2 节）。`version` 只在内存里改成 2，下一次写盘时写成第 2 版。
+- 阶段 3 的代码读得懂第 2 版的文件（没设过的不写、在的都是布尔），不会把整个文件当成坏的。**降级再升级之后 `mitm` 是关的**：旧版本写回文件时把没设过的写成 `false`，新版本读到的是“设过、关”（设计第 16 节第 11 条）；使用者经 API 再打开即可。
+
+用例 `loads_defaults_selections_and_tolerates_garbage`、`a_version_1_file_leaves_the_four_switches_unset`、`a_version_2_file_is_what_phase_3_reads`（`crates/rurge-engine/src/state.rs`）。
+
+### 没有覆盖的
+
+- HTTP/2 的解密（M2b）：只给 `h2` 的客户端照原样转发，`h2 = true` 不生效。
+- `rurge mitm ca generate` / `export`、`http-api-tls` 与阶段 4 的手工验收清单（M2c）。
+- 没有把 CA 装进任何信任库、没有解密过真实的站点、没有经真浏览器试过：全部证据是回环上的用例。
+- `auto-quic-block` 读进来、不生效（M5）。
+- 证书固定判断里两项“没有被停止”的条件没有能红的用例（M2a 记录第 50 行、M2a 延后第 3 行）。
