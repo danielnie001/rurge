@@ -157,13 +157,9 @@ impl Authority {
                     text: text.clone(),
                     password: cfg.ca_passphrase.clone().unwrap_or_default(),
                 },
-                None => {
-                    return if cfg.effective.is_empty() {
-                        Ok(None)
-                    } else {
-                        Err(CaProblem::new(NO_CA.into(), cfg.spans.hostname.clone()))
-                    };
-                }
+                // no CA written is no CA, whatever `hostname` lists: whether
+                // that is a problem is `check`'s to say (`P5` item 1)
+                None => return Ok(None),
             },
         };
         let span = match &source {
@@ -240,7 +236,9 @@ impl Authority {
                 )
             })?;
         let now = clock();
-        if now >= not_after {
+        // the period runs through `notAfter` (RFC 5280 4.1.2.5), which is
+        // also what the verifiers clients use refuse on
+        if now > not_after {
             return Err(CaProblem::new(
                 format!("{src} expired on {}", not_after.date()),
                 span.clone(),
@@ -303,10 +301,11 @@ impl Authority {
         material_of_config(cfg, keystore) == Some(self.material)
     }
 
-    /// Whether the CA is inside its own validity now (`P16`).
+    /// Whether the CA is inside its own validity now (`P16`). The last
+    /// second of `notAfter` is still inside it (RFC 5280 4.1.2.5).
     pub fn usable_now(&self) -> bool {
         let now = self.now();
-        now >= self.not_before && now < self.not_after
+        self.not_before <= now && now <= self.not_after
     }
 
     /// The CA certificate (DER): what `GET /v1/mitm/ca` gives (`M2-D19`).
@@ -798,7 +797,7 @@ mod tests {
         ));
         rows.push((
             "wrong passphrase",
-            cfg_with_ca(&good_p12, "another-pw"),
+            cfg_with_ca(&good_p12, "pw-wrong-5e2b"),
             "cannot be decoded",
             good_p12.clone(),
         ));
@@ -915,6 +914,8 @@ mod tests {
         ));
 
         for (name, cfg, phrase, secret) in rows {
+            // the passphrase this row writes, if it writes one
+            let written = cfg.ca_passphrase.clone().unwrap_or_default();
             let config = config_with("", cfg);
             let diags = check_with(&config, clock.clone()).sorted();
             let said: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
@@ -935,6 +936,14 @@ mod tests {
                 "{name}: {}",
                 d.message
             );
+            if !written.is_empty() {
+                assert!(!d.message.contains(&written), "{name}: {}", d.message);
+                assert!(
+                    d.hint.is_none_or(|h| !h.contains(&written)),
+                    "{name}: {}",
+                    d.message
+                );
+            }
         }
     }
 
@@ -951,6 +960,15 @@ mod tests {
             ),
         ] {
             let loaded = from_text(text, Path::new("t.conf"), &LoadOptions::for_tests());
+            // a `[MITM]` that names no CA is `Ok(None)` whatever the list
+            // says: the warning is `check`'s, not `load`'s
+            assert!(
+                matches!(
+                    Authority::load_at(&loaded.config.mitm, &loaded.config.keystore, clock.clone()),
+                    Ok(None)
+                ),
+                "{text}"
+            );
             let diags = check_with(&loaded.config, clock.clone()).sorted();
             assert_eq!(diags.iter().count(), usize::from(warned), "{text}");
             for d in diags.iter() {
@@ -1030,7 +1048,19 @@ mod tests {
             .expect("a usable CA")
             .expect("a CA was named");
         assert!(authority.usable_now());
-        authority.set_clock(clock_at(NOW + 31 * DAY));
+        // the period runs through `notAfter`, for rurge and for the verifiers
+        // clients use (RFC 5280 4.1.2.5; rustls-webpki only refuses
+        // `time > not_after`)
+        authority.set_clock(clock_at(NOW + 30 * DAY));
+        assert!(authority.usable_now());
+        assert!(
+            matches!(
+                Authority::load_at(&cfg_with_ca(&p12, "pw"), &[], clock_at(NOW + 30 * DAY)),
+                Ok(Some(_))
+            ),
+            "a CA is still usable at the instant it expires"
+        );
+        authority.set_clock(clock_at(NOW + 30 * DAY + 1));
         assert!(!authority.usable_now());
     }
 
@@ -1063,6 +1093,47 @@ mod tests {
                 .ends_with(&format!("expired on {}", date(NOW - 10 * DAY))),
             "{}",
             err.message
+        );
+    }
+
+    /// `P5`: items 2 and 3 are reported at the `ca-keystore-name` line, the
+    /// others at the line of the source the CA came from — not at the
+    /// passphrase's line.
+    #[test]
+    fn a_problem_is_reported_at_the_line_of_the_key_that_names_the_ca() {
+        let clock = clock_at(NOW);
+        let ca = generated(&PKCS_ECDSA_P256_SHA256, "rurge test span CA");
+        let p12 = ca_p12(&ca, "pw-7d1f");
+
+        // the CA is `ca-p12` (line 4); the passphrase is line 3
+        let text = "[MITM]\nhostname = a.test\nca-passphrase = pw-7d1f\nca-p12 = QUJDRA\n";
+        let loaded = from_text(text, Path::new("t.conf"), &LoadOptions::for_tests());
+        let diags = check_with(&loaded.config, clock.clone()).sorted();
+        let said: Vec<&str> = diags.iter().map(|d| d.code).collect();
+        assert_eq!(said, [codes::W_MITM_CA_UNUSABLE], "{text}");
+        assert_eq!(
+            diags.iter().next().unwrap().span.as_ref().map(|s| s.line),
+            Some(4),
+            "{text}"
+        );
+
+        // an item that is not there (line 2), although `ca-p12` (line 4)
+        // holds a CA that would load
+        let text =
+            format!("[MITM]\nca-keystore-name = missing\nhostname = a.test\nca-p12 = {p12}\n");
+        let loaded = from_text(&text, Path::new("t.conf"), &LoadOptions::for_tests());
+        let diags = check_with(&loaded.config, clock).sorted();
+        let said: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("which [Keystore] does not have"),
+            "{}",
+            said[0]
+        );
+        assert_eq!(
+            diags.iter().next().unwrap().span.as_ref().map(|s| s.line),
+            Some(2),
+            "the ca-keystore-name line"
         );
     }
 }

@@ -269,6 +269,8 @@ fn check_names_an_unusable_mitm_ca() {
     let printed = String::from_utf8_lossy(&out);
     assert!(printed.contains("W0039"), "{printed}");
     assert!(printed.contains("MITM is off"), "{printed}");
+    // reported at the `ca-p12` line, the third of the file
+    assert!(printed.contains("mitm.conf:3:"), "{printed}");
     assert!(
         !printed.contains("QUJDRA") && !printed.contains("pw-7d1f"),
         "{printed}"

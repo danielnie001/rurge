@@ -880,7 +880,10 @@ TT3 = trust-tunnel, proxy.test, 443, username=u, password=pw, h3=true, skip-cert
         let loaded = load_checked(&path, &LoadOptions::for_tests()).unwrap();
         let said: Vec<&str> = loaded.diagnostics.iter().map(|d| d.code).collect();
         assert_eq!(said, [codes::W_MITM_CA_UNUSABLE], "{said:?}");
-        let message = &loaded.diagnostics.iter().next().unwrap().message;
+        let first = loaded.diagnostics.iter().next().unwrap();
+        // reported at `ca-p12`, which is line 3 (the passphrase is line 4)
+        assert_eq!(first.span.as_ref().map(|s| s.line), Some(3));
+        let message = &first.message;
         assert!(message.starts_with("MITM is off: "), "{message}");
         assert!(
             !message.contains("QUJDRA") && !message.contains("pw-7d1f"),
