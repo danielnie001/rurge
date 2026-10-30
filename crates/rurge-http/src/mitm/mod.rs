@@ -15,7 +15,7 @@ pub mod decrypt;
 mod fixtures;
 
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 pub use authority::{
     Authority, BACKDATE_DAYS, CaProblem, LEAF_DAYS, LEAF_SLOTS, LeafError, SESSION_SLOTS, check,

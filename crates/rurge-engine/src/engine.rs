@@ -1946,6 +1946,7 @@ impl Dialer for Engine {
         let conn = rurge_http::Conn {
             session,
             entry: rurge_http::Entry::Listener,
+            origin: None,
             idle: self.runtime().idle_timeout,
             // The listener's own hyper service times a request head with its
             // `handshake_timeout`; `head_wait` is only for

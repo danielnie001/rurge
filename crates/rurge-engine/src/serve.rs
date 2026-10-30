@@ -237,6 +237,7 @@ impl Engine {
         let conn = rurge_http::Conn {
             session,
             entry: rurge_http::Entry::Sniffed,
+            origin: None,
             idle: runtime.idle_timeout,
             head_wait: runtime.idle_timeout,
             drop_hold: opts.drop_hold,

@@ -12,6 +12,7 @@
 //! that ends a request's record whatever becomes of its future.
 
 use super::headers::{self, Keep};
+use super::mitm::OriginTls;
 use super::pool::{Meter, Metered, Pool, Reusable};
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri, header};
@@ -36,8 +37,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::Sleep;
+use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -58,6 +60,10 @@ pub struct Conn {
     /// and the SNI.
     pub session: SessionInfo,
     pub entry: Entry,
+    /// `Some` when the connection is decrypted (`phase 4 M2 design 9`): its
+    /// requests are named by `https://` URLs and their protocol is `HTTPS`,
+    /// and `connect` puts TLS between the dialled stream and hyper.
+    pub origin: Option<OriginTls>,
     /// `idle_timeout`: waiting for a response head, and between two frames of
     /// a body (design 8.10).
     pub idle: Duration,
@@ -514,7 +520,14 @@ impl<U: Upstreams> Requests<U> {
         authority: Option<http::uri::Authority>,
     ) -> Prepared<U::Lease> {
         let mut session = self.shared.conn.session.clone();
-        session.protocol = Some(ProtocolKind::Http);
+        // a decrypted connection's requests are HTTPS ones (`phase 4 M2
+        // design 9.1`): the rules see that, and their URLs say `https://`
+        let decrypted = self.shared.conn.origin.is_some();
+        session.protocol = Some(if decrypted {
+            ProtocolKind::Https
+        } else {
+            ProtocolKind::Http
+        });
         session.user_agent = req
             .headers()
             .get(header::USER_AGENT)
@@ -554,7 +567,8 @@ impl<U: Upstreams> Requests<U> {
                     .map(|authority| authority.host().to_ascii_lowercase()),
             )
         } else {
-            let (url, host) = form_of(req, (&session.dst_host, session.dst_port));
+            let scheme = if decrypted { "https" } else { "http" };
+            let (url, host) = form_of(req, (&session.dst_host, session.dst_port), scheme);
             (Some(url), host)
         };
         session.url = url;
@@ -680,9 +694,10 @@ impl<U: Upstreams> Requests<U> {
 
     /// Dials the route and starts its hyper client on the tracker
     /// (`phase 4 M1 design 8.4`): the first send and a send after the request
-    /// was not written both come through here. The dial is not raced against
-    /// the request's token; what it brings back is dropped when the token
-    /// fired meanwhile (`P1`).
+    /// was not written both come through here. A decrypted connection puts the
+    /// TLS to the origin over the dialled stream first (`phase 4 M2 design
+    /// 9.2`). The dial is not raced against the request's token; what it
+    /// brings back is dropped when the token fired meanwhile (`P1`).
     async fn connect(
         &self,
         handle: &Arc<SessionHandle>,
@@ -705,18 +720,45 @@ impl<U: Upstreams> Requests<U> {
         }
         let meter = Meter::new();
         meter.set(Some(handle.clone()));
-        let io = TokioIo::new(Metered::new(upstream.stream, meter.clone()));
+        // The dialled stream is metered before TLS wraps it, so a decrypted
+        // connection counts what goes over the wire and not the plaintext
+        // (`phase 4 M2 design 9.2`, P14). The handshake is not raced against
+        // the token: it has `OriginTls::wait` of its own, as the dial has.
+        let metered = Metered::new(upstream.stream, meter.clone());
+        let sender = match &self.shared.conn.origin {
+            None => self.start(metered).await?,
+            Some(tls) => {
+                let connector = TlsConnector::from(tls.config.clone());
+                let stream =
+                    tokio::time::timeout(tls.wait, connector.connect(tls.name.clone(), metered))
+                        .await
+                        .map_err(|_| DialError::Tls("timed out".to_string()))?
+                        .map_err(|e| DialError::Tls(e.to_string()))?;
+                self.start(stream).await?
+            }
+        };
+        Ok((sender, meter, upstream.forward, upstream.peer))
+    }
+
+    /// Starts the HTTP/1.1 client of a fresh upstream connection on the
+    /// tracker (`phase 4 M1 design 8.4`): the plain stream a dial brought back
+    /// and the TLS stream a decrypted connection put over it both come
+    /// through here. The connection runs on the engine's tracker; an inner
+    /// task restores the ERROR log for a panic. It finishes no handle: the
+    /// response body's wrapper, the request's guard or the relay of an
+    /// upgrade do.
+    async fn start<T>(&self, io: T) -> Result<SendRequest<ReqBody>, DialError>
+    where
+        T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
         let (sender, conn) = match hyper::client::conn::http1::Builder::new()
             .preserve_header_case(true)
-            .handshake(io)
+            .handshake(TokioIo::new(io))
             .await
         {
             Ok(pair) => pair,
             Err(e) => return Err(DialError::Handshake(e.to_string())),
         };
-        // The connection runs on the engine's tracker; an inner task restores
-        // the ERROR log for a panic. It finishes no handle: the response
-        // body's wrapper, the request's guard or the relay of an upgrade do.
         let tracker = self.shared.conn.tracker.clone();
         tracker.spawn(async move {
             let inner = tokio::spawn(async move {
@@ -730,7 +772,7 @@ impl<U: Upstreams> Requests<U> {
                 tracing::error!("upstream connection task panicked: {e}");
             }
         });
-        Ok((sender, meter, upstream.forward, upstream.peer))
+        Ok(sender)
     }
 
     /// A new connection for a request sent again, with the failures of the
@@ -758,6 +800,14 @@ impl<U: Upstreams> Requests<U> {
                 pages,
                 format!("upstream handshake failed: {e}"),
                 format!("Upstream handshake failed: {e}"),
+            )),
+            // an origin's certificate or its silence is not the policy's or
+            // the proxy's own failure (`phase 4 M2 design 9.2`, P14)
+            Err(DialError::Tls(e)) => Err(self.failed(
+                guard,
+                pages,
+                format!("upstream TLS handshake failed: {e}"),
+                format!("Upstream TLS handshake failed: {e}"),
             )),
         }
     }
@@ -888,6 +938,11 @@ impl<U: Upstreams> Requests<U> {
                 // (design 8.9).
                 meter.set(None);
                 let (client, upstream): (BoxedStream, BoxedStream) = match upstream
+                    // A decrypted connection's upstream stream has a TLS layer
+                    // over the metered one, so it is no `Metered<BoxedStream>`:
+                    // it takes the general branch, and from here the relay
+                    // counts what goes over the tunnel (`phase 4 M2 design
+                    // 9.5`).
                     .downcast::<TokioIo<Metered<BoxedStream>>>()
                 {
                     Ok(parts) => {
@@ -964,6 +1019,9 @@ enum DialError {
     Stopped,
     /// The stream was there, hyper's handshake was not.
     Handshake(String),
+    /// The TLS handshake with the origin did not finish, or the origin's
+    /// certificate was not accepted (`phase 4 M2 design 9.2`).
+    Tls(String),
 }
 
 /// The three ways one send can end (`phase 4 M1 design 8.6`).
@@ -1060,14 +1118,20 @@ fn path_and_query(uri: &Uri) -> &str {
 
 /// The URL of a request and the host the rules see (`phase 4 M1 design 8.3`,
 /// P22): an absolute-form request line for both, or `Host` and the request
-/// line's path for an origin-form one.
-fn form_of<B>(req: &Request<B>, fallback: (&HostName, u16)) -> (String, Option<String>) {
+/// line's path for an origin-form one. `scheme` is what a decrypted
+/// connection's URLs start with, whatever an absolute request line writes
+/// (`phase 4 / M2a plan P13`).
+fn form_of<B>(
+    req: &Request<B>,
+    fallback: (&HostName, u16),
+    scheme: &str,
+) -> (String, Option<String>) {
     if req.uri().scheme().is_some()
         && let Some(authority) = req.uri().authority()
     {
         return (
             format!(
-                "http://{}{}",
+                "{scheme}://{}{}",
                 headers::host_port(authority),
                 path_and_query(req.uri())
             ),
@@ -1082,29 +1146,37 @@ fn form_of<B>(req: &Request<B>, fallback: (&HostName, u16)) -> (String, Option<S
         .and_then(|v| v.parse::<http::uri::Authority>().ok())
     {
         return (
-            format!("http://{}{}", headers::host_port(&authority), path),
+            format!("{scheme}://{}{}", headers::host_port(&authority), path),
             Some(authority.host().to_ascii_lowercase()),
         );
     }
+    let default_port = default_port(scheme);
     (
         format!(
-            "http://{}{}",
-            origin_authority(fallback.0, fallback.1),
+            "{scheme}://{}{}",
+            origin_authority(fallback.0, fallback.1, default_port),
             path
         ),
         None,
     )
 }
 
-/// A target as a URL can carry it: the port unless it is 80, and an IPv6
-/// address in brackets (`HostName`'s own display has none, `types.rs`).
-fn origin_authority(host: &HostName, port: u16) -> String {
+/// The port a request's URL leaves out when the connection's target names
+/// none: 80 over plain HTTP, 443 over TLS (`phase 4 M2 design 9.1`).
+fn default_port(scheme: &str) -> u16 {
+    if scheme == "https" { 443 } else { 80 }
+}
+
+/// A target as a URL can carry it: the port unless it is `default_port`, and
+/// an IPv6 address in brackets (`HostName`'s own display has none,
+/// `types.rs`).
+fn origin_authority(host: &HostName, port: u16, default_port: u16) -> String {
     let host = match host {
         HostName::Domain(d) => d.clone(),
         HostName::Ip(IpAddr::V6(v6)) => format!("[{v6}]"),
         HostName::Ip(IpAddr::V4(v4)) => v4.to_string(),
     };
-    if port == 80 {
+    if port == default_port {
         host
     } else {
         format!("{host}:{port}")
@@ -1732,7 +1804,13 @@ pub async fn serve_connection<U: Upstreams>(client: BoxedStream, requests: Reque
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mitm::testing::generated;
+    use rcgen::PKCS_ECDSA_P256_SHA256;
     use rurge_net::testing::TestServer;
+    use rurge_proto::testing::TlsFixture;
+    use rurge_proto::transport::tls::origin_client_config;
+    use rustls::RootCertStore;
+    use rustls::pki_types::ServerName;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -2093,19 +2171,50 @@ mod tests {
         drop_hold: Duration,
         head_wait: Duration,
     ) -> Rig {
+        rig_made(
+            |token| Conn {
+                session: SessionInfo::tcp(HostName::parse("target.test"), 80),
+                entry,
+                origin: None,
+                idle,
+                head_wait,
+                drop_hold,
+                abort: CancellationToken::new(),
+                token,
+                tracker: TaskTracker::new(),
+            },
+            target,
+        )
+        .await
+    }
+
+    /// As `connected`, for a decrypted connection (`phase 4 M2 design 9`): its
+    /// target is `target.test:443`, and its requests reach the origin over TLS
+    /// as `origin` says.
+    async fn rig_tls(origin: OriginTls, target: SocketAddr) -> Rig {
+        rig_made(
+            |token| Conn {
+                session: SessionInfo::tcp(HostName::parse("target.test"), 443),
+                entry: Entry::Sniffed,
+                origin: Some(origin),
+                idle: Duration::from_secs(5),
+                head_wait: Duration::from_secs(5),
+                drop_hold: Duration::from_secs(5),
+                abort: CancellationToken::new(),
+                token,
+                tracker: TaskTracker::new(),
+            },
+            target,
+        )
+        .await
+    }
+
+    /// A connection the engine serves over a duplex stream, built as `made`
+    /// says, with an origin to dial.
+    async fn rig_made(made: impl FnOnce(CancellationToken) -> Conn, target: SocketAddr) -> Rig {
         let token = CancellationToken::new();
         let fake = Fake::new(token.clone(), target);
-        let session = SessionInfo::tcp(HostName::parse("target.test"), 80);
-        let conn = Conn {
-            session,
-            entry,
-            idle,
-            head_wait,
-            drop_hold,
-            abort: CancellationToken::new(),
-            token: token.clone(),
-            tracker: TaskTracker::new(),
-        };
+        let conn = made(token.clone());
         let requests = Requests::new(conn, fake.clone());
         let (server_end, client_end) = tokio::io::duplex(64 * 1024);
         let served = tokio::spawn(serve_connection(Box::new(server_end), requests));
@@ -2117,6 +2226,28 @@ mod tests {
             fake,
             token,
             served,
+        }
+    }
+
+    /// The TLS of the origin side of a decrypted connection (`phase 4 M2
+    /// design 9.2`): a client configuration that verifies against `roots`
+    /// unless `insecure`, the name the origin is verified against (an address
+    /// is verified as one and sends no SNI), and how long the handshake may
+    /// take.
+    fn origin_tls(
+        roots: Arc<RootCertStore>,
+        name: &str,
+        insecure: bool,
+        wait: Duration,
+    ) -> OriginTls {
+        OriginTls {
+            config: origin_client_config(roots, insecure, &[b"http/1.1"])
+                .expect("a client configuration"),
+            name: match name.parse::<IpAddr>() {
+                Ok(ip) => ServerName::IpAddress(ip.into()),
+                Err(_) => ServerName::try_from(name.to_string()).expect("a server name"),
+            },
+            wait,
         }
     }
 
@@ -2797,7 +2928,10 @@ mod tests {
 
     /// Reads until the end of a request head, returning where it ends; `None`
     /// when the connection ended first.
-    async fn read_head(buf: &mut Vec<u8>, stream: &mut tokio::net::TcpStream) -> Option<usize> {
+    async fn read_head(
+        buf: &mut Vec<u8>,
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> Option<usize> {
         loop {
             if let Some(at) = find(buf, b"\r\n\r\n") {
                 return Some(at);
@@ -3343,7 +3477,7 @@ mod tests {
 
     /// An origin-form request with no `Host` is named by the connection's
     /// target, written as a URL can carry it (`design 8.3`): the port only
-    /// when it is not 80, an IPv6 address in brackets.
+    /// when it is not the scheme's default, an IPv6 address in brackets.
     #[test]
     fn a_request_without_host_is_named_by_its_target() {
         for (host, port, want) in [
@@ -3353,10 +3487,57 @@ mod tests {
             ("::1", 80, "http://[::1]/n"),
         ] {
             let req = Request::builder().uri("/n").body(()).unwrap();
-            let (url, http_host) = form_of(&req, (&HostName::parse(host), port));
+            let (url, http_host) = form_of(&req, (&HostName::parse(host), port), "http");
             assert_eq!(url, want, "{host}:{port}");
             assert_eq!(http_host, None, "{host}:{port}");
         }
+    }
+
+    /// A decrypted connection's URLs are `https://` ones, and a port is left
+    /// out only when it is 443 (`phase 4 M2 design 9.1`, P13): a `Host` header
+    /// keeps whatever port it writes, as on a plain connection, and an
+    /// absolute-form request line is no exception to the scheme.
+    #[test]
+    fn a_decrypted_url_leaves_out_port_443_only() {
+        for (host, url, http_host) in [
+            ("target.test", "https://target.test/", "target.test"),
+            (
+                "target.test:8443",
+                "https://target.test:8443/",
+                "target.test",
+            ),
+            ("target.test:443", "https://target.test:443/", "target.test"),
+        ] {
+            let req = Request::builder()
+                .uri("/")
+                .header(header::HOST, host)
+                .body(())
+                .unwrap();
+            let (named, seen) = form_of(&req, (&HostName::parse("target.test"), 443), "https");
+            assert_eq!(named, url, "{host}");
+            assert_eq!(seen.as_deref(), Some(http_host), "{host}");
+        }
+
+        // with no `Host`, the connection's target names the request
+        for (port, url) in [
+            (443, "https://target.test/"),
+            (8443, "https://target.test:8443/"),
+        ] {
+            let req = Request::builder().uri("/").body(()).unwrap();
+            let (named, seen) = form_of(&req, (&HostName::parse("target.test"), port), "https");
+            assert_eq!(named, url, "{port}");
+            assert_eq!(seen, None, "{port}");
+        }
+
+        // the request line's own scheme does not name a decrypted request
+        let req = Request::builder()
+            .uri("http://other.test/x?y=1")
+            .header(header::HOST, "other.test")
+            .body(())
+            .unwrap();
+        let (url, http_host) = form_of(&req, (&HostName::parse("target.test"), 443), "https");
+        assert_eq!(url, "https://other.test/x?y=1");
+        assert_eq!(http_host.as_deref(), Some("other.test"));
     }
 
     /// A client that takes the answer and then stops reading it: hyper stops
@@ -3652,5 +3833,321 @@ mod tests {
         assert_eq!(rig.fake.dials(), 1, "a fresh connection gets one send");
         let handle = rig.fake.finished(0).await;
         assert!(matches!(handle.outcome(), Some(SessionOutcome::Failed(_))));
+    }
+
+    /// Roots that trust a CA made by rcgen under `cn` and nothing else. The
+    /// name matters: webpki looks a trust anchor up by subject first, so a
+    /// root named like the fixture's own CA would fail on the signature
+    /// instead of the issuer.
+    fn roots_of(cn: &str) -> Arc<RootCertStore> {
+        let ca = generated(&PKCS_ECDSA_P256_SHA256, cn);
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.cert.clone()).expect("a trust anchor");
+        Arc::new(roots)
+    }
+
+    /// A TLS origin of the case's own, over `acceptor`: it takes one
+    /// connection through `fixture` (so its `seen` records the handshake),
+    /// reads the request head, writes `answer`, and then echoes with a flush
+    /// after every write (`echo`) or holds the connection until the client
+    /// goes. It gives back its address and the task that serves it.
+    async fn tls_origin(
+        fixture: &Arc<TlsFixture>,
+        acceptor: tokio_rustls::TlsAcceptor,
+        answer: &'static [u8],
+        echo: bool,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fixture = fixture.clone();
+        let served = tokio::spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut stream) = fixture.accept(&acceptor, tcp).await else {
+                return;
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            if read_head(&mut buf, &mut stream).await.is_none() {
+                return;
+            }
+            if stream.write_all(answer).await.is_err() {
+                return;
+            }
+            if echo {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Err(_) => return,
+                        Ok(n) => {
+                            // `flush`: tokio-rustls reports a write as done
+                            // while ciphertext may still sit in its buffer
+                            if stream.write_all(&chunk[..n]).await.is_err()
+                                || stream.flush().await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+                // a `close_notify` first: a TLS stream that just ends reads
+                // as an error on the other side
+                let _ = stream.shutdown().await;
+                return;
+            }
+            let mut chunk = [0u8; 1024];
+            while matches!(stream.read(&mut chunk).await, Ok(n) if n > 0) {}
+        });
+        (addr, served)
+    }
+
+    /// A decrypted connection's request reaches the origin over TLS, and its
+    /// record names it as `https://` and `HTTPS` (`phase 4 M2 design 9.1`,
+    /// 9.2).
+    #[tokio::test]
+    async fn a_decrypted_request_goes_to_the_origin_over_tls() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/a", "secret");
+        let mut rig = rig_tls(
+            origin_tls(
+                fixture.roots(),
+                "target.test",
+                false,
+                Duration::from_secs(5),
+            ),
+            addr_of(&origin),
+        )
+        .await;
+        rig.client
+            .send("GET /a HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"secret");
+        assert_eq!(origin.hits("/a"), 1);
+        let seen = rig.fake.seen();
+        let s = &seen[0];
+        assert_eq!(s.session.url.as_deref(), Some("https://target.test/a"));
+        assert_eq!(s.session.protocol, Some(ProtocolKind::Https));
+        assert!(!s.forwardable, "a decrypted request is never forwarded on");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(handle.status(), Some(200));
+        let (up, down) = handle.bytes();
+        assert!(up > 0 && down > 0, "up {up}, down {down}");
+    }
+
+    /// An origin the roots do not trust is not reached: the request fails
+    /// with rustls' reason in the page and in the record, and the upstream is
+    /// not counted as failed for the proxy's own account (`phase 4 M2 design
+    /// 9.2`, P14).
+    #[tokio::test]
+    async fn an_origin_the_roots_do_not_trust_is_a_502_with_the_reason() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/a", "secret");
+        let mut rig = rig_tls(
+            origin_tls(
+                roots_of("rurge test unrelated CA"),
+                "target.test",
+                false,
+                Duration::from_secs(5),
+            ),
+            addr_of(&origin),
+        )
+        .await;
+        rig.client
+            .send("GET /a HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        let page = String::from_utf8_lossy(&body);
+        assert!(page.contains("Upstream TLS handshake failed"), "{page}");
+        assert!(page.contains("UnknownIssuer"), "{page}");
+        let handle = rig.fake.finished(0).await;
+        match handle.outcome() {
+            Some(SessionOutcome::Failed(reason)) => {
+                assert!(
+                    reason.starts_with("upstream TLS handshake failed: "),
+                    "{reason}"
+                );
+                assert!(reason.contains("UnknownIssuer"), "{reason}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert!(
+            !handle.upstream_failed(),
+            "the origin's certificate is not the proxy's own failure"
+        );
+        assert_eq!(origin.hits("/a"), 0, "the request never reached it");
+    }
+
+    /// `skip-server-cert-verify` is what lets an untrusted origin through:
+    /// the chain and the name are not verified (`phase 4 M2 design 9.2`).
+    #[tokio::test]
+    async fn skip_server_cert_verify_reaches_an_untrusted_origin() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/a", "secret");
+        let mut rig = rig_tls(
+            origin_tls(
+                roots_of("rurge test unrelated CA"),
+                "target.test",
+                true,
+                Duration::from_secs(5),
+            ),
+            addr_of(&origin),
+        )
+        .await;
+        rig.client
+            .send("GET /a HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"secret");
+        assert_eq!(origin.hits("/a"), 1);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+    }
+
+    /// The origin hears the connection's SNI, and an address gets none: rustls
+    /// sends one for a name only (`phase 4 M2 design 9.2`).
+    #[tokio::test]
+    async fn the_origin_hears_the_client_sni_and_an_ip_hears_none() {
+        for (name, wants_sni) in [("target.test", true), ("127.0.0.1", false)] {
+            let fixture = TlsFixture::new(&[name]);
+            let (addr, served) = tls_origin(
+                &fixture,
+                fixture.acceptor(false),
+                b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                false,
+            )
+            .await;
+            let mut rig = rig_tls(
+                origin_tls(fixture.roots(), name, false, Duration::from_secs(5)),
+                addr,
+            )
+            .await;
+            rig.client
+                .send(&format!("GET /a HTTP/1.1\r\nHost: {name}\r\n\r\n"))
+                .await
+                .unwrap();
+            let (head, _) = rig.client.response().await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{name}: {head}");
+            let seen = fixture.seen_at_least(1).await;
+            assert_eq!(
+                seen[0].sni.as_deref(),
+                wants_sni.then_some(name),
+                "{name}: {:?}",
+                seen[0]
+            );
+            served.abort();
+        }
+    }
+
+    /// A handshake that does not finish within `OriginTls::wait` fails the
+    /// request, and does so in that time (`phase 4 M2 design 9.2`).
+    #[tokio::test]
+    async fn a_slow_origin_handshake_is_a_502_after_its_wait() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // the origin takes the connection and says nothing: the handshake
+        // never gets its ServerHello, and the stream stays open until the
+        // case is over
+        let held = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(stream);
+        });
+        let mut rig = rig_tls(
+            origin_tls(
+                fixture.roots(),
+                "target.test",
+                false,
+                Duration::from_millis(300),
+            ),
+            addr,
+        )
+        .await;
+        rig.client
+            .send("GET /a HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let answered = tokio::time::timeout(Duration::from_secs(3), rig.client.response()).await;
+        let (head, body) = answered.expect("an answer within 3 s");
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Upstream TLS handshake failed: timed out"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(
+                "upstream TLS handshake failed: timed out".into()
+            ))
+        );
+        held.abort();
+    }
+
+    /// An upgraded exchange crosses the TLS to the origin, and its bytes are
+    /// counted once: the relay's, not the meter's as well (`phase 4 M2 design
+    /// 9.5`). The two ends are 10 000 bytes apart, far enough from the
+    /// handshake and the headers that a count doubled on either side shows.
+    #[tokio::test]
+    async fn a_websocket_upgrade_goes_through_tls_and_is_counted_once() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let (addr, served) = tls_origin(
+            &fixture,
+            fixture.acceptor(false),
+            b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\n\
+              upgrade: websocket\r\n\r\n",
+            true,
+        )
+        .await;
+        let mut rig = rig_tls(
+            origin_tls(
+                fixture.roots(),
+                "target.test",
+                false,
+                Duration::from_secs(5),
+            ),
+            addr,
+        )
+        .await;
+        rig.client
+            .send(
+                "GET /ws HTTP/1.1\r\nHost: target.test\r\n\
+                 Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let lower = head.to_ascii_lowercase();
+        assert!(lower.contains("upgrade: websocket"), "{head}");
+        let payload = vec![b'x'; 10_000];
+        rig.client.stream.write_all(&payload).await.unwrap();
+        assert_eq!(rig.client.take(payload.len()).await, payload);
+        rig.client.stream.shutdown().await.unwrap();
+        while rig.client.fill().await {}
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(101));
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        let (up, down) = handle.bytes();
+        assert!((10_000..15_000).contains(&up), "up {up}, down {down}");
+        assert!((10_000..15_000).contains(&down), "up {up}, down {down}");
+        served.abort();
     }
 }
