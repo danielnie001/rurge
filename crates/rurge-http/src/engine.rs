@@ -5076,12 +5076,14 @@ mod tests {
         }
     }
 
-    /// The HTTP/2 reason in an error's cause chain, if there is one.
+    /// The HTTP/2 reason of the first `h2::Error` in an error's cause chain:
+    /// `None` when there is none, or when that one carries no reason (an I/O
+    /// error, say).
     fn h2_reason_of(error: &(dyn StdError + 'static)) -> Option<h2::Reason> {
         let mut source: Option<&(dyn StdError + 'static)> = Some(error);
         while let Some(err) = source {
             if let Some(h2) = err.downcast_ref::<h2::Error>() {
-                return Some(h2.reason().unwrap_or(h2::Reason::INTERNAL_ERROR));
+                return h2.reason();
             }
             source = err.source();
         }
@@ -5098,18 +5100,24 @@ mod tests {
         /// Answer the first stream and refuse every later one.
         RefuseAfterOne,
         /// Answer the first stream's head and a part of its body, then reset
-        /// it before its end (`the phase 4 / M2b plan's execution record`).
+        /// it before its end (`the phase 4 / M2b plan's execution record row
+        /// 52`).
         ResetMidBody,
     }
 
     /// An HTTP/2 origin of the case's own (`phase 4 / M2b plan P18`): it takes
     /// TLS connections that offer `h2` alone, follows `script` on its first
-    /// connection, answers every stream of every later one with its path, and
-    /// says when its first connection ended.
+    /// connection, answers every stream of every later one with its path, says
+    /// when its first connection ended, and resets the first stream of
+    /// `ResetMidBody` when the case tells it the part of the body has arrived.
     struct H2Origin {
         addr: SocketAddr,
         connections: Arc<AtomicUsize>,
         ended: Arc<tokio::sync::Notify>,
+        /// Fired by the case once it has read the part `ResetMidBody` sent;
+        /// the origin resets the stream only then (`the phase 4 / M2b plan's
+        /// execution record row 52`).
+        reset: Arc<tokio::sync::Notify>,
     }
 
     async fn h2_origin(fixture: &Arc<TlsFixture>, script: OriginScript) -> H2Origin {
@@ -5118,13 +5126,20 @@ mod tests {
         let acceptor = fixture.acceptor_with_alpn(false, &[b"h2"]);
         let connections = Arc::new(AtomicUsize::new(0));
         let ended = Arc::new(tokio::sync::Notify::new());
+        let reset = Arc::new(tokio::sync::Notify::new());
         let fixture = fixture.clone();
         let count = connections.clone();
         let said = ended.clone();
+        let told = reset.clone();
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let first = count.fetch_add(1, Ordering::SeqCst) == 0;
-                let (fixture, acceptor, ended) = (fixture.clone(), acceptor.clone(), said.clone());
+                let (fixture, acceptor, ended, reset) = (
+                    fixture.clone(),
+                    acceptor.clone(),
+                    said.clone(),
+                    told.clone(),
+                );
                 tokio::spawn(async move {
                     let Ok(stream) = fixture.accept(&acceptor, tcp).await else {
                         return;
@@ -5155,16 +5170,19 @@ mod tests {
                                     let _ = send.send_data(Bytes::from_static(b"part"), false);
                                     // h2's reset drops whatever of the stream is still
                                     // queued to go out (`h2-0.4.19/src/proto/streams/
-                                    // send.rs`), so the connection is driven until the
-                                    // head and the part of the body are written: the case
-                                    // is a reset after the answer began. The writes go out
-                                    // in the first poll; 100 ms is margin, not a wait for
-                                    // the client.
-                                    let _ = tokio::time::timeout(
-                                        Duration::from_millis(100),
-                                        conn.accept(),
-                                    )
-                                    .await;
+                                    // send.rs`), on this side and on rurge's way to the
+                                    // client alike, so the connection is driven first
+                                    // — which is what writes the head and the part —
+                                    // and the reset waits for the case to say it has
+                                    // read the part (`the phase 4 / M2b plan's execution
+                                    // record row 52`). `accept` returns only when the
+                                    // connection ended or the peer opened another
+                                    // stream, and the case has neither before the
+                                    // reset; its own 5 s read is the limit.
+                                    tokio::select! {
+                                        _ = reset.notified() => {}
+                                        _ = conn.accept() => {}
+                                    }
                                     send.send_reset(h2::Reason::REFUSED_STREAM);
                                 }
                                 continue;
@@ -5197,6 +5215,7 @@ mod tests {
             addr,
             connections,
             ended,
+            reset,
         }
     }
 
@@ -5861,7 +5880,12 @@ mod tests {
             .await
             .expect("the stream ended within 5 s")
             .expect("the task did not panic");
-        assert!(answered.is_err(), "the stream was reset");
+        let error = answered.expect_err("the stream was reset");
+        assert_eq!(
+            h2_reason_of(&error),
+            Some(h2::Reason::INTERNAL_ERROR),
+            "{error}"
+        );
         let handle = rig.fake.finished(0).await;
         assert_eq!(
             handle.outcome(),
@@ -5905,7 +5929,12 @@ mod tests {
         let handle = rig.fake.handle(0).await;
         handle.kill();
         let (_, ended) = read_body(body).await;
-        assert!(ended.is_some(), "the body was reset, not read to its end");
+        let error = ended.expect("the body was reset, not read to its end");
+        assert_eq!(
+            h2_reason_of(&error),
+            Some(h2::Reason::INTERNAL_ERROR),
+            "{error}"
+        );
         let handle = rig.fake.finished(0).await;
         assert_eq!(
             handle.outcome(),
@@ -5993,7 +6022,12 @@ mod tests {
         // client's window took (`phase 4 M2 design 10.5`)
         let (read, ended) = read_body(held.into_body()).await;
         assert!(read > 0, "the window's worth was buffered");
-        assert!(ended.is_some(), "the stream was reset, not read to its end");
+        let error = ended.expect("the stream was reset, not read to its end");
+        assert_eq!(
+            h2_reason_of(&error),
+            Some(h2::Reason::INTERNAL_ERROR),
+            "{error}"
+        );
         drop(sender);
         conn.abort();
         let served = served_within(rig.served, Duration::from_secs(5)).await;
@@ -6058,7 +6092,12 @@ mod tests {
         let refused = sender
             .send_request(h2_request(http::Method::GET, "http://target.test/reject"))
             .await;
-        assert!(refused.is_err(), "the stream was reset");
+        let error = refused.expect_err("the stream was reset");
+        assert_eq!(
+            h2_reason_of(&error),
+            Some(h2::Reason::INTERNAL_ERROR),
+            "{error}"
+        );
         let handle = rig.fake.finished(0).await;
         assert_eq!(
             handle.outcome(),
@@ -6106,7 +6145,12 @@ mod tests {
             .send_request(h2_request(http::Method::GET, "http://target.test/drop"))
             .await;
         let held = started.elapsed();
-        assert!(dropped.is_err(), "the stream was reset");
+        let error = dropped.expect_err("the stream was reset");
+        assert_eq!(
+            h2_reason_of(&error),
+            Some(h2::Reason::INTERNAL_ERROR),
+            "{error}"
+        );
         assert!(
             held >= Duration::from_millis(300) && held < Duration::from_secs(3),
             "held {held:?}"
@@ -6143,8 +6187,21 @@ mod tests {
             .await
             .expect("an answer");
         assert_eq!(resp.status(), 200);
-        let (read, ended) = read_body(resp.into_body()).await;
+        let mut body = resp.into_body();
+        // the part first: the origin resets the stream only once the case has it
+        let mut read = 0;
+        while read < 4 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+                .await
+                .expect("a frame within 5 s")
+                .expect("a frame, not the end")
+                .expect("the part, not an error");
+            read += frame.data_ref().map_or(0, |data| data.len());
+        }
         assert_eq!(read, 4, "the part the origin sent before the reset");
+        origin.reset.notify_one();
+        let (rest, ended) = read_body(body).await;
+        assert_eq!(rest, 0, "nothing after the part");
         let error = ended.expect("the body failed");
         assert_eq!(
             h2_reason_of(&error),
