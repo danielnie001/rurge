@@ -1626,6 +1626,16 @@ struct Outing<K> {
     forward: Option<Vec<(String, String)>>,
 }
 
+/// The upstream side of a response on its way to the client (`phase 4 M2 design
+/// 10.5`, `the phase 4 / M2b plan's P14`): the answer's body and the connection
+/// it came on. It sits in a slot `Tail` shares with its watchdog, so that either
+/// can let the upstream go — a client that stopped reading, a killed request,
+/// a stop — and the other one then stops polling a body whose upstream is gone.
+struct UpstreamBody<K> {
+    inner: Incoming,
+    outing: Box<Outing<K>>,
+}
+
 /// Rewrites a request into the form the origin expects: origin-form URI, a
 /// `Host` header matching the request target (`RFC 9112 §3.2.2`).
 fn origin_form<B>(req: &mut Request<B>) -> Result<(), http::Error> {
@@ -1672,6 +1682,23 @@ fn absolute_form<B>(req: &mut Request<B>, extra: &[(String, String)]) -> Result<
     }
     Ok(())
 }
+
+/// The body of a response on its way to the client that failed upstream
+/// (`the phase 4 / M2b plan's execution record row 48`): the text alone,
+/// because hyper takes the HTTP/2 reason to reset the client's stream by from
+/// the error's cause chain (`hyper-1.11.1/src/error.rs`), and an upstream's own
+/// reason must not reach the client — `REFUSED_STREAM` says the request was not
+/// handled and may be sent again (`RFC 9113 §8.7`), when its answer had begun.
+#[derive(Debug)]
+struct UpstreamBodyFailed(String);
+
+impl std::fmt::Display for UpstreamBodyFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UpstreamBodyFailed {}
 
 /// A body that went `Conn::idle` without a frame (`phase 4 M1 design 8.10`).
 /// hyper takes an error out of a body it writes as a user error, so a client's
@@ -1870,7 +1897,11 @@ where
 /// connection back into the pool, and ends both when the body stalls or the
 /// request is cancelled.
 struct Tail<U: Upstreams> {
-    inner: Incoming,
+    /// The upstream, `None` once it was let go — by `complete`, `fail`, `stop`
+    /// or the watchdog (`phase 4 M2 design 10.5`, `the phase 4 / M2b plan's
+    /// P14`). The lock is held for one poll at a time and never across
+    /// `complete`, `fail` or `stop`, which take from it themselves.
+    up: Arc<Mutex<Option<UpstreamBody<U::Key>>>>,
     idle: Duration,
     deadline: Pin<Box<Sleep>>,
     /// The request's token: `kill` and a stop end the exchange here, because
@@ -1888,8 +1919,12 @@ struct Tail<U: Upstreams> {
     watchdog: CancellationToken,
     guard: Guard,
     shared: Arc<Shared<U>>,
-    /// The upstream connection, until the body is over and it goes back.
-    outing: Option<Box<Outing<U::Key>>>,
+    /// The body was read to its end: `is_end_stream` says this and nothing
+    /// else, so that a body whose upstream the watchdog let go — and whose one
+    /// error has not been handed on yet — is not taken for a finished one
+    /// (`the phase 4 / M2b plan's P14`).
+    reached_end: bool,
+    /// Nothing more will be handed on: the body ended, or its one error went.
     done: bool,
 }
 
@@ -1905,8 +1940,12 @@ impl<U: Upstreams> Tail<U> {
         let cancelled = Box::pin(guard.handle().token().clone().cancelled_owned());
         let progress = Progress::new();
         let watchdog = CancellationToken::new();
-        let mut tail = Tail {
+        let up = Arc::new(Mutex::new(Some(UpstreamBody {
             inner,
+            outing: Box::new(outing),
+        })));
+        let mut tail = Tail {
+            up,
             idle,
             deadline: Box::pin(tokio::time::sleep(idle)),
             cancelled,
@@ -1915,13 +1954,19 @@ impl<U: Upstreams> Tail<U> {
             watchdog,
             guard,
             shared,
-            outing: Some(Box::new(outing)),
+            reached_end: false,
             done: false,
         };
         // hyper drops a body whose `is_end_stream` is true without polling it
         // (`proto/h1/dispatch.rs`): a response that arrives with no body at
         // all is read to its end here, where it can still be ended properly
-        if tail.inner.is_end_stream() {
+        let empty = tail
+            .up
+            .lock()
+            .expect("upstream body")
+            .as_ref()
+            .is_some_and(|up| up.inner.is_end_stream());
+        if empty {
             tail.complete();
         } else {
             tail.watch_the_client();
@@ -1929,11 +1974,22 @@ impl<U: Upstreams> Tail<U> {
         tail
     }
 
+    /// Takes the upstream out of the slot, letting nothing go while the lock
+    /// is held (`the phase 4 / M2b plan's P14`).
+    fn take_upstream(&self) -> Option<UpstreamBody<U::Key>> {
+        self.up.lock().expect("upstream body").take()
+    }
+
     /// Watches the client while this body is on its way to it (`design 8.10,
     /// 8.11`): a client that stopped reading never polls the body again, so
     /// `kill`, a stop and the idle timeout could not be seen from `poll_frame`.
     /// The watchdog ends them: the connection goes at once, and the guard says
     /// how the request ended.
+    ///
+    /// On HTTP/2 a request ends with its stream, not the client's connection
+    /// (`phase 4 M2 design 10.5`, `the phase 4 / M2b plan's P14`): the upstream
+    /// is let go and `abort` is left alone — except for a stop, which takes the
+    /// whole connection anyway, and must not wait for a stream nobody reads.
     fn watch_the_client(&self) {
         let progress = self.progress.clone();
         let handle = self.guard.handle().clone();
@@ -1942,6 +1998,10 @@ impl<U: Upstreams> Tail<U> {
         let done = self.watchdog.clone();
         let idle = self.idle;
         let tracker = self.shared.conn.tracker.clone();
+        let h2 = self.shared.conn.h2;
+        let connection = self.shared.conn.token.clone();
+        let left = self.guard.left;
+        let up = self.up.clone();
         tracker.spawn(async move {
             let inner = tokio::spawn(async move {
                 loop {
@@ -1957,7 +2017,15 @@ impl<U: Upstreams> Tail<U> {
                                 "client stopped reading".to_string(),
                             ));
                             tracing::debug!("a client stopped reading its response");
-                            abort.cancel();
+                            if h2 {
+                                // the upstream is let go, and the client's
+                                // stream is reset when hyper polls the body
+                                // again (`the phase 4 / M2b plan's P14`)
+                                let upstream = up.lock().expect("upstream body").take();
+                                drop(upstream);
+                            } else {
+                                abort.cancel();
+                            }
                             return;
                         }
                         remaining
@@ -1966,7 +2034,16 @@ impl<U: Upstreams> Tail<U> {
                         biased;
                         _ = done.cancelled() => return,
                         _ = request.cancelled() => {
-                            abort.cancel();
+                            // A stop takes every stream of the connection, so
+                            // the connection goes; a kill ends this stream
+                            // alone (`phase 4 M2 design 10.5`).
+                            if h2 && !connection.is_cancelled() {
+                                let upstream = up.lock().expect("upstream body").take();
+                                handle.finish(outcome_of(&handle, &connection, left));
+                                drop(upstream);
+                            } else {
+                                abort.cancel();
+                            }
                             return;
                         }
                         _ = tokio::time::sleep(sleep_for) => {}
@@ -1988,9 +2065,10 @@ impl<U: Upstreams> Tail<U> {
             return;
         }
         self.done = true;
+        self.reached_end = true;
         self.watchdog.cancel();
         self.guard.handle().finish(SessionOutcome::Completed);
-        if let Some(outing) = self.outing.take() {
+        if let Some(UpstreamBody { outing, .. }) = self.take_upstream() {
             let Outing {
                 key,
                 sender,
@@ -2028,7 +2106,7 @@ impl<U: Upstreams> Tail<U> {
         }
         self.done = true;
         self.watchdog.cancel();
-        self.outing.take();
+        self.take_upstream();
         self.guard.handle().finish(SessionOutcome::Failed(message));
     }
 
@@ -2039,17 +2117,31 @@ impl<U: Upstreams> Tail<U> {
         }
         self.done = true;
         self.watchdog.cancel();
-        self.outing.take();
+        self.take_upstream();
         self.guard.retire();
     }
 }
 
 impl<U: Upstreams> Drop for Tail<U> {
     /// The body went away without a word (hyper dropped it): there is nothing
-    /// left for the watchdog to watch.
+    /// left for the watchdog to watch, and the upstream goes with it, as it did
+    /// when it was a field of its own (`the phase 4 / M2b plan's P14`).
     fn drop(&mut self) {
         self.watchdog.cancel();
+        let upstream = self.up.lock().expect("upstream body").take();
+        drop(upstream);
     }
+}
+
+/// One poll of an upstream body, taken out of the slot before anything else is
+/// done with it (`the phase 4 / M2b plan's P14`): the frame and whether it was
+/// the last one, the error, the end, `Pending`, or a slot the watchdog emptied.
+enum PolledUpstream {
+    Frame(Frame<Bytes>, bool),
+    Failed(hyper::Error),
+    End,
+    Pending,
+    Gone,
 }
 
 impl<U: Upstreams> Body for Tail<U> {
@@ -2064,12 +2156,31 @@ impl<U: Upstreams> Body for Tail<U> {
         if this.done {
             return Poll::Ready(None);
         }
-        if this.inner.is_end_stream() {
-            this.complete();
-            return Poll::Ready(None);
-        }
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
+        // one poll of the upstream, under the lock, and its result taken out
+        // of it: `complete`, `fail` and `stop` take from the same slot
+        // themselves, and a lock taken twice never comes back
+        let polled = {
+            let mut up = this.up.lock().expect("upstream body");
+            match up.as_mut() {
+                None => PolledUpstream::Gone,
+                Some(up) => {
+                    if up.inner.is_end_stream() {
+                        PolledUpstream::End
+                    } else {
+                        match Pin::new(&mut up.inner).poll_frame(cx) {
+                            Poll::Ready(Some(Ok(frame))) => {
+                                PolledUpstream::Frame(frame, up.inner.is_end_stream())
+                            }
+                            Poll::Ready(Some(Err(e))) => PolledUpstream::Failed(e),
+                            Poll::Ready(None) => PolledUpstream::End,
+                            Poll::Pending => PolledUpstream::Pending,
+                        }
+                    }
+                }
+            }
+        };
+        match polled {
+            PolledUpstream::Frame(frame, ended) => {
                 this.deadline
                     .as_mut()
                     .reset(tokio::time::Instant::now() + this.idle);
@@ -2081,21 +2192,37 @@ impl<U: Upstreams> Body for Tail<U> {
                 }
                 // the frame just handed out was the last one: hyper will drop
                 // the body now instead of polling it again
-                if this.inner.is_end_stream() {
+                if ended {
                     this.complete();
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => {
-                this.fail(format!("upstream body failed: {e}"));
-                Poll::Ready(Some(Err(Box::new(e))))
+            PolledUpstream::Failed(e) => {
+                let message = format!("upstream body failed: {e}");
+                this.fail(message.clone());
+                Poll::Ready(Some(Err(Box::new(UpstreamBodyFailed(message)))))
             }
-            Poll::Ready(None) => {
+            PolledUpstream::End => {
                 this.progress.moved();
                 this.complete();
                 Poll::Ready(None)
             }
-            Poll::Pending => {
+            PolledUpstream::Gone => {
+                // the watchdog let the upstream go: one error, and hyper resets
+                // the client's stream with it (`the phase 4 / M2b plan's P14`).
+                // A request whose token fired was killed or stopped, and ends
+                // as `stop` ends it; otherwise the idle timeout ended it. Both
+                // make hyper reset the stream with `INTERNAL_ERROR`, their
+                // `source` being `None`.
+                this.done = true;
+                let error: BoxError = if this.guard.handle().token().is_cancelled() {
+                    Box::new(Close)
+                } else {
+                    Box::new(Stalled("client stopped reading"))
+                };
+                Poll::Ready(Some(Err(error)))
+            }
+            PolledUpstream::Pending => {
                 this.progress.waiting();
                 if this.cancelled.as_mut().poll(cx).is_ready() {
                     this.stop();
@@ -2110,14 +2237,45 @@ impl<U: Upstreams> Body for Tail<U> {
         }
     }
 
+    /// Only a body read to its end is over: a body whose upstream was let go
+    /// still owes its client the one error (`the phase 4 / M2b plan's P14`).
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.reached_end
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        if self.reached_end {
+            // nothing is left; hyper asks only while `is_end_stream` is false,
+            // so this is for `http-body`'s contract and not for hyper
+            return SizeHint::with_exact(0);
+        }
+        match self.up.lock().expect("upstream body").as_ref() {
+            Some(up) => up.inner.size_hint(),
+            // the upstream was let go: nothing is known of what is left
+            None => SizeHint::default(),
+        }
     }
 }
+
+/// How a request nobody finished ended (`P18`): killed, stopped with the
+/// connection, or left by the client (`phase 4 M2 design 10.5`). The guard asks
+/// it when it drops or is retired, and so does the watchdog for a request whose
+/// token fired while the client was not reading, where the guard cannot see it
+/// (`the phase 4 / M2b plan's P14`).
+fn outcome_of(
+    handle: &SessionHandle,
+    stop: &CancellationToken,
+    left: &'static str,
+) -> SessionOutcome {
+    if handle.was_killed() {
+        SessionOutcome::Failed("killed".to_string())
+    } else if stop.is_cancelled() {
+        SessionOutcome::Completed
+    } else {
+        SessionOutcome::Failed(left.to_string())
+    }
+}
+
 /// The guard of one request (`phase 4 M1 design 8.11`, P18): while the future
 /// lives it holds the handle; dropped first, it ends the handle the way the
 /// request ended — killed, stopped with the connection, or left by the client.
@@ -2158,13 +2316,7 @@ impl Guard {
     /// How a request nobody finished ended (`P18`; `cancelled_outcome` before
     /// it).
     fn outcome(&self) -> SessionOutcome {
-        if self.handle.was_killed() {
-            SessionOutcome::Failed("killed".to_string())
-        } else if self.stop.is_cancelled() {
-            SessionOutcome::Completed
-        } else {
-            SessionOutcome::Failed(self.left.to_string())
-        }
+        outcome_of(&self.handle, &self.stop, self.left)
     }
 
     /// Ends the handle the way the guard would, and from now on the guard
@@ -4910,6 +5062,32 @@ mod tests {
             .to_vec()
     }
 
+    /// A response body read to its end: the bytes it gave, and the error it
+    /// ended with — `None` for a body that ended normally.
+    async fn read_body(mut body: Incoming) -> (usize, Option<hyper::Error>) {
+        let mut read = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), body.frame()).await {
+                Ok(Some(Ok(frame))) => read += frame.data_ref().map_or(0, |data| data.len()),
+                Ok(None) => return (read, None),
+                Ok(Some(Err(e))) => return (read, Some(e)),
+                Err(_) => panic!("the body ended within 5 s, after {read} bytes"),
+            }
+        }
+    }
+
+    /// The HTTP/2 reason in an error's cause chain, if there is one.
+    fn h2_reason_of(error: &(dyn StdError + 'static)) -> Option<h2::Reason> {
+        let mut source: Option<&(dyn StdError + 'static)> = Some(error);
+        while let Some(err) = source {
+            if let Some(h2) = err.downcast_ref::<h2::Error>() {
+                return Some(h2.reason().unwrap_or(h2::Reason::INTERNAL_ERROR));
+            }
+            source = err.source();
+        }
+        None
+    }
+
     /// What an HTTP/2 origin does with its first connection (`phase 4 / M2b
     /// plan P18`).
     #[derive(Clone, Copy)]
@@ -4919,6 +5097,9 @@ mod tests {
         GoAwayAfterOne,
         /// Answer the first stream and refuse every later one.
         RefuseAfterOne,
+        /// Answer the first stream's head and a part of its body, then reset
+        /// it before its end (`the phase 4 / M2b plan's execution record`).
+        ResetMidBody,
     }
 
     /// An HTTP/2 origin of the case's own (`phase 4 / M2b plan P18`): it takes
@@ -4956,12 +5137,37 @@ mod tests {
                             accepted += 1;
                             if first && accepted > 1 {
                                 match script {
-                                    OriginScript::GoAwayAfterOne => {}
+                                    OriginScript::GoAwayAfterOne | OriginScript::ResetMidBody => {}
                                     OriginScript::RefuseAfterOne => {
                                         respond.send_reset(h2::Reason::REFUSED_STREAM);
                                         continue;
                                     }
                                 }
+                            }
+                            if first
+                                && accepted == 1
+                                && matches!(script, OriginScript::ResetMidBody)
+                            {
+                                // a head with no `content-length`, a part of the
+                                // body, and a reset before the end
+                                let answer = Response::builder().body(()).expect("a response");
+                                if let Ok(mut send) = respond.send_response(answer, false) {
+                                    let _ = send.send_data(Bytes::from_static(b"part"), false);
+                                    // h2's reset drops whatever of the stream is still
+                                    // queued to go out (`h2-0.4.19/src/proto/streams/
+                                    // send.rs`), so the connection is driven until the
+                                    // head and the part of the body are written: the case
+                                    // is a reset after the answer began. The writes go out
+                                    // in the first poll; 100 ms is margin, not a wait for
+                                    // the client.
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_millis(100),
+                                        conn.accept(),
+                                    )
+                                    .await;
+                                    send.send_reset(h2::Reason::REFUSED_STREAM);
+                                }
+                                continue;
                             }
                             let path = request.uri().path().as_bytes().to_vec();
                             let answer = Response::builder()
@@ -5625,6 +5831,349 @@ mod tests {
         assert_eq!(requests[0].authority.as_deref(), Some("target.test:8443"));
         assert_eq!(requests[0].header("te"), Some("trailers"));
         assert_eq!(requests[0].header("host"), None);
+        drop(sender);
+        conn.abort();
+        served_within(rig.served, Duration::from_secs(5)).await;
+    }
+
+    /// A stream killed while its answer waits for the upstream is reset alone
+    /// (`phase 4 M2 design 10.5`, `the phase 4 / M2b plan's P14`): the
+    /// connection and its next request go on.
+    #[tokio::test]
+    async fn a_killed_h2_stream_is_reset_and_the_others_go_on() {
+        let origin = TestServer::spawn().await;
+        origin.set("/slow", "late");
+        origin.set_delay("/slow", Duration::from_secs(10));
+        origin.set("/ok", "fine");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let hang = tokio::spawn(
+            sender.send_request(h2_request(http::Method::GET, "http://target.test/slow")),
+        );
+        let handle = rig.fake.handle(0).await;
+        handle.kill();
+        let answered = tokio::time::timeout(Duration::from_secs(5), hang)
+            .await
+            .expect("the stream ended within 5 s")
+            .expect("the task did not panic");
+        assert!(answered.is_err(), "the stream was reset");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("killed".into()))
+        );
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/ok"))
+            .await
+            .expect("an answer on the same connection");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await, b"fine");
+        assert!(!rig.served.is_finished(), "the connection is still open");
+        drop(sender);
+        conn.abort();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 2);
+    }
+
+    /// A stream killed while its answer flows is reset alone, and its upstream
+    /// is let go (`phase 4 M2 design 10.5`, `the phase 4 / M2b plan's P14`): on
+    /// HTTP/2 a kill must not take the client's whole connection with it, as
+    /// it does on HTTP/1.1.
+    #[tokio::test]
+    async fn a_killed_h2_stream_whose_body_flows_is_reset_and_its_upstream_let_go() {
+        let origin = streaming_origin().await;
+        let rig = rig_h2(origin.addr, Duration::from_secs(5), Duration::from_secs(5)).await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/big"))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 200);
+        let mut body = resp.into_body();
+        // a part of the answer first: the kill comes while the body flows
+        let first = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .expect("a frame within 5 s")
+            .expect("a frame, not the end")
+            .expect("the body did not fail yet");
+        assert!(first.data_ref().is_some_and(|data| !data.is_empty()));
+        let handle = rig.fake.handle(0).await;
+        handle.kill();
+        let (_, ended) = read_body(body).await;
+        assert!(ended.is_some(), "the body was reset, not read to its end");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("killed".into()))
+        );
+        // the upstream connection was let go, not lent again
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while origin.closed.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the upstream connection was closed within 3 s");
+        assert!(origin.accepted.load(Ordering::Relaxed) == 1);
+        assert!(!rig.served.is_finished(), "the connection is still open");
+        drop(sender);
+        conn.abort();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 1);
+    }
+
+    /// A client that stops reading one stream on HTTP/2 fails only that
+    /// request (`phase 4 M2 design 10.5`, `the phase 4 / M2b plan's P14`): its
+    /// upstream is let go, its record says the client stopped reading, and the
+    /// connection serves another request in full.
+    #[tokio::test]
+    async fn an_h2_client_that_stops_reading_one_stream_fails_only_that_request() {
+        let origin = streaming_origin().await;
+        let rig = rig_h2(
+            origin.addr,
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+        )
+        .await;
+        // the windows are the case's own: the first stream stops at 1 MiB, so
+        // its answer is held, while the second's 4 MiB still fit in the
+        // connection's
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .initial_stream_window_size(1 << 20)
+            .initial_connection_window_size(16 << 20)
+            .handshake::<_, Full<Bytes>>(TokioIo::new(rig.client))
+            .await
+            .expect("an HTTP/2 handshake");
+        let conn = tokio::spawn(conn);
+        let held = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/big"))
+            .await
+            .expect("an answer");
+        assert_eq!(held.status(), 200);
+        // nothing of it is read: the idle timeout ends the request, and the
+        // origin sees its connection go
+        let handle = tokio::time::timeout(Duration::from_secs(3), rig.fake.finished(0))
+            .await
+            .expect("the first request ended within 3 s");
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("client stopped reading".into()))
+        );
+        assert_eq!(handle.status(), Some(200));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while origin.closed.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the upstream connection was closed within 3 s");
+        // the next request on the same connection is served in full
+        let second = tokio::time::timeout(Duration::from_secs(5), async {
+            let resp = sender
+                .send_request(h2_request(http::Method::GET, "http://target.test/big"))
+                .await
+                .expect("an answer");
+            assert_eq!(resp.status(), 200);
+            body_of(resp).await
+        })
+        .await
+        .expect("the second answer within 5 s");
+        assert_eq!(second.len(), BIG_BODY);
+        assert_eq!(
+            rig.fake.finished(1).await.outcome(),
+            Some(SessionOutcome::Completed)
+        );
+        assert!(!rig.served.is_finished(), "the connection is still open");
+        // the first stream is reset when hyper polls it again, after what the
+        // client's window took (`phase 4 M2 design 10.5`)
+        let (read, ended) = read_body(held.into_body()).await;
+        assert!(read > 0, "the window's worth was buffered");
+        assert!(ended.is_some(), "the stream was reset, not read to its end");
+        drop(sender);
+        conn.abort();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 2);
+    }
+
+    /// A stop while an HTTP/2 client does not read one stream still ends the
+    /// connection in time (`phase 4 M2 design 10.5`, `the phase 4 / M2b plan's
+    /// P14`): a stop takes the whole connection anyway, so the watchdog cancels
+    /// `abort` as it does on HTTP/1.1.
+    #[tokio::test]
+    async fn a_stop_while_an_h2_client_does_not_read_ends_the_connection() {
+        let origin = streaming_origin().await;
+        let rig = rig_h2(
+            origin.addr,
+            // long enough that the idle deadline is not the one that ends it
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let held = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/big"))
+            .await
+            .expect("an answer");
+        assert_eq!(held.status(), 200);
+        let handle = rig.fake.handle(0).await;
+        wait_until(|| handle.status() == Some(200) && handle.bytes().1 > 0).await;
+        rig.token.cancel();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 1);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed), "stopped");
+        drop(held);
+        drop(sender);
+        conn.abort();
+    }
+
+    /// A `REJECT` with no page resets only its own stream on HTTP/2 (`phase 4
+    /// M2 design 10.5`, `the phase 4 / M2b plan's P14`).
+    #[tokio::test]
+    async fn a_rejected_h2_request_without_a_page_resets_only_its_stream() {
+        let origin = TestServer::spawn().await;
+        origin.set("/ok", "fine");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        rig.fake.script(
+            "/reject",
+            Step::Refused {
+                refusal: Refusal::Reject(RejectKind::Reject),
+                pages: Pages {
+                    error: true,
+                    reject: false,
+                },
+            },
+        );
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let refused = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/reject"))
+            .await;
+        assert!(refused.is_err(), "the stream was reset");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Rejected(RejectKind::Reject))
+        );
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/ok"))
+            .await
+            .expect("an answer on the same connection");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await, b"fine");
+        assert!(!rig.served.is_finished(), "the connection is still open");
+        drop(sender);
+        conn.abort();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 2);
+    }
+
+    /// `REJECT-DROP` on HTTP/2 holds the stream for `Conn::drop_hold` and then
+    /// resets it, and the connection goes on (`phase 4 M2 design 10.5`, `the
+    /// phase 4 / M2b plan's P14`).
+    #[tokio::test]
+    async fn a_dropped_h2_request_is_held_then_reset() {
+        let origin = TestServer::spawn().await;
+        origin.set("/ok", "fine");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        )
+        .await;
+        rig.fake.script(
+            "/drop",
+            Step::Refused {
+                refusal: Refusal::Reject(RejectKind::Drop),
+                pages: Pages {
+                    error: true,
+                    reject: true,
+                },
+            },
+        );
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let started = std::time::Instant::now();
+        let dropped = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/drop"))
+            .await;
+        let held = started.elapsed();
+        assert!(dropped.is_err(), "the stream was reset");
+        assert!(
+            held >= Duration::from_millis(300) && held < Duration::from_secs(3),
+            "held {held:?}"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Rejected(RejectKind::Drop))
+        );
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/ok"))
+            .await
+            .expect("an answer on the same connection");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await, b"fine");
+        drop(sender);
+        conn.abort();
+        served_within(rig.served, Duration::from_secs(5)).await;
+    }
+
+    /// An upstream HTTP/2 stream reset in the middle of its answer reaches the
+    /// client as `INTERNAL_ERROR`, not with the origin's own reason (`the phase
+    /// 4 / M2b plan's execution record row 48`): `REFUSED_STREAM` says the
+    /// request was not handled and may be sent again (RFC 9113 §8.7), and by
+    /// now its answer has begun.
+    #[tokio::test]
+    async fn an_upstream_h2_stream_reset_mid_body_reaches_the_client_as_internal_error() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = h2_origin(&fixture, OriginScript::ResetMidBody).await;
+        let rig = rig_tls_h2(origin_tls_h2(fixture.roots(), "target.test"), origin.addr).await;
+        let (mut sender, conn) = h2_client(rig.client.stream).await;
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "https://target.test/one"))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 200);
+        let (read, ended) = read_body(resp.into_body()).await;
+        assert_eq!(read, 4, "the part the origin sent before the reset");
+        let error = ended.expect("the body failed");
+        assert_eq!(
+            h2_reason_of(&error),
+            Some(h2::Reason::INTERNAL_ERROR),
+            "{error}"
+        );
+        let handle = rig.fake.finished(0).await;
+        match handle.outcome() {
+            Some(SessionOutcome::Failed(reason)) => {
+                assert!(reason.starts_with("upstream body failed: "), "{reason}")
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        // the shared upstream connection is still there for the next request
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "https://target.test/two"))
+            .await
+            .expect("an answer on the same connection");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await, b"/two");
+        assert_eq!(
+            origin.connections.load(Ordering::SeqCst),
+            1,
+            "one upstream connection"
+        );
+        assert!(
+            !rig.served.is_finished(),
+            "the client's connection is still open"
+        );
         drop(sender);
         conn.abort();
         served_within(rig.served, Duration::from_secs(5)).await;
