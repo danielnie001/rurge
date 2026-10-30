@@ -40,6 +40,9 @@ rurge-proto-ssh = { workspace = true, features = ["testing"] }
 rurge-proto-wireguard = { workspace = true, features = ["testing"] }
 rurge-tun = { workspace = true, features = ["testing"] }
 tokio-rustls.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
 socket2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

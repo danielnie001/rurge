@@ -10,6 +10,11 @@
 mod common;
 use common::tun::*;
 use common::*;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::client::conn::http2;
+use hyper::{Method, Request, StatusCode, header};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rurge_config::rule::ProtocolKind;
 use rurge_engine::MitmCounts;
 use std::sync::Arc;
@@ -2177,4 +2182,521 @@ async fn a_decrypted_request_tunnels_through_an_http_proxy() {
         heads[0].request_line.starts_with("CONNECT origin.test:443"),
         "{heads:?}"
     );
+}
+
+/// The `[MITM]` section with `h2 = true`: a decrypted connection may be served
+/// as HTTP/2, and the origin side offers `h2` first (`the phase 4 / M2b plan's
+/// P15`).
+fn mitm_h2_section(hostname: &str, ca_p12: &str) -> String {
+    format!("{}\nh2 = true", mitm_section(hostname, ca_p12))
+}
+
+/// An engine decrypting `origin.test` with `h2 = true`, its SOCKS5 policy
+/// pointing at `origin`, and the roots the client of a decrypted connection
+/// trusts (the CA rurge signs with).
+async fn harness_with_h2(
+    origin: SocketAddr,
+    roots: Arc<rustls::RootCertStore>,
+    rules: &str,
+    general: &str,
+) -> (Harness, Arc<rustls::RootCertStore>, FakeSocks5) {
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let sections = mitm_h2_section("origin.test", &mitm.ca_p12_base64("pw"));
+    let h = harness_mitm(
+        Profile {
+            general,
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules,
+            sections: &sections,
+            ..Profile::default()
+        },
+        roots,
+    )
+    .await;
+    (h, mitm.roots(), upstream)
+}
+
+/// A decrypted connection to `origin.test:443` that offered `alpn`, and the
+/// protocol the handshake settled on. The client trusts the MITM CA and
+/// nothing else, so a handshake that ends says the leaf was rurge's.
+async fn decrypted(
+    h: &Harness,
+    roots: Arc<rustls::RootCertStore>,
+    alpn: &[&[u8]],
+) -> (Option<String>, tokio_rustls::client::TlsStream<TcpStream>) {
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let tls = handshake(tunnel, client_config(roots, alpn, true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    let settled = tls
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .map(|p| String::from_utf8_lossy(p).into_owned());
+    (settled, tls)
+}
+
+/// hyper's HTTP/2 client over a decrypted connection: the sender, and the task
+/// that has to keep running for the connection to move (`the phase 4 / M2b
+/// plan's P18`).
+async fn h2_over(
+    tls: tokio_rustls::client::TlsStream<TcpStream>,
+) -> (
+    http2::SendRequest<Full<Bytes>>,
+    tokio::task::JoinHandle<hyper::Result<()>>,
+) {
+    let (sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(tls))
+        .await
+        .expect("an HTTP/2 handshake over the decrypted stream");
+    (sender, tokio::spawn(conn))
+}
+
+/// Lets an HTTP/2 client go: its sender is dropped and the connection's task
+/// ends within the bound, cleanly.
+async fn close_h2(
+    sender: http2::SendRequest<Full<Bytes>>,
+    conn: tokio::task::JoinHandle<hyper::Result<()>>,
+) {
+    drop(sender);
+    tokio::time::timeout(WITHIN, conn)
+        .await
+        .expect("the connection ends within the bound")
+        .expect("the connection's task did not panic")
+        .expect("the client's side of the connection ends cleanly");
+}
+
+/// A `GET` as hyper's HTTP/2 client takes it: the absolute URI names the
+/// scheme and the authority, so the engine sees the request line it would see
+/// on HTTP/1.1 (`the phase 4 / M2b plan's P18`).
+fn h2_get(path: &str) -> Request<Full<Bytes>> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(format!("https://origin.test{path}"))
+        .body(Full::new(Bytes::new()))
+        .expect("a request")
+}
+
+/// One request on an HTTP/2 connection, bounded as every wait of these tests
+/// is: the status, and the whole body.
+async fn h2_send(
+    sender: &mut http2::SendRequest<Full<Bytes>>,
+    request: Request<Full<Bytes>>,
+) -> (StatusCode, Vec<u8>) {
+    let response = tokio::time::timeout(WITHIN, sender.send_request(request))
+        .await
+        .expect("the answer comes within the bound")
+        .expect("the request goes through");
+    let status = response.status();
+    let body = tokio::time::timeout(WITHIN, response.into_body().collect())
+        .await
+        .expect("the body comes within the bound")
+        .expect("a response body")
+        .to_bytes()
+        .to_vec();
+    (status, body)
+}
+
+/// What one decrypted `GET /a` left: the protocol the client settled on, the
+/// version the origin recorded, and the engine's record of the request.
+struct Combination {
+    client: Option<String>,
+    origin: String,
+    record: rurge_engine::RequestRecord,
+}
+
+/// One decrypted `GET /a`, the client offering `client_alpn` and the origin
+/// speaking `origin_alpn`. rustls takes the server's list order, so both
+/// offering `[h2, http/1.1]` settles on `h2` (`the phase 4 / M2b plan's P15`).
+async fn one_combination(client_alpn: &[&[u8]], origin_alpn: &[&[u8]]) -> Combination {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor_with_alpn(false, origin_alpn)).await;
+    server.set("/a", "from the origin");
+    let (h, client_roots, _upstream) = harness_with_h2(
+        origin_addr(&server),
+        origin.roots(),
+        "DOMAIN,origin.test,A",
+        "",
+    )
+    .await;
+
+    let (settled, tls) = decrypted(&h, client_roots, client_alpn).await;
+    if settled.as_deref() == Some("h2") {
+        let (mut sender, conn) = h2_over(tls).await;
+        let (status, body) = h2_send(&mut sender, h2_get("/a")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"from the origin");
+        close_h2(sender, conn).await;
+    } else {
+        assert_eq!(settled.as_deref(), Some("http/1.1"), "{settled:?}");
+        let mut tls = tls;
+        let response = get(&mut tls, "origin.test", "/a").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("from the origin"), "{response}");
+    }
+
+    let versions: Vec<String> = server
+        .requests()
+        .into_iter()
+        .map(|request| request.version)
+        .collect();
+    assert_eq!(versions.len(), 1, "{versions:?}");
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    Combination {
+        client: settled,
+        origin: versions[0].clone(),
+        record: records[0].clone(),
+    }
+}
+
+/// The one record a decrypted `GET /a` leaves: the request an `https://` one,
+/// answered 200 and completed.
+fn the_one_https_record(record: &rurge_engine::RequestRecord) {
+    assert_eq!(record.protocol, Some(ProtocolKind::Https), "{record:?}");
+    assert_eq!(
+        record.url.as_deref(),
+        Some("https://origin.test/a"),
+        "{record:?}"
+    );
+    assert_eq!(record.status_code, Some(200), "{record:?}");
+    assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+}
+
+/// The four combinations of what the client offers and what the origin speaks
+/// are all decrypted (`the phase 4 / M2b plan's P15`): the request reaches the
+/// origin in the version it settled on, and leaves one record of its own.
+#[tokio::test]
+async fn four_combinations_of_http1_and_h2_are_decrypted() {
+    // HTTP/1.1 on both sides: what M2a served, with `h2` on
+    let both_h1 = one_combination(&[&b"http/1.1"[..]], &[&b"http/1.1"[..]]).await;
+    assert_eq!(both_h1.client.as_deref(), Some("http/1.1"));
+    assert_eq!(both_h1.origin, "HTTP/1.1");
+    the_one_https_record(&both_h1.record);
+
+    // an HTTP/1.1 client, and an origin that speaks HTTP/2
+    let h1_to_h2 = one_combination(&[&b"http/1.1"[..]], &[&b"h2"[..], &b"http/1.1"[..]]).await;
+    assert_eq!(h1_to_h2.client.as_deref(), Some("http/1.1"));
+    assert_eq!(h1_to_h2.origin, "HTTP/2.0");
+    the_one_https_record(&h1_to_h2.record);
+
+    // an HTTP/2 client, and an origin that speaks only HTTP/1.1
+    let h2_to_h1 = one_combination(&[&b"h2"[..], &b"http/1.1"[..]], &[&b"http/1.1"[..]]).await;
+    assert_eq!(h2_to_h1.client.as_deref(), Some("h2"));
+    assert_eq!(h2_to_h1.origin, "HTTP/1.1");
+    the_one_https_record(&h2_to_h1.record);
+
+    // HTTP/2 on both sides
+    let both_h2 = one_combination(
+        &[&b"h2"[..], &b"http/1.1"[..]],
+        &[&b"h2"[..], &b"http/1.1"[..]],
+    )
+    .await;
+    assert_eq!(both_h2.client.as_deref(), Some("h2"));
+    assert_eq!(both_h2.origin, "HTTP/2.0");
+    the_one_https_record(&both_h2.record);
+}
+
+/// With `h2 = true` a client that offers only `h2` is decrypted: the handshake
+/// settles on `h2` and its request is answered (`the phase 4 / M2b plan's
+/// P15`; with `h2` off, `a_client_offering_only_h2_is_passed_through`).
+#[tokio::test]
+async fn an_h2_only_client_is_decrypted_when_h2_is_on() {
+    let combination = one_combination(&[&b"h2"[..]], &[&b"http/1.1"[..]]).await;
+    assert_eq!(
+        combination.client.as_deref(),
+        Some("h2"),
+        "the handshake settled on what the client offered"
+    );
+    assert_eq!(combination.origin, "HTTP/1.1");
+    the_one_https_record(&combination.record);
+}
+
+/// Two streams of one HTTP/2 connection are routed one by one: the one whose
+/// URL the `URL-REGEX` matches is refused on its own stream with the reject
+/// page, the other goes to the origin, and the connection carries on
+/// (`phase 4 M2 design 9.1`, `10.5`).
+#[tokio::test]
+async fn each_h2_stream_follows_its_own_rule() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let (h, roots, _upstream) = harness_with_h2(
+        origin_addr(&server),
+        origin.roots(),
+        "URL-REGEX,^https://origin\\.test/b,REJECT\nDOMAIN,origin.test,A",
+        "show-error-page-for-reject = true",
+    )
+    .await;
+
+    let (settled, tls) = decrypted(&h, roots, &[&b"h2"[..]]).await;
+    assert_eq!(settled.as_deref(), Some("h2"));
+    let (mut sender, conn) = h2_over(tls).await;
+
+    let (status, body) = h2_send(&mut sender, h2_get("/a")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"from the origin");
+
+    let (status, body) = h2_send(&mut sender, h2_get("/b")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let page = String::from_utf8_lossy(&body).into_owned();
+    assert!(
+        page.contains("<code>URL-REGEX,^https://origin\\.test/b,REJECT</code>"),
+        "the reject page names the rule: {page}"
+    );
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(
+        records[0].rule.as_deref(),
+        Some("DOMAIN,origin.test,A"),
+        "{records:?}"
+    );
+    assert_eq!(records[0].status_code, Some(200), "{records:?}");
+    assert_eq!(
+        records[1].rule.as_deref(),
+        Some("URL-REGEX,^https://origin\\.test/b,REJECT"),
+        "{records:?}"
+    );
+    assert_eq!(records[1].status_code, Some(403), "{records:?}");
+
+    // the connection carries on: another stream through the same sender
+    let (status, body) = h2_send(&mut sender, h2_get("/a")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"from the origin");
+
+    let records = the_records(&h, 3).await;
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(
+        records[2].rule.as_deref(),
+        Some("DOMAIN,origin.test,A"),
+        "{records:?}"
+    );
+    assert_eq!(records[2].status_code, Some(200), "{records:?}");
+    assert_eq!(records[2].status, RecordStatus::Completed, "{records:?}");
+    close_h2(sender, conn).await;
+}
+
+/// Concurrent streams of one HTTP/2 client share one upstream HTTP/2
+/// connection (`phase 4 M2 design 10.2` and `M2-D15`): however many streams
+/// are open at once, the origin is asked on one connection.
+#[tokio::test]
+async fn concurrent_h2_streams_share_one_upstream_connection() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/slow", "from the origin");
+    server.set_delay("/slow", Duration::from_millis(200));
+    let (h, roots, _upstream) = harness_with_h2(
+        origin_addr(&server),
+        origin.roots(),
+        "DOMAIN,origin.test,A",
+        "",
+    )
+    .await;
+
+    let (settled, tls) = decrypted(&h, roots, &[&b"h2"[..]]).await;
+    assert_eq!(settled.as_deref(), Some("h2"));
+    let (mut sender, conn) = h2_over(tls).await;
+
+    // one request first, so that the upstream connection is there to share
+    let (status, body) = h2_send(&mut sender, h2_get("/slow")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"from the origin");
+
+    // five streams at once, each on its own clone of the same sender
+    let mut streams = tokio::task::JoinSet::new();
+    for _ in 0..5 {
+        let mut sender = sender.clone();
+        streams.spawn(async move { h2_send(&mut sender, h2_get("/slow")).await });
+    }
+    while let Some(joined) = tokio::time::timeout(WITHIN, streams.join_next())
+        .await
+        .expect("every stream is answered within the bound")
+    {
+        let (status, body) = joined.expect("a stream's task did not panic");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"from the origin");
+    }
+    assert_eq!(server.hits("/slow"), 6, "every stream reached the origin");
+    assert_eq!(
+        server.connections(),
+        1,
+        "every stream rode the one upstream connection"
+    );
+    close_h2(sender, conn).await;
+}
+
+/// The `cookie` an HTTP/2 client splits into two fields reaches an HTTP/1.1
+/// origin as one field, and the `:authority` it named becomes `Host` (RFC 9113
+/// 8.2.3, 8.3.1; `the phase 4 / M2b plan's P8`).
+#[tokio::test]
+async fn the_cookies_of_an_h2_client_reach_an_http1_origin_as_one_field() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server =
+        TestServer::spawn_tls_with(origin.acceptor_with_alpn(false, &[&b"http/1.1"[..]])).await;
+    server.set("/a", "from the origin");
+    let (h, roots, _upstream) = harness_with_h2(
+        origin_addr(&server),
+        origin.roots(),
+        "DOMAIN,origin.test,A",
+        "",
+    )
+    .await;
+
+    let (settled, tls) = decrypted(&h, roots, &[&b"h2"[..]]).await;
+    assert_eq!(settled.as_deref(), Some("h2"));
+    let (mut sender, conn) = h2_over(tls).await;
+
+    let mut request = h2_get("/a");
+    request
+        .headers_mut()
+        .append(header::COOKIE, header::HeaderValue::from_static("a=1"));
+    request
+        .headers_mut()
+        .append(header::COOKIE, header::HeaderValue::from_static("b=2"));
+    let (status, body) = h2_send(&mut sender, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"from the origin");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].version, "HTTP/1.1", "{requests:?}");
+    let cookies: Vec<&str> = requests[0]
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(cookies, ["a=1; b=2"], "the two fields became one, joined");
+    assert_eq!(
+        requests[0].header("host"),
+        Some("origin.test"),
+        "the `:authority` the client named is the `Host`"
+    );
+    close_h2(sender, conn).await;
+}
+
+/// A WebSocket upgrade from an HTTP/1.1 client goes over HTTP/1.1 to an origin
+/// that speaks `h2`: the echo is the same as M2a's, and the origin's handshake
+/// settled on `http/1.1` (`the phase 4 / M2b plan's P12`).
+#[tokio::test]
+async fn a_websocket_from_an_http1_client_goes_over_http1_where_the_origin_speaks_h2() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    // `switching_echo_over_tls` accepts with `origin.acceptor(false)`, which
+    // offers `[h2, http/1.1]`
+    let server = switching_echo_over_tls(&origin).await;
+    let (h, roots, _upstream) =
+        harness_with_h2(server, origin.roots(), "DOMAIN,origin.test,A", "").await;
+
+    let (settled, mut tls) = decrypted(&h, roots, &[&b"http/1.1"[..]]).await;
+    assert_eq!(settled.as_deref(), Some("http/1.1"));
+    tls.write_all(
+        b"GET /ws HTTP/1.1\r\nHost: origin.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let head = read_head(&mut tls).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("upgrade: websocket"),
+        "{head}"
+    );
+
+    // far from the handshake and the headers, so a byte out of place shows
+    let payload: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
+    tls.write_all(&payload).await.unwrap();
+    let mut back = vec![0u8; payload.len()];
+    tokio::time::timeout(WITHIN, tls.read_exact(&mut back))
+        .await
+        .expect("the echo comes within the bound")
+        .expect("the echo reaches the client");
+    assert_eq!(back, payload, "every byte comes back in its place");
+
+    let seen = origin.seen_at_least(1).await;
+    assert_eq!(
+        seen[0].alpn.as_deref(),
+        Some("http/1.1"),
+        "the upgrade dials HTTP/1.1 only"
+    );
+
+    tls.shutdown().await.expect("the close_notify goes out");
+    let mut rest = Vec::new();
+    tokio::time::timeout(WITHIN, tls.read_to_end(&mut rest))
+        .await
+        .expect("the end comes within the bound")
+        .expect("the client's side ends with a close_notify");
+    assert!(rest.is_empty(), "{rest:?}");
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status_code, Some(101), "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Completed, "{records:?}");
+    assert_eq!(
+        records[0].url.as_deref(),
+        Some("https://origin.test/ws"),
+        "{records:?}"
+    );
+}
+
+/// HTTP/2's `CONNECT` is answered 501 and leaves one record of its own: the
+/// carrier connection records nothing beside it (`the phase 4 / M2b plan's
+/// P6`).
+#[tokio::test]
+async fn a_connect_over_h2_has_one_record_and_a_501() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    // nothing is dialled here: a `CONNECT` is answered before it would be
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    let (h, roots, _upstream) = harness_with_h2(
+        origin_addr(&server),
+        origin.roots(),
+        "DOMAIN,origin.test,A",
+        "",
+    )
+    .await;
+
+    let (settled, tls) = decrypted(&h, roots, &[&b"h2"[..]]).await;
+    assert_eq!(settled.as_deref(), Some("h2"));
+    let (mut sender, conn) = h2_over(tls).await;
+
+    // the request line is the authority alone, as RFC 9113 8.5 gives a
+    // `CONNECT`: hyper writes `:authority` from it, and no `:scheme`/`:path`
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri("origin.test:443")
+        .body(Full::new(Bytes::new()))
+        .expect("a request");
+    let (status, body) = h2_send(&mut sender, request).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(body, b"CONNECT over HTTP/2 is not supported");
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some("CONNECT over HTTP/2 is not supported"),
+        "{records:?}"
+    );
+    assert_eq!(records[0].status_code, Some(501), "{records:?}");
+    // the `CONNECT` named an authority and no URL
+    assert_eq!(records[0].url, None, "{records:?}");
+
+    close_h2(sender, conn).await;
+
+    // The only fixed wait here is for the end of the connection the client has
+    // just closed, and for the record it would make if it made one. Its record
+    // is made when the engine reads the client's EOF — far shorter than the
+    // 300 ms waited on the loopback.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.engine.request_log().recent(10).len(),
+        1,
+        "the carrier connection left a record of its own beside its request's"
+    );
+    assert!(h.engine.request_log().active().is_empty());
 }
