@@ -244,6 +244,37 @@ fn check_exit_codes() {
         }));
 }
 
+/// An unusable `[MITM]` CA is named where a profile is checked: `W0039`, a
+/// warning, so the exit code stays 0, and neither the material nor the
+/// passphrase is quoted (`phase 4 M2 design 5.3`).
+#[test]
+fn check_names_an_unusable_mitm_ca() {
+    let dir = tempfile::tempdir().unwrap();
+    let mitm = write(
+        &dir,
+        "mitm.conf",
+        "[MITM]\nhostname = a.test\nca-p12 = QUJDRA\nca-passphrase = pw-7d1f\n\
+[Rule]\nFINAL,DIRECT\n",
+    );
+    let out = rurge_command()
+        .args(["check", "-c"])
+        .arg(&mitm)
+        .args(["--data-dir"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let printed = String::from_utf8_lossy(&out);
+    assert!(printed.contains("W0039"), "{printed}");
+    assert!(printed.contains("MITM is off"), "{printed}");
+    assert!(
+        !printed.contains("QUJDRA") && !printed.contains("pw-7d1f"),
+        "{printed}"
+    );
+}
+
 /// A problem is reported with what to do about it: in the text the hint is
 /// the line after its diagnostic, in the JSON it is a field of it, and a
 /// code that has no hint has `null`.

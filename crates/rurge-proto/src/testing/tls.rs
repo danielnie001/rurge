@@ -113,20 +113,23 @@ impl TlsFixture {
         pem("PRIVATE KEY", &self.leaf_key)
     }
 
+    /// The fixture's CA certificate (DER): the trust anchor `roots()` holds.
+    pub fn ca_der(&self) -> &[u8] {
+        self.ca.as_ref()
+    }
+
     /// A client certificate signed by the fixture's CA as a Base64 PKCS#12
     /// with the password `pw`: the value of a `[Keystore]` item.
     pub fn client_p12_base64(&self, common_name: &str) -> String {
-        use p12_keystore::{Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain};
         let (cert, key) = self.issue_client(common_name);
-        let chain = PrivateKeyChain::new(
-            key,
-            [1u8, 2, 3, 4],
-            [Certificate::from_der(&cert).expect("our own certificate")],
-        );
-        let mut store = KeyStore::new();
-        store.add_entry("client", KeyStoreEntry::PrivateKeyChain(chain));
-        let der = store.writer("pw").write().expect("p12");
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der)
+        p12_base64(&[cert], &key, "pw")
+    }
+
+    /// The fixture's own CA and its private key as a Base64 PKCS#12: a
+    /// certificate authority a test hands rurge as `ca-p12` (P26).
+    pub fn ca_p12_base64(&self, password: &str) -> String {
+        let chain = vec![self.ca.as_ref().to_vec()];
+        p12_base64(&chain, &self.issuer.key().serialize_der(), password)
     }
 
     /// A client certificate signed by the fixture's CA: (certificate DER, PKCS#8 key DER).
@@ -342,9 +345,41 @@ fn pem(label: &str, der: &[u8]) -> String {
     out
 }
 
+/// A PKCS#12 holding `chain` (leaf first) and `key_pkcs8`, password
+/// `password`, as the Base64 of a `[Keystore]` item or of `ca-p12`: what
+/// `rurge_proto::keystore::decode_pkcs12` reads back. The alias, the local
+/// key id and the default encryption are the ones `client_p12_base64` has
+/// always written (`phase 4 / M2a plan P26`).
+pub fn p12_base64(chain: &[Vec<u8>], key_pkcs8: &[u8], password: &str) -> String {
+    use p12_keystore::{Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain};
+    let chain: Vec<Certificate> = chain
+        .iter()
+        .map(|der| Certificate::from_der(der).expect("a certificate of our own"))
+        .collect();
+    let chain = PrivateKeyChain::new(key_pkcs8, [1u8, 2, 3, 4], chain);
+    let mut store = KeyStore::new();
+    store.add_entry("client", KeyStoreEntry::PrivateKeyChain(chain));
+    let der = store.writer(password).write().expect("a p12 of our own");
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der)
+}
+
+/// A PKCS#12 holding `cert` alone, with no private key: what
+/// `decode_pkcs12` refuses with "holds no private key with a certificate".
+pub fn p12_cert_base64(cert: &[u8], password: &str) -> String {
+    use p12_keystore::{Certificate, KeyStore, KeyStoreEntry};
+    let mut store = KeyStore::new();
+    store.add_entry(
+        "certificate",
+        KeyStoreEntry::Certificate(Certificate::from_der(cert).expect("a certificate of our own")),
+    );
+    let der = store.writer(password).write().expect("a p12 of our own");
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     #[test]
     fn pem_and_p12_exports_are_well_formed() {
@@ -373,5 +408,32 @@ mod tests {
             span: rurge_config::Span::new(std::sync::Arc::from(std::path::Path::new("t.conf")), 1),
         };
         crate::keystore::decode_p12(&item).expect("our own p12 decodes");
+    }
+
+    /// `p12_base64` writes what `decode_pkcs12` reads back — the certificate
+    /// chain given and the PKCS#8 key — and `ca_p12_base64` gives the
+    /// fixture's own CA with its key: a certificate authority a test hands
+    /// rurge as `ca-p12` (`phase 4 / M2a plan P26`).
+    #[test]
+    fn p12_exports_hold_the_certificate_and_the_key() {
+        use base64::engine::general_purpose::STANDARD;
+        let fixture = TlsFixture::new(&["localhost"]);
+        let (cert, key) = fixture.issue_client("a client");
+        let written = p12_base64(std::slice::from_ref(&cert), &key, "pw");
+        let der = STANDARD.decode(written).expect("our own Base64");
+        let identity = crate::keystore::decode_pkcs12("`ca-p12`", &der, "pw").expect("our own p12");
+        assert_eq!(identity.chain.len(), 1);
+        assert_eq!(identity.chain[0].as_ref(), cert.as_slice());
+        assert_eq!(identity.key.secret_der(), key.as_slice());
+
+        let written = fixture.ca_p12_base64("pw");
+        let der = STANDARD.decode(written).expect("our own Base64");
+        let identity = crate::keystore::decode_pkcs12("`ca-p12`", &der, "pw").expect("the CA p12");
+        assert_eq!(identity.chain.len(), 1);
+        assert_eq!(identity.chain[0].as_ref(), fixture.ca_der());
+        assert_eq!(
+            identity.key.secret_der(),
+            fixture.issuer.key().serialize_der().as_slice()
+        );
     }
 }

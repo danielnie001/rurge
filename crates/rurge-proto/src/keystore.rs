@@ -10,37 +10,51 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 /// What a keystore item's `base64` holds, written with or without its
 /// padding. The error names the item; it never repeats the material.
 pub fn decode_base64(item: &KeystoreItem) -> Result<Vec<u8>, BuildError> {
-    STANDARD
-        .decode(&item.base64)
-        .or_else(|_| STANDARD_NO_PAD.decode(&item.base64))
-        .map_err(|_| {
-            BuildError::new(format!(
-                "keystore item `{}`: `base64` is not valid Base64",
-                item.name
-            ))
-        })
+    base64_bytes(&item.base64).ok_or_else(|| {
+        BuildError::new(format!(
+            "keystore item `{}`: `base64` is not valid Base64",
+            item.name
+        ))
+    })
 }
 
-/// Decodes a `p12` keystore item into a client identity (leaf first).
-/// The error names the item; it never repeats the password or the material.
+/// Base64 with its padding or without it, and nothing else: the two forms
+/// the manual's `base64` accepts. `None` when neither reads the text.
+pub fn base64_bytes(text: &str) -> Option<Vec<u8>> {
+    STANDARD
+        .decode(text)
+        .or_else(|_| STANDARD_NO_PAD.decode(text))
+        .ok()
+}
+
+/// Decodes an item into a client identity (leaf first). The error names the
+/// item; it never repeats the password or the material.
 pub fn decode_p12(item: &KeystoreItem) -> Result<ClientIdentity, BuildError> {
-    let name = &item.name;
-    let der = decode_base64(item)?;
-    let store = p12_keystore::KeyStore::from_pkcs12(&der, item.password.as_deref().unwrap_or(""))
-        .map_err(|e| {
+    decode_pkcs12(
+        &format!("keystore item `{}`", item.name),
+        &decode_base64(item)?,
+        item.password.as_deref().unwrap_or(""),
+    )
+}
+
+/// Decodes PKCS#12 DER into a client identity (leaf first). `label` names the
+/// material in the error — the `[Keystore]` item or `ca-p12` — and the error
+/// never repeats the password or the material itself (`phase 4 M2 design 5.1`).
+pub fn decode_pkcs12(
+    label: &str,
+    der: &[u8],
+    password: &str,
+) -> Result<ClientIdentity, BuildError> {
+    let store = p12_keystore::KeyStore::from_pkcs12(der, password).map_err(|e| {
         BuildError::new(format!(
-            "keystore item `{name}` cannot be decoded (wrong password or unsupported PKCS#12): {e}"
+            "{label} cannot be decoded (wrong password or unsupported PKCS#12): {e}"
         ))
     })?;
     let (_, chain) = store.private_key_chain().ok_or_else(|| {
-        BuildError::new(format!(
-            "keystore item `{name}` holds no private key with a certificate"
-        ))
+        BuildError::new(format!("{label} holds no private key with a certificate"))
     })?;
     if chain.chain().is_empty() {
-        return Err(BuildError::new(format!(
-            "keystore item `{name}` holds no certificate"
-        )));
+        return Err(BuildError::new(format!("{label} holds no certificate")));
     }
     Ok(ClientIdentity {
         chain: chain
@@ -125,6 +139,38 @@ mod tests {
             err.message,
             "keystore item `cert1`: `base64` is not valid Base64"
         );
+    }
+
+    /// The label a caller writes into the message is what names the material,
+    /// so `ca-p12` and a keystore item read alike; the passphrase is never
+    /// repeated (phase 4 M2 design 5.1).
+    #[test]
+    fn decode_pkcs12_names_its_label() {
+        let der = STANDARD.decode(OPENSSL_MODERN).unwrap();
+        let err = decode_pkcs12("`ca-p12`", &der, "hunter2-wrong")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.message.starts_with("`ca-p12` cannot be decoded"),
+            "{}",
+            err.message
+        );
+        assert!(!err.message.contains("hunter2-wrong"), "{}", err.message);
+        // the same DER with the right passphrase is the identity `decode_p12` gives
+        let identity = decode_pkcs12("`ca-p12`", &der, "rurge-test").unwrap();
+        assert_eq!(identity.chain.len(), 1);
+        assert_eq!(
+            hex(&Sha256::digest(identity.chain[0].as_ref())),
+            OPENSSL_CERT_SHA256
+        );
+    }
+
+    /// Base64 with or without its padding, and nothing else.
+    #[test]
+    fn base64_bytes_reads_with_or_without_padding() {
+        assert_eq!(base64_bytes("aGVsbG8=").as_deref(), Some(&b"hello"[..]));
+        assert_eq!(base64_bytes("aGVsbG8").as_deref(), Some(&b"hello"[..]));
+        assert!(base64_bytes("aGVsbG8=s3cret").is_none());
     }
 
     #[test]

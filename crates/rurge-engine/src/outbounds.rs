@@ -395,12 +395,18 @@ pub fn dry_build(cfg: &Config) -> Diagnostics {
     diagnostics
 }
 
-/// `rurge_config::config::load` plus the dry build: the one way `run`, a
-/// reload and — under `check_profile` — `check` and `POST /v1/profiles/check`
-/// read a profile.
+/// `rurge_config::config::load` plus the dry build and the MITM CA's checks
+/// (`phase 4 M2 design 5.3`): the one way `run`, a reload and — under
+/// `check_profile` — `check` and `POST /v1/profiles/check` read a profile.
+///
+/// Both additions read and sign on this thread: a PKCS#12's PBKDF can iterate
+/// as often as the file says, so every caller has to be a blocking one.
 pub fn load_checked(path: &Path, opts: &LoadOptions) -> Result<Loaded, LoadError> {
     let mut loaded = load(path, opts)?;
     loaded.diagnostics.extend(dry_build(&loaded.config));
+    loaded
+        .diagnostics
+        .extend(rurge_http::mitm::check(&loaded.config));
     Ok(loaded)
 }
 
@@ -856,6 +862,30 @@ TT3 = trust-tunnel, proxy.test, 443, username=u, password=pw, h3=true, skip-cert
             2
         );
         assert!(load_checked(&dir.path().join("missing.conf"), &LoadOptions::for_tests()).is_err());
+    }
+
+    /// `load_checked` is also where an unusable `[MITM]` CA is named
+    /// (`phase 4 M2 design 5.3`): one `W0039`, without the material or the
+    /// passphrase.
+    #[test]
+    fn load_checked_reports_an_unusable_mitm_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mitm.conf");
+        std::fs::write(
+            &path,
+            "[MITM]\nhostname = a.test\nca-p12 = QUJDRA\nca-passphrase = pw-7d1f\n\
+[Rule]\nFINAL,DIRECT\n",
+        )
+        .unwrap();
+        let loaded = load_checked(&path, &LoadOptions::for_tests()).unwrap();
+        let said: Vec<&str> = loaded.diagnostics.iter().map(|d| d.code).collect();
+        assert_eq!(said, [codes::W_MITM_CA_UNUSABLE], "{said:?}");
+        let message = &loaded.diagnostics.iter().next().unwrap().message;
+        assert!(message.starts_with("MITM is off: "), "{message}");
+        assert!(
+            !message.contains("QUJDRA") && !message.contains("pw-7d1f"),
+            "{message}"
+        );
     }
 
     #[test]

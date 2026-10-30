@@ -20,10 +20,19 @@ http-body-util.workspace = true
 bytes.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+rcgen = { workspace = true, features = ["x509-parser"] }
+x509-parser.workspace = true
+time.workspace = true
+lru.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+sha2.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 rurge-net = { workspace = true, features = ["testing"] }
-rustls.workspace = true
+rurge-proto = { workspace = true, features = ["testing"] }
+base64.workspace = true
 
 [lints]
 workspace = true

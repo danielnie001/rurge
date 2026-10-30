@@ -6,6 +6,9 @@
 //! headers of an exchange (`headers`) and the HTTP/1.1 service that serves
 //! them (`engine`).
 //!
+//! M2 brings `mitm`: the certificate authority of `[MITM]`, which is read,
+//! checked and reported on when a profile is loaded.
+//!
 //! The engine stays outside this crate: which policy a request takes, how
 //! its outbound connection is made and how an upgraded exchange is relayed
 //! are asked of it through `Upstreams`, so this crate never rules, never
@@ -13,6 +16,7 @@
 
 pub mod engine;
 pub mod headers;
+pub mod mitm;
 pub mod pool;
 pub mod prefix;
 pub mod sniff;

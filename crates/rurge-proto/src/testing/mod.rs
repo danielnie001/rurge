@@ -27,7 +27,7 @@ pub use shadow_tls::{
 pub use shadowsocks::{FakeShadowsocks, RecordedDatagram, RecordedShadowsocks, ShadowsocksScript};
 pub use snell::{FakeSnell, RecordedSnell, SnellScript};
 pub use socks5::{FakeSocks5, RecordedSocks5, Socks5Script};
-pub use tls::{SeenHandshake, TlsFixture};
+pub use tls::{SeenHandshake, TlsFixture, p12_base64, p12_cert_base64};
 pub use trojan::{FakeTrojan, RecordedTrojan, TrojanScript};
 pub use vmess::{FakeVmess, RecordedVmess, VmessScript};
 pub use ws::{FakeWs, RecordedWs, WsScript};

@@ -54,6 +54,8 @@ toml = "0.8"
 rurge-dns = { path = "crates/rurge-dns" }
 hickory-proto = "0.26"
 lru = "0.18"
+x509-parser = "0.18"
+time = "0.3"
 resolv-conf = "0.7"
 ipconfig = "0.3"
 if-addrs = "0.15"

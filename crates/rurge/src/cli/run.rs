@@ -484,15 +484,29 @@ fn count(diags: &rurge_config::Diagnostics, severity: rurge_config::Severity) ->
 /// Reloads the profile from disk and swaps it in (M3b design §7.4). Every
 /// failure path keeps the running config, so a bad edit never takes the
 /// daemon down.
+///
+/// Reading a profile now includes the MITM CA's checks, whose PKCS#12
+/// decoding iterates as often as the file says (`phase 4 M2 design 5.3`), so
+/// the load runs on a blocking thread (`the phase 4 / M2a plan's P12`).
 async fn reload(d: &Daemon<'_>, listeners: &mut Vec<(ListenerSpec, Running)>) -> ReloadReport {
     use rurge_config::Severity;
-    let mut loaded = match rurge_engine::load_checked(d.config, d.load_opts) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("error: reload failed, keeping current config: {e}");
-            return failed_report();
-        }
-    };
+    let config = d.config.to_path_buf();
+    let opts = d.load_opts.clone();
+    let mut loaded =
+        match tokio::task::spawn_blocking(move || rurge_engine::load_checked(&config, &opts)).await
+        {
+            Ok(Ok(l)) => l,
+            // a load that failed, and one whose blocking task panicked or was
+            // cancelled: both keep the running config
+            Ok(Err(e)) => {
+                eprintln!("error: reload failed, keeping current config: {e}");
+                return failed_report();
+            }
+            Err(e) => {
+                eprintln!("error: reload failed, keeping current config: {e}");
+                return failed_report();
+            }
+        };
     let errors = count(&loaded.diagnostics, Severity::Error);
     let warnings = count(&loaded.diagnostics, Severity::Warning);
     if errors > 0 {

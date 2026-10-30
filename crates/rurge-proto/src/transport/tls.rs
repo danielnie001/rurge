@@ -250,6 +250,41 @@ impl QuicTls {
     }
 }
 
+/// The client configuration of a decrypted connection towards an origin
+/// (`phase 4 M2 design 9.2`): the chain and the name are verified against
+/// `roots` unless `insecure` (`skip-server-cert-verify`), and `alpn` is
+/// offered. Verification reuses this module's verifier: `insecure` never
+/// looks at the chain or the name, but still proves in the handshake that
+/// the peer holds the key of the certificate it presented. The name is given
+/// per connection (`TlsConnector::connect`); an IP address sends no SNI.
+pub fn origin_client_config(
+    roots: Arc<RootCertStore>,
+    insecure: bool,
+    alpn: &[&[u8]],
+) -> Result<Arc<ClientConfig>, BuildError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mode = if insecure {
+        Mode::Insecure
+    } else {
+        let inner = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
+            .build()
+            .map_err(|e| BuildError::new(format!("cannot set up certificate verification: {e}")))?;
+        Mode::Standard {
+            inner,
+            verify_name: None,
+        }
+    };
+    let mut config = ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|e| BuildError::new(format!("cannot set up TLS: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Verifier { mode, provider }))
+        .with_no_client_auth();
+    config.enable_sni = true;
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(Arc::new(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,5 +655,81 @@ mod tests {
                 assert!(err.to_string().contains("BadSignature"), "{err}");
             }
         }
+    }
+
+    /// A trust anchor that signs nothing the fixture serves, under a subject
+    /// of its own: an empty store cannot even set up standard verification.
+    fn unrelated_roots() -> Arc<RootCertStore> {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        let key = KeyPair::generate().expect("a CA key");
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "rurge unrelated CA");
+        let ca = params.self_signed(&key).expect("a CA certificate");
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(ca.der().to_vec()))
+            .expect("a trust anchor");
+        Arc::new(roots)
+    }
+
+    /// The configuration of a decrypted connection towards an origin: the
+    /// chain and the name are verified against the roots given, unless
+    /// `insecure`, and the ALPN asked for is the one offered.
+    #[tokio::test]
+    async fn origin_client_config_verifies_unless_insecure() {
+        let origin = TlsFixture::new(&["localhost"]);
+        let addr = origin.spawn_echo(false).await;
+        let other = TlsFixture::new(&["localhost"]);
+
+        async fn talk_with(
+            config: Arc<rustls::ClientConfig>,
+            addr: SocketAddr,
+        ) -> io::Result<(BoxedStream, Option<Vec<u8>>)> {
+            let connector = TlsConnector::from(config);
+            let tcp = TcpStream::connect(addr).await?;
+            let name = ServerName::try_from("localhost").expect("a name");
+            let mut tls = connector.connect(name, tcp).await?;
+            let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+            tls.write_all(b"ping").await?;
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).await?;
+            assert_eq!(&buf, b"ping");
+            Ok((Box::new(tls), alpn))
+        }
+
+        // trusted roots: done, with the protocol offered
+        let (_, alpn) = talk_with(
+            origin_client_config(origin.roots(), false, &[b"http/1.1"]).unwrap(),
+            addr,
+        )
+        .await
+        .expect("the origin is trusted");
+        assert_eq!(alpn.as_deref(), Some(&b"http/1.1"[..]));
+
+        // a root that does not sign the leaf and carries another subject:
+        // no chain can be built, and the reason says the issuer is unknown.
+        // (`TlsFixture`'s CAs all carry the same subject, so using another
+        // fixture's roots here would report `BadSignature` instead: webpki
+        // takes that root as the issuer by its subject, then checks the
+        // signature.)
+        let err = talk_with(
+            origin_client_config(unrelated_roots(), false, &[b"http/1.1"]).unwrap(),
+            addr,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert!(err.to_string().contains("UnknownIssuer"), "{err}");
+
+        // `skip-server-cert-verify`: the chain is not looked at at all
+        talk_with(
+            origin_client_config(other.roots(), true, &[b"http/1.1"]).unwrap(),
+            addr,
+        )
+        .await
+        .expect("insecure verification reaches an untrusted origin");
     }
 }

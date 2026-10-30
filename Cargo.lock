@@ -3350,19 +3350,27 @@ dependencies = [
 name = "rurge-http"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "lru",
+ "rcgen",
+ "ring",
  "rurge-config",
  "rurge-inbound",
  "rurge-net",
  "rurge-proto",
  "rustls",
+ "sha2 0.10.9",
+ "time",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
