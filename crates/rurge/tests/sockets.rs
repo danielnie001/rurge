@@ -59,7 +59,7 @@ const LISTED: [(&str, &str, &str); 25] = [
     (
         "crates/rurge-api/src/lib.rs",
         "TcpListener::bind(",
-        "`serve`: the HTTP API's listener, which does not go out",
+        "`serve` and `serve_tls`: the HTTP API's listener, which does not go out",
     ),
     (
         "crates/rurge-engine/src/outbounds.rs",

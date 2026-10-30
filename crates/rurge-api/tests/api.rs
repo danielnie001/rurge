@@ -6,7 +6,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use rurge_api::{ApiContext, BAN_FAILURES, ServerFuture, serve};
+use rurge_api::{ApiContext, BAN_FAILURES, ServerFuture, serve, serve_tls};
 use rurge_config::config::{LoadOptions, from_text};
 use rurge_config::session::ListenerKind;
 use rurge_config::{RemoteRef, RemoteRole, SourceInfo};
@@ -25,14 +25,16 @@ use rurge_net::testing::{TestServer, seed_cache};
 use rurge_proto::testing::TlsFixture;
 use rurge_rules::geoip::{ASN_FILE, COUNTRY_FILE};
 use rurge_rules::{DbKind, GeoDb, GeoUrls, OutboundMode};
+use rustls::pki_types::ServerName;
 use serde_json::{Value, json};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
 const KEY: &str = "s3cret";
@@ -149,6 +151,26 @@ impl Api {
         .await
         .unwrap();
         (addr, server, token)
+    }
+
+    /// A second API server over the same engine, over TLS this time, spawned
+    /// and not handed back: it ends with the token that ends everything here.
+    async fn serve_tls_apart(&self) -> SocketAddr {
+        let (addr, server) = serve_tls(
+            "127.0.0.1:0".parse().unwrap(),
+            KEY.to_string(),
+            ApiContext {
+                engine: self.engine.clone(),
+                control: self.control.clone(),
+                load_options: load_options(),
+                sources: None,
+            },
+            self.token.clone(),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(server);
+        addr
     }
 
     fn http(&self) -> SocketAddr {
@@ -388,6 +410,85 @@ async fn call_download(
     let disposition = header("content-disposition");
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     (status, content_type, disposition, bytes)
+}
+
+/// A `GET` over the API's own TLS, and what the connection it went over says:
+/// the status, the body, the certificate the server presented (DER) and the
+/// protocol that was negotiated. The whole exchange — the connection, the
+/// handshake and the answer — is bounded, as every TLS step of these cases is
+/// (phase 4 M2 design 17).
+async fn https_get(
+    addr: SocketAddr,
+    ca_der: &[u8],
+    name: ServerName<'static>,
+    path: &str,
+    key: Option<&str>,
+) -> (u16, Vec<u8>, Vec<u8>, Option<Vec<u8>>) {
+    let exchange = async {
+        let tcp = TcpStream::connect(addr).await.expect("the API's port");
+        let config = rurge_http::mitm::api::client_config(ca_der).expect("a client configuration");
+        let tls = TlsConnector::from(config)
+            .connect(name, tcp)
+            .await
+            .expect("the API's certificate is trusted");
+        let leaf = tls.get_ref().1.peer_certificates().expect("a certificate")[0]
+            .as_ref()
+            .to_vec();
+        let alpn = tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
+                .await
+                .expect("an HTTP/1.1 connection");
+        tokio::spawn(connection);
+        // origin form and an explicit `Host`: the request line names the path
+        // alone, as hyper's `client::conn` writes it
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("host", addr.to_string());
+        if let Some(key) = key {
+            request = request.header("x-key", key);
+        }
+        let response = sender
+            .send_request(request.body(Full::new(Bytes::new())).unwrap())
+            .await
+            .expect("an answer");
+        let status = response.status().as_u16();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("the body")
+            .to_bytes()
+            .to_vec();
+        (status, body, leaf, alpn)
+    };
+    tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("the exchange finishes within the bound")
+}
+
+/// A plain HTTP/1.1 `GET` sent to `addr`, in one write for the head and the
+/// body together (`CLAUDE.md`), and everything that came back until the server
+/// closed or the bound was up.
+async fn plain_get(addr: SocketAddr, path: &str) -> Vec<u8> {
+    let mut tcp = TcpStream::connect(addr).await.expect("the API's port");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    tcp.write_all(request.as_bytes())
+        .await
+        .expect("the request");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match tcp.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await;
+    got
 }
 
 async fn call(
@@ -736,6 +837,113 @@ async fn the_mitm_ca_is_a_404_without_a_usable_ca() {
     assert_eq!(
         get(&api, "/v1/mitm/ca").await,
         (404, json!({ "error": "no usable MITM CA" }))
+    );
+}
+
+/// The API of `http-api-tls` is served over TLS with the MITM CA's
+/// certificates (phase 4 M2 design 14.1): the answers are the same as over
+/// plain HTTP, the certificate names the address the client connected to when
+/// it asked for no name, and the same port never answers plain HTTP.
+#[tokio::test]
+async fn the_api_is_served_over_tls_with_the_mitm_ca() {
+    let ca = TlsFixture::new(&[]);
+    let api = api_with_extra(
+        "",
+        &format!(
+            "[MITM]\nca-p12 = {}\nca-passphrase = pw\n",
+            ca.ca_p12_base64("pw")
+        ),
+    )
+    .await;
+    let addr = api.serve_tls_apart().await;
+    // rustls sends no SNI for an address, and the API names the address the
+    // client connected to
+    let name = ServerName::IpAddress(IpAddr::from(Ipv4Addr::LOCALHOST).into());
+    let (status, body, leaf, alpn) =
+        https_get(addr, ca.ca_der(), name.clone(), "/v1/outbound", Some(KEY)).await;
+    assert_eq!(status, 200);
+    let answer: Value = serde_json::from_slice(&body).expect("JSON");
+    assert!(
+        answer.get("mode").is_some(),
+        "the answer of `GET /v1/outbound`: {answer}"
+    );
+    assert_eq!(
+        alpn.as_deref(),
+        Some(&b"http/1.1"[..]),
+        "the API speaks HTTP/1.1"
+    );
+    let (_, cert) = x509_parser::parse_x509_certificate(&leaf).expect("a certificate");
+    let san = cert
+        .subject_alternative_name()
+        .expect("the extensions parse")
+        .expect("a subject alternative name");
+    let names: Vec<String> = san
+        .value
+        .general_names
+        .iter()
+        .map(|name| match name {
+            x509_parser::extensions::GeneralName::IPAddress(raw) => {
+                let bytes = <[u8; 4]>::try_from(*raw).expect("an IPv4 address");
+                IpAddr::V4(bytes.into()).to_string()
+            }
+            other => panic!("a name of another kind: {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, ["127.0.0.1"], "the leaf names the local address");
+    let (_, ca_cert) = x509_parser::parse_x509_certificate(ca.ca_der()).expect("a certificate");
+    assert_eq!(
+        cert.issuer(),
+        ca_cert.subject(),
+        "the certificate is signed by the test CA"
+    );
+
+    // the CA over TLS is the CA of the profile, byte for byte
+    let (status, body, _, _) = https_get(addr, ca.ca_der(), name, "/v1/mitm/ca", Some(KEY)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, ca.ca_der(), "the CA's DER, byte for byte");
+
+    // the same port plain: a TLS record is what a client that does not speak
+    // TLS is given, and an answer to the plain request is not
+    let plain = plain_get(addr, "/v1/outbound").await;
+    assert!(
+        !plain.starts_with(b"HTTP/"),
+        "the API answered plain HTTP although http-api-tls is on: {:?}",
+        String::from_utf8_lossy(&plain)
+    );
+}
+
+/// `serve_tls` binds even when the engine has no MITM CA, and then answers
+/// nothing: every handshake fails, and there is no plain HTTP to fall back to
+/// (phase 4 M2 design 14.1).
+#[tokio::test]
+async fn serve_tls_without_a_ca_answers_nothing() {
+    let api = api().await;
+    assert!(
+        api.engine.api_tls().is_none(),
+        "this profile names no MITM CA"
+    );
+    let addr = api.serve_tls_apart().await;
+    let ca = TlsFixture::new(&[]);
+    let tcp = TcpStream::connect(addr).await.expect("the API's port");
+    let config = rurge_http::mitm::api::client_config(ca.ca_der()).expect("a client configuration");
+    let handshake = tokio::time::timeout(
+        Duration::from_secs(5),
+        TlsConnector::from(config).connect(
+            ServerName::IpAddress(IpAddr::from(Ipv4Addr::LOCALHOST).into()),
+            tcp,
+        ),
+    )
+    .await
+    .expect("the handshake ends within the bound");
+    assert!(
+        handshake.is_err(),
+        "the client was given a certificate with no CA behind it"
+    );
+    let plain = plain_get(addr, "/v1/outbound").await;
+    assert!(
+        !plain.starts_with(b"HTTP/"),
+        "the API answered plain HTTP although http-api-tls is on: {:?}",
+        String::from_utf8_lossy(&plain)
     );
 }
 

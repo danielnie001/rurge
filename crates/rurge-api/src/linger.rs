@@ -183,6 +183,16 @@ impl Closing {
                 .expect("the stream is only taken when the connection is dropped"),
         )
     }
+
+    /// The address this connection was accepted on, as long as the connection
+    /// is still the server's: once it has been handed to the task that lingers
+    /// on it, there is none to be had here.
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        match self.stream.as_ref() {
+            Some(stream) => stream.local_addr(),
+            None => Err(io::ErrorKind::NotConnected.into()),
+        }
+    }
 }
 
 impl AsyncRead for Closing {

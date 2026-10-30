@@ -5,6 +5,7 @@ mod auth;
 mod error;
 mod linger;
 mod routes;
+mod tls;
 
 use axum::Router;
 use axum::middleware;
@@ -19,7 +20,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tls::{TlsListener, TlsSource};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub use auth::{BAN_DURATION, BAN_FAILURES, BAN_WINDOW};
 
@@ -51,9 +55,11 @@ pub(crate) type App = Arc<Shared>;
 pub type ServerFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// The API's routes, guarded by the `X-Key` layer. They are served the way
-/// [`serve`] does, with `into_make_service_with_connect_info::<Peer>()` over a
-/// [`Lingering`] listener: the auth layer needs the peer address to count
-/// failures and ban a source, and gets it from that and nothing else.
+/// [`serve`] and [`serve_tls`] do, with
+/// `into_make_service_with_connect_info::<Peer>()` over a [`Lingering`]
+/// listener, or over the TLS listener that wraps one: the auth layer needs the
+/// peer address to count failures and ban a source, and gets it from that and
+/// nothing else.
 pub(crate) fn router(key: String, ctx: ApiContext) -> Router {
     let app: App = Arc::new(Shared {
         engine: ctx.engine,
@@ -125,6 +131,35 @@ pub(crate) fn router(key: String, ctx: ApiContext) -> Router {
         .with_state(app)
 }
 
+/// Binds `addr` for the API and says what is bound: the port a `:0` asked for,
+/// and a warning when the address is not a loopback one. [`serve`] and
+/// [`serve_tls`] both bind here, so that the API binds in one place.
+async fn bind(addr: SocketAddr) -> io::Result<(TcpListener, SocketAddr)> {
+    let listener = TcpListener::bind(addr).await?;
+    let local = listener.local_addr()?;
+    if !local.ip().is_loopback() {
+        tracing::warn!(
+            %local,
+            "http-api listens on a non-loopback address: anyone who reaches it with the key controls this rurge"
+        );
+    }
+    Ok((listener, local))
+}
+
+/// What the two servers do once `axum::serve` is done: report an error, and
+/// wait for the connections that linger, so that a client does not lose the
+/// answer to `POST /v1/stop` to the process ending, for `LINGER_TIME` at the
+/// most.
+async fn stopped(result: io::Result<()>, connections: TaskTracker) {
+    if let Err(e) = result {
+        tracing::error!(error = %e, "http-api server stopped with an error");
+    }
+    // The server is done with its connections, or about to drop the last of
+    // them. The ones that linger are waited for.
+    connections.close();
+    connections.wait().await;
+}
+
 /// Binds `addr` and returns the bound address plus the server future. The
 /// caller spawns the future (the daemon puts it on the engine's task tracker);
 /// it completes after `shutdown` is cancelled, in-flight responses finish, and
@@ -136,14 +171,7 @@ pub async fn serve(
     ctx: ApiContext,
     shutdown: CancellationToken,
 ) -> io::Result<(SocketAddr, ServerFuture)> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let local = listener.local_addr()?;
-    if !local.ip().is_loopback() {
-        tracing::warn!(
-            %local,
-            "http-api listens on a non-loopback address: anyone who reaches it with the key controls this rurge"
-        );
-    }
+    let (listener, local) = bind(addr).await?;
     let app = router(key, ctx);
     let listener = Lingering::new(listener);
     let connections = listener.connections();
@@ -151,15 +179,35 @@ pub async fn serve(
         let result = axum::serve(listener, app.into_make_service_with_connect_info::<Peer>())
             .with_graceful_shutdown(async move { shutdown.cancelled().await })
             .await;
-        if let Err(e) = result {
-            tracing::error!(error = %e, "http-api server stopped with an error");
-        }
-        // The server is done with its connections, or about to drop the last
-        // of them. The ones that linger are waited for, so that a client does
-        // not lose the answer to `POST /v1/stop` to the process ending, for
-        // `LINGER_TIME` at the most.
-        connections.close();
-        connections.wait().await;
+        stopped(result, connections).await;
+    };
+    Ok((local, Box::pin(fut)))
+}
+
+/// `serve`, with TLS around every connection (`http-api-tls`, phase 4 M2
+/// design 14.1). The caller has checked `Engine::api_tls` first: without a
+/// CA every connection fails its handshake, and there is no plain HTTP.
+pub async fn serve_tls(
+    addr: SocketAddr,
+    key: String,
+    ctx: ApiContext,
+    shutdown: CancellationToken,
+) -> io::Result<(SocketAddr, ServerFuture)> {
+    let (listener, local) = bind(addr).await?;
+    // asked once for each connection, so that the connections after a reload
+    // that brought another CA are signed with that one (the phase 4 / M2c
+    // plan's P9)
+    let engine = Arc::clone(&ctx.engine);
+    let source: TlsSource = Arc::new(move || engine.api_tls());
+    let app = router(key, ctx);
+    let listener = Lingering::new(listener);
+    let connections = listener.connections();
+    let listener = TlsListener::new(listener, source, shutdown.clone());
+    let fut = async move {
+        let result = axum::serve(listener, app.into_make_service_with_connect_info::<Peer>())
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .await;
+        stopped(result, connections).await;
     };
     Ok((local, Box::pin(fut)))
 }
