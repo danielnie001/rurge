@@ -9,17 +9,21 @@
 
 use crate::FAKE_ADDRESS_NOT_KNOWN;
 use crate::control::Mode;
-use crate::engine::{Engine, policy_known};
+use crate::engine::{Engine, HANDSHAKE_TIMEOUT, policy_known};
 use crate::fake_address::Turned;
 use rurge_config::HostName;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
-use rurge_dns::fakeip::in_space;
-use rurge_http::{Prefixed, Sniffed};
-use rurge_inbound::{DialError, Dialer, ServeOpts, SessionHandle, SessionOutcome, hold_dropped};
+use rurge_dns::fakeip::{Lease, in_space};
+use rurge_http::mitm::{HandshakeFailure, Mitm, OriginTls, source_of};
+use rurge_http::{ClientHello, Prefixed, Sniffed};
+use rurge_inbound::{
+    DialError, Dialer, ProcessSlot, ServeOpts, SessionHandle, SessionOutcome, hold_dropped,
+};
 use rurge_net::connector::BoxedStream;
 use rurge_proto::RejectKind;
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -83,6 +87,21 @@ pub struct HttpCounts {
     pub requests: u64,
 }
 
+/// The parts of one client connection that `serve_http` and `serve_mitm` set
+/// up the same way, before its requests are served: the connection's token and
+/// its carrier handle, the process behind it, the lease a fake address was
+/// turned back with, and the session itself, whose name and SNI are what its
+/// requests are routed by.
+struct Carried {
+    engine: Arc<Engine>,
+    session: SessionInfo,
+    token: CancellationToken,
+    process: ProcessSlot,
+    lease: Option<Lease>,
+    carrier: Arc<SessionHandle>,
+    opts: ServeOpts,
+}
+
 impl Engine {
     /// Whether `session` is to be answered "connected" first and dialed only
     /// after its first bytes were read (design 4.1).
@@ -135,10 +154,12 @@ impl Engine {
             return false;
         }
         // design 4.1 (5): the two ports of the design, and whatever
-        // `force-http-engine-hosts` adds (whose default port is 80)
+        // `force-http-engine-hosts` adds (whose default port is 80) — and a
+        // port `[MITM]` widens sniffing to (`phase 4 M2 design 7.6`)
         if port != 80
             && port != 443
             && general.force_http_engine_hosts.matches(host, port) != Some(true)
+            && !self.widened_by_mitm(session, runtime.mitm.as_deref())
         {
             return false;
         }
@@ -193,6 +214,114 @@ impl Engine {
             == Some(true)
     }
 
+    /// The name the session is about (`phase 4 M2 design 7.6`): the name behind
+    /// an address of rurge's space, at whatever entry, or else the target as it
+    /// came in. `None` when the address is rurge's and no name stands behind
+    /// it — such a session is dialed as it is, and the dial fails as
+    /// `turn_back` says. Only asked, never leased: the dial leases.
+    fn named_target(&self, session: &SessionInfo) -> Option<HostName> {
+        match &session.dst_host {
+            HostName::Ip(ip) if in_space(*ip) => match self.fake_pool.load_full() {
+                // no TUN runs: the address is an address like any other
+                None => Some(session.dst_host.clone()),
+                Some(pool) => pool.name_of(ip.to_canonical()).map(HostName::Domain),
+            },
+            host => Some(host.clone()),
+        }
+    }
+
+    /// Whether `[MITM]` widens sniffing to this session (`phase 4 M2 design
+    /// 7.6`, `M2-D9`): the switch is on, this generation has a usable CA, and
+    /// the source and the list allow the session. The list allows it when the
+    /// port is one a non-negated entry writes down, or when the target is
+    /// listed.
+    fn widened_by_mitm(&self, session: &SessionInfo, mitm: Option<&Mitm>) -> bool {
+        if !self.mitm_on() {
+            return false;
+        }
+        let Some(mitm) = mitm else {
+            return false;
+        };
+        let Some(target) = self.named_target(session) else {
+            return false;
+        };
+        mitm.widens(
+            source_of(session.listener, session.src),
+            &target,
+            session.dst_port,
+        )
+    }
+
+    /// What a sniffed TLS session is decrypted with (`phase 4 M2 design 7.1`,
+    /// in the order of the phase 4 / M2a plan's P18): the switch, the
+    /// session's name, and this generation's CA, list and ALPN. `None` passes
+    /// the session through as `M1` does.
+    ///
+    /// The two lines of DEBUG say why a session the list covers was not
+    /// decrypted: a generation without a usable CA, and a client that offers
+    /// no protocol rurge decrypts. Every other session passed through is the
+    /// usual state of TLS.
+    fn decrypting(
+        &self,
+        session: &SessionInfo,
+        hello: &ClientHello,
+    ) -> Option<(Arc<Mitm>, HostName)> {
+        if !self.mitm_on() {
+            return None;
+        }
+        let target = self.named_target(session)?;
+        let sni = hello
+            .sni
+            .as_deref()
+            .map(|name| HostName::parse(name).canonical());
+        // the name the truth is told about, and the one a leaf is issued for:
+        // the SNI, or the target when there is none (`phase 4 M2 design 7.3`)
+        let name = sni.clone().unwrap_or_else(|| target.clone());
+        let runtime = self.runtime();
+        let Some(mitm) = runtime.mitm.clone() else {
+            let listed = match &sni {
+                Some(sni) => runtime
+                    .config
+                    .mitm
+                    .effective
+                    .matches_sni(sni, session.dst_port),
+                None => runtime
+                    .config
+                    .mitm
+                    .effective
+                    .matches(&target, session.dst_port),
+            };
+            if listed == Some(true) {
+                tracing::debug!(
+                    "{name} is listed for MITM but this generation has no usable CA; passing it through"
+                );
+            }
+            return None;
+        };
+        match mitm.decides(
+            source_of(session.listener, session.src),
+            sni.as_ref(),
+            &target,
+            session.dst_port,
+            &hello.alpn,
+        ) {
+            rurge_http::mitm::Decision::Decrypt => Some((mitm, name)),
+            rurge_http::mitm::Decision::AlpnMismatch => {
+                let alpn: Vec<String> = hello
+                    .alpn
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect();
+                tracing::debug!(
+                    "{name} is listed for MITM but the client offers no protocol rurge decrypts ({}); passing it through",
+                    alpn.join(", ")
+                );
+                None
+            }
+            rurge_http::mitm::Decision::Pass => None,
+        }
+    }
+
     /// Serves a connection the engine judges HTTP (`P9`, `P10`): a sniffed one
     /// whose first bytes are a request, or one `force-http-engine-hosts` keeps
     /// in the engine whatever it sent. Every request is routed and dialed on
@@ -233,11 +362,133 @@ impl Engine {
         // connection, as `dial` does for a session of its own
         self.quic_adaptive()
             .on_tcp(&session.dst_host.to_string(), Instant::now());
+        self.serve_requests(
+            Carried {
+                engine,
+                session,
+                token,
+                process,
+                lease,
+                carrier,
+                opts,
+            },
+            Box::new(client),
+            None,
+        )
+        .await;
+    }
+
+    /// Serves a sniffed TLS session rurge decrypts (`phase 4 M2 design 7.1`,
+    /// `8.2`): the handshake with the client is raced with the stop, and only
+    /// once it is done is there a connection to record anything about.
+    ///
+    /// A handshake a stop interrupts leaves nothing behind: no record, no
+    /// count, no line — the client's bytes are dropped with the task, as a
+    /// sniff a stop interrupts is.
+    async fn serve_mitm(
+        &self,
+        mut session: SessionInfo,
+        client: Prefixed<BoxedStream>,
+        mitm: Arc<Mitm>,
+        name: HostName,
+        opts: ServeOpts,
+    ) {
+        let Some(engine) = self.self_arc() else {
+            return;
+        };
+        let turned = self.turn_back(&mut session);
+        let process = self.look_up_owner(&session);
+        // the connection's token, as `serve_http` makes it: the requests'
+        // tokens are its children
+        let token = self.session_token();
+        let carrier = SessionHandle::new_with_slot(
+            self.next_id(),
+            session.clone(),
+            token.clone(),
+            process.clone(),
+        );
+        let lease = match turned {
+            Turned::Unchanged => None,
+            Turned::Name(lease) => Some(lease),
+            Turned::Unknown => {
+                self.attach_observers(&carrier);
+                carrier.finish(SessionOutcome::Failed(FAKE_ADDRESS_NOT_KNOWN.to_string()));
+                return;
+            }
+        };
+        // the client's TCP session to this host, as `serve_http` tells it
+        self.quic_adaptive()
+            .on_tcp(&session.dst_host.to_string(), Instant::now());
+        // Nothing is held yet: the handshake holds no handle and no record, so
+        // a stop ends it at once (`phase 4 M2 design 8.2`).
+        let accepted = tokio::select! {
+            biased;
+            _ = token.cancelled() => return,
+            _ = stopped(opts.stop.as_ref()) => return,
+            accepted = mitm.accept(client, &name, HANDSHAKE_TIMEOUT) => accepted,
+        };
+        let accepted = match accepted {
+            Ok(accepted) => accepted,
+            Err(failure) => {
+                // the connection's own record, as a connection whose requests
+                // never reached the rules gets one (`phase 4 M2 design 8.2`,
+                // the plan's P21). The log lines, the counts and the rate
+                // limit are the next task's.
+                let reason = match failure {
+                    HandshakeFailure::Untrusted { alert } => format!(
+                        "the client does not trust the certificate rurge issued (alert {alert})"
+                    ),
+                    HandshakeFailure::Failed { reason } => {
+                        format!("TLS handshake with the client failed: {reason}")
+                    }
+                };
+                self.attach_observers(&carrier);
+                carrier.finish(SessionOutcome::Failed(reason));
+                return;
+            }
+        };
+        self.serve_requests(
+            Carried {
+                engine,
+                session,
+                token,
+                process,
+                lease,
+                carrier,
+                opts,
+            },
+            accepted.stream,
+            Some(accepted.origin),
+        )
+        .await;
+    }
+
+    /// The requests of one client connection (`phase 4 M1 design 10.2`), which
+    /// `serve_http` and `serve_mitm` set up alike: every request is routed and
+    /// dialed on its own (`ConnUpstreams`), and the connection itself gets a
+    /// record only when none of them reached the rules. A decrypted connection
+    /// (`origin` is `Some`, `phase 4 M2 design 9`) is the same in everything
+    /// but the TLS to the origin and the URL each request is named by.
+    async fn serve_requests(
+        &self,
+        carried: Carried,
+        client: BoxedStream,
+        origin: Option<OriginTls>,
+    ) {
+        let Carried {
+            engine,
+            session,
+            token,
+            process,
+            lease,
+            carrier,
+            opts,
+        } = carried;
         let runtime = self.runtime();
         let conn = rurge_http::Conn {
             session,
             entry: rurge_http::Entry::Sniffed,
-            origin: None,
+            origin,
             idle: runtime.idle_timeout,
             head_wait: runtime.idle_timeout,
             drop_hold: opts.drop_hold,
@@ -256,7 +507,7 @@ impl Engine {
             false,
         );
         let mut serving = std::pin::pin!(rurge_http::serve_connection(
-            Box::new(client),
+            client,
             rurge_http::Requests::new(conn, upstreams),
         ));
         // A stop cancels the connection's token and then waits for the same
@@ -274,7 +525,8 @@ impl Engine {
         };
         if served.routed == 0 {
             // nothing of the connection reached the rules: it gets a record of
-            // its own, and the reason hyper had for ending it
+            // its own, and the reason hyper had for ending it (the next task
+            // adds the hint of certificate pinning to these)
             self.attach_observers(&carrier);
             carrier.finish(SessionOutcome::Failed(
                 served.error.unwrap_or_else(|| "no request".to_string()),
@@ -317,8 +569,16 @@ impl Engine {
             Sniffed::Tls(hello) => {
                 // the ClientHello's SNI is lowercase already, or absent when it
                 // was not ASCII
-                session.sni = hello.sni;
+                session.sni = hello.sni.clone();
                 session.protocol = Some(ProtocolKind::Https);
+                // what a sniffed TLS session is decrypted with is judged on
+                // the generation and the switch of this moment (`phase 4 M2
+                // design 7.1`); a session that is not decrypted carries on as
+                // `M1` passes it through
+                if let Some((mitm, name)) = self.decrypting(&session, &hello) {
+                    self.serve_mitm(session, client, mitm, name, opts).await;
+                    return;
+                }
             }
             Sniffed::Http => {
                 session.protocol = Some(ProtocolKind::Http);

@@ -8,7 +8,7 @@ use crate::observe::{RequestLog, TrafficStats};
 use crate::owner::{EXTERNAL, LOOKUPS, NOT_IN_TIME, SLOW, SlotProcess, query_for};
 use crate::runtime::Runtime;
 use crate::shared::EngineShared;
-use crate::state::StateStore;
+use crate::state::{Features, StateStore};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rurge_config::Builtin;
 use rurge_config::HostName;
@@ -194,6 +194,11 @@ pub struct Engine {
     suspended: ArcSwap<Option<String>>,
     /// "proxy mode but no usable global policy" is warned once per change.
     global_warned: AtomicBool,
+    /// Whether rurge decrypts what `[MITM]` lists (`phase 4 M2 design 11.1`):
+    /// on unless `state.json` says otherwise (the general design's P4-D19).
+    /// Unlike the mode it is not part of a generation: it takes effect for the
+    /// next session and does not end the decrypted connections that are open.
+    mitm_on: AtomicBool,
     /// The pool of fake addresses of the TUN that runs, if one does (phase 3
     /// M3 design 13): the proxy listeners turn the fake addresses that come in
     /// at them back into names with it (`turn_back`). Set by `start_tun` and
@@ -254,6 +259,12 @@ impl Engine {
                 .expect("a generation is published once"),
         );
         shared.resolver.store(runtime.stack.resolver.clone());
+        // The first generation is put in use here, without
+        // `publish_generation`: what it decrypts with is remembered just the
+        // same (the phase 4 / M2a plan's P17).
+        if let Some(mitm) = &runtime.mitm {
+            shared.mitm.remember(mitm.authority());
+        }
         let receivers = runtime.subscriptions.take_receivers();
         let engine = Arc::new_cyclic(|me| Engine {
             runtime: ArcSwap::from_pointee(runtime),
@@ -267,6 +278,7 @@ impl Engine {
             global_policy: ArcSwap::from_pointee(global),
             suspended: ArcSwap::from_pointee(None),
             global_warned: AtomicBool::new(false),
+            mitm_on: AtomicBool::new(true),
             fake_pool: ArcSwapOption::empty(),
             sniff_counts: crate::serve::SniffCounts::default(),
             request_count: AtomicU64::new(0),
@@ -652,6 +664,11 @@ impl Engine {
             .smart
             .retain(|name| registry.contains(name));
         self.shared.auto.retain(&next.config.group_specs);
+        // remembered before the first store as well: it takes a lock with
+        // `expect`, and nothing that is known to fail comes after the stores
+        if let Some(mitm) = &next.mitm {
+            self.shared.mitm.remember(mitm.authority());
+        }
         self.shared.cell.store(registry);
         self.shared.resolver.store(next.stack.resolver.clone());
     }
@@ -712,6 +729,44 @@ impl Engine {
 
     pub fn global_policy(&self) -> Option<String> {
         (**self.global_policy.load()).clone()
+    }
+
+    /// Whether rurge decrypts the sessions `[MITM]` lists (`phase 4 M2 design
+    /// 11.1`). On unless `state.json` said otherwise at start.
+    pub fn mitm_on(&self) -> bool {
+        self.mitm_on.load(Ordering::Relaxed)
+    }
+
+    /// Sets the `mitm` switch, and keeps it in `state.json` when one is
+    /// attached (the plan's P20: the shape of `set_mode`). A decrypted
+    /// connection that is open goes on; the next TLS session judged is the
+    /// first this reaches.
+    pub async fn set_mitm(&self, on: bool) {
+        self.mitm_on.store(on, Ordering::Relaxed);
+        if let Some(store) = self.state.get() {
+            store.update(|s| s.features.mitm = Some(on)).await;
+        }
+    }
+
+    /// The switches `state.json` recorded at start (the plan's P20): only what
+    /// was set is taken, and nothing is written — a start does not write the
+    /// file, so a file of the first version stays as it is until something is
+    /// switched.
+    pub fn restore_switches(&self, features: &Features) {
+        if let Some(on) = features.mitm {
+            self.mitm_on.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// The DER of the CA this generation signs with (`phase 4 M2 design
+    /// 12.2`): what `GET /v1/mitm/ca` serves. `None` when this generation
+    /// has no usable CA.
+    pub fn mitm_ca_der(&self) -> Option<Vec<u8>> {
+        let runtime = self.runtime();
+        runtime
+            .mitm
+            .as_ref()
+            .map(|mitm| mitm.authority().ca_der().to_vec())
     }
 
     /// Refuses the sessions that begin from now on (`Some(why)`), or ends the

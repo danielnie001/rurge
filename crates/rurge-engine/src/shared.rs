@@ -1,5 +1,6 @@
 //! What outlives a config generation (M1 design 6.2, 6.3; M2 design 7.2).
 
+use crate::mitm::MitmShared;
 use crate::owner::OwnerLookup;
 use arc_swap::ArcSwapOption;
 use rurge_config::{NetworkCell, NetworkFacts};
@@ -206,6 +207,10 @@ pub struct EngineShared {
     /// How long a sniffable session's first bytes are waited for (phase 4 M1
     /// design 6.3): `rurge_http::sniff::SNIFF_WAIT`. Only tests shorten it.
     pub sniff_wait: Duration,
+    /// The last `Authority` a published generation had (phase 4 M2 design
+    /// 5.4): a generation built with the same material takes it on, so that
+    /// the leaves and the TLS sessions it cached go on being used.
+    pub mitm: Arc<MitmShared>,
 }
 
 impl EngineShared {
@@ -222,6 +227,7 @@ impl EngineShared {
             network: Arc::new(NetworkCell::new(NetworkFacts::default())),
             owners: None,
             sniff_wait: rurge_http::sniff::SNIFF_WAIT,
+            mitm: Arc::new(MitmShared::new()),
         }
     }
 }

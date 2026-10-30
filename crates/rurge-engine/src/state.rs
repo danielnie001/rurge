@@ -10,17 +10,26 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const STATE_FILE: &str = "state.json";
-pub const STATE_VERSION: u32 = 1;
+/// The second version made the four switches of `[MITM]` and of the later
+/// stages three-state: never set, on, off (`phase 4 M2 design 11.2`).
+pub const STATE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Features {
     pub system_proxy: bool,
     pub enhanced_mode: bool,
-    pub mitm: bool,
-    pub capture: bool,
-    pub rewrite: bool,
-    pub scripting: bool,
+    /// Never set, on, or off: an absent key is a switch the user never
+    /// touched, and a first-version file's `false` is not a choice either
+    /// (`read_state` drops it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mitm: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scripting: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -141,7 +150,20 @@ impl StateStore {
 fn read_state(path: &Path) -> State {
     match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<State>(&text) {
-            Ok(state) => state,
+            Ok(mut state) => {
+                // A first-version file wrote the four switches as booleans,
+                // and the code that wrote them could never switch one on:
+                // none of them is a choice of the user's (`phase 4 M2 design
+                // 11.2`). The next write puts the second version on disk.
+                if state.version < STATE_VERSION {
+                    state.features.mitm = None;
+                    state.features.capture = None;
+                    state.features.rewrite = None;
+                    state.features.scripting = None;
+                    state.version = STATE_VERSION;
+                }
+                state
+            }
             Err(e) => {
                 let broken = path.with_extension("json.broken");
                 tracing::warn!(path = %path.display(), error = %e, kept = %broken.display(), "state.json is malformed; using defaults");
@@ -183,7 +205,11 @@ mod tests {
         .unwrap();
         let (_, state) = StateStore::open(path).await;
         assert_eq!(state.outbound_mode.as_deref(), Some("direct"));
-        assert!(state.features.mitm && !state.features.capture);
+        // the four switches of the first version were never a choice of the
+        // user's: they are read as never set (the plan's P15, P19)
+        assert_eq!(state.features.mitm, None);
+        assert_eq!(state.features.capture, None);
+        assert_eq!(state.version, STATE_VERSION);
         assert_eq!(state.selections_for("surge.conf").get("Pick"), Some("HK"));
         assert!(state.selections_for("other.conf").is_empty());
         assert_eq!(
@@ -193,6 +219,90 @@ mod tests {
         assert_eq!(profile_key(&Path::new("p").join("my.conf")), "my.conf");
         let round = serde_json::to_string(&state).unwrap();
         assert_eq!(serde_json::from_str::<State>(&round).unwrap(), state);
+    }
+
+    /// A file of the first version named the four switches; the code that
+    /// wrote them could not switch any of them on, so whatever it wrote is no
+    /// choice of the user's (phase 4 M2 design 11.2): all four read as never
+    /// set, and the file counts as a second-version one from now on.
+    #[tokio::test]
+    async fn a_version_1_file_leaves_the_four_switches_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        std::fs::write(
+            &path,
+            r#"{"version":1,"features":{"mitm":false,"capture":true}}"#,
+        )
+        .unwrap();
+        let (_, state) = StateStore::open(path).await;
+        assert_eq!(state.version, 2);
+        assert_eq!(state.features.mitm, None);
+        assert_eq!(state.features.capture, None);
+        assert_eq!(state.features.rewrite, None);
+        assert_eq!(state.features.scripting, None);
+    }
+
+    /// Only the switches somebody set are written: the rest of the file is
+    /// what the first version knew, and an older `rurge` reads it (phase 4 M2
+    /// design 11.2).
+    #[tokio::test]
+    async fn only_the_switches_that_were_set_are_written() {
+        let state = State {
+            features: Features {
+                mitm: Some(false),
+                ..Features::default()
+            },
+            ..State::default()
+        };
+        let text = serde_json::to_string(&state).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["version"], serde_json::json!(2));
+        assert_eq!(
+            json["features"],
+            serde_json::json!({"system_proxy": false, "enhanced_mode": false, "mitm": false})
+        );
+    }
+
+    /// What the phase 3 code read: booleans, every key defaulted. It reads a
+    /// second-version file without calling it broken, and takes the switch
+    /// that was written.
+    #[tokio::test]
+    async fn a_version_2_file_is_what_phase_3_reads() {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct OldFeatures {
+            system_proxy: bool,
+            enhanced_mode: bool,
+            mitm: bool,
+            capture: bool,
+            rewrite: bool,
+            scripting: bool,
+        }
+
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct OldState {
+            version: u32,
+            outbound_mode: Option<String>,
+            features: OldFeatures,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let (store, _) = StateStore::open(path.clone()).await;
+        store
+            .update(|s| {
+                s.outbound_mode = Some("direct".into());
+                s.features.mitm = Some(true);
+            })
+            .await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let old: OldState = serde_json::from_str(&text).expect("the first version reads it");
+        assert_eq!(old.version, 2);
+        assert_eq!(old.outbound_mode.as_deref(), Some("direct"));
+        assert!(old.features.mitm);
+        assert!(!old.features.capture);
+        assert!(!old.features.rewrite && !old.features.scripting);
     }
 
     #[tokio::test]

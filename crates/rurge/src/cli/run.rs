@@ -1739,6 +1739,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
             engine.runtime().rules.rules().len(),
         );
         engine.attach_state(store.clone());
+        // the switches `state.json` recorded, before the first session can be
+        // judged (`phase 4 M2 design 11.2`)
+        engine.restore_switches(&state.features);
         // a global policy saved by an earlier run (mode may be rule today)
         if engine.global_policy().is_none()
             && let Some(saved) = state.global_policy.clone()

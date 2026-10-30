@@ -57,12 +57,20 @@ pub struct TlsFixture {
 impl TlsFixture {
     /// A fresh CA and a server certificate for `names` (DNS names or IP literals).
     pub fn new(names: &[&str]) -> Arc<TlsFixture> {
+        TlsFixture::with_ca_name("rurge test CA", names)
+    }
+
+    /// `new`, with the CA's subject `ca_name`: webpki takes a certificate whose
+    /// subject is the trust anchor's for the issuer and compares signatures, so
+    /// a test that needs two CAs to be told apart gives them different names
+    /// (the phase 4 / M2a plan's execution record row 27).
+    pub fn with_ca_name(ca_name: &str, names: &[&str]) -> Arc<TlsFixture> {
         let ca_key = KeyPair::generate().expect("ca key");
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params
             .distinguished_name
-            .push(DnType::CommonName, "rurge test CA");
+            .push(DnType::CommonName, ca_name);
         let ca = ca_params
             .self_signed(&ca_key)
             .expect("ca cert")

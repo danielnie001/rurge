@@ -9,6 +9,7 @@ pub mod engine;
 mod external_resources;
 mod fake_address;
 mod http;
+pub mod mitm;
 pub mod observe;
 pub mod outbounds;
 pub mod owner;
@@ -35,6 +36,7 @@ pub use engine::{
     UnknownPolicy,
 };
 pub use external_resources::{ExternalResource, UnusedLines};
+pub use mitm::MitmShared;
 pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, TrafficTotals};
 pub use outbounds::{EngineFactory, dry_build, load_checked};
 pub use owner::{OwnerLookup, OwnerQuery};

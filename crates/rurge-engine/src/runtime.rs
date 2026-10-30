@@ -6,6 +6,7 @@ use crate::shared::{EngineShared, OwnResolve};
 use crate::stack::{DnsOverride, Stack, StackOptions, build_stack};
 use crate::subscriptions::Subscriptions;
 use rurge_config::{Config, Diagnostics};
+use rurge_http::mitm::{Authority, Mitm};
 use rurge_net::connector::SystemResolve;
 use rurge_policy::PolicyRegistry;
 use rurge_rules::{OutboundMode, RuleEngine};
@@ -54,6 +55,10 @@ pub struct Runtime {
     /// The DNS override of the network the machine was on when this
     /// generation was built; the resolver was made with it.
     dns_override: DnsOverride,
+    /// What this generation decrypts with (phase 4 M2 design 5.4): `None`
+    /// when `[MITM]` names no CA, when it cannot be used, or when TLS cannot
+    /// be set up. Only the entries and the hand-over read it.
+    pub(crate) mitm: Option<Arc<Mitm>>,
 }
 
 impl Runtime {
@@ -158,6 +163,9 @@ impl Runtime {
             .map_err(|e| anyhow::anyhow!("cannot build the policies: {e}"))?
             .with_network(opts.shared.network.clone()),
         );
+        // last: it reads the authority the previous generation left, and the
+        // profile is not needed after it
+        let mitm = build_mitm(&config, &opts.shared).await;
         Ok(Runtime {
             config: Arc::new(config),
             stack,
@@ -174,6 +182,7 @@ impl Runtime {
             tun,
             pre_matched: Recorded::default(),
             dns_override,
+            mitm,
         })
     }
 
@@ -199,5 +208,72 @@ impl Runtime {
     /// out (`PipelineConnector::connectors`).
     pub fn dns_pipeline(&self) -> Option<&Arc<crate::dns_pipeline::PipelineConnector>> {
         self.dns_pipeline.as_ref()
+    }
+}
+
+/// This generation's MITM (phase 4 M2 design 5.4, the phase 4 / M2a plan's
+/// P16).
+///
+/// `None` when `[MITM]` names no CA at all, when the CA cannot be loaded
+/// (`W0039` has said why at load time), or when the TLS configurations cannot
+/// be built. An authority whose material is the one the last published
+/// generation used, and which is still usable, is taken on: the leaves and the
+/// TLS sessions it cached are what the connections before it were served
+/// with.
+///
+/// Both the CA and the roots of the origin side are read on a blocking thread:
+/// the PKCS&num;12 decoding does a PBKDF with an iteration count the file
+/// decides, and the first read of the system's roots touches the system store.
+async fn build_mitm(config: &Config, shared: &EngineShared) -> Option<Arc<Mitm>> {
+    let cfg = &config.mitm;
+    if cfg.ca_keystore_name.is_none() && cfg.ca_p12.is_none() {
+        return None;
+    }
+    let authority = match shared.mitm.last_live() {
+        Some(last) if last.same_material(cfg, &config.keystore) && last.usable_now() => last,
+        _ => {
+            // `load_checked` has already named what is wrong with the CA
+            // (`W0039`), so this is only what the log of a failure says
+            let cfg = cfg.clone();
+            let keystore = config.keystore.clone();
+            match tokio::task::spawn_blocking(move || Authority::load(&cfg, &keystore)).await {
+                Ok(Ok(Some(authority))) => Arc::new(authority),
+                Ok(Ok(None)) => return None,
+                Ok(Err(problem)) => {
+                    tracing::debug!(
+                        problem = %problem.message,
+                        "the MITM CA cannot be loaded; MITM is off for this generation"
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "loading the MITM CA failed; MITM is off for this generation"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+    let roots = match &shared.roots {
+        Some(roots) => Arc::clone(roots),
+        None => match tokio::task::spawn_blocking(rurge_net::tls::union_root_store).await {
+            Ok(roots) => roots,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "the roots of the origin side cannot be read; MITM is off for this generation"
+                );
+                return None;
+            }
+        },
+    };
+    match Mitm::build(cfg, authority, roots) {
+        Ok(mitm) => Some(Arc::new(mitm)),
+        Err(e) => {
+            tracing::warn!("MITM is off: cannot set up TLS: {e}");
+            None
+        }
     }
 }
