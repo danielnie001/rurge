@@ -456,6 +456,11 @@ impl<U: Upstreams> Requests<U> {
                 if let Some(peer) = peer {
                     handle.trail().set_peer(peer);
                 }
+                // no `forward`: only a decrypted connection's upstream speaks
+                // HTTP/2, and a sniffed request is never forwarded in absolute
+                // form (`forwardable` is false for it), so an HTTP/2 upstream
+                // has none to lose (`the phase 4 / M2b plan's execution record
+                // row 39`)
                 (Sender::H2(sender), Meter::new(), None, peer)
             } else {
                 let borrowed = {
@@ -5441,7 +5446,11 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&body)
         );
-        assert_eq!(rig.fake.dials(), 1, "a request with a body goes again");
+        assert_eq!(
+            rig.fake.dials(),
+            1,
+            "a request with a body is not sent again"
+        );
         let second = rig.fake.finished(1).await;
         match second.outcome() {
             Some(SessionOutcome::Failed(reason)) => {
