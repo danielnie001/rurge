@@ -277,15 +277,12 @@ impl<U: Upstreams> Requests<U> {
         if self.shared.conn.h2 && req.method() == http::Method::CONNECT {
             let prepared = self.prepare(&mut req, None);
             let handle = self.shared.upstreams.open(prepared.session);
+            // only an HTTP/2 connection reaches here
             let _guard = Guard::new(
                 handle.clone(),
                 self.shared.conn.token.clone(),
                 self.shared.activity.clone(),
-                if self.shared.conn.h2 {
-                    "client cancelled the request"
-                } else {
-                    "client closed the connection"
-                },
+                "client cancelled the request",
             );
             handle.set_method(req.method().as_str());
             self.shared.routed.fetch_add(1, Ordering::Relaxed);
@@ -1872,7 +1869,9 @@ struct Activity {
     /// Requests between their guard being made and being dropped, an upgrade's
     /// relay included: the guard lives with the relay.
     in_flight: AtomicUsize,
-    /// Milliseconds since `epoch` at which `in_flight` last fell to zero.
+    /// Milliseconds since `epoch` at which a request last left. Every `leave`
+    /// writes it, so the last writer's moment is the one the count falls to
+    /// zero at; `leave` writes it before the count goes down.
     quiet_since: AtomicU64,
 }
 
@@ -1889,17 +1888,22 @@ impl Activity {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One request fewer, and the moment it went quiet when it was the last
-    /// one in flight.
+    /// One request fewer. The moment goes in first, and the count only after
+    /// it: `quiet` reads the count and then the moment, so a request that ends
+    /// after a long time must not be seen as a count of zero beside a moment
+    /// from before it began — that would be quiet at once instead of after
+    /// `d`. Writing it on every `leave` is what makes the last writer's moment
+    /// the one read once the count is zero.
     fn leave(&self) {
-        if self.in_flight.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.quiet_since
-                .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-        }
+        self.quiet_since
+            .fetch_max(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        // `Release` against `in_flight`'s `Acquire`: a reader that sees the
+        // count after this decrement sees the moment written above it.
+        self.in_flight.fetch_sub(1, Ordering::Release);
     }
 
     fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Relaxed)
+        self.in_flight.load(Ordering::Acquire)
     }
 
     fn quiet_since(&self) -> tokio::time::Instant {
