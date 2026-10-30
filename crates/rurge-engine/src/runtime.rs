@@ -222,8 +222,8 @@ impl Runtime {
 /// with.
 ///
 /// Both the CA and the roots of the origin side are read on a blocking thread:
-/// the PKCS&num;12 decoding does a PBKDF with an iteration count the file
-/// decides, and the first read of the system's roots touches the system store.
+/// the PKCS#12 decoding does a PBKDF with an iteration count the file decides,
+/// and the first read of the system's roots touches the system store.
 async fn build_mitm(config: &Config, shared: &EngineShared) -> Option<Arc<Mitm>> {
     let cfg = &config.mitm;
     if cfg.ca_keystore_name.is_none() && cfg.ca_p12.is_none() {

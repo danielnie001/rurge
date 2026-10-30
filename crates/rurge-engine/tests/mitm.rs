@@ -24,9 +24,8 @@ fn mitm_section(hostname: &str, ca_p12: &str) -> String {
 /// apart: webpki takes a certificate with the same subject for the issuer and
 /// compares the signature, which fails as `BadSignature` rather than as
 /// `UnknownIssuer` (the phase 4 / M2a plan's execution record row 27).
-fn mitm_ca() -> (String, Arc<rustls::RootCertStore>) {
-    let fixture = TlsFixture::with_ca_name("rurge test MITM CA", &[]);
-    (fixture.ca_p12_base64("pw"), fixture.roots())
+fn mitm_ca() -> Arc<TlsFixture> {
+    TlsFixture::with_ca_name("rurge test MITM CA", &[])
 }
 
 /// A rustls client trusting `roots` and nothing else; `sni` is whether it
@@ -165,7 +164,8 @@ async fn a_listed_host_is_decrypted_through_socks5() {
         ..Socks5Script::default()
     })
     .await;
-    let (ca, mitm_roots) = mitm_ca();
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let h = harness_mitm(
         Profile {
             proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
@@ -177,6 +177,11 @@ async fn a_listed_host_is_decrypted_through_socks5() {
         origin.roots(),
     )
     .await;
+    assert_eq!(
+        h.engine.mitm_ca_der().as_deref(),
+        Some(mitm.ca_der()),
+        "the certificate the API serves is the CA rurge signs with"
+    );
 
     let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
     let mut tls = handshake(
@@ -216,7 +221,8 @@ async fn with_the_switch_off_the_client_sees_the_origin_certificate() {
         ..Socks5Script::default()
     })
     .await;
-    let (ca, mitm_roots) = mitm_ca();
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let h = harness_mitm(
         Profile {
             proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
@@ -272,7 +278,8 @@ async fn a_client_offering_only_h2_is_passed_through() {
         ..Socks5Script::default()
     })
     .await;
-    let (ca, mitm_roots) = mitm_ca();
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let h = harness_mitm(
         Profile {
             proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
@@ -298,10 +305,71 @@ async fn a_client_offering_only_h2_is_passed_through() {
     assert!(error.to_string().contains("UnknownIssuer"), "{error}");
 
     let lines = log.lines();
+    let expected = "origin.test is listed for MITM but the client offers no protocol rurge decrypts (h2); passing it through";
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("origin.test") && line.contains("h2")),
+            .any(|line| line.starts_with("DEBUG") && line.contains(expected)),
+        "{lines:?}"
+    );
+}
+
+/// A listed host whose `[MITM]` names a CA rurge cannot open: this generation
+/// has no `Mitm`, so the session is passed through as it is, and the one line
+/// of DEBUG says why (`phase 4 M2 design 7.1`, the plan's P18).
+#[tokio::test]
+async fn a_listed_host_without_a_usable_ca_is_passed_through() {
+    let log = LogCapture::start();
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    // the CA is the right one, its passphrase is not: `W0039` says so at load
+    // and this generation has no `Mitm`
+    let section = format!(
+        "[MITM]\nhostname = origin.test\nca-p12 = {}\nca-passphrase = wrong-pw",
+        mitm.ca_p12_base64("pw")
+    );
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &section,
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+    assert!(
+        h.engine.mitm_ca_der().is_none(),
+        "a CA rurge cannot open leaves this generation without one"
+    );
+
+    // a client that trusts the origin's CA is served by it, as before
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(
+        tunnel,
+        client_config(origin.roots(), &[], true),
+        "origin.test",
+    )
+    .await
+    .expect("the session is passed through to the origin");
+    let response = get(&mut tls, "origin.test", "/a").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let lines = log.lines();
+    let expected =
+        "origin.test is listed for MITM but this generation has no usable CA; passing it through";
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("DEBUG") && line.contains(expected)),
         "{lines:?}"
     );
 }
@@ -320,7 +388,8 @@ async fn without_sni_the_target_decides_on_443_only() {
         ..Socks5Script::default()
     })
     .await;
-    let (ca, mitm_roots) = mitm_ca();
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let h = harness_mitm(
         Profile {
             general: "force-http-engine-hosts = origin.test:8443",
@@ -374,7 +443,8 @@ async fn a_written_port_makes_its_port_sniffable() {
     let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
     server.set("/a", "from the origin");
     let port = origin_addr(&server).port();
-    let (ca, mitm_roots) = mitm_ca();
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let section = mitm_section(&format!("origin.test:{port}"), &ca);
     let h = harness_mitm(
         direct_profile(
@@ -404,7 +474,8 @@ async fn a_bare_entry_does_not_sniff_another_port() {
     let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
     server.set("/a", "from the origin");
     let port = origin_addr(&server).port();
-    let (ca, mitm_roots) = mitm_ca();
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let section = mitm_section("origin.test", &ca);
     let h = harness_mitm(
         direct_profile(
@@ -445,7 +516,8 @@ async fn a_zero_port_entry_widens_its_own_target_only() {
     let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
     origin.set("/a", "from the origin");
     let other = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
-    let (ca, mitm_roots) = mitm_ca();
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let section = mitm_section("origin.test:0", &ca);
     let h = harness_mitm(
         direct_profile(
@@ -487,12 +559,13 @@ fn client_hello(config: Arc<rustls::ClientConfig>, name: &str) -> Vec<u8> {
 }
 
 /// A stop that lands while the handshake with the client is under way leaves
-/// no record and nothing counted: the connection had no handle to finish
-/// (`phase 4 M2 design 8.2`).
+/// no record: the connection had no handle to finish (`phase 4 M2 design
+/// 8.2`).
 #[tokio::test]
 async fn a_stop_during_the_handshake_leaves_no_record() {
     let origin = TlsFixture::new(&["origin.test"]);
-    let (ca, mitm_roots) = mitm_ca();
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let section = mitm_section("origin.test", &ca);
     let rig = Rig::on(
         harness_mitm(
@@ -519,11 +592,36 @@ async fn a_stop_during_the_handshake_leaves_no_record() {
     ))
     .await
     .unwrap();
+    // No origin is running for this test: the first bytes back can only be
+    // rurge's own answer to the hello, which means its `accept` has signed a
+    // leaf, sent its ServerHello and is waiting for the client's next step.
+    let mut first = [0u8; 1];
+    let read = tokio::time::timeout(WITHIN, tcp.read(&mut first))
+        .await
+        .expect("the engine answers the ClientHello within the bound")
+        .expect("the session carries the engine's answer");
+    assert_eq!(read, 1, "the engine answered before the stop");
+    assert_eq!(first[0], 0x16, "a TLS handshake record");
 
     rig.tun.stop();
-    // waits for a record that must not come: the stop ends the handshake at
-    // once, and the sniff wait of these tests is 300 ms, so this is more than
-    // the whole session ever had
+    // the client is let go at once: the rest of the handshake is read off and
+    // then the stream ends, all of it within one bound
+    let drain = async {
+        let mut rest = [0u8; 1024];
+        loop {
+            match tcp.read(&mut rest).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    };
+    tokio::time::timeout(WITHIN, drain)
+        .await
+        .expect("the stop ends the handshake at once");
+
+    // waits for a record that must not come: the stop's branch returns at
+    // once, so a record it wrote would be there before it returned — 300 ms is
+    // a wide margin on a branch that has nothing left to do but return
     tokio::time::sleep(Duration::from_millis(300)).await;
     let records = rig.h.engine.request_log().recent(1000);
     assert!(records.is_empty(), "{records:?}");
@@ -542,7 +640,8 @@ async fn a_reload_with_the_same_material_keeps_the_leaves() {
         ..Socks5Script::default()
     })
     .await;
-    let (ca, mitm_roots) = mitm_ca();
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let h = harness_mitm(
         Profile {
             proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
@@ -585,7 +684,8 @@ async fn a_reload_with_the_same_material_keeps_the_leaves() {
 /// (`phase 4 M2 design 11.1`, `11.2`, the plan's P20).
 #[tokio::test]
 async fn the_switch_is_restored_from_state_json() {
-    let (ca, roots) = mitm_ca();
+    let mitm = mitm_ca();
+    let (ca, roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let section = mitm_section("origin.test", &ca);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(STATE_FILE);
@@ -606,7 +706,7 @@ async fn the_switch_is_restored_from_state_json() {
     assert_eq!(json["version"], serde_json::json!(2), "{text}");
     assert_eq!(json["features"]["mitm"], serde_json::json!(false), "{text}");
 
-    let (_, state) = StateStore::open(path.clone()).await;
+    let (restored, state) = StateStore::open(path.clone()).await;
     assert_eq!(state.features.mitm, Some(false));
     let other = harness_mitm(
         Profile {
@@ -616,7 +716,11 @@ async fn the_switch_is_restored_from_state_json() {
         roots,
     )
     .await;
+    other.engine.attach_state(restored);
     assert!(other.engine.mitm_on(), "the switch is on unless set");
+    let before = std::fs::read(&path).unwrap();
     other.engine.restore_switches(&state.features);
     assert!(!other.engine.mitm_on(), "the file's word is taken");
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(before, after, "a start does not write state.json");
 }
