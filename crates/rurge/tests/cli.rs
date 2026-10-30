@@ -313,6 +313,299 @@ fn check_says_the_api_does_not_start_without_a_usable_ca() {
     );
 }
 
+/// The DER a certificate PEM carries: the Base64 between its two marker
+/// lines.
+fn der_of_pem(pem: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let body = pem
+        .split_once("-----BEGIN CERTIFICATE-----")
+        .expect("a PEM header")
+        .1
+        .split_once("-----END CERTIFICATE-----")
+        .expect("a PEM footer")
+        .0;
+    base64::engine::general_purpose::STANDARD
+        .decode(body.lines().map(str::trim).collect::<String>())
+        .expect("the Base64 of a certificate")
+}
+
+/// The four files `rurge mitm ca generate` writes (`phase 4 M2 design 13`).
+const CA_FILES: [&str; 4] = [
+    "rurge-ca.pem",
+    "rurge-ca.cer",
+    "rurge-ca.p12",
+    "rurge-mitm.conf",
+];
+
+/// `rurge mitm ca generate` writes four files into a directory that is
+/// already there and says how to use and trust the CA; the passphrase and the
+/// PKCS#12 — which hold the private key — are in the two files alone
+/// (`phase 4 M2 design 13`, `15`).
+#[test]
+fn mitm_ca_generate_writes_four_files_and_prints_no_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca");
+    fs::create_dir(&ca).unwrap();
+
+    let out = rurge_command()
+        .args(["mitm", "ca", "generate", "--out"])
+        .arg(&ca)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{stderr}");
+    let printed = String::from_utf8_lossy(&out.stdout).to_string();
+
+    for name in CA_FILES {
+        let path = ca.join(name);
+        assert!(path.is_file(), "{name} was not written");
+        let named = path.display().to_string();
+        assert!(
+            printed.contains(&named),
+            "{named} is not named in: {printed}"
+        );
+    }
+    for said in [
+        "wrote a new MITM CA, \"rurge MITM CA ",
+        "certutil -user -addstore Root",
+        "security add-trusted-cert",
+        "update-ca-certificates",
+        "update-ca-trust",
+        "trust anchor",
+        "sql:$HOME/.pki/nssdb",
+        "Firefox",
+        "Android",
+        "iOS",
+        "to use it: copy the lines of rurge-mitm.conf into your profile",
+    ] {
+        assert!(printed.contains(said), "`{said}` is not in: {printed}");
+    }
+
+    // the passphrase and the PKCS#12 are in rurge-mitm.conf alone
+    let conf = fs::read_to_string(ca.join("rurge-mitm.conf")).unwrap();
+    let value_of = |key: &str| {
+        let prefix = format!("{key} = ");
+        let line = conf
+            .lines()
+            .find(|l| l.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("rurge-mitm.conf has no {key}"));
+        line[prefix.len()..].to_string()
+    };
+    let passphrase = value_of("ca-passphrase");
+    let p12 = value_of("ca-p12");
+    for secret in [passphrase.as_str(), &p12[..40], "PRIVATE KEY"] {
+        assert!(
+            !printed.contains(secret),
+            "the output holds a secret: {secret}"
+        );
+        assert!(
+            !stderr.contains(secret),
+            "the error output holds a secret: {secret}"
+        );
+    }
+
+    // the PEM and the DER are one certificate
+    let pem = fs::read_to_string(ca.join("rurge-ca.pem")).unwrap();
+    assert_eq!(
+        der_of_pem(&pem),
+        fs::read(ca.join("rurge-ca.cer")).unwrap(),
+        "the PEM and the DER are one certificate"
+    );
+
+    // a profile that names the CA loads, and the CA is usable
+    let profile = write(
+        &dir,
+        "ca.conf",
+        &format!("{conf}hostname = a.test\n[Rule]\nFINAL,DIRECT\n"),
+    );
+    let checked = rurge_command()
+        .args(["check", "-c"])
+        .arg(&profile)
+        .arg("--data-dir")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&checked.stdout).to_string();
+    assert!(checked.status.success(), "{said}");
+    assert!(!said.contains("W0039"), "{said}");
+    assert!(!said.contains("W0040"), "{said}");
+}
+
+/// `generate` neither makes the directory it is given nor writes over a file
+/// that is already there (`the phase 4 / M2c plan's P6`).
+#[test]
+fn mitm_ca_generate_does_not_overwrite_or_create_a_directory() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let missing = dir.path().join("missing");
+    let out = rurge_command()
+        .args(["mitm", "ca", "generate", "--out"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains(&missing.display().to_string()), "{stderr}");
+    assert!(!missing.exists(), "the directory was made");
+
+    let taken = dir.path().join("taken");
+    fs::create_dir(&taken).unwrap();
+    let kept = taken.join("rurge-ca.p12");
+    fs::write(&kept, "keep").unwrap();
+    let out = rurge_command()
+        .args(["mitm", "ca", "generate", "--out"])
+        .arg(&taken)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains(&kept.display().to_string()), "{stderr}");
+    for name in ["rurge-ca.pem", "rurge-ca.cer", "rurge-mitm.conf"] {
+        assert!(!taken.join(name).exists(), "{name} was made");
+    }
+    assert_eq!(fs::read_to_string(&kept).unwrap(), "keep");
+}
+
+/// On Unix the two files that hold the private key and its passphrase belong
+/// to their owner alone; the certificate is public and keeps what the umask
+/// gives it (`phase 4 M2 design 13`, `M2-D20`). Compiled and run on Unix only.
+#[cfg(unix)]
+#[test]
+fn mitm_ca_generate_keeps_the_secrets_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca");
+    fs::create_dir(&ca).unwrap();
+    rurge_command()
+        .args(["mitm", "ca", "generate", "--out"])
+        .arg(&ca)
+        .assert()
+        .success();
+
+    for name in ["rurge-ca.p12", "rurge-mitm.conf"] {
+        let mode = fs::metadata(ca.join(name)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{name}");
+    }
+}
+
+/// `rurge mitm ca export` prints the certificate of the CA a profile names,
+/// and writes the very bytes to a file when asked — never over one that is
+/// there (`the phase 4 / M2c plan's P7`).
+#[test]
+fn mitm_ca_export_prints_the_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca");
+    fs::create_dir(&ca).unwrap();
+    rurge_command()
+        .args(["mitm", "ca", "generate", "--out"])
+        .arg(&ca)
+        .assert()
+        .success();
+    let conf = fs::read_to_string(ca.join("rurge-mitm.conf")).unwrap();
+    let profile = write(
+        &dir,
+        "ca.conf",
+        &format!("{conf}hostname = a.test\n[Rule]\nFINAL,DIRECT\n"),
+    );
+    let data = dir.path().join("data");
+    let export = |extra: &[&std::path::Path]| {
+        let mut cmd = rurge_command();
+        cmd.args(["mitm", "ca", "export", "-c"])
+            .arg(&profile)
+            .arg("--data-dir")
+            .arg(&data);
+        for arg in extra {
+            cmd.arg(arg);
+        }
+        cmd.output().unwrap()
+    };
+    let der = fs::read(ca.join("rurge-ca.cer")).unwrap();
+
+    let out = export(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{stderr}");
+    let pem = String::from_utf8(out.stdout.clone()).expect("the certificate as text");
+    assert!(
+        pem.starts_with("-----BEGIN CERTIFICATE-----\n"),
+        "a PEM is printed: {pem}"
+    );
+    assert_eq!(der_of_pem(&pem), der, "the certificate of the profile");
+
+    let written = dir.path().join("a.pem");
+    let out = export(&[std::path::Path::new("--out"), &written]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(fs::read_to_string(&written).unwrap(), pem);
+
+    let cer = dir.path().join("a.cer");
+    let out = export(&[
+        std::path::Path::new("--out"),
+        &cer,
+        std::path::Path::new("--der"),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(fs::read(&cer).unwrap(), der);
+
+    // a file that is there is not written over
+    let out = export(&[std::path::Path::new("--out"), &written]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains(&written.display().to_string()), "{stderr}");
+    assert_eq!(fs::read_to_string(&written).unwrap(), pem);
+
+    // `--der` is about a file: on its own it is a usage error
+    let out = export(&[std::path::Path::new("--der")]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--out"), "{stderr}");
+}
+
+/// `export` says why there is no certificate to give: no CA named, or one
+/// rurge cannot use — and quotes neither the material nor the passphrase
+/// (`phase 4 M2 design 5.3`, `13`).
+#[test]
+fn mitm_ca_export_refuses_a_profile_without_a_usable_ca() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let none = write(
+        &dir,
+        "none.conf",
+        "[General]\nloglevel = notify\n[Rule]\nFINAL,DIRECT\n",
+    );
+    let out = rurge_command()
+        .args(["mitm", "ca", "export", "-c"])
+        .arg(&none)
+        .arg("--data-dir")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("names no CA"), "{stderr}");
+
+    let broken = write(
+        &dir,
+        "broken.conf",
+        "[MITM]\nca-p12 = QUJDRA\nca-passphrase = pw-7d1f\n[Rule]\nFINAL,DIRECT\n",
+    );
+    let out = rurge_command()
+        .args(["mitm", "ca", "export", "-c"])
+        .arg(&broken)
+        .arg("--data-dir")
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("MITM is off"), "{stderr}");
+    assert!(
+        !stderr.contains("QUJDRA") && !stderr.contains("pw-7d1f"),
+        "{stderr}"
+    );
+}
+
 /// A problem is reported with what to do about it: in the text the hint is
 /// the line after its diagnostic, in the JSON it is a field of it, and a
 /// code that has no hint has `null`.

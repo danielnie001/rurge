@@ -3202,6 +3202,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "base64",
  "bytes",
  "clap",
  "getrandom 0.3.4",
@@ -3216,6 +3217,7 @@ dependencies = [
  "rurge-config",
  "rurge-dns",
  "rurge-engine",
+ "rurge-http",
  "rurge-net",
  "rurge-platform",
  "rurge-proto",

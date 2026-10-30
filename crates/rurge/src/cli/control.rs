@@ -8,7 +8,7 @@ use rurge_config::config::{LoadOptions, Platform, load};
 use rurge_engine::profile::disk_remote;
 use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub const NOT_CONFIGURED: &str = "http-api is not configured; add \"http-api = <key>@127.0.0.1:6171\" to [General] or pass --remote/--key (reload can also be triggered by SIGHUP or --watch)";
@@ -61,6 +61,32 @@ pub(crate) fn connect_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+/// The profile `-c` names, read the way the daemon reads it
+/// (`resolve_endpoint`, `rurge mitm ca export`).
+///
+/// `platform` evaluates the profile as if on another system, as the daemon is
+/// not the only reader; `data_dir` is where the downloaded sources are, and
+/// the copy of a managed profile that the daemon really runs on.
+pub(crate) fn load_profile(
+    config: &Path,
+    platform: Option<Platform>,
+    data_dir: Option<&Path>,
+) -> anyhow::Result<rurge_config::config::Loaded> {
+    let platform = platform.unwrap_or_else(Platform::current);
+    let data_dir = data_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(rurge_platform::dirs::data_dir);
+    let opts = LoadOptions {
+        environment: super::environment(platform, capabilities::CORE_VERSION),
+        platform,
+        capabilities: capabilities::current(),
+        // what the daemon runs on, which is the copy of a managed profile
+        // while there is one
+        remote: Some(disk_remote(&data_dir)),
+    };
+    load(config, &opts).with_context(|| format!("cannot read {}", config.display()))
+}
+
 /// `--remote` + `--key` → profile `http-api` (only parsed) → `NOT_CONFIGURED`.
 pub fn resolve_endpoint(args: &ControlArgs) -> anyhow::Result<(SocketAddr, String)> {
     if let Some(remote) = args.remote {
@@ -73,21 +99,7 @@ pub fn resolve_endpoint(args: &ControlArgs) -> anyhow::Result<(SocketAddr, Strin
     let Some(config) = &args.config else {
         return Err(anyhow!("{NOT_CONFIGURED}"));
     };
-    let platform = args.platform.unwrap_or_else(Platform::current);
-    let data_dir = args
-        .data_dir
-        .clone()
-        .unwrap_or_else(rurge_platform::dirs::data_dir);
-    let opts = LoadOptions {
-        environment: super::environment(platform, capabilities::CORE_VERSION),
-        platform,
-        capabilities: capabilities::current(),
-        // what the daemon runs on, which is the copy of a managed profile
-        // while there is one
-        remote: Some(disk_remote(&data_dir)),
-    };
-    let loaded =
-        load(config, &opts).with_context(|| format!("cannot read {}", config.display()))?;
+    let loaded = load_profile(config, args.platform, args.data_dir.as_deref())?;
     match &loaded.config.general.http_api {
         Some(api) => Ok((
             connect_addr(api.addr),

@@ -35,6 +35,8 @@ enum Command {
     Status(cli::control::StatusArgs),
     /// Install or remove the automatic start of rurge
     Service(cli::service::ServiceArgs),
+    /// Tools for the CA that MITM signs with
+    Mitm(cli::mitm::MitmArgs),
 }
 
 fn main() -> ExitCode {
@@ -56,6 +58,7 @@ fn main() -> ExitCode {
         Command::Stop(args) => cli::control::stop(args),
         Command::Status(args) => cli::control::status(args),
         Command::Service(args) => cli::service::run(args),
+        Command::Mitm(args) => cli::mitm::run(args),
     };
     match result {
         Ok(code) => code,
