@@ -634,3 +634,14 @@ M2 的文档任务把下面各条写进兼容性清单（`docs/surge-compatibili
 
 20. 第 10.5 节终止一条"它的应答正文出错，hyper 重置这个流"只写了重置、没有写原因码：终止、看门狗到时、没有错误页的 `REJECT`、`REJECT-DROP` 与上游正文出错，客户端一侧的那个流一律以 `INTERNAL_ERROR` 重置，上游的原因码不转给客户端（讲 HTTP/1.1 的客户端不受影响：hyper 的 HTTP/1.1 一侧遇到正文出错就关掉连接，没有原因码可言）（执行记录第 48、52 行）。
 21. 第 16 节第 10 条的"请求的字节只算正文"与第 16 条（第 10.2 节"一个请求的 `up` / `down` 只算它的请求正文与应答正文"）里"拨这条连接的那一个请求另带握手之前记下的字节"：那一段不是"握手之前记下的"、也不是准确的数——计量是在 `start_h2` 返回之后才设成 `None` 的，在那之前走过的字节都算在它头上，除了 TLS 握手与 HTTP/2 的前言，可能还有 SETTINGS 的交换与 TLS 1.3 的会话票据，多少看时机（执行记录第 42 行）。
+
+**写 M2c 计划时**（`docs/superpowers/plans/2026-10-31-phase4-m2c-ca-tools-api-tls-plan.md`，以它的「计划期决定」为准）：
+
+22. 第 14.1 节 `W0040` 的消息改为 "http-api-tls is on but there is no usable MITM CA: the API does not start with this profile"：原文 "the MITM CA cannot be used" 漏了没有写 CA 的那一种；重载时这一条也会报出来，而那时 API 还在用之前的 CA，所以写成"不会以这份 Profile 启动"。另：只在 Profile 有 `http-api` 时报；`[Keystore]` 那一项的 Base64 坏了、已经报了 `E0021`（因此没有 `W0039`）时照样报（计划 P2）。
+23. 第 13 节末条说 `generate` 放在 `rurge-http` 是因为"rcgen 与 p12-keystore 都在那里"，这不准：`rurge-http` 今天不依赖 `p12-keystore`（`decode_pkcs12` 在 `rurge-proto`），`base64` 只是它的开发依赖。M2c 给 `rurge-http` 加 `p12-keystore`、把 `base64` 挪进正式依赖；`rurge-api` 与可执行文件另加 `rustls`、`tokio-rustls`；`rurge-api` 的开发依赖加 `rurge-http`。都在锁文件里，包数不变。第 3 节的依赖列表随之（计划 P5）。
+24. 第 13 节"生成之后自己读回一次 `rurge-ca.p12`（`decode_pkcs12`）"：读回用 `Authority::load`，解码之外还查它是不是 CA、能不能签（计划 P6）。
+25. 第 13 节 `rurge mitm ca export` 的参数另有 `--platform` 与 `--data-dir`，同 `rurge status`：托管的 Profile 的 `[MITM]` 在数据目录里的副本里（计划 P7）。
+26. 第 14.1 节"API 照旧用最后一个生效过的 `Authority`"：API 每接一条连接问一次（`Engine::api_tls`），所以重载换了 CA 之后，新的连接由新的 CA 签——命令行经 `-c` 读的也正是新的 CA。第 3 节"`http-api-tls` 的监听器"的入口是另一个函数 `serve_tls`，`serve` 不变；有没有可用的 CA 由可执行文件在起 API 之前问（计划 P9、P11、P12）。
+27. 第 14.1 节"重载让 CA 不可用时……WARN 一行"：重载时关于 API 另有两种告警——`http-api-tls` 本身在重载里改了，与启动时没有 CA、重载之后有了。`http-api` 变了时"保留现在的地址与钥匙"那一句只在 API 真的在跑时说：`http-api-tls` 开着而没有 CA 时 API 没有起（计划 P13）。
+
+**执行 M2c 时**：由 M2c 的任务 8 补上（计划「执行期修正记录」里改了本文正文意思的行）。
