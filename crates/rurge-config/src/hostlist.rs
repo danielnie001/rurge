@@ -68,18 +68,80 @@ impl HostList {
 
     /// First entry whose host and port both match decides: `Some(!negate)`.
     pub fn matches(&self, host: &HostName, port: u16) -> Option<bool> {
-        for e in &self.entries {
-            let port_ok = match e.port {
-                PortSpec::Any => true,
-                PortSpec::Port(p) => p == port,
-                PortSpec::Default => self.default_port.is_none_or(|d| d == port),
-            };
-            if port_ok && pattern_matches(&e.pattern, host) {
-                return Some(!e.negate);
-            }
-        }
-        None
+        self.decide(host, |e| match e.port {
+            PortSpec::Any => true,
+            PortSpec::Port(p) => p == port,
+            PortSpec::Default => self.default_port.is_none_or(|d| d == port),
+        })
     }
+
+    /// The first entry whose host matches and whose port is not asked for
+    /// decides: an entry without a port matches on every port (phase 4 M2
+    /// design 7.3: a bare entry matches the sniffed SNI regardless of the
+    /// connection's port).
+    pub fn matches_sni(&self, host: &HostName, port: u16) -> Option<bool> {
+        self.decide(host, |e| match e.port {
+            PortSpec::Any | PortSpec::Default => true,
+            PortSpec::Port(p) => p == port,
+        })
+    }
+
+    /// The ports the entries that include a host write down, in increasing
+    /// order and once each: the ports rurge sniffs on every target (phase 4
+    /// M2 design 7.6). An excluded entry widens nothing, and `:0` is every
+    /// port already rather than one to add.
+    pub fn explicit_ports(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self
+            .entries
+            .iter()
+            .filter(|e| !e.negate)
+            .filter_map(|e| match e.port {
+                PortSpec::Port(p) if p != 0 => Some(p),
+                _ => None,
+            })
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
+    fn decide(
+        &self,
+        host: &HostName,
+        port_matches: impl Fn(&HostListEntry) -> bool,
+    ) -> Option<bool> {
+        self.entries
+            .iter()
+            .find(|e| port_matches(e) && pattern_matches(&e.pattern, host))
+            .map(|e| !e.negate)
+    }
+
+    /// This list without the entries `other` writes the same way: the same
+    /// `-`, and the text after it equal apart from the case (`phase 4 M2
+    /// design 4.2` — the port is part of the text, so `example.com` and
+    /// `example.com:443` differ). The order and the default port are this
+    /// list's.
+    pub fn without(&self, other: &HostList) -> HostList {
+        HostList {
+            entries: self
+                .entries
+                .iter()
+                .filter(|e| !other.entries.iter().any(|o| written_alike(e, o)))
+                .cloned()
+                .collect(),
+            default_port: self.default_port,
+            invalid: self.invalid.clone(),
+        }
+    }
+}
+
+/// Whether the two entries are written the same way: the same `-`, and the
+/// text after it equal ignoring ASCII case.
+fn written_alike(a: &HostListEntry, b: &HostListEntry) -> bool {
+    fn body(e: &HostListEntry) -> &str {
+        e.raw.strip_prefix('-').unwrap_or(&e.raw).trim()
+    }
+    a.negate == b.negate && body(a).eq_ignore_ascii_case(body(b))
 }
 
 fn pattern_matches(p: &HostPattern, host: &HostName) -> bool {
@@ -195,6 +257,52 @@ mod tests {
 
     fn h(s: &str) -> HostName {
         HostName::parse(s)
+    }
+
+    /// With an SNI, an entry without a port matches on every port; the plain
+    /// `matches` still asks for the default port. An entry with a port, or
+    /// with `:0`, is the same for both.
+    #[test]
+    fn matches_sni_ignores_the_port_of_a_bare_entry() {
+        let bare = HostList::parse("example.com", Some(443));
+        assert_eq!(bare.matches_sni(&h("example.com"), 8443), Some(true));
+        assert_eq!(bare.matches(&h("example.com"), 8443), None);
+
+        let on_a_port = HostList::parse("example.com:8443", Some(443));
+        assert_eq!(on_a_port.matches_sni(&h("example.com"), 8443), Some(true));
+        assert_eq!(on_a_port.matches(&h("example.com"), 8443), Some(true));
+        assert_eq!(on_a_port.matches_sni(&h("example.com"), 443), None);
+        assert_eq!(on_a_port.matches(&h("example.com"), 443), None);
+
+        let on_every_port = HostList::parse("example.com:0", Some(443));
+        for port in [1, 443, 8443] {
+            assert_eq!(
+                on_every_port.matches_sni(&h("example.com"), port),
+                Some(true)
+            );
+            assert_eq!(on_every_port.matches(&h("example.com"), port), Some(true));
+        }
+
+        let excluded = HostList::parse("-bad.example.com, *.example.com", Some(443));
+        assert_eq!(
+            excluded.matches_sni(&h("bad.example.com"), 8443),
+            Some(false)
+        );
+        assert_eq!(excluded.matches(&h("bad.example.com"), 443), Some(false));
+    }
+
+    #[test]
+    fn explicit_ports_are_the_ports_of_entries_that_include() {
+        let list = HostList::parse(
+            "a.com:8443, -b.com:9443, c.com, d.com:0, e.com:8443, f.com:25",
+            Some(443),
+        );
+        assert_eq!(list.explicit_ports(), [25, 8443]);
+        assert!(
+            HostList::parse("a.com, b.com:0", Some(443))
+                .explicit_ports()
+                .is_empty()
+        );
     }
 
     #[test]

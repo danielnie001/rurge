@@ -286,6 +286,14 @@ fn the_debug_of_a_loaded_profile_holds_no_secret() {
     let loaded = load(&profile());
     let shown = format!("{:#?}", loaded.config);
     assert_eq!(leaks(&shown), Vec::<String>::new());
+    // the two credentials of `[MITM]` are typed into `MitmConfig`: the `Debug`
+    // says whether each is set and never what it is
+    assert!(!shown.contains(&format!("{MARKER}-ca")), "{shown}");
+    assert!(
+        !shown.contains(&format!("{MARKER}{MARKER}{MARKER}")),
+        "{shown}"
+    );
+    assert!(shown.contains("ca_p12"), "{shown}");
 }
 
 /// What a loaded profile writes out as text. A rule as `Display` gives it is

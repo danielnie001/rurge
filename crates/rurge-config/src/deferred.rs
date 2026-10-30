@@ -4,7 +4,6 @@ use crate::text::{Entry, Profile};
 use crate::value::starts_with_ci;
 
 const DEFERRED: &[&str] = &[
-    "MITM",
     "URL Rewrite",
     "Header Rewrite",
     "Body Rewrite",
@@ -64,8 +63,9 @@ mod tests {
 
     #[test]
     fn prefix_and_membership_matching() {
-        assert!(is_deferred("MITM"));
-        assert!(is_deferred("mitm"));
+        // typed since phase 4 M2
+        assert!(!is_deferred("MITM"));
+        assert!(!is_deferred("mitm"));
         assert!(is_deferred("Tailscale home"));
         assert!(is_deferred("Tailscale "));
         assert!(!is_deferred("Tailscale"));
@@ -82,17 +82,17 @@ mod tests {
     #[test]
     fn collect_keeps_only_active_entries_and_get_is_case_insensitive() {
         let (mut profile, d) = parse_str(
-            "[MITM]\nhostname = *.example.com\nskip-server-cert-verify = true\n",
+            "[Testing]\nhostname = *.example.com\nskip-server-cert-verify = true\n",
             Arc::from(Path::new("d.conf")),
             Origin::Main,
         );
         assert!(d.is_empty(), "{:?}", d.into_vec());
-        profile.section_mut("MITM").unwrap().entries[1].disabled = true;
+        profile.section_mut("Testing").unwrap().entries[1].disabled = true;
         let deferred = DeferredSections::collect(&profile);
         assert_eq!(deferred.sections.len(), 1);
-        let mitm = deferred.get("mitm").unwrap();
-        assert_eq!(mitm.entries.len(), 1);
-        assert_eq!(mitm.entries[0].raw, "hostname = *.example.com");
+        let testing = deferred.get("testing").unwrap();
+        assert_eq!(testing.entries.len(), 1);
+        assert_eq!(testing.entries[0].raw, "hostname = *.example.com");
     }
 
     #[test]

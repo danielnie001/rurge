@@ -556,7 +556,13 @@ fn test_url_or(
     }
 }
 
-fn bool_or(diags: &mut Diagnostics, span: &Span, key: &str, value: &str, current: bool) -> bool {
+pub(crate) fn bool_or(
+    diags: &mut Diagnostics,
+    span: &Span,
+    key: &str,
+    value: &str,
+    current: bool,
+) -> bool {
     match parse_bool(value) {
         Some(b) => b,
         None => {
@@ -745,7 +751,7 @@ fn overlaps(item: &IpNet, space: &IpNet) -> bool {
     item.contains(space) || space.contains(item)
 }
 
-fn parse_host_list(
+pub(crate) fn parse_host_list(
     diags: &mut Diagnostics,
     span: &Span,
     key: &str,
@@ -848,7 +854,7 @@ fn migrated(diags: &mut Diagnostics, span: &Span, old: &str, new: &str) {
 /// recognised, every line below it arrives here, and its "key" is a policy's
 /// name — or, for a line whose `=` after the name is missing and for a pasted
 /// share link, text with a password in it.
-fn is_key_name(key: &str) -> bool {
+pub(crate) fn is_key_name(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 64
         && key

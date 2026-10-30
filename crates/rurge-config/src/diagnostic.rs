@@ -273,6 +273,9 @@ pub mod codes {
     /// A `[Host]` entry that asks for `server:force-syslib`, which answers
     /// with fake addresses while the enhanced mode is on.
     pub const W_FORCE_SYSLIB: &str = "W0038";
+    /// `[MITM]` names a CA that cannot be used, or lists hosts with no CA:
+    /// MITM is off (phase 4 M2 design 5.2).
+    pub const W_MITM_CA_UNUSABLE: &str = "W0039";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.
@@ -321,6 +324,8 @@ pub mod codes {
     /// - `W0031`: the cipher of an imported line is not the reader's to
     ///   change, and the message of the profile's own line says to use an AEAD
     ///   cipher.
+    /// - `W0039`: no one sentence fits every problem it reports — each of
+    ///   them says its own remedy in the message.
     /// - `I0001`, `I0002`, `I0003`, `I0004`: they inform.
     pub fn hint(code: &str) -> Option<&'static str> {
         Some(match code {
@@ -483,6 +488,7 @@ mod tests {
         codes::W_PARAM_NOT_APPLICABLE,
         codes::W_PARAM_NOT_EFFECTIVE,
         codes::W_STREAM_CIPHER,
+        codes::W_MITM_CA_UNUSABLE,
         codes::I_LEGACY_MIGRATED,
         codes::I_LINE_DISABLED,
         codes::I_GEOIP_DB_MISSING,

@@ -7,6 +7,7 @@ use crate::host::{HostEntry, HostKey, HostValue, SystemMode, parse_host_entry};
 use crate::ip_rewrite::{self, IpRewrite};
 use crate::keystore::{KeystoreItem, parse_keystore_item, unknown_field};
 use crate::managed::{self, ManagedConfig, parse_managed};
+use crate::mitm::{MitmConfig, parse_mitm};
 use crate::network::NetworkFacts;
 use crate::policy::{
     Builtin, GroupKind, PolicyGroup, PolicyKind, ProxyPolicy, is_name, named, parse_group,
@@ -221,6 +222,8 @@ pub struct SourceInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub general: General,
+    /// `[MITM]`: what is decrypted and with which certificate authority.
+    pub mitm: MitmConfig,
     pub policies: Vec<ProxyPolicy>,
     /// Typed parameters of every policy whose type has a spec (same order as
     /// `policies`; policies with errors are absent).
@@ -665,6 +668,7 @@ pub fn from_profile(
 
     let managed = parse_managed(&profile.header, &mut diags);
     let general = parse_general(profile.section("General"), &mut diags);
+    let mitm = parse_mitm(profile.section("MITM"), &mut diags);
 
     let inline_names: HashSet<String> = profile
         .sections_with_prefix("Ruleset ")
@@ -975,6 +979,7 @@ pub fn from_profile(
 
     let mut config = Config {
         general,
+        mitm,
         policies,
         specs: Vec::new(),
         not_implemented: HashMap::new(),
@@ -2153,7 +2158,7 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
     fn a_load_gives_each_diagnostic_the_hint_of_its_code() {
         let l = load_text(
             "stray line\n[General]\nmystery = 1\nvif-mode = on\ncompatibility-mode = true\n\
-[Nowhere]\nx = 1\n[MITM]\nx = 1\n\
+[Nowhere]\nx = 1\n[Script]\nx = 1\n\
 [Proxy]\nA = nope, h.test, 1\nB = http, h.test, 80, alice, pw, bogus=1\nB = http, h.test, 81\n\
 [Rule]\nDOMAIN,a,Missing\nFOO,a,DIRECT\nFINAL,DIRECT\nFINAL,DIRECT\nDOMAIN,z,DIRECT\n",
         );
@@ -2631,7 +2636,7 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         );
         assert!(c.contains(&codes::W_DEVICE_POLICY_AS_REJECT));
         assert_eq!(l.config.unknown_sections, ["Weird"]);
-        assert_eq!(l.config.deferred.sections.len(), 2);
+        assert_eq!(l.config.deferred.sections.len(), 1);
     }
 
     /// `[IP Rewrite]` is in effect (phase 3 M5): its active lines are read in
@@ -6239,13 +6244,35 @@ DOMAIN-SET,../{PATH_MARK}-up.list,DIRECT\nRULE-SET,https://example.com/e.list,DI
         assert_eq!(line_in("false", &wifi), Some(true));
     }
 
+    /// `[MITM]` is in effect (phase 4 M2): its keys are read into
+    /// `Config::mitm`, and the section is no longer one that is kept and does
+    /// nothing.
+    #[test]
+    fn the_mitm_section_is_typed_and_no_longer_deferred() {
+        let l = load_text("[MITM]\nhostname = a.com\nca-p12 = AAAA\n[Rule]\nFINAL,DIRECT\n");
+        assert!(
+            !l.diagnostics.has_errors(),
+            "{:?}",
+            l.diagnostics.into_vec()
+        );
+        assert_eq!(codes_of(&l), Vec::<&str>::new());
+        let mitm = &l.config.mitm;
+        assert_eq!(
+            mitm.hostname
+                .matches(&crate::types::HostName::parse("a.com"), 443),
+            Some(true)
+        );
+        assert_eq!(mitm.ca_p12.as_deref(), Some("AAAA"));
+        assert!(l.config.deferred.get("MITM").is_none());
+    }
+
     /// `[SSID Setting]` is read: it is no longer one of the sections that
     /// are kept and do nothing, and a line a requirement turns off is not a
     /// line.
     #[test]
     fn an_ssid_setting_section_is_read_and_no_longer_inactive() {
         let l = load_text(
-            "[SSID Setting]\n#!IOS-ONLY SSID:Home suspend=true\nSSID:Office suspend=true\n[MITM]\nhostname = *\n[Rule]\nFINAL,DIRECT\n",
+            "[SSID Setting]\n#!IOS-ONLY SSID:Home suspend=true\nSSID:Office suspend=true\n[Script]\nx = 1\n[Rule]\nFINAL,DIRECT\n",
         );
         let inactive: Vec<&str> = l
             .diagnostics
@@ -6255,7 +6282,7 @@ DOMAIN-SET,../{PATH_MARK}-up.list,DIRECT\nRULE-SET,https://example.com/e.list,DI
             .collect();
         assert_eq!(
             inactive,
-            ["sections parsed but inactive in this version: [MITM]"]
+            ["sections parsed but inactive in this version: [Script]"]
         );
         assert!(l.config.deferred.get("SSID Setting").is_none());
         let lines: Vec<u32> = l.config.ssid_settings.iter().map(|s| s.span.line).collect();
