@@ -1400,12 +1400,21 @@ async fn switching_echo_over_tls(origin: &Arc<TlsFixture>) -> SocketAddr {
                 let mut buf = vec![0u8; 8192];
                 loop {
                     match s.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => {
+                            // the echo is over from the client's side: the TLS
+                            // ending goes out before the stream is let go, or
+                            // the relay reads an `UnexpectedEof` and stops the
+                            // other direction too (the phase 4 / M2a plan's
+                            // execution record row 39)
+                            let _ = s.shutdown().await;
+                            break;
+                        }
                         Ok(n) => {
                             if s.write_all(&buf[..n]).await.is_err() || s.flush().await.is_err() {
                                 break;
                             }
                         }
+                        Err(_) => break,
                     }
                 }
             });
@@ -1548,8 +1557,8 @@ async fn two_requests_of_one_decrypted_connection_follow_their_own_rules() {
     let blocked = get(&mut tls, "origin.test", "/blocked").await;
     assert!(blocked.starts_with("HTTP/1.1 403"), "{blocked}");
     assert!(
-        blocked.contains("DOMAIN") || blocked.contains("REJECT"),
-        "the reject page is rurge's own: {blocked}"
+        blocked.contains("<code>URL-REGEX,^https://origin\\.test/blocked,REJECT</code>"),
+        "the reject page names the rule: {blocked}"
     );
     let ok = get(&mut tls, "origin.test", "/ok").await;
     assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
@@ -1958,8 +1967,8 @@ async fn a_reload_that_breaks_the_ca_leaves_open_connections_decrypted() {
     assert!(first.starts_with("HTTP/1.1 200"), "{first}");
     the_records(&h, 1).await;
 
-    // the CA this generation would load cannot be opened at all: the second
-    // version of the plan, `AAAA` is not a PKCS#12
+    // the CA this generation would load cannot be opened: `AAAA` is Base64,
+    // but not a PKCS#12
     let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
     let broken = text.replace(&format!("ca-p12 = {ca}"), "ca-p12 = AAAA");
     swap_to(&h, broken).await;
@@ -2039,15 +2048,20 @@ async fn a_websocket_echoes_through_a_decrypted_connection() {
         .expect("the echo reaches the client");
     assert_eq!(back, payload, "every byte comes back in its place");
 
-    // An upgraded connection has no TLS ending of its own on rurge's side:
-    // the bytes are relayed as they come, and the tunnel is closed with the
-    // origin's. The client's close_notify goes out; whether an EOF or an
-    // alert comes back is the relay's business, not this test's.
-    let _ = tls.shutdown().await;
-    drop(tls);
+    // The client closes its own side; the relay closes the origin's write side,
+    // and the origin's `close_notify` comes back the same way. So the client's
+    // read ends cleanly, not with an EOF at the TLS layer.
+    tls.shutdown().await.expect("the close_notify goes out");
+    let mut rest = Vec::new();
+    tokio::time::timeout(WITHIN, tls.read_to_end(&mut rest))
+        .await
+        .expect("the end comes within the bound")
+        .expect("the client's side ends with a close_notify");
+    assert!(rest.is_empty(), "{rest:?}");
     let records = the_records(&h, 1).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0].status_code, Some(101), "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Completed, "{records:?}");
     assert_eq!(
         records[0].url.as_deref(),
         Some("https://origin.test/ws"),
@@ -2055,8 +2069,9 @@ async fn a_websocket_echoes_through_a_decrypted_connection() {
     );
 }
 
-/// `[MITM] hostname = *` does not reach plain HTTP: the request to port 80 is
-/// the engine's as it always was, and its record says `http`
+/// `[MITM] hostname = *` does not reach plain HTTP: with a usable CA and a
+/// list that takes every name, a request to port 80 is the engine's as it
+/// always was, no handshake with a client is tried, and its record says `http`
 /// (`phase 4 M2 design 7.1`, `9.1`).
 #[tokio::test]
 async fn plain_http_is_untouched_by_mitm() {
@@ -2067,19 +2082,26 @@ async fn plain_http_is_untouched_by_mitm() {
         ..Socks5Script::default()
     })
     .await;
+    let mitm = mitm_ca();
+    let (ca, roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
     let h = harness_mitm(
         Profile {
             proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
             hosts: "origin.test = 127.0.0.1",
             rules: "DOMAIN,origin.test,A",
-            sections: "[MITM]\nhostname = *",
+            sections: &mitm_section("*", &ca),
             ..Profile::default()
         },
-        // nothing upstream here is decrypted or verified: the request is plain
-        // HTTP, and the `[MITM]` list reaches no such session
-        Arc::new(rustls::RootCertStore::empty()),
+        // nothing upstream here is TLS, so no origin certificate is ever
+        // checked; the roots only have to be some, because setting MITM up
+        // builds a verifier from them and an empty store is none
+        roots,
     )
     .await;
+    assert!(
+        h.engine.mitm_ca_der().is_some(),
+        "this generation has a usable CA, so MITM is on"
+    );
 
     let mut tunnel = connect_via_socks5(h.socks(), "origin.test", 80).await;
     tunnel
@@ -2104,6 +2126,11 @@ async fn plain_http_is_untouched_by_mitm() {
         "{records:?}"
     );
     assert_eq!(records[0].status_code, Some(200), "{records:?}");
+    assert_eq!(
+        h.engine.http_counts().mitm,
+        MitmCounts::default(),
+        "no TLS handshake with a client was tried"
+    );
 }
 
 /// A decrypted request to an HTTP proxy policy is tunnelled: rurge sends the
