@@ -22,6 +22,9 @@ pub mod prefix;
 pub mod sniff;
 pub mod tls;
 
+mod exec;
+mod version;
+
 pub use engine::{
     Conn, Entry, Named, Pages, Refusal, Requests, Routed, Served, Upstream, Upstreams,
     serve_connection,

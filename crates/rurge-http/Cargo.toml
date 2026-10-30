@@ -33,6 +33,7 @@ ring.workspace = true
 rurge-net = { workspace = true, features = ["testing"] }
 rurge-proto = { workspace = true, features = ["testing"] }
 base64.workspace = true
+h2.workspace = true
 
 [lints]
 workspace = true

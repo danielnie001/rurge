@@ -2017,6 +2017,8 @@ impl Dialer for Engine {
             abort: conn.abort,
             token: token.clone(),
             tracker: self.tracker().clone(),
+            // the listener speaks HTTP/1.1 (`phase 4 M2 design 10.1`)
+            h2: false,
         };
         // The listener has no stop of its own: an upgraded relay is ended by
         // the connection's own token, which a stop of the engine cancels.

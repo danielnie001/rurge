@@ -64,6 +64,17 @@ pub fn bad_request(msg: &str) -> Response<ResponseBody> {
         .expect("static response")
 }
 
+/// A request rurge understands and will not carry (`phase 4 M2 design 10.1`):
+/// the answer is the message alone, not an error page, because it is the
+/// client's request that is out of scope and not the connection's failure.
+pub fn not_implemented(msg: &str) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(full(Bytes::from(msg.to_string())))
+        .expect("static response")
+}
+
 pub struct ErrorPage<'a> {
     pub title: &'a str,
     pub session_id: u64,
@@ -166,6 +177,18 @@ mod tests {
         );
         assert_eq!(connect_established().status(), 200);
         assert_eq!(bad_request("nope").status(), 400);
+    }
+
+    #[tokio::test]
+    async fn not_implemented_is_a_501_with_the_message() {
+        let response = not_implemented("CONNECT over HTTP/2 is not supported");
+        assert_eq!(response.status(), 501);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"CONNECT over HTTP/2 is not supported");
     }
 
     /// What answers a REJECT-TINYGIF request is one pixel, and a transparent

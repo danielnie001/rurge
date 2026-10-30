@@ -535,6 +535,9 @@ impl Engine {
             abort: CancellationToken::new(),
             token: token.clone(),
             tracker: self.tracker().clone(),
+            // the client's ALPN is read from the handshake in task 4; until
+            // then every decrypted connection is served as HTTP/1.1
+            h2: false,
         };
         let upstreams = crate::http::ConnUpstreams::new(
             engine,

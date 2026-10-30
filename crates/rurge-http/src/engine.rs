@@ -11,9 +11,11 @@
 //! proxy, the hop-by-hop headers both ways, the idle timeouts and the guard
 //! that ends a request's record whatever becomes of its future.
 
+use super::exec::Exec;
 use super::headers::{self, Keep};
 use super::mitm::OriginTls;
 use super::pool::{Meter, Metered, Pool, Reusable};
+use super::version::{Form, fit};
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri, header};
 use http_body_util::BodyExt;
@@ -33,7 +35,7 @@ use rurge_proto::RejectKind;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -65,11 +67,14 @@ pub struct Conn {
     /// and `connect` puts TLS between the dialled stream and hyper.
     pub origin: Option<OriginTls>,
     /// `idle_timeout`: waiting for a response head, and between two frames of
-    /// a body (design 8.10).
+    /// a body (design 8.10). For an HTTP/2 connection it also says how long
+    /// the connection may have no request in flight before it is sent a
+    /// GOAWAY (`phase 4 M2 design 10.1`, `the phase 4 / M2b plan's P5`).
     pub idle: Duration,
     /// Reading a request head, the keep-alive idle included: `idle` for
     /// `Sniffed`, the listener's `handshake_timeout` for `Listener` (design
-    /// 8.10, 9).
+    /// 8.10, 9). An HTTP/2 connection does not use it: its requests come in
+    /// on streams of a connection that is already open.
     pub head_wait: Duration,
     /// REJECT-DROP (design 8.8).
     pub drop_hold: Duration,
@@ -83,6 +88,11 @@ pub struct Conn {
     /// The engine's tracker: the upstream connections' hyper tasks and the
     /// relays of upgrades run on it.
     pub tracker: TaskTracker,
+    /// The client speaks HTTP/2 on this connection (`phase 4 M2 design 10.1`):
+    /// a decrypted connection whose client chose `h2` in ALPN. The engine
+    /// serves it with hyper's HTTP/2 server, and `head_wait` is not used for
+    /// it.
+    pub h2: bool,
 }
 
 /// What the engine says the name behind a fake address is (`phase 4 M1 design
@@ -210,6 +220,11 @@ struct Shared<U: Upstreams> {
     /// How many requests reached `route` (`P10`): a connection that reaches no
     /// route gets a record of its own instead (`design 10.2`).
     routed: AtomicU64,
+    /// What is in flight on the connection and when it last went quiet
+    /// (`phase 4 M2 design 10.1`, `the phase 4 / M2b plan's P4`): an HTTP/2
+    /// connection with nothing in flight for `Conn::idle` is sent a GOAWAY. An
+    /// HTTP/1.1 connection keeps the count too and never reads it.
+    activity: Arc<Activity>,
 }
 
 /// The flow of every request of one client connection (`phase 4 M1 design
@@ -235,6 +250,7 @@ impl<U: Upstreams> Requests<U> {
                 upstreams,
                 pool: Mutex::new(Pool::new()),
                 routed: AtomicU64::new(0),
+                activity: Activity::new(),
             }),
         }
     }
@@ -244,13 +260,39 @@ impl<U: Upstreams> Requests<U> {
         &self.shared.conn.token
     }
 
-    /// How many requests reached `route` so far (`P10`).
+    /// How many requests reached `route` so far (`P10`). A `CONNECT` answered
+    /// with 501 on an HTTP/2 connection counts too: it has a record of its own
+    /// (`the phase 4 / M2b plan's P6`).
     pub fn routed(&self) -> u64 {
         self.shared.routed.load(Ordering::Relaxed)
     }
 
     pub async fn handle(&self, req: Request<Incoming>) -> Result<Response<ResponseBody>, Close> {
         let mut req = req;
+        // 0. A `CONNECT` on an HTTP/2 connection is the tunnel of RFC 9113
+        // §8.5, which rurge does not carry: answered 501 and recorded, so that
+        // the connection does not get a "no request" record of its own for it
+        // (`phase 4 M2 design 10.1`, `the phase 4 / M2b plan's P6`). Not routed
+        // and not dialled, and no error page: 501 is not a failure.
+        if self.shared.conn.h2 && req.method() == http::Method::CONNECT {
+            let prepared = self.prepare(&mut req, None);
+            let handle = self.shared.upstreams.open(prepared.session);
+            let _guard = Guard::new(
+                handle.clone(),
+                self.shared.conn.token.clone(),
+                self.shared.activity.clone(),
+                if self.shared.conn.h2 {
+                    "client cancelled the request"
+                } else {
+                    "client closed the connection"
+                },
+            );
+            handle.set_method(req.method().as_str());
+            self.shared.routed.fetch_add(1, Ordering::Relaxed);
+            handle.set_status(StatusCode::NOT_IMPLEMENTED.as_u16());
+            handle.finish(SessionOutcome::Failed(CONNECT_NOT_SUPPORTED.to_string()));
+            return Ok(responses::not_implemented(CONNECT_NOT_SUPPORTED));
+        }
         // 1. what the rules see (design 8.3). A listener request that is not
         // an absolute `http://` one is no request of this engine's (design 9).
         let authority = match self.shared.conn.entry {
@@ -269,12 +311,36 @@ impl<U: Upstreams> Requests<U> {
                 Some(authority) => Some(authority),
             },
         };
+        // What `:authority` and `Host` become as a request crosses to the
+        // other version, and what a request that names no host at all gets:
+        // the connection's target (`phase 4 M2 design 10.3`, `the phase 4 /
+        // M2b plan's P8`). A decrypted connection's requests are `https` ones,
+        // as `prepare` reads them (`phase 4 / M2a plan P13`).
+        let scheme = if self.shared.conn.origin.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let fallback = origin_authority(
+            &self.shared.conn.session.dst_host,
+            self.shared.conn.session.dst_port,
+            default_port(scheme),
+        );
         let prepared = self.prepare(&mut req, authority);
 
         // 2. the request's handle, and the guard that ends it whatever
         // happens to the future (design 8.11, P18)
         let handle = self.shared.upstreams.open(prepared.session);
-        let guard = Guard::new(handle.clone(), self.shared.conn.token.clone());
+        let guard = Guard::new(
+            handle.clone(),
+            self.shared.conn.token.clone(),
+            self.shared.activity.clone(),
+            if self.shared.conn.h2 {
+                "client cancelled the request"
+            } else {
+                "client closed the connection"
+            },
+        );
         handle.set_method(req.method().as_str());
         if let Some(lease) = prepared.lease {
             handle.on_finish(move |_, _| drop(lease));
@@ -346,6 +412,9 @@ impl<U: Upstreams> Requests<U> {
         // Only an upgrade keeps `Upgrade` and `Connection: upgrade`; every
         // other request drops them (design 8.7, 8.9).
         let upgrade = wants_upgrade(&req);
+        // What the request names, read before `strip` takes `TE` away
+        // (`phase 4 M2 design 10.3`, `the phase 4 / M2b plan's P8`).
+        let form = Form::of(&req, fallback);
         headers::strip(
             req.headers_mut(),
             Keep {
@@ -374,6 +443,16 @@ impl<U: Upstreams> Requests<U> {
                 header::TRANSFER_ENCODING,
                 HeaderValue::from_static("chunked"),
             );
+        }
+        // The request as its upstream takes it (`phase 4 M2 design 10.3`, `the
+        // phase 4 / M2b plan's P8`): an HTTP/2 request becomes an HTTP/1.1 one —
+        // origin form, `Host` from its authority, one `cookie` — and a request
+        // already in that form is left alone. Task 2 fits it to whatever the
+        // chosen upstream speaks instead of `HTTP_11`.
+        if let Err(e) = fit(&mut req, http::Version::HTTP_11, &form) {
+            handle.set_status(StatusCode::BAD_REQUEST.as_u16());
+            handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
+            return Ok(responses::bad_request("malformed request URI"));
         }
         // The client's side of an upgrade is taken before the request is
         // split: a request that asked for one, and a `CONNECT` on a sniffed
@@ -410,7 +489,10 @@ impl<U: Upstreams> Requests<U> {
                     return self.upstream_failed(&guard, pages, e);
                 };
                 meter.set(None);
-                let sent = match self.retry(&guard, pages, route, req, &progress, idle).await {
+                let sent = match self
+                    .retry(&guard, pages, route, req, &form, &progress)
+                    .await
+                {
                     Ok((sent, new_sender, new_meter, new_forward, new_peer)) => {
                         sender = new_sender;
                         meter = new_meter;
@@ -438,7 +520,14 @@ impl<U: Upstreams> Requests<U> {
                 };
                 meter.set(None);
                 let sent = match self
-                    .retry(&guard, pages, route, with_empty_body(head), &progress, idle)
+                    .retry(
+                        &guard,
+                        pages,
+                        route,
+                        with_empty_body(head),
+                        &form,
+                        &progress,
+                    )
                     .await
                 {
                     Ok((sent, new_sender, new_meter, new_forward, new_peer)) => {
@@ -494,6 +583,14 @@ impl<U: Upstreams> Requests<U> {
             let upstream_upgrade = hyper::upgrade::on(&mut resp);
             let client_upgrade = client_upgrade.expect("an upgrade was asked for");
             return Ok(self.promote(guard, resp, client_upgrade, upstream_upgrade, meter, tunnel));
+        }
+        // An answer that came over HTTP/2 is shown to an HTTP/1.1 client as
+        // HTTP/1.1 (`phase 4 M2 design 10.3`, `the phase 4 / M2b plan's P8`):
+        // hyper's server would rewrite it itself and log that it did, which is
+        // not rurge's log line to make. An HTTP/2 client's answer is left alone
+        // (hyper's HTTP/2 server writes its own version whatever it is told).
+        if resp.version() == http::Version::HTTP_2 && !self.shared.conn.h2 {
+            *resp.version_mut() = http::Version::HTTP_11;
         }
         handle.set_status(resp.status().as_u16());
         headers::strip(resp.headers_mut(), Keep::NONE);
@@ -815,15 +912,18 @@ impl<U: Upstreams> Requests<U> {
     /// The one send a request sent again gets: on a new connection under the
     /// same route, with the wait for the answer started over (`phase 4 M1
     /// design 8.6`, `P1`). The new connection's parts come back with the
-    /// result so that the caller keeps answering on it.
+    /// result so that the caller keeps answering on it. The request is fitted
+    /// to what that connection speaks, as the first send was (`phase 4 M2
+    /// design 10.3`, `the phase 4 / M2b plan's P8`); the idle timeout is the
+    /// connection's, as it was for the first send.
     async fn retry(
         &self,
         guard: &Guard,
         pages: Pages,
         route: U::Route,
-        req: Request<ReqBody>,
+        mut req: Request<ReqBody>,
+        form: &Form,
         progress: &Arc<Progress>,
-        idle: Duration,
     ) -> Result<
         (
             Sent,
@@ -845,6 +945,15 @@ impl<U: Upstreams> Requests<U> {
         }
         meter.set(Some(handle.clone()));
         progress.restart();
+        let idle = self.shared.conn.idle;
+        // the request goes out on this connection as it would have on the
+        // first one: whatever it now speaks is what it is fitted to (`phase 4
+        // M2 design 10.3`, `the phase 4 / M2b plan's P8`).
+        if let Err(e) = fit(&mut req, http::Version::HTTP_11, form) {
+            handle.set_status(StatusCode::BAD_REQUEST.as_u16());
+            handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
+            return Err(Ok(responses::bad_request("malformed request URI")));
+        }
         let sent = tokio::select! {
             biased;
             _ = handle.token().cancelled() => return Err(Err(Close)),
@@ -1112,7 +1221,7 @@ fn failure_prefix(kind: FailKind) -> &'static str {
 }
 
 /// The path and query of a URI, or `/`.
-fn path_and_query(uri: &Uri) -> &str {
+pub(crate) fn path_and_query(uri: &Uri) -> &str {
     uri.path_and_query().map(|p| p.as_str()).unwrap_or("/")
 }
 
@@ -1690,15 +1799,34 @@ impl<U: Upstreams> Body for Tail<U> {
 /// The guard of one request (`phase 4 M1 design 8.11`, P18): while the future
 /// lives it holds the handle; dropped first, it ends the handle the way the
 /// request ended — killed, stopped with the connection, or left by the client.
+/// It also holds the connection's count of requests in flight (`phase 4 M2
+/// design 10.1`, `the phase 4 / M2b plan's P4`).
 struct Guard {
     handle: Arc<SessionHandle>,
     /// The connection's token: a request ended by it was not left behind.
     stop: CancellationToken,
+    /// The connection's requests in flight: one more while this guard lives.
+    activity: Arc<Activity>,
+    /// What the handle says when the client went away without a word: on
+    /// HTTP/1.1 that is the connection closing, on HTTP/2 a stream the client
+    /// reset (`phase 4 M2 design 10.1`, `the phase 4 / M2b plan's P7`).
+    left: &'static str,
 }
 
 impl Guard {
-    fn new(handle: Arc<SessionHandle>, stop: CancellationToken) -> Guard {
-        Guard { handle, stop }
+    fn new(
+        handle: Arc<SessionHandle>,
+        stop: CancellationToken,
+        activity: Arc<Activity>,
+        left: &'static str,
+    ) -> Guard {
+        activity.enter();
+        Guard {
+            handle,
+            stop,
+            activity,
+            left,
+        }
     }
 
     fn handle(&self) -> &Arc<SessionHandle> {
@@ -1713,7 +1841,7 @@ impl Guard {
         } else if self.stop.is_cancelled() {
             SessionOutcome::Completed
         } else {
-            SessionOutcome::Failed("client closed the connection".to_string())
+            SessionOutcome::Failed(self.left.to_string())
         }
     }
 
@@ -1728,6 +1856,75 @@ impl Drop for Guard {
     fn drop(&mut self) {
         if !self.handle.is_finished() {
             self.handle.finish(self.outcome());
+        }
+        self.activity.leave();
+    }
+}
+
+/// What is in flight on one client connection, and when it last went quiet
+/// (`phase 4 M2 design 10.1`, `the phase 4 / M2b plan's P4`). An HTTP/2
+/// connection with nothing in flight for `Conn::idle` is sent a GOAWAY; an
+/// HTTP/1.1 connection keeps the count and never reads it.
+struct Activity {
+    /// The clock every other field counts from. It never moves, so that the
+    /// count needs no lock.
+    epoch: tokio::time::Instant,
+    /// Requests between their guard being made and being dropped, an upgrade's
+    /// relay included: the guard lives with the relay.
+    in_flight: AtomicUsize,
+    /// Milliseconds since `epoch` at which `in_flight` last fell to zero.
+    quiet_since: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Arc<Activity> {
+        Arc::new(Activity {
+            epoch: tokio::time::Instant::now(),
+            in_flight: AtomicUsize::new(0),
+            quiet_since: AtomicU64::new(0),
+        })
+    }
+
+    fn enter(&self) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One request fewer, and the moment it went quiet when it was the last
+    /// one in flight.
+    fn leave(&self) {
+        if self.in_flight.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.quiet_since
+                .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    fn quiet_since(&self) -> tokio::time::Instant {
+        self.epoch + Duration::from_millis(self.quiet_since.load(Ordering::Relaxed))
+    }
+}
+
+/// Waits until no request has been in flight on `activity` for `d`, counting
+/// from the later of `since` and the moment the last one ended (`phase 4 M2
+/// design 10.1`, `the phase 4 / M2b plan's P4`). `since` is when the
+/// connection started serving, or when a GOAWAY went out: the grace after a
+/// GOAWAY is not eaten by the quiet time before it.
+async fn quiet(activity: &Activity, d: Duration, since: tokio::time::Instant) {
+    loop {
+        if activity.in_flight() == 0 {
+            let deadline = activity.quiet_since().max(since) + d;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        } else {
+            // A request in flight has to end before this can be quiet, and
+            // `leave` is what records the moment; until then there is nothing
+            // to wake early for.
+            tokio::time::sleep(d).await;
         }
     }
 }
@@ -1745,6 +1942,36 @@ pub struct Served {
 /// Serves `client` until it ends or `requests`' connection token fires, and
 /// then until the connection has let go (`phase 4 M1 design 8.1, 8.11`).
 pub async fn serve_connection<U: Upstreams>(client: BoxedStream, requests: Requests<U>) -> Served {
+    if requests.shared.conn.h2 {
+        serve_h2(client, requests).await
+    } else {
+        serve_h1(client, requests).await
+    }
+}
+
+/// How many streams one client connection may have open at once (`phase 4 M2
+/// design 10.1`, M2-D14): RFC 9113 §6.5.2 asks for at least 100, and hyper's
+/// own default of 200 is more than a proxy of this size needs.
+const MAX_CONCURRENT_STREAMS: u32 = 100;
+
+/// How long an HTTP/2 connection gets after a GOAWAY before it is dropped
+/// (`phase 4 M2 design 10.1`, `the phase 4 / M2b plan's P5`). h2 finishes its
+/// graceful close only after the client answers a PING (`h2-0.4.19/src/proto/
+/// connection.rs`), and hyper during a handshake only notes that the close was
+/// asked for; a client that does neither must not hold an idle connection or a
+/// stop open. One second is what Go's `net/http` gives its HTTP/2 server after
+/// a GOAWAY.
+const GOAWAY_GRACE: Duration = Duration::from_secs(1);
+
+/// What a `CONNECT` on an HTTP/2 connection is answered with and recorded as
+/// (`phase 4 M2 design 10.1`, `the phase 4 / M2b plan's P6`): the tunnel of
+/// RFC 9113 §8.5 is not something rurge carries.
+const CONNECT_NOT_SUPPORTED: &str = "CONNECT over HTTP/2 is not supported";
+
+/// Serves `client` as HTTP/1.1 (`phase 4 M1 design 8.1`): until the connection
+/// ends or `requests`' connection token fires, and then until the connection
+/// has let go.
+async fn serve_h1<U: Upstreams>(client: BoxedStream, requests: Requests<U>) -> Served {
     let head_wait = requests.shared.conn.head_wait;
     let token = requests.token().clone();
     let abort = requests.shared.conn.abort.clone();
@@ -1801,10 +2028,85 @@ pub async fn serve_connection<U: Upstreams>(client: BoxedStream, requests: Reque
     }
 }
 
+/// Serves `client` as HTTP/2 (`phase 4 M2 design 10.1`, `the phase 4 / M2b
+/// plan's P3`, P5): until the connection ends, `abort` fires, the connection's
+/// token fires, or nothing has been in flight for `Conn::idle`. A stop and a
+/// quiet connection wind it down with a GOAWAY and then wait at most
+/// `GOAWAY_GRACE` for it to close itself.
+async fn serve_h2<U: Upstreams>(client: BoxedStream, requests: Requests<U>) -> Served {
+    let idle = requests.shared.conn.idle;
+    let activity = requests.shared.activity.clone();
+    let token = requests.token().clone();
+    let abort = requests.shared.conn.abort.clone();
+    let counter = requests.clone();
+    let tracker = requests.shared.conn.tracker.clone();
+    let service = service_fn(move |req: Request<Incoming>| {
+        let requests = requests.clone();
+        async move { requests.handle(req).await }
+    });
+    let conn = hyper::server::conn::http2::Builder::new(Exec(tracker))
+        .timer(TokioTimer::new())
+        // no keep-alive PING (the default `None`), and no extended `CONNECT`
+        // (the default `false`; the general design's P4-D11)
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .serve_connection(TokioIo::new(client), service);
+    let mut conn = std::pin::pin!(conn);
+    let serving = tokio::time::Instant::now();
+    // `abort` is the engine's word that the connection has to go at once (a
+    // killed request, a client that stopped reading): dropping the connection
+    // is what ends it then, and no error is recorded for it. A stop with
+    // nothing routed is the same (P5).
+    let mut goaway = false;
+    let ended = tokio::select! {
+        biased;
+        _ = abort.cancelled() => None,
+        res = conn.as_mut() => res.err().map(|e| e.to_string()),
+        _ = token.cancelled() => {
+            // nothing of this connection reached the rules: there is nothing
+            // to wind down, as on HTTP/1.1
+            goaway = counter.routed() > 0;
+            None
+        }
+        // nothing in flight for `idle`: the client keeps the connection for
+        // nothing, so it is told to stop opening streams here (P4, P5)
+        _ = quiet(&activity, idle, serving) => {
+            goaway = true;
+            None
+        }
+    };
+    // A GOAWAY is not the end by itself: the streams already open are answered,
+    // and h2's graceful close waits for the client to answer a PING before it
+    // sends its last GOAWAY (P5). The grace is the engine's own limit.
+    let error = if goaway {
+        conn.as_mut().graceful_shutdown();
+        let sent = tokio::time::Instant::now();
+        tokio::select! {
+            biased;
+            _ = abort.cancelled() => None,
+            res = conn.as_mut() => res.err().map(|e| e.to_string()),
+            _ = quiet(&activity, GOAWAY_GRACE, sent) => {
+                tracing::debug!(
+                    "an HTTP/2 client did not close its connection within a second of GOAWAY; dropping it"
+                );
+                None
+            }
+        }
+    } else {
+        ended
+    };
+    Served {
+        routed: counter.routed(),
+        error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mitm::testing::generated;
+    use http_body_util::Full;
+    use hyper::client::conn::http2;
+    use hyper_util::rt::TokioExecutor;
     use rcgen::PKCS_ECDSA_P256_SHA256;
     use rurge_net::testing::TestServer;
     use rurge_proto::testing::TlsFixture;
@@ -2182,6 +2484,7 @@ mod tests {
                 abort: CancellationToken::new(),
                 token,
                 tracker: TaskTracker::new(),
+                h2: false,
             },
             target,
         )
@@ -2203,6 +2506,7 @@ mod tests {
                 abort: CancellationToken::new(),
                 token,
                 tracker: TaskTracker::new(),
+                h2: false,
             },
             target,
         )
@@ -4149,5 +4453,391 @@ mod tests {
         assert!((10_000..15_000).contains(&up), "up {up}, down {down}");
         assert!((10_000..15_000).contains(&down), "up {up}, down {down}");
         served.abort();
+    }
+
+    /// A connection the engine serves over a duplex stream that speaks HTTP/2
+    /// (`phase 4 / M2b plan P18`): the client's end is the test's to drive —
+    /// through `h2_client`, or by writing nothing at all.
+    struct H2Rig {
+        client: DuplexStream,
+        fake: Fake,
+        token: CancellationToken,
+        served: tokio::task::JoinHandle<Served>,
+    }
+
+    /// As `rig_head_wait`, for an HTTP/2 connection (`phase 4 M2 design 10.1`).
+    /// Its origin is dialled as plain HTTP/1.1, so the URLs of its requests are
+    /// `http://` ones.
+    async fn rig_h2(target: SocketAddr, idle: Duration, drop_hold: Duration) -> H2Rig {
+        let token = CancellationToken::new();
+        let fake = Fake::new(token.clone(), target);
+        let conn = Conn {
+            session: SessionInfo::tcp(HostName::parse("target.test"), 80),
+            entry: Entry::Sniffed,
+            origin: None,
+            idle,
+            head_wait: Duration::from_secs(5),
+            drop_hold,
+            abort: CancellationToken::new(),
+            token: token.clone(),
+            tracker: TaskTracker::new(),
+            h2: true,
+        };
+        let requests = Requests::new(conn, fake.clone());
+        let (server_end, client) = tokio::io::duplex(64 * 1024);
+        let served = tokio::spawn(serve_connection(Box::new(server_end), requests));
+        H2Rig {
+            client,
+            fake,
+            token,
+            served,
+        }
+    }
+
+    /// hyper's HTTP/2 client over `stream` (`phase 4 / M2b plan P18`): the
+    /// sender, and the task that has to keep running for the connection to
+    /// move.
+    async fn h2_client(
+        stream: DuplexStream,
+    ) -> (
+        http2::SendRequest<Full<Bytes>>,
+        tokio::task::JoinHandle<hyper::Result<()>>,
+    ) {
+        let (sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(stream))
+            .await
+            .expect("an HTTP/2 handshake");
+        (sender, tokio::spawn(conn))
+    }
+
+    /// A request as hyper's HTTP/2 client takes it: the absolute URI goes into
+    /// `:scheme` and `:authority`, so that `handle` sees the request line it
+    /// would see on HTTP/1.1 (`phase 4 / M2b plan P18`).
+    fn h2_request(method: http::Method, url: &str) -> Request<Full<Bytes>> {
+        Request::builder()
+            .method(method)
+            .uri(url)
+            .body(Full::new(Bytes::new()))
+            .expect("a request")
+    }
+
+    /// The serving task's answer, waiting at most `within` for it.
+    async fn served_within(served: tokio::task::JoinHandle<Served>, within: Duration) -> Served {
+        tokio::time::timeout(within, served)
+            .await
+            .expect("the connection ended in time")
+            .expect("the serving task did not panic")
+    }
+
+    /// A response body, read to its end.
+    async fn body_of(resp: Response<Incoming>) -> Vec<u8> {
+        resp.into_body()
+            .collect()
+            .await
+            .expect("a response body")
+            .to_bytes()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn an_h2_client_is_served_over_an_http1_upstream() {
+        let origin = TestServer::spawn().await;
+        origin.set("/hello", "hi there");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/hello"))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await, b"hi there");
+        let requests = origin.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].version, "HTTP/1.1", "the origin is HTTP/1.1");
+        assert_eq!(requests[0].path, "/hello");
+        assert_eq!(requests[0].header("host"), Some("target.test"));
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.session().url.as_deref(),
+            Some("http://target.test/hello")
+        );
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(handle.status(), Some(200));
+        let (up, down) = handle.bytes();
+        assert!(up > 0 && down > 0, "up {up}, down {down}");
+        // the client leaves: the connection ends and the serving task with it
+        drop(sender);
+        conn.abort();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 1);
+    }
+
+    #[tokio::test]
+    async fn the_authority_of_an_h2_request_names_it_and_becomes_host() {
+        let origin = TestServer::spawn().await;
+        origin.set("/a", "one");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        // no `Host`: the request names itself in `:authority` only
+        let resp = sender
+            .send_request(h2_request(
+                http::Method::GET,
+                "http://target.test:8443/a?q=1",
+            ))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 200);
+        let _ = body_of(resp).await;
+        let seen = rig.fake.seen();
+        assert_eq!(
+            seen[0].session.url.as_deref(),
+            Some("http://target.test:8443/a?q=1")
+        );
+        assert_eq!(seen[0].session.http_host.as_deref(), Some("target.test"));
+        // `TestServer` records the path alone; the query is the URL's above
+        let requests = origin.requests();
+        assert_eq!(requests[0].path, "/a");
+        assert_eq!(requests[0].header("host"), Some("target.test:8443"));
+        drop(sender);
+        conn.abort();
+        served_within(rig.served, Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn the_cookies_of_an_h2_request_are_joined_for_an_http1_upstream() {
+        let origin = TestServer::spawn().await;
+        origin.set("/cookies", "ok");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let mut req = h2_request(http::Method::GET, "http://target.test/cookies");
+        req.headers_mut()
+            .append(header::COOKIE, HeaderValue::from_static("a=1"));
+        req.headers_mut()
+            .append(header::COOKIE, HeaderValue::from_static("b=2"));
+        req.headers_mut()
+            .insert(header::TE, HeaderValue::from_static("trailers"));
+        let resp = sender.send_request(req).await.expect("an answer");
+        assert_eq!(resp.status(), 200);
+        let _ = body_of(resp).await;
+        let requests = origin.requests();
+        let cookies: Vec<&str> = requests[0]
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(cookies, vec!["a=1; b=2"], "one joined field");
+        assert_eq!(requests[0].header("te"), None);
+        drop(sender);
+        conn.abort();
+        served_within(rig.served, Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn the_h2_server_offers_100_streams_and_no_extended_connect() {
+        let origin = TestServer::spawn().await;
+        origin.set("/hello", "hi there");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        // h2's own client, not hyper's: the SETTINGS it read are what the
+        // engine promised (`phase 4 / M2b plan P18`)
+        let (mut sender, mut conn) = h2::client::handshake(rig.client)
+            .await
+            .expect("an HTTP/2 handshake");
+        let req = Request::builder()
+            .method(http::Method::GET)
+            .uri("http://target.test/hello")
+            .body(())
+            .expect("a request");
+        let (answered, _body) = sender.send_request(req, true).expect("a stream");
+        // the peer's SETTINGS are confirmed by the time an answer comes back
+        let answered = tokio::select! {
+            answered = answered => answered.expect("an answer"),
+            res = &mut conn => panic!("the connection ended before an answer: {res:?}"),
+        };
+        assert_eq!(answered.status(), 200);
+        assert_eq!(conn.max_concurrent_send_streams(), 100);
+        assert!(!sender.is_extended_connect_protocol_enabled());
+    }
+
+    #[tokio::test]
+    async fn a_connect_over_h2_is_a_501_with_a_record() {
+        let origin = TestServer::spawn().await;
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let resp = sender
+            .send_request(h2_request(http::Method::CONNECT, "target.test:443"))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 501);
+        assert_eq!(body_of(resp).await, b"CONNECT over HTTP/2 is not supported");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(
+                "CONNECT over HTTP/2 is not supported".into()
+            ))
+        );
+        assert_eq!(handle.method().as_deref(), Some("CONNECT"));
+        assert_eq!(handle.status(), Some(501));
+        assert!(rig.fake.seen().is_empty(), "a `CONNECT` is not routed");
+        assert_eq!(rig.fake.dials(), 0, "and not dialled");
+        drop(sender);
+        conn.abort();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 1, "its record is its own");
+    }
+
+    #[tokio::test]
+    async fn a_stream_the_client_resets_is_cancelled_and_the_connection_stays() {
+        let origin = TestServer::spawn().await;
+        origin.set("/hang", "late");
+        origin.set_delay("/hang", Duration::from_secs(10));
+        origin.set("/ok", "fine");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        // dropping the future of a request resets its stream (`CANCEL`); the
+        // connection goes on
+        let hang = tokio::spawn(
+            sender.send_request(h2_request(http::Method::GET, "http://target.test/hang")),
+        );
+        let _ = rig.fake.handle(0).await;
+        hang.abort();
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(
+                "client cancelled the request".into()
+            ))
+        );
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/ok"))
+            .await
+            .expect("an answer on the same connection");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await, b"fine");
+        assert!(!rig.served.is_finished(), "the connection is still open");
+        drop(sender);
+        conn.abort();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 2);
+    }
+
+    #[tokio::test]
+    async fn an_idle_h2_connection_is_sent_goaway() {
+        let origin = TestServer::spawn().await;
+        origin.set("/hello", "hi there");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/hello"))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await, b"hi there");
+        assert!(!sender.is_closed(), "the connection is still open");
+        // 300 ms of nothing is a GOAWAY: the client's connection ends
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !sender.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a GOAWAY within 3 s");
+        // whether the client's connection ended `Ok` or by the peer closing it
+        // is not this test's to say
+        let _ = tokio::time::timeout(Duration::from_secs(3), conn)
+            .await
+            .expect("the client's connection ended within 3 s");
+        let served = served_within(rig.served, Duration::from_secs(3)).await;
+        assert_eq!(served.routed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_silent_h2_client_is_dropped_after_idle_and_the_grace() {
+        let origin = TestServer::spawn().await;
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+        )
+        .await;
+        // the client says nothing at all: no preface, no frame. The connection
+        // is up, so it has to be held, not dropped
+        let _client = rig.client;
+        let started = tokio::time::Instant::now();
+        let served = served_within(rig.served, Duration::from_secs(3)).await;
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(1_200),
+            "the idle timeout and the grace, with 100 ms of margin: {took:?}"
+        );
+        assert_eq!(served.routed, 0);
+        assert_eq!(served.error, None, "the engine dropped the connection");
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_an_h2_connection_with_goaway() {
+        let origin = TestServer::spawn().await;
+        origin.set("/hang", "late");
+        origin.set_delay("/hang", Duration::from_secs(10));
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let hang = tokio::spawn(
+            sender.send_request(h2_request(http::Method::GET, "http://target.test/hang")),
+        );
+        let _ = rig.fake.handle(0).await;
+        rig.token.cancel();
+        let answered = tokio::time::timeout(Duration::from_secs(5), hang)
+            .await
+            .expect("the stream ended within 5 s")
+            .expect("the task did not panic");
+        assert!(answered.is_err(), "the stream was reset");
+        let _ = tokio::time::timeout(Duration::from_secs(5), conn)
+            .await
+            .expect("the client's connection ended within 5 s");
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 1);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed), "stopped");
     }
 }
