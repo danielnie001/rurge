@@ -805,17 +805,17 @@ M2c 做完了（2026-10-31；计划 `docs/superpowers/plans/2026-10-31-phase4-m2
 - **任务 3**（`0da8262`）：`rurge mitm ca generate` / `export`；+5 条（91 / 5016）。
 - **任务 4**（`52c8dc7`）：`ApiTls` 与 `Engine::api_tls`；+6 条（91 / 5022）。
 - **任务 5**（`8198345`、修正轮 1 `9d4f05a`）：TLS 的监听器与 `serve_tls`；+10 条（91 / 5032）。
-- **任务 6**（`6cd1d89`、修正轮 1 `852e483`）：起 API、重载的告警、命令行的 HTTPS 与两条端到端；+4 条（91 / 5036）。
+- **任务 6**（`6cd1d89`、`0dabdff`、修正轮 1 `852e483`）：起 API、重载的告警、命令行的 HTTPS 与两条端到端；+4 条（91 / 5036）。
 - **任务 7**（`c8c1fca`、修正轮 1 `113dc44`、修正轮 2 `eedd9b1`）：阶段 4 的手工验收清单，只改文档。
 - **任务 8**（本节的提交）：文档收尾（设计第 22 节与第 23 节第 28、29 条、兼容性清单、`docs/api/phase4.md`、`docs/testing.md`、本节与依赖附录、`requirements.md`、两份 README、`CLAUDE.md`、`docs/README.md`），只改文档，0 条用例（91 / 5036）。
 
-门禁：每个任务各跑了一次全量。任务 4 的第一次全量里 `--test http` 的测试二进制以 `STATUS_HEAP_CORRUPTION` 退出，整个门禁重跑全绿；任务 1 与任务 2 各有一次测试二进制同样退出，单独重跑那一个全过；任务 5 修正轮 1 新增的计时用例单独循环跑了 20 次（`task-5-loop-tls.log`、`task-5-loop-api.log`、`task-5-fix-1-loop-tls.log`、`task-6-loop-mitm.log`）。这些都是一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；需要参照服务端的互操作用例在本机立刻返回、算在通过的数里。
+门禁：除任务 7 外，每个任务各跑了一次全量（任务 7 与它的两轮修正只改文档，没有跑，修正记录第 41、43、45 行）。任务 4 的第一次全量里 `--test http` 的测试二进制以 `STATUS_HEAP_CORRUPTION` 退出，整个门禁重跑全绿；任务 1 与任务 2 各有一次测试二进制同样退出，单独重跑那一个全过。新写的计时用例单独循环跑了 20 次，全过，五圈各属于谁：任务 1 改了等待之后的 `crates/rurge-engine/tests/pipeline.rs` 那一条（`a_dns_session_is_labelled_by_its_scheme_whatever_the_port`，M2b 延后第 1 行，`task-1-loop-pipeline.log`）、任务 5 的五条握手用例（`task-5-loop-tls.log`）、任务 5 的 `--test api` 两条（`task-5-loop-api.log`）、任务 5 修正轮 1 那五条又一圈（`task-5-fix-1-loop-tls.log`）、任务 6 的 `run::mitm` 两条（`task-6-loop-mitm.log`）。这些都是一台 Windows 11 x86-64 开发机上的一次运行，不是 CI；需要参照服务端的互操作用例在本机立刻返回、算在通过的数里。
 
 没做的，与不要当成已经有的：
 
 - **`#[cfg(unix)]` 的两处本机没有编译过**：`crates/rurge/src/cli/mitm.rs` 的 `restrict`（两个私密文件的 `0600`）与 `crates/rurge/tests/cli.rs` 的 `mitm_ca_generate_keeps_the_secrets_private`。第一次编译与运行它们的是项目所有者推送之后的 CI；在那之前，“Unix 上私密文件是 `0600`”只有读代码与照 `fakeip/file.rs` 写这两条依据。
 - **没有手工验收**：`docs/acceptance/phase4-manual.md` 30 项一项也没有做；没有把 CA 装进任何信任库、没有经真浏览器打开过解密的站点、没有观察过 `generate` 打印的安装命令在任何平台上跑起来是什么样。全部证据在回环上。
-- **M1a、M1b、M2a、M2b 与 M2c 的提交 CI 都没有见过**：三个平台一次也没有编译、运行过阶段 4 的代码（`0600` 那两处除外，它们也没编译过）。
+- **M1a、M1b、M2a、M2b 与 M2c 的提交 CI 都没有见过**：**CI 的**三个平台一次也没有编译、运行过阶段 4 的代码；这台 Windows 开发机编译、运行过它们，只有 `#[cfg(unix)]` 的那两处（`restrict` 与 `mitm_ca_generate_keeps_the_secrets_private`）在这里编译不到。
 - **`--remote` 对开了 `http-api-tls` 的实例连不上**（M2-D21）：没有加指定 CA 文件的参数；只有带 `-c` 的本机能用。
 - **API 讲 HTTPS 时只讲 `http/1.1`**：没有 HTTP/2，也不在 ALPN 里给 `h2`。
 - **Windows 上 `generate` 不给两个私密文件设 ACL**（M2-D20）：它们随所在目录的权限。
@@ -839,7 +839,7 @@ M2c 做完了（2026-10-31；计划 `docs/superpowers/plans/2026-10-31-phase4-m2
 去向写着项目所有者的（后来的会话不要自己定）：
 
 - **推送与读回那次 CI**：M1a、M1b、M2a、M2b 与 M2c 的提交都在本地；设计第 2 节写的是 M1 与 M2 一起、M2c 做完之后推（M2-D1）。推送之后先读那次运行的注解与任务摘要；`#[cfg(unix)]` 的两处第一次在那里编译与运行。
-- **代所有者作的裁定可以改**：设计与计划的已决事项（M2-D1 ～ D25、P1 ～ P18），与本文件、兼容性清单、计划表里写“协调者的裁定”的各行——M2c 的有记录第 19、22、23、26、35 行与派工单里定的几件（`W0040` 只写一处常量、`base64` 进开发依赖、`generate` ⑥ 的 Unix / Windows 两句用 `cfg!(unix)`、`sockets.rs` 新行按字节序放、`Endpoint` 不实现 `Debug`）；执行者的裁定同样可以改。
+- **代所有者作的裁定可以改**：设计与计划的已决事项（M2-D1 ～ D25、P1 ～ P18），与本文件、兼容性清单、计划表里写“协调者的裁定”的各行——M2c 的有记录第 10、19、23、26、35 行与第 38 行 ③，以及派工单里定的几件（`W0040` 只写一处常量、`base64` 进开发依赖、`generate` ⑥ 的 Unix / Windows 两句用 `cfg!(unix)`、`sockets.rs` 新行按字节序放、`Endpoint` 不实现 `Debug`）；执行者的裁定同样可以改。
 - **M2a 计划「延后事项」第 1、2 行**（去向都是项目所有者）：① 运行中要不要按时查 CA 的有效期、到期时告警或停止解密——M2c 已把它列进设计第 22 节；② 解密的流上对端不发 `close_notify` 就关闭要不要当作结束（M2a 照 rustls 的缺省报 `UnexpectedEof`）。
 - **M2c 计划「延后事项」第 1 行**（去向是项目所有者）：证书固定提示会把“握手完成之后才核证书、因而不信 CA”的客户端也报成证书固定；改不改提示的措辞（“exclude it with `-<名字>`”）由所有者定——对这些客户端，正确的做法是装上并信任 CA。
 - **设计第 22 节的开放问题**照旧归所有者：Q1（解密的请求带完整 URL 与查询串算不算 API 输出）、Q3（`[MITM] # note` 这样的节头）、Q4（`p12-keystore` 升到 0.4.x 与 `webpki-roots` 的许可）、Q5（把 CA 自动装进信任库）、经虚拟网卡来的会话名字在 INFO 及以上。
