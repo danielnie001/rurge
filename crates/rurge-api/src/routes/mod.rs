@@ -3,6 +3,7 @@ pub mod features;
 pub mod geoip;
 pub mod log;
 pub mod misc;
+pub mod mitm;
 pub mod outbound;
 pub mod policies;
 pub mod policy_groups;

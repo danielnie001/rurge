@@ -3247,6 +3247,7 @@ dependencies = [
  "rurge-engine",
  "rurge-net",
  "rurge-policy",
+ "rurge-proto",
  "rurge-rules",
  "serde",
  "serde_json",
@@ -3255,6 +3256,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "x509-parser",
 ]
 
 [[package]]

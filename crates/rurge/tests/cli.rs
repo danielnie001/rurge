@@ -3837,6 +3837,31 @@ loglevel = notify",
         assert!(state.contains("\"outbound_mode\": \"rule\""), "{state}");
     }
 
+    /// A start takes the `mitm` switch from `state.json` (phase 4 M2 design
+    /// 11.2): a second-version file that turned it off leaves it off. The
+    /// start does not write the file back; `a_start_with_the_recorded_profile_leaves_state_json_as_it_is`
+    /// holds that.
+    #[test]
+    fn a_daemon_restores_the_mitm_switch_from_state_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join("state.json"),
+            r#"{"version":2,"features":{"mitm":false}}"#,
+        )
+        .unwrap();
+        let mut daemon = spawn_daemon(&conf, &data);
+        let port = api_port(&daemon);
+        assert_eq!(
+            api_call(port, "GET", "/v1/features/mitm", "k", None),
+            (200, r#"{"enabled":false}"#.to_string())
+        );
+        assert_eq!(api_call(port, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0));
+    }
+
     #[test]
     fn run_reloads_and_stops_via_the_api() {
         let dir = tempfile::tempdir().unwrap();

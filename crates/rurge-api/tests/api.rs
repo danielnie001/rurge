@@ -22,6 +22,7 @@ use rurge_engine::{
 use rurge_net::BoxFuture;
 use rurge_net::resource::{ResourceOptions, ResourceSource, cache_file, resource_key};
 use rurge_net::testing::{TestServer, seed_cache};
+use rurge_proto::testing::TlsFixture;
 use rurge_rules::geoip::{ASN_FILE, COUNTRY_FILE};
 use rurge_rules::{DbKind, GeoDb, GeoUrls, OutboundMode};
 use serde_json::{Value, json};
@@ -187,6 +188,12 @@ async fn api_with(rules: &str) -> Api {
     api_in(rules, "").await
 }
 
+/// `api_with` with `extra`, a whole section put after the rules of the
+/// profile (the phase 4 / M2a plan's P27): `[MITM]\n…`.
+async fn api_with_extra(rules: &str, extra: &str) -> Api {
+    api_built(rules, "", None, extra, |_| {}).await
+}
+
 /// `groups` go after `Pick`. A proxy would be tested at a loopback port,
 /// never at the default `http://bing.com/`; no test here has one tested,
 /// and none may count on what that port answers.
@@ -196,22 +203,24 @@ async fn api_in(rules: &str, groups: &str) -> Api {
 
 /// `api_in`, `seed` having filled the data directory before the engine starts.
 async fn api_seeded(rules: &str, groups: &str, seed: impl FnOnce(&Path)) -> Api {
-    api_built(rules, groups, None, seed).await
+    api_built(rules, groups, None, "", seed).await
 }
 
 /// `api_seeded` with a generation that downloads, its two GeoIP databases
 /// asked of `geo`. By the time it is built every first download has been
 /// tried, and those `geo` cannot give have failed.
 async fn api_online(rules: &str, groups: &str, geo: &TestServer, seed: impl FnOnce(&Path)) -> Api {
-    api_built(rules, groups, Some(geo), seed).await
+    api_built(rules, groups, Some(geo), "", seed).await
 }
 
 /// `geo` is the server the generation downloads its GeoIP databases from; it
-/// does not go to the network without one.
+/// does not go to the network without one. `extra` closes the profile, after
+/// `[Rule]`: a section the test needs, such as `[MITM]`.
 async fn api_built(
     rules: &str,
     groups: &str,
     geo: Option<&TestServer>,
+    extra: &str,
     seed: impl FnOnce(&Path),
 ) -> Api {
     let dns = MockDns::spawn().await;
@@ -229,7 +238,7 @@ internet-test-url = http://target.test:{}/hello\nproxy-test-url = http://127.0.0
 [Proxy]\nHK = tailscale, section-name=ts\nBlock = reject-tinygif\n\
 Locked = trojan, 1.2.3.4, 443, password=x\n\
 [Proxy Group]\nPick = select, HK, DIRECT\n{groups}\n\
-[Rule]\n{rules}\nDOMAIN,ads.test,REJECT\nFINAL,DIRECT\n",
+[Rule]\n{rules}\nDOMAIN,ads.test,REJECT\nFINAL,DIRECT\n{extra}",
         dns.addr(),
         target.url("/").port().unwrap()
     );
@@ -346,6 +355,39 @@ async fn call_text(
         .to_string();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     (status, content_type, bytes)
+}
+
+/// `call_raw` with the answer's `Content-Disposition` as well, for the one
+/// endpoint whose file name is part of what it gives. It sends a `GET` with no
+/// body.
+async fn call_download(
+    addr: SocketAddr,
+    path: &str,
+    key: Option<&str>,
+) -> (u16, String, String, Bytes) {
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+    let mut req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{addr}{path}"));
+    if let Some(k) = key {
+        req = req.header("x-key", k);
+    }
+    let resp = client
+        .request(req.body(Full::new(Bytes::new())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    let content_type = header("content-type");
+    let disposition = header("content-disposition");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, content_type, disposition, bytes)
 }
 
 async fn call(
@@ -540,10 +582,10 @@ async fn the_global_policy_cannot_be_cleared_while_in_proxy_mode() {
 async fn features_collections_stop_and_unknown_paths() {
     let api = api().await;
     assert_eq!(
-        get(&api, "/v1/features/mitm").await,
+        get(&api, "/v1/features/capture").await,
         (200, json!({ "enabled": false }))
     );
-    let (status, _) = post(&api, "/v1/features/mitm", json!({ "enabled": true })).await;
+    let (status, _) = post(&api, "/v1/features/capture", json!({ "enabled": true })).await;
     assert_eq!(status, 501);
     assert_eq!(
         get(&api, "/v1/features/system_proxy").await,
@@ -563,9 +605,9 @@ async fn features_collections_stop_and_unknown_paths() {
         (200, json!({ "enabled": true }))
     );
     assert_eq!(
-        get(&api, "/v1/features/mitm").await,
+        get(&api, "/v1/features/capture").await,
         (200, json!({ "enabled": false })),
-        "only system_proxy and enhanced_mode are live"
+        "only system_proxy, enhanced_mode and mitm are live"
     );
     assert_eq!(
         post(
@@ -621,6 +663,80 @@ async fn features_collections_stop_and_unknown_paths() {
     assert_eq!((status, body), (401, json!({ "error": "unauthorized" })));
     assert_eq!(post(&api, "/v1/stop", json!({})).await, (200, json!({})));
     wait_until(async || api.control.stops.load(Ordering::SeqCst) == 1).await;
+}
+
+/// The `mitm` switch (phase 4 M2 design 11.1): on unless `state.json` said
+/// otherwise, switched through the API, and what is switched is written to the
+/// second version of that file.
+#[tokio::test]
+async fn the_mitm_switch_is_read_switched_and_kept() {
+    let api = api().await;
+    assert_eq!(
+        get(&api, "/v1/features/mitm").await,
+        (200, json!({ "enabled": true }))
+    );
+    assert_eq!(
+        post(&api, "/v1/features/mitm", json!({ "enabled": false })).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/features/mitm").await,
+        (200, json!({ "enabled": false }))
+    );
+    let saved: Value = std::fs::read_to_string(&api.state_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(saved["version"], 2);
+    assert_eq!(saved["features"]["mitm"], false);
+    assert_eq!(
+        post(&api, "/v1/features/mitm", json!({ "enabled": true })).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/features/mitm").await,
+        (200, json!({ "enabled": true }))
+    );
+}
+
+/// `GET /v1/mitm/ca` (phase 4 M2 design 12.2): the DER of the CA `[MITM]`
+/// names, as a certificate file a client can be asked to trust. The key may
+/// come in the query string, as it may for every other endpoint.
+#[tokio::test]
+async fn the_mitm_ca_is_given_in_der() {
+    let ca = TlsFixture::new(&[]);
+    let api = api_with_extra(
+        "",
+        &format!(
+            "[MITM]\nca-p12 = {}\nca-passphrase = pw\n",
+            ca.ca_p12_base64("pw")
+        ),
+    )
+    .await;
+    let (status, content_type, disposition, body) =
+        call_download(api.addr, "/v1/mitm/ca", Some(KEY)).await;
+    assert_eq!(status, 200);
+    assert_eq!(content_type, "application/x-x509-ca-cert");
+    assert_eq!(disposition, "attachment; filename=\"rurge-ca.cer\"");
+    assert_eq!(body.as_ref(), ca.ca_der(), "the CA's DER, byte for byte");
+    let (rest, cert) = x509_parser::parse_x509_certificate(&body).expect("a certificate");
+    assert!(rest.is_empty(), "{} bytes past the certificate", rest.len());
+    assert!(cert.subject().to_string().contains("rurge test CA"));
+    let (status, _, _, body) =
+        call_download(api.addr, &format!("/v1/mitm/ca?x-key={KEY}"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(body.as_ref(), ca.ca_der());
+}
+
+/// `GET /v1/mitm/ca` with no CA this generation can sign with is a 404, not an
+/// empty file.
+#[tokio::test]
+async fn the_mitm_ca_is_a_404_without_a_usable_ca() {
+    let api = api().await;
+    assert_eq!(
+        get(&api, "/v1/mitm/ca").await,
+        (404, json!({ "error": "no usable MITM CA" }))
+    );
 }
 
 /// `GET /v1/features/enhanced_mode`: the two switches it has, the eleven reasons
@@ -1118,7 +1234,8 @@ async fn rurge_http_counts_start_at_zero() {
             200,
             json!({
                 "sniffed": {"tls": 0, "http": 0, "other": 0, "timeout": 0, "closed": 0},
-                "requests": 0
+                "requests": 0,
+                "mitm": {"decrypted": 0, "untrusted": 0, "failed": 0, "noRequest": 0}
             })
         )
     );
@@ -1126,7 +1243,7 @@ async fn rurge_http_counts_start_at_zero() {
     assert_eq!(status, 200);
     assert_eq!(
         bytes.as_ref(),
-        br#"{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0},"requests":0}"#
+        br#"{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0},"requests":0,"mitm":{"decrypted":0,"untrusted":0,"failed":0,"noRequest":0}}"#
             .as_slice()
     );
     assert_eq!(
