@@ -52,6 +52,10 @@ pub enum Decision {
 /// (`phase 4 M2 design 9.2`, the same 30 seconds as `8.2`).
 pub struct OriginTls {
     pub config: Arc<ClientConfig>,
+    /// The same trust and the same name, offering `http/1.1` only: an upgrade
+    /// or a tunnel needs an upstream that speaks it (`phase 4 M2 design 10.4`,
+    /// `the phase 4 / M2b plan's P12`).
+    pub h1: Arc<ClientConfig>,
     pub name: ServerName<'static>,
     pub wait: Duration,
 }
@@ -101,6 +105,7 @@ pub struct Mitm {
     explicit_ports: Vec<u16>,
     server: Arc<ServerConfig>,
     origin: Arc<ClientConfig>,
+    h1: Arc<ClientConfig>,
 }
 
 impl Mitm {
@@ -113,6 +118,10 @@ impl Mitm {
     ) -> Result<Mitm, BuildError> {
         let server = server_config(&authority)?;
         let origin = origin_client_config(roots, cfg.skip_server_cert_verify, &[b"http/1.1"])?;
+        // `h2` is off in this milestone: what an upgrade gets is what every
+        // request gets (`the phase 4 / M2b plan's P15` leaves the widening to
+        // task 4)
+        let h1 = Arc::clone(&origin);
         Ok(Mitm {
             authority,
             effective: cfg.effective.clone(),
@@ -120,6 +129,7 @@ impl Mitm {
             explicit_ports: cfg.effective.explicit_ports(),
             server,
             origin,
+            h1,
         })
     }
 
@@ -231,6 +241,7 @@ impl Mitm {
             watch,
             origin: OriginTls {
                 config: Arc::clone(&self.origin),
+                h1: Arc::clone(&self.h1),
                 name: origin,
                 wait,
             },

@@ -117,6 +117,24 @@ impl Meter {
     fn current(&self) -> Option<Arc<SessionHandle>> {
         self.0.lock().expect("meter").clone()
     }
+
+    /// Counts `n` bytes as the lent request's, written upstream
+    /// (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's P11`). A shared
+    /// HTTP/2 connection is never lent, so the request counts its own body
+    /// through a meter of its own.
+    pub(crate) fn count_up(&self, n: u64) {
+        if let Some(handle) = self.current() {
+            handle.add_up(n);
+        }
+    }
+
+    /// Counts `n` bytes as the lent request's, read from upstream
+    /// (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's P11`).
+    pub(crate) fn count_down(&self, n: u64) {
+        if let Some(handle) = self.current() {
+            handle.add_down(n);
+        }
+    }
 }
 
 /// An upstream stream that counts its bytes onto the request the pool has lent

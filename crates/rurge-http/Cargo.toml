@@ -28,12 +28,12 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 sha2.workspace = true
 ring.workspace = true
+h2.workspace = true
 
 [dev-dependencies]
 rurge-net = { workspace = true, features = ["testing"] }
 rurge-proto = { workspace = true, features = ["testing"] }
 base64.workspace = true
-h2.workspace = true
 
 [lints]
 workspace = true

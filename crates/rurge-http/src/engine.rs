@@ -22,6 +22,7 @@ use http_body_util::BodyExt;
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1::SendRequest;
+use hyper::client::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rurge_config::HostName;
@@ -32,6 +33,7 @@ use rurge_inbound::{Close, FailKind, SessionHandle, SessionOutcome};
 use rurge_net::BoxFuture;
 use rurge_net::connector::BoxedStream;
 use rurge_proto::RejectKind;
+use std::error::Error as StdError;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -225,6 +227,53 @@ struct Shared<U: Upstreams> {
     /// connection with nothing in flight for `Conn::idle` is sent a GOAWAY. An
     /// HTTP/1.1 connection keeps the count too and never reads it.
     activity: Arc<Activity>,
+    /// The HTTP/2 upstream connections this client connection shares between
+    /// its requests, one per key at most (`phase 4 M2 design 10.2`, `the phase
+    /// 4 / M2b plan's P10`). They are never put back: a request under the key
+    /// finds the one that is still open.
+    h2: Mutex<Vec<SharedH2<U::Key>>>,
+}
+
+/// One shared HTTP/2 upstream connection of a client connection (`phase 4 M2
+/// design 10.2`, `the phase 4 / M2b plan's P10`): the key it is shared under,
+/// a handle of its streams, and where its dial went.
+struct SharedH2<K> {
+    key: K,
+    sender: http2::SendRequest<ReqBody>,
+    peer: Option<SocketAddr>,
+}
+
+impl<U: Upstreams> Shared<U> {
+    /// A stream of the live HTTP/2 connection under `key`, if there is one
+    /// (`the phase 4 / M2b plan's P10`): its sender is cloned, so the request
+    /// holds its own stream and not the connection. Items whose connection
+    /// went away (a GOAWAY, the origin closing it) are dropped on the way.
+    fn borrow_h2(&self, key: &U::Key) -> Option<(http2::SendRequest<ReqBody>, Option<SocketAddr>)> {
+        let mut h2 = self.h2.lock().expect("h2");
+        h2.retain(|shared| !shared.sender.is_closed());
+        let shared = h2.iter().find(|shared| &shared.key == key)?;
+        Some((shared.sender.clone(), shared.peer))
+    }
+
+    /// Puts a freshly dialled HTTP/2 connection under `key`, unless one is
+    /// open there already (`the phase 4 / M2b plan's P10`). The key moves into
+    /// the item, so the request that dialled this one no longer has one: a
+    /// connection of its own is never pooled and never lent.
+    fn share(
+        &self,
+        key: &mut Option<U::Key>,
+        sender: http2::SendRequest<ReqBody>,
+        peer: Option<SocketAddr>,
+    ) {
+        let mut h2 = self.h2.lock().expect("h2");
+        h2.retain(|shared| !shared.sender.is_closed());
+        if h2.iter().any(|shared| key.as_ref() == Some(&shared.key)) {
+            return;
+        }
+        if let Some(key) = key.take() {
+            h2.push(SharedH2 { key, sender, peer });
+        }
+    }
 }
 
 /// The flow of every request of one client connection (`phase 4 M1 design
@@ -251,6 +300,7 @@ impl<U: Upstreams> Requests<U> {
                 pool: Mutex::new(Pool::new()),
                 routed: AtomicU64::new(0),
                 activity: Activity::new(),
+                h2: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -368,47 +418,87 @@ impl<U: Upstreams> Requests<U> {
             return self.answer(&guard, refusal, pages).await;
         }
 
-        // 4. an upstream connection: one idle in the pool under this key, or
-        // a fresh dial in this task (design 8.4, 8.5)
-        let borrowed = {
-            let mut pool = self.shared.pool.lock().expect("pool");
-            pool.take(&key, Instant::now())
-        };
-        // The route of a borrowed connection is still unused: a request the
-        // borrowed connection does not carry is sent again on a connection
-        // dialled with it (design 8.6).
-        let (mut sender, mut meter, mut forward, mut peer, mut route) = match borrowed {
-            Some(pooled) => {
-                // a borrowed connection is ready now, and its dial is the one
-                // the record's peer address and bytes belong to
-                handle.mark_connected();
-                if let Some(peer) = pooled.peer {
-                    handle.trail().set_peer(peer);
-                }
-                pooled.meter.set(Some(handle.clone()));
-                (
-                    pooled.sender,
-                    pooled.meter,
-                    pooled.forward,
-                    pooled.peer,
-                    Some(route),
-                )
-            }
-            None => {
-                let (sender, meter, forward, peer) = match self.redial(&guard, pages, route).await {
-                    Ok(parts) => parts,
-                    Err(answer) => return answer,
-                };
-                (sender, meter, forward, peer, None)
-            }
-        };
-
-        // 5. the request as its upstream takes it (design 8.7), sent with the
-        // idle timeout between the frames of its body
+        // An upgrade or a tunnel can cross to no HTTP/2 upstream: it needs a
+        // connection that speaks HTTP/1.1 (`phase 4 M2 design 10.4`, `the
+        // phase 4 / M2b plan's P12`). Read before the hop-by-hop headers go:
+        // `Upgrade` and `Connection` are two of them.
         let sniffed = self.shared.conn.entry == Entry::Sniffed;
         // Only an upgrade keeps `Upgrade` and `Connection: upgrade`; every
         // other request drops them (design 8.7, 8.9).
         let upgrade = wants_upgrade(&req);
+        // a `CONNECT` on a sniffed connection, whose 2xx answer becomes a
+        // tunnel (design 8.9)
+        let tunnel = sniffed && req.method() == http::Method::CONNECT;
+        let needs_h1 = upgrade || tunnel;
+        // 4. an upstream connection (`phase 4 M2 design 10.2`, `the phase 4 /
+        // M2b plan's P10`): one shared under this key if what carries this
+        // request may speak HTTP/2 and such a connection is open, then one
+        // idle in the pool under this key, then a fresh dial in this task
+        // (design 8.4, 8.5). The key leaves the request only if a shared
+        // HTTP/2 connection takes it over.
+        let mut key = Some(key);
+        let mut route = Some(route);
+        let borrowed_h2 = if needs_h1 {
+            None
+        } else {
+            self.shared
+                .borrow_h2(key.as_ref().expect("the key is still in hand"))
+        };
+        // The route of a borrowed connection is still unused: a request the
+        // borrowed connection does not carry is sent again on a connection
+        // dialled with it (design 8.6).
+        let (mut sender, mut meter, mut forward, mut peer) =
+            if let Some((sender, peer)) = borrowed_h2 {
+                // a shared connection is live now, and its dial is the one the
+                // record's peer address belongs to (its bytes were the dialling
+                // request's: `the phase 4 / M2b plan's P11`)
+                handle.mark_connected();
+                if let Some(peer) = peer {
+                    handle.trail().set_peer(peer);
+                }
+                (Sender::H2(sender), Meter::new(), None, peer)
+            } else {
+                let borrowed = {
+                    let mut pool = self.shared.pool.lock().expect("pool");
+                    pool.take(
+                        key.as_ref().expect("the key is still in hand"),
+                        Instant::now(),
+                    )
+                };
+                match borrowed {
+                    Some(pooled) => {
+                        // a borrowed connection is ready now, and its dial is the
+                        // one the record's peer address and bytes belong to
+                        handle.mark_connected();
+                        if let Some(peer) = pooled.peer {
+                            handle.trail().set_peer(peer);
+                        }
+                        pooled.meter.set(Some(handle.clone()));
+                        (
+                            Sender::H1(pooled.sender),
+                            pooled.meter,
+                            pooled.forward,
+                            pooled.peer,
+                        )
+                    }
+                    None => match self
+                        .redial(
+                            &guard,
+                            pages,
+                            route.take().expect("the dial is not used yet"),
+                            &mut key,
+                            needs_h1,
+                        )
+                        .await
+                    {
+                        Ok(parts) => parts,
+                        Err(answer) => return answer,
+                    },
+                }
+            };
+
+        // 5. the request as its upstream takes it (design 8.7), sent with the
+        // idle timeout between the frames of its body
         // What the request names, read before `strip` takes `TE` away
         // (`phase 4 M2 design 10.3`, `the phase 4 / M2b plan's P8`).
         let form = Form::of(&req, fallback);
@@ -441,12 +531,13 @@ impl<U: Upstreams> Requests<U> {
                 HeaderValue::from_static("chunked"),
             );
         }
-        // The request as its upstream takes it (`phase 4 M2 design 10.3`, `the
-        // phase 4 / M2b plan's P8`): an HTTP/2 request becomes an HTTP/1.1 one —
-        // origin form, `Host` from its authority, one `cookie` — and a request
-        // already in that form is left alone. Task 2 fits it to whatever the
-        // chosen upstream speaks instead of `HTTP_11`.
-        if let Err(e) = fit(&mut req, http::Version::HTTP_11, &form) {
+        // The request as the upstream that will carry it takes it (`phase 4
+        // M2 design 10.3`, `the phase 4 / M2b plan's P8`): an HTTP/2 request
+        // becomes an HTTP/1.1 one — origin form, `Host` from its authority,
+        // one `cookie` — an HTTP/1.1 request becomes an HTTP/2 one with no
+        // `Host` and only `TE: trailers`, and a request already in the form of
+        // its own connection is left alone.
+        if let Err(e) = fit(&mut req, sender.version(), &form) {
             handle.set_status(StatusCode::BAD_REQUEST.as_u16());
             handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
             return Ok(responses::bad_request("malformed request URI"));
@@ -454,7 +545,6 @@ impl<U: Upstreams> Requests<U> {
         // The client's side of an upgrade is taken before the request is
         // split: a request that asked for one, and a `CONNECT` on a sniffed
         // connection, whose 2xx answer becomes a tunnel (design 8.9).
-        let tunnel = sniffed && req.method() == http::Method::CONNECT;
         // An idempotent request with no body keeps its head: if a borrowed
         // connection cuts it off after it was written, it goes again on a new
         // one (design 8.6).
@@ -465,15 +555,29 @@ impl<U: Upstreams> Requests<U> {
         let client_upgrade = (upgrade || tunnel).then(|| hyper::upgrade::on(&mut req));
         let idle = self.shared.conn.idle;
         let progress = Progress::new();
-        let (parts, body) = req.into_parts();
-        let req = Request::from_parts(parts, Idle::new(body, idle, progress.clone()).boxed());
+        // What this request's own body and answer count as, on a shared HTTP/2
+        // connection whose connection-level meter was cleared when it was
+        // dialled (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's P11`).
+        // It is set before every send, by the version of the sender used then.
+        let request_meter = Meter::new();
+        let (parts, request_body) = req.into_parts();
+        let req = Request::from_parts(
+            parts,
+            Idle::new(request_body, idle, progress.clone(), request_meter.clone()).boxed(),
+        );
+        // Only an HTTP/2 connection counts by the request: an HTTP/1.1 one is
+        // lent to it and counts on the connection (`P11`).
+        request_meter.set(match sender {
+            Sender::H2(_) => Some(handle.clone()),
+            Sender::H1(_) => None,
+        });
         // `biased`: once the token is cancelled the answer is "closed by
         // policy", never the error page a dropped upstream would produce; a
         // response head that arrived beats the deadline that ran out
         let answered = tokio::select! {
             biased;
             _ = handle.token().cancelled() => return Err(Close),
-            sent = send(&mut sender, req) => sent,
+            sent = sender.send(req) => sent,
             _ = head_deadline(progress.clone(), idle) => return self.timed_out(&guard, pages),
         };
         let mut resp = match answered {
@@ -487,7 +591,19 @@ impl<U: Upstreams> Requests<U> {
                 };
                 meter.set(None);
                 let sent = match self
-                    .retry(&guard, pages, route, req, &form, &progress)
+                    .retry(
+                        &guard,
+                        pages,
+                        route,
+                        req,
+                        Resend {
+                            form: &form,
+                            progress: &progress,
+                            key: &mut key,
+                            h1_only: needs_h1,
+                            body: &request_meter,
+                        },
+                    )
                     .await
                 {
                     Ok((sent, new_sender, new_meter, new_forward, new_peer)) => {
@@ -509,12 +625,20 @@ impl<U: Upstreams> Requests<U> {
             Sent::Failed(e) => {
                 // The request may have been written: only an idempotent one
                 // with no body whose connection cut the answer off goes again,
-                // from the head kept above (design 8.6).
-                let (Some(head), Some(route), true) =
-                    (head, route.take(), e.is_incomplete_message())
-                else {
+                // from the head kept above (design 8.6); so does one the
+                // origin refused without handling it (RFC 9113 §8.7, `the
+                // phase 4 / M2b plan's P13`).
+                if !e.is_incomplete_message() && !refused(&e) {
+                    return self.upstream_failed(&guard, pages, e);
+                }
+                let (Some(head), Some(route)) = (head, route.take()) else {
                     return self.upstream_failed(&guard, pages, e);
                 };
+                if refused(&e) {
+                    tracing::debug!(
+                        "an upstream refused the request; sending it again on a new connection"
+                    );
+                }
                 meter.set(None);
                 let sent = match self
                     .retry(
@@ -522,8 +646,13 @@ impl<U: Upstreams> Requests<U> {
                         pages,
                         route,
                         with_empty_body(head),
-                        &form,
-                        &progress,
+                        Resend {
+                            form: &form,
+                            progress: &progress,
+                            key: &mut key,
+                            h1_only: needs_h1,
+                            body: &request_meter,
+                        },
                     )
                     .await
                 {
@@ -544,6 +673,12 @@ impl<U: Upstreams> Requests<U> {
                 }
             }
         };
+        // An HTTP/2 answer's head is the first byte of it: the connection
+        // counts nothing itself, so the request marks its own (`phase 4 M2
+        // design 10.2`, `the phase 4 / M2b plan's P11`).
+        if matches!(sender, Sender::H2(_)) {
+            handle.mark_first_byte();
+        }
         if forward.is_some() && resp.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
             // the credentials in question are rurge's own, towards its
             // upstream: the client can do nothing about them, and the
@@ -593,13 +728,20 @@ impl<U: Upstreams> Requests<U> {
         headers::strip(resp.headers_mut(), Keep::NONE);
         let (parts, body) = resp.into_parts();
         let outing = Outing {
-            key,
+            // a shared HTTP/2 connection is found under its key, not put back
+            // there; an HTTP/1.1 connection keeps the key unless a send on
+            // HTTP/2 of this request took it over (`the phase 4 / M2b plan's
+            // P10`)
+            key: match sender {
+                Sender::H1(_) => key,
+                Sender::H2(_) => None,
+            },
             sender,
             meter,
             peer,
             forward,
         };
-        let tail = Tail::new(body, guard, self.shared.clone(), outing);
+        let tail = Tail::new(body, guard, self.shared.clone(), outing, request_meter);
         Ok(Response::from_parts(parts, tail.boxed()))
     }
 
@@ -790,15 +932,19 @@ impl<U: Upstreams> Requests<U> {
     /// (`phase 4 M1 design 8.4`): the first send and a send after the request
     /// was not written both come through here. A decrypted connection puts the
     /// TLS to the origin over the dialled stream first (`phase 4 M2 design
-    /// 9.2`). The dial is not raced against the request's token; what it
-    /// brings back is dropped when the token fired meanwhile (`P1`).
+    /// 9.2`), offering `h2` unless `h1_only`, which an upgrade or a tunnel asks
+    /// for (`phase 4 M2 design 10.4`, `the phase 4 / M2b plan's P12`); what the
+    /// origin chose in ALPN says which client starts. The dial is not raced
+    /// against the request's token; what it brings back is dropped when the
+    /// token fired meanwhile (`P1`).
     async fn connect(
         &self,
         handle: &Arc<SessionHandle>,
         route: U::Route,
+        h1_only: bool,
     ) -> Result<
         (
-            SendRequest<ReqBody>,
+            Sender,
             Meter,
             Option<Vec<(String, String)>>,
             Option<SocketAddr>,
@@ -820,17 +966,36 @@ impl<U: Upstreams> Requests<U> {
         // the token: it has `OriginTls::wait` of its own, as the dial has.
         let metered = Metered::new(upstream.stream, meter.clone());
         let sender = match &self.shared.conn.origin {
-            None => self.start(metered).await?,
+            // plain HTTP/2 (h2c) is not something rurge speaks: a plain
+            // connection is HTTP/1.1 only (`the phase 4 / M2b plan's P9`)
+            None => Sender::H1(self.start_h1(metered).await?),
             Some(tls) => {
-                let connector = TlsConnector::from(tls.config.clone());
+                let config = if h1_only {
+                    Arc::clone(&tls.h1)
+                } else {
+                    Arc::clone(&tls.config)
+                };
+                let connector = TlsConnector::from(config);
                 let stream =
                     tokio::time::timeout(tls.wait, connector.connect(tls.name.clone(), metered))
                         .await
                         .map_err(|_| DialError::Tls("timed out".to_string()))?
                         .map_err(|e| DialError::Tls(e.to_string()))?;
-                self.start(stream).await?
+                if stream.get_ref().1.alpn_protocol() == Some(b"h2") {
+                    Sender::H2(self.start_h2(stream).await?)
+                } else {
+                    Sender::H1(self.start_h1(stream).await?)
+                }
             }
         };
+        // From here the request counts only its own body (`phase 4 M2 design
+        // 10.2`, `the phase 4 / M2b plan's P11`): the connection is shared,
+        // and what it spent so far — the TLS handshake, and whatever of the
+        // preface went out before this line — stays with the request that
+        // dialled it. Nothing may lend the connection again.
+        if matches!(sender, Sender::H2(_)) {
+            meter.set(None);
+        }
         Ok((sender, meter, upstream.forward, upstream.peer))
     }
 
@@ -841,7 +1006,7 @@ impl<U: Upstreams> Requests<U> {
     /// task restores the ERROR log for a panic. It finishes no handle: the
     /// response body's wrapper, the request's guard or the relay of an
     /// upgrade do.
-    async fn start<T>(&self, io: T) -> Result<SendRequest<ReqBody>, DialError>
+    async fn start_h1<T>(&self, io: T) -> Result<SendRequest<ReqBody>, DialError>
     where
         T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
@@ -869,24 +1034,68 @@ impl<U: Upstreams> Requests<U> {
         Ok(sender)
     }
 
+    /// Starts the HTTP/2 client of a fresh upstream connection on the tracker,
+    /// as `start_h1` does for HTTP/1.1 (`phase 4 M2 design 10.2`, `the phase 4 /
+    /// M2b plan's P9`). The parameters are hyper's own defaults: nothing keeps
+    /// the connection alive with a PING.
+    async fn start_h2<T>(&self, io: T) -> Result<http2::SendRequest<ReqBody>, DialError>
+    where
+        T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let (sender, conn) = match http2::Builder::new(Exec(self.shared.conn.tracker.clone()))
+            .handshake(TokioIo::new(io))
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => return Err(DialError::Handshake(e.to_string())),
+        };
+        let tracker = self.shared.conn.tracker.clone();
+        tracker.spawn(async move {
+            let inner = tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    tracing::debug!(error = %e, "upstream HTTP/2 connection ended");
+                }
+            });
+            if let Err(e) = inner.await
+                && e.is_panic()
+            {
+                tracing::error!("upstream HTTP/2 connection task panicked: {e}");
+            }
+        });
+        Ok(sender)
+    }
+
     /// A new connection for a request sent again, with the failures of the
     /// dial already answered for the client (`phase 4 M1 design 8.6`, `P4`).
+    /// `h1_only` is what the request needs of it (`the phase 4 / M2b plan's
+    /// P12`); an HTTP/2 connection it brings is shared under `key` before
+    /// anything is sent on it (`the phase 4 / M2b plan's P10`).
     async fn redial(
         &self,
         guard: &Guard,
         pages: Pages,
         route: U::Route,
+        key: &mut Option<U::Key>,
+        h1_only: bool,
     ) -> Result<
         (
-            SendRequest<ReqBody>,
+            Sender,
             Meter,
             Option<Vec<(String, String)>>,
             Option<SocketAddr>,
         ),
         Result<Response<ResponseBody>, Close>,
     > {
-        match self.connect(guard.handle(), route).await {
-            Ok(parts) => Ok(parts),
+        match self.connect(guard.handle(), route, h1_only).await {
+            Ok((sender, meter, forward, peer)) => {
+                // at once, not when the answer comes: a concurrent request
+                // under the same key has to find it while this one is still
+                // waiting for its answer (P10)
+                if let Sender::H2(shared) = &sender {
+                    self.shared.share(key, shared.clone(), peer);
+                }
+                Ok((sender, meter, forward, peer))
+            }
             Err(DialError::Refused(refusal)) => Err(self.answer(guard, refusal, pages).await),
             Err(DialError::Stopped) => Err(Err(Close)),
             Err(DialError::Handshake(e)) => Err(self.failed(
@@ -919,34 +1128,52 @@ impl<U: Upstreams> Requests<U> {
         pages: Pages,
         route: U::Route,
         mut req: Request<ReqBody>,
-        form: &Form,
-        progress: &Arc<Progress>,
+        resend: Resend<'_, U::Key>,
     ) -> Result<
         (
             Sent,
-            SendRequest<ReqBody>,
+            Sender,
             Meter,
             Option<Vec<(String, String)>>,
             Option<SocketAddr>,
         ),
         Result<Response<ResponseBody>, Close>,
     > {
-        let (mut sender, meter, forward, peer) = match self.redial(guard, pages, route).await {
-            Ok(parts) => parts,
-            Err(answer) => return Err(answer),
-        };
+        let Resend {
+            form,
+            progress,
+            key,
+            h1_only,
+            body,
+        } = resend;
+        let (mut sender, meter, forward, peer) =
+            match self.redial(guard, pages, route, key, h1_only).await {
+                Ok(parts) => parts,
+                Err(answer) => return Err(answer),
+            };
         let handle = guard.handle();
         handle.mark_connected();
         if let Some(peer) = peer {
             handle.trail().set_peer(peer);
         }
-        meter.set(Some(handle.clone()));
+        // A connection lent out by turns counts the bytes of whoever holds it;
+        // one shared by HTTP/2 counts nothing of its own since it was dialled
+        // (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's P11`).
+        if matches!(sender, Sender::H1(_)) {
+            meter.set(Some(handle.clone()));
+        }
+        // what this request counts by itself follows the version it is sent in
+        // (`P11`)
+        body.set(match sender {
+            Sender::H2(_) => Some(handle.clone()),
+            Sender::H1(_) => None,
+        });
         progress.restart();
         let idle = self.shared.conn.idle;
         // the request goes out on this connection as it would have on the
         // first one: whatever it now speaks is what it is fitted to (`phase 4
         // M2 design 10.3`, `the phase 4 / M2b plan's P8`).
-        if let Err(e) = fit(&mut req, http::Version::HTTP_11, form) {
+        if let Err(e) = fit(&mut req, sender.version(), form) {
             handle.set_status(StatusCode::BAD_REQUEST.as_u16());
             handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
             return Err(Ok(responses::bad_request("malformed request URI")));
@@ -954,7 +1181,7 @@ impl<U: Upstreams> Requests<U> {
         let sent = tokio::select! {
             biased;
             _ = handle.token().cancelled() => return Err(Err(Close)),
-            sent = send(&mut sender, req) => sent,
+            sent = sender.send(req) => sent,
             _ = head_deadline(progress.clone(), idle) => {
                 return Err(self.timed_out(guard, pages));
             }
@@ -1142,16 +1369,79 @@ enum Sent {
     Failed(hyper::Error),
 }
 
-/// Sends one request and tells the caller whether it was written
-/// (`phase 4 M1 design 8.6`).
-async fn send(sender: &mut SendRequest<ReqBody>, req: Request<ReqBody>) -> Sent {
-    match sender.try_send_request(req).await {
-        Ok(resp) => Sent::Answered(resp),
-        Err(mut e) => match e.take_message() {
-            Some(req) => Sent::NotWritten(req, e.into_error()),
-            None => Sent::Failed(e.into_error()),
-        },
+/// What a request sent again brings from its first send: the form it names
+/// itself in, how far it got, the key its upstream connection is shared or
+/// pooled under, and what that connection has to speak (`phase 4 M1 design
+/// 8.6`, `phase 4 M2 design 10.2`, 10.3). Grouped so that `retry` stays within
+/// clippy's argument count (`the phase 4 / M2b plan's execution record row
+/// 25`).
+struct Resend<'a, K> {
+    form: &'a Form,
+    progress: &'a Arc<Progress>,
+    /// The key, until a connection that carries this request takes it over
+    /// (`the phase 4 / M2b plan's P10`).
+    key: &'a mut Option<K>,
+    /// An upgrade or a tunnel needs an upstream that speaks HTTP/1.1
+    /// (`phase 4 M2 design 10.4`, `the phase 4 / M2b plan's P12`).
+    h1_only: bool,
+    /// What the request counts its own body and answer as, once it is sent on
+    /// a shared HTTP/2 connection (`the phase 4 / M2b plan's P11`).
+    body: &'a Meter,
+}
+
+/// The upstream connection one request is sent on, in the version it speaks
+/// (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's P9`): an HTTP/1.1
+/// connection of the pool, which one request holds at a time, or one of the
+/// streams of a shared HTTP/2 connection.
+enum Sender {
+    H1(SendRequest<ReqBody>),
+    H2(http2::SendRequest<ReqBody>),
+}
+
+impl Sender {
+    /// The version the request is fitted to before it is sent (`phase 4 M2
+    /// design 10.3`, `the phase 4 / M2b plan's P8`).
+    fn version(&self) -> http::Version {
+        match self {
+            Sender::H1(_) => http::Version::HTTP_11,
+            Sender::H2(_) => http::Version::HTTP_2,
+        }
     }
+
+    /// Sends one request and tells the caller whether it was written
+    /// (`phase 4 M1 design 8.6`). Both versions hand a request back whole, or
+    /// none of it, through the same `TrySendError`.
+    async fn send(&mut self, req: Request<ReqBody>) -> Sent {
+        let sent = match self {
+            Sender::H1(sender) => sender.try_send_request(req).await,
+            Sender::H2(sender) => sender.try_send_request(req).await,
+        };
+        match sent {
+            Ok(resp) => Sent::Answered(resp),
+            Err(mut e) => match e.take_message() {
+                Some(req) => Sent::NotWritten(req, e.into_error()),
+                None => Sent::Failed(e.into_error()),
+            },
+        }
+    }
+}
+
+/// Whether the upstream refused the request without handling it (`the phase 4
+/// / M2b plan's P13`): h2's `REFUSED_STREAM`, or a GOAWAY from the origin that
+/// says this stream was not processed (RFC 9113 §8.7, which is what h2 makes
+/// of a stream id beyond the last one a received GOAWAY named). Such a request
+/// may be sent again whole. The `h2::Error` sits at the first layer of
+/// `hyper::Error` today; the walk does not count on it.
+fn refused(e: &hyper::Error) -> bool {
+    let mut source = StdError::source(e);
+    while let Some(error) = source {
+        if let Some(h2) = error.downcast_ref::<h2::Error>() {
+            return h2.reason() == Some(h2::Reason::REFUSED_STREAM)
+                || (h2.is_go_away() && h2.is_remote());
+        }
+        source = StdError::source(error);
+    }
+    false
 }
 
 /// The methods a request may be sent again after it was written (RFC 9110
@@ -1319,8 +1609,13 @@ fn rename<B>(req: &mut Request<B>, authority: &http::uri::Authority, name: &str)
 /// The parts of an upstream connection the request that used it hands back
 /// to the pool once the response body is over (`design 8.5`, 10.1).
 struct Outing<K> {
-    key: K,
-    sender: SendRequest<ReqBody>,
+    /// The key of a pooled HTTP/1.1 connection; `None` for a shared HTTP/2
+    /// one, and for an HTTP/1.1 connection whose key a send on HTTP/2 took
+    /// over (`the phase 4 / M2b plan's P10`).
+    key: Option<K>,
+    /// HTTP/1.1's connection or HTTP/2's shared one (`phase 4 M2 design 10.2`):
+    /// only the first goes back to the pool (`the phase 4 / M2b plan's P10`).
+    sender: Sender,
     meter: Meter,
     peer: Option<SocketAddr>,
     forward: Option<Vec<(String, String)>>,
@@ -1491,15 +1786,19 @@ struct Idle<B> {
     deadline: Option<Pin<Box<Sleep>>>,
     /// What the wait for the response head reads (`design 8.10`).
     progress: Arc<Progress>,
+    /// Counts the bytes of this request's body as its own, on a shared HTTP/2
+    /// connection (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's P11`).
+    body: Meter,
 }
 
 impl<B> Idle<B> {
-    fn new(inner: B, idle: Duration, progress: Arc<Progress>) -> Idle<B> {
+    fn new(inner: B, idle: Duration, progress: Arc<Progress>, body: Meter) -> Idle<B> {
         Idle {
             inner,
             idle,
             deadline: None,
             progress,
+            body,
         }
     }
 }
@@ -1530,6 +1829,11 @@ where
                     .as_mut()
                     .reset(tokio::time::Instant::now() + this.idle);
                 this.progress.moved();
+                // a data frame is this request's body; trailers are not bytes
+                // of it (`the phase 4 / M2b plan's P11`)
+                if let Some(data) = frame.data_ref() {
+                    this.body.count_up(data.len() as u64);
+                }
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
@@ -1570,6 +1874,10 @@ struct Tail<U: Upstreams> {
     /// How far the body got, for the watchdog that watches the client
     /// (`design 8.10`).
     progress: Arc<Progress>,
+    /// Counts the bytes of this request's answer as its own, on a shared
+    /// HTTP/2 connection (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's
+    /// P11`).
+    body: Meter,
     /// Fired when the body is over (or the body is dropped): the watchdog
     /// stops caring.
     watchdog: CancellationToken,
@@ -1586,6 +1894,7 @@ impl<U: Upstreams> Tail<U> {
         guard: Guard,
         shared: Arc<Shared<U>>,
         outing: Outing<U::Key>,
+        body: Meter,
     ) -> Tail<U> {
         let idle = shared.conn.idle;
         let cancelled = Box::pin(guard.handle().token().clone().cancelled_owned());
@@ -1597,6 +1906,7 @@ impl<U: Upstreams> Tail<U> {
             deadline: Box::pin(tokio::time::sleep(idle)),
             cancelled,
             progress,
+            body,
             watchdog,
             guard,
             shared,
@@ -1684,7 +1994,12 @@ impl<U: Upstreams> Tail<U> {
                 forward,
             } = *outing;
             meter.set(None);
-            if !sender.is_closed() {
+            // a shared HTTP/2 connection is never put back: the next request
+            // under its key finds it where it is (`the phase 4 / M2b plan's
+            // P10`), and one whose key a send on HTTP/2 took over has none
+            if let (Some(key), Sender::H1(sender)) = (key, sender)
+                && !sender.is_closed()
+            {
                 let pooled = Pooled {
                     sender,
                     meter,
@@ -1754,6 +2069,11 @@ impl<U: Upstreams> Body for Tail<U> {
                     .as_mut()
                     .reset(tokio::time::Instant::now() + this.idle);
                 this.progress.moved();
+                // a data frame is this request's answer; trailers are not
+                // bytes of it (`the phase 4 / M2b plan's P11`)
+                if let Some(data) = frame.data_ref() {
+                    this.body.count_down(data.len() as u64);
+                }
                 // the frame just handed out was the last one: hyper will drop
                 // the body now instead of polling it again
                 if this.inner.is_end_stream() {
@@ -2517,6 +2837,28 @@ mod tests {
         .await
     }
 
+    /// As `rig_tls`, for a client that speaks HTTP/2 (`phase 4 M2 design
+    /// 10.1`, `the phase 4 / M2b plan's P9`): its end is the h2 client's to
+    /// drive.
+    async fn rig_tls_h2(origin: OriginTls, target: SocketAddr) -> Rig {
+        rig_made(
+            |token| Conn {
+                session: SessionInfo::tcp(HostName::parse("target.test"), 443),
+                entry: Entry::Sniffed,
+                origin: Some(origin),
+                idle: Duration::from_secs(5),
+                head_wait: Duration::from_secs(5),
+                drop_hold: Duration::from_secs(5),
+                abort: CancellationToken::new(),
+                token,
+                tracker: TaskTracker::new(),
+                h2: true,
+            },
+            target,
+        )
+        .await
+    }
+
     /// A connection the engine serves over a duplex stream, built as `made`
     /// says, with an origin to dial.
     async fn rig_made(made: impl FnOnce(CancellationToken) -> Conn, target: SocketAddr) -> Rig {
@@ -2548,14 +2890,34 @@ mod tests {
         insecure: bool,
         wait: Duration,
     ) -> OriginTls {
+        let config =
+            origin_client_config(roots, insecure, &[b"http/1.1"]).expect("a client configuration");
         OriginTls {
-            config: origin_client_config(roots, insecure, &[b"http/1.1"])
-                .expect("a client configuration"),
+            h1: Arc::clone(&config),
+            config,
             name: match name.parse::<IpAddr>() {
                 Ok(ip) => ServerName::IpAddress(ip.into()),
                 Err(_) => ServerName::try_from(name.to_string()).expect("a server name"),
             },
             wait,
+        }
+    }
+
+    /// As `origin_tls`, for an origin that speaks HTTP/2 too (`the phase 4 /
+    /// M2b plan's P9`): the connection offers `h2` first and `http/1.1`
+    /// second, and what an upgrade takes offers HTTP/1.1 alone.
+    fn origin_tls_h2(roots: Arc<RootCertStore>, name: &str) -> OriginTls {
+        let h1 = origin_client_config(Arc::clone(&roots), false, &[b"http/1.1"])
+            .expect("a client configuration");
+        OriginTls {
+            config: origin_client_config(roots, false, &[b"h2", b"http/1.1"])
+                .expect("a client configuration"),
+            h1,
+            name: match name.parse::<IpAddr>() {
+                Ok(ip) => ServerName::IpAddress(ip.into()),
+                Err(_) => ServerName::try_from(name.to_string()).expect("a server name"),
+            },
+            wait: Duration::from_secs(5),
         }
     }
 
@@ -4065,7 +4427,7 @@ mod tests {
         // refuses the request on the spot and hands it back whole. That is
         // the `NotWritten` a second attempt is built on (design 8.6).
         let (server, _client) = tokio::io::duplex(64);
-        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+        let (sender, conn) = hyper::client::conn::http1::Builder::new()
             .handshake(TokioIo::new(server))
             .await
             .unwrap();
@@ -4075,7 +4437,7 @@ mod tests {
             .uri("http://target.test/x")
             .body(no_body())
             .unwrap();
-        match send(&mut sender, req).await {
+        match Sender::H1(sender).send(req).await {
             Sent::NotWritten(req, e) => {
                 assert_eq!(req.method(), http::Method::POST);
                 assert_eq!(req.uri(), &"http://target.test/x".parse::<Uri>().unwrap());
@@ -4543,6 +4905,90 @@ mod tests {
             .to_vec()
     }
 
+    /// What an HTTP/2 origin does with its first connection (`phase 4 / M2b
+    /// plan P18`).
+    #[derive(Clone, Copy)]
+    enum OriginScript {
+        /// Answer the first stream, then send a GOAWAY and let the connection
+        /// end.
+        GoAwayAfterOne,
+        /// Answer the first stream and refuse every later one.
+        RefuseAfterOne,
+    }
+
+    /// An HTTP/2 origin of the case's own (`phase 4 / M2b plan P18`): it takes
+    /// TLS connections that offer `h2` alone, follows `script` on its first
+    /// connection, answers every stream of every later one with its path, and
+    /// says when its first connection ended.
+    struct H2Origin {
+        addr: SocketAddr,
+        connections: Arc<AtomicUsize>,
+        ended: Arc<tokio::sync::Notify>,
+    }
+
+    async fn h2_origin(fixture: &Arc<TlsFixture>, script: OriginScript) -> H2Origin {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = fixture.acceptor_with_alpn(false, &[b"h2"]);
+        let connections = Arc::new(AtomicUsize::new(0));
+        let ended = Arc::new(tokio::sync::Notify::new());
+        let fixture = fixture.clone();
+        let count = connections.clone();
+        let said = ended.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+                let (fixture, acceptor, ended) = (fixture.clone(), acceptor.clone(), said.clone());
+                tokio::spawn(async move {
+                    let Ok(stream) = fixture.accept(&acceptor, tcp).await else {
+                        return;
+                    };
+                    if let Ok(mut conn) = h2::server::handshake(stream).await {
+                        let mut accepted: usize = 0;
+                        // `accept` drives the connection too: PINGs are
+                        // answered, and the last GOAWAY is written
+                        while let Some(Ok((request, mut respond))) = conn.accept().await {
+                            accepted += 1;
+                            if first && accepted > 1 {
+                                match script {
+                                    OriginScript::GoAwayAfterOne => {}
+                                    OriginScript::RefuseAfterOne => {
+                                        respond.send_reset(h2::Reason::REFUSED_STREAM);
+                                        continue;
+                                    }
+                                }
+                            }
+                            let path = request.uri().path().as_bytes().to_vec();
+                            let answer = Response::builder()
+                                .header(header::CONTENT_LENGTH, path.len())
+                                .body(())
+                                .expect("a response");
+                            if let Ok(mut send) = respond.send_response(answer, false) {
+                                let _ = send.send_data(Bytes::from(path), true);
+                            }
+                            if first
+                                && accepted == 1
+                                && matches!(script, OriginScript::GoAwayAfterOne)
+                            {
+                                conn.graceful_shutdown();
+                            }
+                        }
+                    }
+                    // the connection is over: the stream goes, and the TCP
+                    // connection with it
+                    if first {
+                        ended.notify_one();
+                    }
+                });
+            }
+        });
+        H2Origin {
+            addr,
+            connections,
+            ended,
+        }
+    }
+
     #[tokio::test]
     async fn an_h2_client_is_served_over_an_http1_upstream() {
         let origin = TestServer::spawn().await;
@@ -4843,5 +5289,335 @@ mod tests {
         assert_eq!(served.routed, 1);
         let handle = rig.fake.finished(0).await;
         assert_eq!(handle.outcome(), Some(SessionOutcome::Completed), "stopped");
+    }
+
+    #[tokio::test]
+    async fn an_h2_origin_is_spoken_to_in_h2() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/a", "over h2");
+        let mut rig = rig_tls(
+            origin_tls_h2(fixture.roots(), "target.test"),
+            addr_of(&origin),
+        )
+        .await;
+        rig.client
+            .send("GET /a HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"over h2");
+        let requests = origin.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].version, "HTTP/2.0", "the origin speaks h2");
+        assert_eq!(requests[0].authority.as_deref(), Some("target.test"));
+        assert_eq!(requests[0].header("host"), None, "h2 has no `Host`");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.session().url.as_deref(),
+            Some("https://target.test/a")
+        );
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(handle.status(), Some(200));
+        assert!(handle.connect_time().is_some());
+        assert!(handle.first_byte_time().is_some());
+    }
+
+    #[tokio::test]
+    async fn requests_of_one_key_share_one_h2_connection() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/first", "one");
+        origin.set("/slow", "slow");
+        origin.set_delay("/slow", Duration::from_millis(200));
+        let rig = rig_tls_h2(
+            origin_tls_h2(fixture.roots(), "target.test"),
+            addr_of(&origin),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client.stream).await;
+        // the first request is the one that dials
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "https://target.test/first"))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await, b"one");
+        // five more at once: the streams of one connection, not five dials
+        let mut slow = Vec::new();
+        for _ in 0..5 {
+            let mut one = sender.clone();
+            slow.push(tokio::spawn(async move {
+                let resp = one
+                    .send_request(h2_request(http::Method::GET, "https://target.test/slow"))
+                    .await
+                    .expect("an answer");
+                (resp.status(), body_of(resp).await)
+            }));
+        }
+        for task in slow {
+            let (status, body) = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("an answer within 5 s")
+                .expect("the task did not panic");
+            assert_eq!(status, 200);
+            assert_eq!(body, b"slow");
+        }
+        assert_eq!(rig.fake.dials(), 1, "one dial for the whole connection");
+        assert_eq!(origin.connections(), 1, "and one connection to the origin");
+        drop(sender);
+        conn.abort();
+        served_within(rig.served, Duration::from_secs(5)).await;
+
+        // a client that speaks HTTP/1.1 shares the same way, one request
+        // after another
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/one", "first");
+        origin.set("/two", "second");
+        let mut rig = rig_tls(
+            origin_tls_h2(fixture.roots(), "target.test"),
+            addr_of(&origin),
+        )
+        .await;
+        for path in ["/one", "/two"] {
+            rig.client
+                .send(&format!("GET {path} HTTP/1.1\r\nHost: target.test\r\n\r\n"))
+                .await
+                .unwrap();
+            let (head, _) = rig.client.response().await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        }
+        assert_eq!(rig.fake.dials(), 1, "the second request borrows");
+        assert_eq!(origin.connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_the_origin_refuses_is_sent_again_once() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = h2_origin(&fixture, OriginScript::RefuseAfterOne).await;
+        let mut rig = rig_tls(origin_tls_h2(fixture.roots(), "target.test"), origin.addr).await;
+        // the first request dials the connection; the second borrows it and
+        // is refused on it (`phase 4 / M2b plan P13`)
+        rig.client
+            .send("GET /one HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"/one");
+        rig.client
+            .send("GET /two HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"/two", "the request went again, whole");
+        assert_eq!(rig.fake.dials(), 2, "a second connection for the retry");
+        assert_eq!(origin.connections.load(Ordering::SeqCst), 2);
+
+        // a request with a body may have been handled: 502, no second try
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = h2_origin(&fixture, OriginScript::RefuseAfterOne).await;
+        let mut rig = rig_tls(origin_tls_h2(fixture.roots(), "target.test"), origin.addr).await;
+        rig.client
+            .send("GET /one HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, _) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        rig.client
+            .send(
+                "POST /two HTTP/1.1\r\nHost: target.test\r\n\
+                 Content-Length: 5\r\n\r\nabcde",
+            )
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Upstream request failed"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rig.fake.dials(), 1, "a request with a body goes again");
+        let second = rig.fake.finished(1).await;
+        match second.outcome() {
+            Some(SessionOutcome::Failed(reason)) => {
+                assert!(reason.starts_with("upstream request failed: "), "{reason}")
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// A shared HTTP/2 connection counts each request's own body and answer,
+    /// and the request that dialled it carries the handshake
+    /// (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's P11`).
+    #[tokio::test]
+    async fn the_bytes_of_requests_on_a_shared_h2_connection_are_their_bodies() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/first", "first");
+        origin.set("/second", "second");
+        // the origin does not read a request's body, and answers only after
+        // this delay: the 100 bytes are on the wire by then
+        origin.set_delay("/second", Duration::from_millis(100));
+        let mut rig = rig_tls(
+            origin_tls_h2(fixture.roots(), "target.test"),
+            addr_of(&origin),
+        )
+        .await;
+        rig.client
+            .send("GET /first HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"first");
+        let first = rig.fake.finished(0).await;
+        let (_, down) = first.bytes();
+        assert!(
+            down >= 5,
+            "the request that dialled carries the handshake: down {down}"
+        );
+        // the body goes in the same write as the head
+        let payload = vec![b'x'; 100];
+        let mut wire =
+            b"POST /second HTTP/1.1\r\nHost: target.test\r\nContent-Length: 100\r\n\r\n".to_vec();
+        wire.extend_from_slice(&payload);
+        rig.client.stream.write_all(&wire).await.unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"second");
+        let second = rig.fake.finished(1).await;
+        assert_eq!(
+            second.bytes(),
+            (100, 6),
+            "the body sent and the answer, and nothing of the connection"
+        );
+        assert!(second.first_byte_time().is_some());
+        assert_eq!(rig.fake.dials(), 1, "the second request borrows");
+    }
+
+    #[tokio::test]
+    async fn another_key_gets_another_h2_connection() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/a", "one");
+        origin.set("/b", "two");
+        let mut rig = rig_tls(
+            origin_tls_h2(fixture.roots(), "target.test"),
+            addr_of(&origin),
+        )
+        .await;
+        rig.fake.script("/a", Step::Go(7)).script("/b", Step::Go(8));
+        for path in ["/a", "/b"] {
+            rig.client
+                .send(&format!("GET {path} HTTP/1.1\r\nHost: target.test\r\n\r\n"))
+                .await
+                .unwrap();
+            let (head, _) = rig.client.response().await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        }
+        assert_eq!(rig.fake.dials(), 2, "a connection per key");
+        assert_eq!(origin.connections(), 2);
+    }
+
+    /// A shared connection the origin has finished with is not lent again
+    /// (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's P10`).
+    #[tokio::test]
+    async fn an_h2_connection_that_went_away_is_not_lent_again() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = h2_origin(&fixture, OriginScript::GoAwayAfterOne).await;
+        let mut rig = rig_tls(origin_tls_h2(fixture.roots(), "target.test"), origin.addr).await;
+        rig.client
+            .send("GET /one HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"/one");
+        // the connection is over before the next request: whether the item is
+        // gone or only closed, the request must not go on it
+        tokio::time::timeout(Duration::from_secs(5), origin.ended.notified())
+            .await
+            .expect("the origin's first connection ended within 5 s");
+        rig.client
+            .send("GET /two HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"/two");
+        assert_eq!(rig.fake.dials(), 2, "a new connection for the new request");
+        assert_eq!(origin.connections.load(Ordering::SeqCst), 2);
+    }
+
+    /// An upgrade takes the configuration that offers `http/1.1` alone, even
+    /// where the origin would speak HTTP/2 (`phase 4 M2 design 10.4`, `the
+    /// phase 4 / M2b plan's P12`).
+    #[tokio::test]
+    async fn an_upgrade_dials_http1_where_the_origin_speaks_h2() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let (addr, served) = tls_origin(
+            &fixture,
+            fixture.acceptor(false),
+            b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\n\
+              upgrade: websocket\r\n\r\n",
+            true,
+        )
+        .await;
+        let mut rig = rig_tls(origin_tls_h2(fixture.roots(), "target.test"), addr).await;
+        rig.client
+            .send(
+                "GET /ws HTTP/1.1\r\nHost: target.test\r\n\
+                 Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let payload = vec![b'x'; 1_000];
+        rig.client.stream.write_all(&payload).await.unwrap();
+        assert_eq!(rig.client.take(payload.len()).await, payload);
+        rig.client.stream.shutdown().await.unwrap();
+        while rig.client.fill().await {}
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(101));
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        let seen = fixture.seen();
+        assert_eq!(
+            seen.last().and_then(|seen| seen.alpn.clone()).as_deref(),
+            Some("http/1.1"),
+            "the upgrade offered HTTP/1.1 alone"
+        );
+        served.abort();
+    }
+
+    #[tokio::test]
+    async fn an_h2_request_keeps_its_authority_and_te_trailers_to_an_h2_origin() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/x", "ok");
+        let rig = rig_tls_h2(
+            origin_tls_h2(fixture.roots(), "target.test"),
+            addr_of(&origin),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client.stream).await;
+        let mut req = h2_request(http::Method::GET, "https://target.test:8443/x");
+        req.headers_mut()
+            .insert(header::TE, HeaderValue::from_static("trailers"));
+        let resp = sender.send_request(req).await.expect("an answer");
+        assert_eq!(resp.status(), 200);
+        let _ = body_of(resp).await;
+        let requests = origin.requests();
+        assert_eq!(requests[0].authority.as_deref(), Some("target.test:8443"));
+        assert_eq!(requests[0].header("te"), Some("trailers"));
+        assert_eq!(requests[0].header("host"), None);
+        drop(sender);
+        conn.abort();
+        served_within(rig.served, Duration::from_secs(5)).await;
     }
 }
