@@ -38,8 +38,15 @@ use tokio_util::task::TaskTracker;
 pub(crate) type TlsSource = Arc<dyn Fn() -> Option<ApiTls> + Send + Sync>;
 
 /// How many handshakes are in flight at once: the same count as the
-/// connections that are read away from (`LINGER_MAX`), so that a client that
-/// connects over and over holds this many descriptors and no more.
+/// connections that are read away from (`LINGER_MAX`), which is where the
+/// number comes from (the phase 4 / M2c plan's P10). A connection beyond it is
+/// closed at once rather than waiting for a place, and is then let go of like
+/// any other connection: `Closing` reads away from it for `LINGER_TIME` at the
+/// most, among `LINGER_MAX` connections that linger at once. So a client that
+/// connects over and over and never finishes a handshake holds
+/// `TLS_HANDSHAKES + LINGER_MAX` connections at once (128 of them today), and
+/// not `TLS_HANDSHAKES` alone. A connection whose handshake is done has been
+/// handed to `axum`, and is not one of these.
 pub(crate) const TLS_HANDSHAKES: usize = LINGER_MAX;
 
 /// The longest a handshake is given (`M2-D21`): a client that says nothing, or
@@ -287,10 +294,13 @@ mod tests {
 
     /// Waits, up to the bound, for `f` to say so: the cases below need a
     /// connection to have been accepted before the next one is made, and the
-    /// order the kernel accepts them in is not promised. The tracker counts a
-    /// connection from the moment it is accepted, and the handshake task that
-    /// carries it on top of that, so a case asks for at least as many as it
-    /// has made.
+    /// order the kernel accepts them in is not promised.
+    ///
+    /// The tracker counts a connection from the moment it is accepted, and the
+    /// handshake task that carries it on top of that, with no `await` between
+    /// the two, so a connection that is in its handshake counts twice: "at
+    /// least one" says that one connection was accepted and its handshake task
+    /// started, and "at least four" that two are in their handshakes.
     async fn until(what: &str, mut f: impl FnMut() -> bool) {
         let deadline = Instant::now() + BOUND;
         while !f() {
@@ -458,20 +468,18 @@ mod tests {
         let Fixture { api, .. } = fixture();
         let rig = Rig::new(signing(api), 2, Duration::from_secs(600)).await;
         let _first = dial(rig.addr).await;
-        until("the first connection to be accepted", || {
+        until("the first connection to be in its handshake", || {
             !rig.connections.is_empty()
         })
         .await;
         let _second = dial(rig.addr).await;
-        until("the second connection to be accepted", || {
-            rig.connections.len() >= 2
+        until("both connections to be in their handshake", || {
+            rig.connections.len() >= 4
         })
         .await;
         let mut third = dial(rig.addr).await;
-        until("the third connection to be accepted", || {
-            rig.connections.len() >= 3
-        })
-        .await;
+        // no wait for the third: both places are taken, so it is closed as
+        // soon as it is accepted, and `assert_closed` has a bound of its own
         assert_closed(&mut third).await;
     }
 
