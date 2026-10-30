@@ -654,6 +654,28 @@ async fn a_stop_during_the_handshake_counts_nothing() {
     );
 }
 
+/// The lines of `lines` at `level` that carry `sentence` whole, in the order
+/// they were written: a line is matched by its level and by the whole text of
+/// the plan's P21 sentence, so a misspelling anywhere in one is a red test.
+fn lines_with(lines: &[String], level: &str, sentence: &str) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| line.starts_with(level) && line.contains(sentence))
+        .cloned()
+        .collect()
+}
+
+// The sentences of the plan's P21 with `origin.test` in them, as a session
+// through a listener has them (`phase 4 M2 design 8.2`, `8.3`, `15`).
+const UNTRUSTED_NAMED: &str = "the client does not trust the certificate rurge issued for origin.test: trust rurge's MITM CA on the client, or exclude the host with -origin.test in [MITM] hostname";
+const UNTRUSTED_VIRTUAL: &str = "the client does not trust the certificate rurge issued for a host reached through the virtual interface (the name is in the DEBUG log and the request record): trust rurge's MITM CA on the client, or exclude the host in [MITM] hostname";
+const PINNING_NAMED: &str = "origin.test is likely protected by certificate pinning: the client finished the TLS handshake and closed without a request; exclude it with -origin.test in [MITM] hostname";
+const PINNING_VIRTUAL: &str = "a host reached through the virtual interface is likely protected by certificate pinning (the name is in the DEBUG log and the request record): the client finished the TLS handshake and closed without a request";
+/// The line of a handshake that failed for another reason, up to its reason.
+const FAILED_NAMED: &str = "the TLS handshake with the client failed for origin.test: ";
+const FAILED_VIRTUAL: &str =
+    "the TLS handshake with the client failed for a host reached through the virtual interface: ";
+
 /// A client that does not trust the certificate rurge issued is refused and
 /// counted every time, and warned about once an hour: the second connection's
 /// line is DEBUG only (`phase 4 M2 design 8.2`, `8.4`; the plan's P21, `P22`).
@@ -702,27 +724,23 @@ async fn an_untrusting_client_is_warned_once_an_hour_and_counted_each_time() {
     }
 
     let lines = log.lines();
-    let warned: Vec<&String> = lines
-        .iter()
-        .filter(|line| line.starts_with("WARN") && line.contains("does not trust"))
-        .collect();
+    let warned = lines_with(&lines, "WARN", UNTRUSTED_NAMED);
     assert_eq!(warned.len(), 1, "{lines:?}");
-    assert!(warned[0].contains("origin.test"), "{warned:?}");
     assert!(warned[0].contains("port=443"), "{warned:?}");
     assert!(warned[0].contains("alert=unknown_ca"), "{warned:?}");
     // the second time the same words are at DEBUG, and they name the host
-    let named = "the client does not trust the certificate rurge issued for origin.test";
+    let quiet = lines_with(&lines, "DEBUG", UNTRUSTED_NAMED);
+    assert_eq!(quiet.len(), 1, "{lines:?}");
+    assert!(quiet[0].contains("port=443"), "{quiet:?}");
+    assert!(quiet[0].contains("alert=unknown_ca"), "{quiet:?}");
     assert_eq!(
-        lines
-            .iter()
-            .filter(|line| line.starts_with("DEBUG") && line.contains(named))
-            .count(),
-        1,
-        "{lines:?}"
+        h.engine.http_counts().mitm,
+        MitmCounts {
+            untrusted: 2,
+            ..MitmCounts::default()
+        },
+        "two clients were refused, and nothing was decrypted"
     );
-    let counts = h.engine.http_counts().mitm;
-    assert_eq!(counts.untrusted, 2, "{counts:?}");
-    assert_eq!(counts.decrypted, 0, "{counts:?}");
 }
 
 /// A client that finishes the handshake and closes without a request is what
@@ -780,27 +798,26 @@ async fn a_client_that_closes_after_the_handshake_gets_the_pinning_hint() {
         );
     }
 
-    let hint = "origin.test is likely protected by certificate pinning";
     let lines = log.lines();
+    let warned = lines_with(&lines, "WARN", PINNING_NAMED);
+    assert_eq!(warned.len(), 1, "{lines:?}");
+    assert!(warned[0].contains("port=443"), "{warned:?}");
+    let quiet = lines_with(&lines, "DEBUG", PINNING_NAMED);
     assert_eq!(
-        lines
-            .iter()
-            .filter(|line| line.starts_with("WARN") && line.contains(hint))
-            .count(),
+        quiet.len(),
         1,
-        "{lines:?}"
+        "the second hint about the same host is DEBUG only: {lines:?}"
     );
+    assert!(quiet[0].contains("port=443"), "{quiet:?}");
     assert_eq!(
-        lines
-            .iter()
-            .filter(|line| line.starts_with("DEBUG") && line.contains(hint))
-            .count(),
-        1,
-        "the second hint about the same host is DEBUG only"
+        h.engine.http_counts().mitm,
+        MitmCounts {
+            decrypted: 2,
+            no_request: 2,
+            ..MitmCounts::default()
+        },
+        "both clients finished the handshake and neither sent a request"
     );
-    let counts = h.engine.http_counts().mitm;
-    assert_eq!(counts.decrypted, 2, "{counts:?}");
-    assert_eq!(counts.no_request, 2, "{counts:?}");
 }
 
 /// A client that finishes the handshake and then says nothing at all is not a
@@ -852,13 +869,20 @@ async fn a_request_head_that_times_out_is_no_pinning_hint() {
         reason, "no request after the TLS handshake (likely certificate pinning)",
         "a head that timed out is no pinning hint"
     );
-    assert_eq!(h.engine.http_counts().mitm.no_request, 0);
+    assert_eq!(
+        h.engine.http_counts().mitm,
+        MitmCounts {
+            decrypted: 1,
+            ..MitmCounts::default()
+        },
+        "the handshake is counted, and the ending is neither a hint nor a failure"
+    );
     let lines = log.lines();
     assert!(
         !lines
             .iter()
-            .any(|line| line.starts_with("WARN") && line.contains("certificate pinning")),
-        "{lines:?}"
+            .any(|line| line.contains("certificate pinning")),
+        "the hint is in no line of any level: {lines:?}"
     );
     drop(tls);
 }
@@ -911,23 +935,32 @@ async fn a_handshake_the_client_abandons_is_failed_at_info() {
             .starts_with("TLS handshake with the client failed: "),
         "{record:?}"
     );
-    let info = "the TLS handshake with the client failed for origin.test: ";
     let lines = log.lines();
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("INFO") && line.contains(info)),
-        "{lines:?}"
+    let info = lines_with(&lines, "INFO", FAILED_NAMED);
+    assert_eq!(info.len(), 1, "{lines:?}");
+    assert!(info[0].contains("port=443"), "{info:?}");
+    assert_eq!(
+        h.engine.http_counts().mitm,
+        MitmCounts {
+            failed: 1,
+            ..MitmCounts::default()
+        },
+        "the handshake failed and nothing was decrypted"
     );
-    assert_eq!(h.engine.http_counts().mitm.failed, 1);
 }
 
 /// The alert a client that does not trust the server's certificate ends its
 /// handshake with: fatal (2), `unknown_ca` (`0x30`). The test writes it
-/// itself — when verification fails, tokio-rustls writes the alert it queued
-/// once and drops it if the socket will not take it at once, and an app
-/// socket dropped with the alert still in it resets the session, so the
-/// engine would see a reset rather than the client's `unknown_ca`.
+/// itself in the clear, and rustls 0.23.43 reads a clear alert here: in TLS
+/// 1.3 it takes `ContentType::Alert` messages in the clear while it has not
+/// decrypted anything from the peer yet and the payload is at most two bytes
+/// (`conn.rs`), and a client whose verification failed is exactly there — it
+/// never sent its encrypted Finished. It is also why tokio-rustls matters
+/// only for the timing: when verification fails it writes the alert it
+/// queued once, in `read_io`'s last-gasp `write_io`, and drops it if the
+/// socket will not take it at once; and an app socket dropped with data still
+/// unsent resets the session, so the engine would see a reset rather than the
+/// client's `unknown_ca`.
 const UNKNOWN_CA_ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x30];
 
 /// Through the virtual interface the lines of WARN and INFO name neither the
@@ -992,9 +1025,13 @@ async fn through_the_virtual_interface_the_warnings_name_no_host() {
         .connect(SocketAddr::new(fake, 443))
         .await
         .expect("the session is accepted");
-    let mut tls = handshake(tcp, client_config(mitm_roots, &[], true), "origin.test")
-        .await
-        .expect("the client trusts the MITM CA");
+    let mut tls = handshake(
+        tcp,
+        client_config(mitm_roots.clone(), &[], true),
+        "origin.test",
+    )
+    .await
+    .expect("the client trusts the MITM CA");
     tls.shutdown().await.expect("the close_notify goes out");
     let mut rest = Vec::new();
     tokio::time::timeout(WITHIN, tls.read_to_end(&mut rest))
@@ -1002,42 +1039,168 @@ async fn through_the_virtual_interface_the_warnings_name_no_host() {
         .expect("the engine lets go within the bound")
         .expect("the stream ends cleanly");
 
-    let records = the_records(&rig.h, 2).await;
+    // and one that sends a hello and leaves: a handshake that failed for
+    // another reason is said at INFO, and that line names no host either
+    let (fake, _) = rig.fakes("origin.test");
+    let mut tcp = rig
+        .app
+        .connect(SocketAddr::new(fake, 443))
+        .await
+        .expect("the session is accepted");
+    tcp.write_all(&client_hello(
+        client_config(mitm_roots, &[], true),
+        "origin.test",
+    ))
+    .await
+    .unwrap();
+    // the engine's answer to the hello means the sniff is over and `accept`
+    // waits for the client's next step, as in
+    // `a_stop_in_the_middle_of_the_handshake`
+    let mut first = [0u8; 1];
+    let read = tokio::time::timeout(WITHIN, tcp.read(&mut first))
+        .await
+        .expect("the engine answers the ClientHello within the bound")
+        .expect("the session carries the engine's answer");
+    assert_eq!(read, 1, "the engine answered before the close");
+    assert_eq!(first[0], 0x16, "a TLS handshake record");
+    tcp.shutdown()
+        .await
+        .expect("the end of the stream goes out");
+    let records = the_records(&rig.h, 3).await;
+    // the socket goes only now: shut down, it ends the session without a
+    // reset, and the record above is the engine's own end of it
+    drop(tcp);
+
+    assert_eq!(records.len(), 3, "{records:?}");
     for record in &records {
         assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
         assert!(record.dst.contains("origin.test"), "{record:?}");
     }
+    let abandoned = "TLS handshake with the client failed: ";
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with(abandoned))
+            .count(),
+        1,
+        "the third client's record is the abandoned handshake: {records:?}"
+    );
+
     let lines = log.lines();
-    let warns: Vec<&String> = lines
+    let untrusted_warn = lines_with(&lines, "WARN", UNTRUSTED_VIRTUAL);
+    assert_eq!(untrusted_warn.len(), 1, "{lines:?}");
+    let pinning_warn = lines_with(&lines, "WARN", PINNING_VIRTUAL);
+    assert_eq!(pinning_warn.len(), 1, "{lines:?}");
+    let failed_info = lines_with(&lines, "INFO", FAILED_VIRTUAL);
+    assert_eq!(failed_info.len(), 1, "{lines:?}");
+    for line in untrusted_warn
         .iter()
-        .filter(|line| line.starts_with("WARN") && line.contains("virtual interface"))
-        .collect();
-    assert_eq!(warns.len(), 2, "{lines:?}");
-    for line in &warns {
+        .chain(pinning_warn.iter())
+        .chain(failed_info.iter())
+    {
         assert!(!line.contains("origin.test"), "{line}");
         assert!(!line.contains("port="), "{line}");
     }
-    let untrusted = "the client does not trust the certificate rurge issued for origin.test";
+    // each of the three names the host in a line of DEBUG, and none of those
+    // lines has a port: `port` is only on a session through a listener
+    for sentence in [UNTRUSTED_NAMED, PINNING_NAMED, FAILED_NAMED] {
+        let named = lines_with(&lines, "DEBUG", sentence);
+        assert_eq!(named.len(), 1, "{sentence}: {lines:?}");
+        assert!(!named[0].contains("port="), "{named:?}");
+    }
     assert_eq!(
-        lines
-            .iter()
-            .filter(|line| line.starts_with("DEBUG") && line.contains(untrusted))
-            .count(),
-        1,
-        "{lines:?}"
+        rig.h.engine.http_counts().mitm,
+        MitmCounts {
+            decrypted: 1,
+            untrusted: 1,
+            failed: 1,
+            no_request: 1,
+        },
+        "each client ended its own way"
     );
-    let pinning = "origin.test is likely protected by certificate pinning";
+}
+
+/// A stop that lands after the handshake is no hint about certificate
+/// pinning: the client did finish the handshake and sent nothing, and the
+/// stop is what ended the connection (`phase 4 M2 design 8.3`, the plan's
+/// P21).
+#[tokio::test]
+async fn a_stop_after_the_handshake_is_no_pinning_hint() {
+    let log = LogCapture::start();
+    let origin = TlsFixture::new(&["origin.test"]);
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let section = mitm_section("origin.test", &ca);
+    let rig = Rig::on(
+        harness_mitm(
+            Profile {
+                rules: &guarded("DOMAIN,origin.test,DIRECT"),
+                sections: &section,
+                ..Profile::default()
+            },
+            origin.roots(),
+        )
+        .await,
+    )
+    .await;
+
+    let (fake, _) = rig.fakes("origin.test");
+    let tcp = rig
+        .app
+        .connect(SocketAddr::new(fake, 443))
+        .await
+        .expect("the session is accepted");
+    let mut tls = handshake(tcp, client_config(mitm_roots, &[], true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    // The client's side is done once it sent its Finished; the engine's is
+    // done when `accept` returned, which is what counts the handshake. The
+    // stop has to land after that, or it is the stop of `8.2` that leaves
+    // nothing behind at all.
+    wait_until("the engine to finish its handshake", || {
+        rig.h.engine.http_counts().mitm.decrypted == 1
+    })
+    .await;
+
+    rig.tun.stop();
+    // the client is let go at once: the stop resets the session on the app's
+    // side of the adapter, as it does for an HTTP connection of the adapter
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(WITHIN, tls.read(&mut byte))
+        .await
+        .expect("the stop ends the connection at once");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "the app is let go: {read:?}"
+    );
+
+    let records = the_records(&rig.h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_ne!(
+        records[0].error.as_deref(),
+        Some("no request after the TLS handshake (likely certificate pinning)"),
+        "a stop is no pinning hint: {records:?}"
+    );
     assert_eq!(
-        lines
-            .iter()
-            .filter(|line| line.starts_with("DEBUG") && line.contains(pinning))
-            .count(),
-        1,
-        "{lines:?}"
+        rig.h.engine.http_counts().mitm,
+        MitmCounts {
+            decrypted: 1,
+            ..MitmCounts::default()
+        },
+        "the handshake is counted, and the ending is neither a hint nor a failure"
     );
-    let counts = rig.h.engine.http_counts().mitm;
-    assert_eq!(counts.untrusted, 1, "{counts:?}");
-    assert_eq!(counts.no_request, 1, "{counts:?}");
+    let lines = log.lines();
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("certificate pinning")),
+        "the hint is in no line of any level: {lines:?}"
+    );
 }
 
 /// A reload with the same material keeps the authority, and with it the
@@ -1125,14 +1288,18 @@ async fn the_mitm_counts_survive_a_reload() {
     let response = get(&mut tls, "origin.test", "/a").await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     the_records(&h, 1).await;
-    assert_eq!(h.engine.http_counts().mitm.decrypted, 1);
+    let decrypted = MitmCounts {
+        decrypted: 1,
+        ..MitmCounts::default()
+    };
+    assert_eq!(h.engine.http_counts().mitm, decrypted);
 
     let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
     h.engine
         .swap_runtime(runtime(h.dir.path(), &text, h.engine.shared()).await);
     assert_eq!(
-        h.engine.http_counts().mitm.decrypted,
-        1,
+        h.engine.http_counts().mitm,
+        decrypted,
         "a reload does not clear the counts"
     );
 }

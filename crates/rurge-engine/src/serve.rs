@@ -446,8 +446,10 @@ impl Engine {
                 // the connection's own record, as a connection whose requests
                 // never reached the rules gets one (`phase 4 M2 design 8.2`,
                 // the plan's P21) — with the line and the count the failure
-                // has, and both of those limited to one WARN per host and
-                // hour by `8.4`
+                // has. Only the WARN is limited: one per kind and host and
+                // hour, and what it holds back is written at DEBUG (`8.4`).
+                // The count and the record are there every time, and the line
+                // of a failure that is not about trust is not limited at all.
                 let reason = match failure {
                     HandshakeFailure::Untrusted { alert } => {
                         self.mitm_counts.untrusted();
