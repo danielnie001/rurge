@@ -557,3 +557,7 @@ M1b 执行时又改了下面几处。以这里为准，理由在 M1b 计划（`d
 8. **第 8.11 节：停止时第一个请求头还没读完的连接当场结束**（M1b 记录第 44 行）：hyper 1.11.1 的新连接从 `KA::Busy` 开始，`graceful_shutdown()` 只在读缓冲空着时当场关，否则只关 `KA::Idle` 的连接——半个请求头的连接会一直读到 `header_read_timeout`（嗅探到的连接是 `idle_timeout`，缺省 600 秒）。所以连接令牌先到、而这一条连接上一个请求也没走到选路（`routed() == 0`）时当场结束，不 `graceful_shutdown`；走到过选路的照第 8.11 节优雅关闭。
 9. **第 9 节与 R27：fake 地址的租约比“这个请求结束”长**（M1b 记录第 37 行）：租约不挂在监听器的局部变量里，而挂在 `ConnUpstreams` 上，因此活到这条客户端连接真正结束（升级之后转发的任务还握着它）。第 9 节写的“租约握到这个请求结束”以这一条为准。
 10. **第 9 节：反查不到名字的 fake 地址先求规则、再答 502**（M1b 记录第 56、60 行）：`rurge-http` 先 `route` 再看反查的结果，所以绝对形式的请求先求过规则（规则的命中数加一、记录带着命中的规则）再答 `fake address not known`；`CONNECT` 那一路（`Dialer::dial` 的 `Turned::Unknown`）在求规则之前就失败，记录没有规则。两路的次序不同，本里程碑没有统一。
+
+M3b 执行时又订正了一处。以这里为准，理由在阶段 4 / M3b 计划（`docs/superpowers/plans/2026-10-31-phase4-m3b-body-rewrite-map-local-plan.md`）「执行期修正记录」第 20 行；上面各条照旧有效。
+
+11. **第 13 节第 6 条“trailers 只在声明过时转发”比实际宽**（M3 设计第 22 节第 20 条那一条修正的同一件事）：到 HTTP/1.1 客户端的 trailer 一个也不转——引擎把 `Trailer` 当逐跳的头去掉（第 8.7 节），而 hyper 1.11.1 的 HTTP/1.1 编码器只写 `Trailer` 里声明过的那些，头里没有它就一条也不写；两端都讲 HTTP/2 时照转（`crates/rurge-http/src/engine.rs` 的 `an_unchanged_response_keeps_its_bytes_and_trailers`，经一条配上而没有改动的规则）。

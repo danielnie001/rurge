@@ -663,3 +663,7 @@ M3 的文档任务把下面各条写进兼容性清单（`docs/surge-compatibili
 20. 第 3 节 `Rewrite::build` 的签名多一个参数 `url_data: &dyn Fn(&str) -> UrlData`（`UrlData` 是 `Arc<dyn Fn() -> Option<Bytes> + Send + Sync>`）：引擎把 Map Local 的每个 URL 挂进这一代的资源管理器，交回读当时那一份数据的闭包；`rurge-http` 不必认识资源管理器怎样登记一类资源（计划 P19）。
 
 21. 第 10.3 节"读到一半出错……同上游正文出错"与第 12 节 `failed` 的"Map Local 的数据读不到"：`failed` 只数答复之前就读不到的（文件打不开、不是普通文件、URL 还没有数据，都是 502 或关闭）；读到一半出错或文件读到一半变短的不计入 `failed`——这个请求已经由 Map Local 答复、计入 `mapLocal`，坏的是正文的递送，同上游正文出错不算重写的失败。记录分别是 `Map Local: reading <路径> failed: <错误>` 与 `Map Local: <路径> became shorter while it was read`（计划 P15、P16）。
+
+**执行 M3b 时**：由 M3b 的任务 9 补上（本计划的「执行期修正记录」）。
+
+22. 第 9.4 节的"`gzip`：flate2 的 `MultiGzDecoder`"与同一节末句"解码出错同样不改写、留备注"：标着 `Content-Encoding: gzip`、`x-gzip` 或 `deflate` 而正文是空的，那一层解成空的、不建解码器，接着解下一层——flate2 的 `MultiGzDecoder` 对空的输入交 `UnexpectedEof`，照第 9.4 节的字面，手册给空正文生成内容的 `^$` 写法在它上面就不成了；`br`、`zstd`、`compress` 与别的名字照旧交回 `Err`。以修正记录第 40 行为准（M3c 加 `br`、`zstd` 时照这一条）。

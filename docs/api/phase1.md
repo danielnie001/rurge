@@ -120,8 +120,8 @@ rurge 在 `[General] http-api = <key>@<ip>:<port>` 指定的地址上提供 Surg
 
 | 字段 | rurge | 与手册的差异 |
 | --- | --- | --- |
-| `path` | 资源叫什么。规则集与域名集是写下的地址，其中的用户名口令显示为 `***`，路径与查询串照写的样子（与 `GET /v1/rules` 和日志里一样）；订阅（`policy-path`）是 ``policy-path of `<组名>` ``，地址是凭据，不显示；两个 GeoIP 库是文件名；托管 Profile 是 ``managed profile (<scheme>://<host>[:port]/…)``；远程 `#!include` 是 ``remote include <键的前 8 位> (<scheme>://<host>[:port]/…)``；本地文件是它的路径 | 手册的例子是资源的 URL。托管 Profile 与远程 include 的链接整个是凭据（服务商发的链接带令牌），日志、诊断与这个端点都只显示 `scheme://host[:port]/…` |
-| `type` | `ruleset`、`domainset`、`policy-group`（`policy-path` 订阅），另有 rurge 自己的三个：`geoip`（两个 GeoIP 库）、`profile`（托管 Profile）、`include`（远程 `#!include`） | 手册："One of `ruleset`, `domainset`, `script`, `policy-group` and `data`."；rurge 没有 `script` 与 `data`（脚本在阶段 5，Map Local 的数据在阶段 4） |
+| `path` | 资源叫什么。规则集与域名集是写下的地址，其中的用户名口令显示为 `***`，路径与查询串照写的样子（与 `GET /v1/rules` 和日志里一样）；订阅（`policy-path`）是 ``policy-path of `<组名>` ``，地址是凭据，不显示；两个 GeoIP 库是文件名；托管 Profile 是 ``managed profile (<scheme>://<host>[:port]/…)``；远程 `#!include` 是 ``remote include <键的前 8 位> (<scheme>://<host>[:port]/…)``；本地文件是它的路径；阶段 4 / M3b 起 `[Map Local]` 的 URL 数据是 ``map local data <键的前 8 位> (<scheme>://<host>[:port]/…)``（写法同远程 include） | 手册的例子是资源的 URL。托管 Profile 与远程 include 的链接整个是凭据（服务商发的链接带令牌），日志、诊断与这个端点都只显示 `scheme://host[:port]/…` |
+| `type` | `ruleset`、`domainset`、`policy-group`（`policy-path` 订阅），另有 rurge 自己的三个：`geoip`（两个 GeoIP 库）、`profile`（托管 Profile）、`include`（远程 `#!include`） | 手册："One of `ruleset`, `domainset`, `script`, `policy-group` and `data`."；rurge 没有 `script` 与 `data`（脚本在阶段 5，Map Local 的数据在阶段 4）；阶段 4 / M3b 起有 `data`（`[Map Local]` 里以 `http://` 或 `https://` 开头的 `data`），见 `docs/api/phase4.md` 的「M3b」一节「外部资源的 `data`」；`script` 仍没有 |
 | `key` | 地址的 SHA-256，64 位小写十六进制（本地文件取 `file:<路径>` 的 SHA-256），也是缓存目录 `<数据目录>/resources/<key>/` 的名字。在列表里不唯一：一个地址既是 Profile 的来源又是规则集时，列出两项（`type` 不同）、一个键 | 手册只说是资源的标识、更新端点用它（例子是 32 位十六进制）；算法是 rurge 自己的 |
 | `local` | 资源是本地文件 | 同手册 |
 | `ready` | rurge 手里有这份资源的内容；最近一次更新失败而留着旧内容的也算 | 手册："Whether the resource content is available." |

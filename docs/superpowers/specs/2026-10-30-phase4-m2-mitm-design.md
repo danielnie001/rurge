@@ -650,3 +650,7 @@ M2 的文档任务把下面各条写进兼容性清单（`docs/surge-compatibili
 
 28. 第 14.1 节"`rurge check` 给 `W0040`"：起守护进程时也报。`rurge run` 经 `load_checked`（`crates/rurge-engine/src/outbounds.rs:404`）把 `rurge_http::mitm::check` 的诊断并进加载的结果，起监听器之前打在**标准错误**上（`crates/rurge/src/cli/run.rs:1673` 的 `print_diagnostics`，不带位置），与 P12 的那一行 WARN 同时出现；`rurge check` 把它打在标准输出、按位置排序。重载时的那一种第 22 条已经写了（执行记录第 35 行 ③）。
 29. 第 8.3 节只列了"浏览器的预连接"一个误报来源：另有一个。握手完成之后才核证书的客户端（OpenSSL / LibreSSL 版的 curl 等）不信 CA 时也满足第 8.3 节的三个条件，被说成证书固定；`curl --pinnedpubkey` 在 rurge 看来同样是证书固定，不是"不信任"。提示的措辞（"exclude it with `-<名字>`"）对前一种不对——它们要的是在客户端里装上并信任 CA，与第 8.2 节的 WARN 说的是一件事。改不改措辞归项目所有者（执行记录第 42 行、计划「延后事项」第 1 行）。
+
+**执行 M3b 时**：由 M3b 的任务 9 补上（理由在阶段 4 / M3b 计划 `docs/superpowers/plans/2026-10-31-phase4-m3b-body-rewrite-map-local-plan.md`「执行期修正记录」第 20 行）。
+
+30. 第 10.3 节末条"trailers 照 M1b（声明过才转）"——同上，比实际宽：`Trailer` 是逐跳的头，引擎在 M1b 就把它去掉了，hyper 1.11.1 的 HTTP/1.1 编码器只写 `Trailer` 里声明过的那些，所以到 HTTP/1.1 客户端的 trailer 一个也不转；两端都讲 HTTP/2 时照转（M3 设计第 22 节第 20 条）。
