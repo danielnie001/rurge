@@ -18,13 +18,17 @@ pub struct HttpJson {
     /// The TLS sessions `[MITM]` decrypted, and how the ones that did not go
     /// through ended (`phase 4 M2 design 12.3`).
     pub mitm: MitmJson,
-    /// What the rewrites of `[URL Rewrite]` and `[Header Rewrite]` did
-    /// (`phase 4 M3 design 12`), since the engine started.
+    /// What the rewrites of `[URL Rewrite]`, `[Header Rewrite]`,
+    /// `[Body Rewrite]` and `[Map Local]` did (`phase 4 M3 design 12`), since
+    /// the engine started.
     pub rewrite: RewriteJson,
 }
 
-/// The rewrite counts. `body` and `mapLocal` stay at zero until M3b, which is
-/// why the shape has them from M3a on (`phase 4 M3 design 12`, `M3-D25`).
+/// The rewrite counts (`phase 4 M3 design 12`, `M3-D25`): `body` is the
+/// requests whose body a `[Body Rewrite]` rule changed, once each however many
+/// rules and both directions acted; `mapLocal` the requests a `[Map Local]`
+/// rule answered, the `HEAD`, 204 and 304 answers included and the ones it
+/// could not answer not.
 #[derive(Serialize)]
 pub struct RewriteJson {
     pub url: u64,

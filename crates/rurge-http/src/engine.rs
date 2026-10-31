@@ -16,8 +16,9 @@ use super::headers::{self, Keep};
 use super::mitm::OriginTls;
 use super::pool::{Meter, Metered, Pool, Reusable};
 use super::rewrite::{
-    Ahead, Buffer, HostChange, MapRule, MapSource, REQUEST, ReadAhead, Rewrite, UrlOutcome,
-    candidates, read_ahead, redirect, request_buffer, retarget_request, write_back_host,
+    Ahead, Buffer, HostChange, MapRule, MapSource, REQUEST, RESPONSE, ReadAhead, Rewrite,
+    UrlOutcome, candidates, read_ahead, redirect, request_buffer, response_buffer,
+    retarget_request, write_back_host,
 };
 use super::version::{Form, fit};
 use bytes::Bytes;
@@ -623,10 +624,10 @@ impl<U: Upstreams> Requests<U> {
                 UrlOutcome::Go(None) => {}
             }
         }
-        // 5. `[Map Local]` (`phase 4 M3 design 10.2`, the phase 4 / M3b plan's
-        // P14): a rule that matches answers the request itself, and nothing is
-        // dialled. A request that upgrades is asked too — only its headers are
-        // looked at — and gets a plain answer.
+        // `[Map Local]` (`phase 4 M3 design 10.2`, the phase 4 / M3b plan's P14,
+        // its sixth step): a rule that matches answers the request itself, and
+        // nothing is dialled. A request that upgrades is asked too — only its
+        // headers are looked at — and gets a plain answer.
         if let (Some(rules), Some(text)) = (rewrite.as_deref(), url.as_deref()) {
             let mut notes = Vec::new();
             let matched = rules.map_local(text, &mut notes);
@@ -646,12 +647,13 @@ impl<U: Upstreams> Requests<U> {
         // tunnel (design 8.9)
         let tunnel = sniffed && req.method() == http::Method::CONNECT;
         let needs_h1 = upgrade || tunnel;
-        // 6. the request's body (`phase 4 M3 design 9.5`, the phase 4 / M3b
-        // plan's P14): only when a rule of this direction matches the URL, and
-        // only for a body that can be read whole. A body that cannot be —
-        // chunked, expected with `100-continue`, of no length over HTTP/2 — is
-        // forwarded as it came, with a note and one WARN an hour for every
-        // rule that matched it (`phase 4 M3 design 9.2`, `14`).
+        // the request's body (`phase 4 M3 design 9.5`, the phase 4 / M3b plan's
+        // P14, its seventh step): only when a rule of this direction matches the
+        // URL, and only for a body that can be read whole. A body that cannot be
+        // — chunked, expected with `100-continue`, of no length over HTTP/2 — is
+        // forwarded as it came, with a note and one WARN an hour for every rule
+        // that matched it (`phase 4 M3 design 9.2`, `14`).
+        let mut body_changed = false;
         let request_body_rules = match (rewrite.as_deref(), url.as_deref()) {
             (Some(rules), Some(text)) if !needs_h1 => {
                 let mut notes = Vec::new();
@@ -759,6 +761,7 @@ impl<U: Upstreams> Requests<U> {
                                             HeaderValue::from(bytes.len()),
                                         );
                                         rules.counters().body();
+                                        body_changed = true;
                                         ReadAhead::whole(bytes, None)
                                     }
                                     None => ReadAhead::whole(data, trailers),
@@ -960,6 +963,9 @@ impl<U: Upstreams> Requests<U> {
         // dialled (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's P11`).
         // It is set before every send, by the version of the sender used then.
         let request_meter = Meter::new();
+        // what the answer's side asks about this request: whether a body may be
+        // buffered at all (`phase 4 M3 design 9.2`)
+        let method = req.method().clone();
         let (parts, request_body) = req.into_parts();
         let req = Request::from_parts(
             parts,
@@ -1189,6 +1195,128 @@ impl<U: Upstreams> Requests<U> {
                 );
             }
         }
+        // the answer's body (`phase 4 M3 design 9.5`, the phase 4 / M3b plan's
+        // P14, its twelfth step): as the request's, on the other side, and only
+        // when a rule of this direction matches and the answer can have a body
+        // (`M3-D19`).
+        let (mut parts, body) = resp.into_parts();
+        let response_body_rules = match (rewrite.as_deref(), url.as_deref()) {
+            (Some(rules), Some(text)) if response_buffer(&method, parts.status) => {
+                let mut notes = Vec::new();
+                let matched = rules.body_rules(Direction::Response, text, &mut notes);
+                note_rewrites(&handle, rules, notes);
+                (!matched.is_empty()).then(|| {
+                    (
+                        Arc::clone(rewrite.as_ref().expect("the rules are in hand")),
+                        matched,
+                    )
+                })
+            }
+            _ => None,
+        };
+        let body = match response_body_rules {
+            None => ReadAhead::through(body),
+            Some((generation, matched)) => {
+                let rules: &Rewrite = &generation;
+                // the bytes read here are the upstream's, and on a shared
+                // HTTP/2 connection nothing else counts them: `read_ahead`
+                // counts them onto this request, and `Tail` leaves them alone
+                // because they are no longer polled from upstream
+                let ahead = read_ahead(
+                    body,
+                    RESPONSE.bytes,
+                    self.shared.conn.idle,
+                    handle.token(),
+                    Some(&request_meter),
+                )
+                .await;
+                match ahead {
+                    Ahead::Whole { data, trailers } => {
+                        let encodings: Vec<HeaderValue> = parts
+                            .headers
+                            .get_all(header::CONTENT_ENCODING)
+                            .iter()
+                            .cloned()
+                            .collect();
+                        let job = {
+                            let generation = Arc::clone(&generation);
+                            let matched = matched.clone();
+                            let data = data.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let mut notes = Vec::new();
+                                let changed = generation.rewrite_body(
+                                    &matched, &encodings, &data, RESPONSE, &mut notes,
+                                );
+                                (changed, notes)
+                            })
+                        };
+                        let outcome = tokio::select! {
+                            biased;
+                            _ = handle.token().cancelled() => return Err(Close),
+                            outcome = job => outcome,
+                        };
+                        let changed = match outcome {
+                            Ok((changed, notes)) => {
+                                note_rewrites(&handle, rules, notes);
+                                changed
+                            }
+                            Err(e) => {
+                                tracing::error!("body rewrite task failed: {e}");
+                                None
+                            }
+                        };
+                        match changed {
+                            Some(bytes) => {
+                                parts.headers.remove(header::CONTENT_ENCODING);
+                                parts.headers.remove(header::TRANSFER_ENCODING);
+                                parts
+                                    .headers
+                                    .insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+                                // one request counts once, however many rules
+                                // and directions changed its body (P18)
+                                if !body_changed {
+                                    rules.counters().body();
+                                }
+                                ReadAhead::whole(bytes, None)
+                            }
+                            None => ReadAhead::whole(data, trailers),
+                        }
+                    }
+                    Ahead::Over { ahead, rest } => {
+                        let mut notes = Vec::new();
+                        for &i in &matched {
+                            notes.push(crate::rewrite::Note::Skipped(format!(
+                                "Body Rewrite skipped: {}: the body is over {}",
+                                rules.body_rule(i).source(),
+                                RESPONSE.text
+                            )));
+                        }
+                        note_rewrites(&handle, rules, notes);
+                        // what was read goes out first, then the rest as it
+                        // comes (`phase 4 M3 design 9.3`)
+                        ReadAhead::resumed(ahead, rest)
+                    }
+                    Ahead::Stalled => {
+                        return self.failed(
+                            &guard,
+                            pages,
+                            "upstream body stalled".to_string(),
+                            UPSTREAM_BODY_STALLED.to_string(),
+                        );
+                    }
+                    Ahead::Failed(e) => {
+                        return self.failed(
+                            &guard,
+                            pages,
+                            format!("upstream body failed: {e}"),
+                            UPSTREAM_BODY_FAILED.to_string(),
+                        );
+                    }
+                    Ahead::Cancelled => return Err(Close),
+                }
+            }
+        };
+        let resp = Response::from_parts(parts, body);
         handle.set_status(resp.status().as_u16());
         let (parts, body) = resp.into_parts();
         let outing = Outing {
@@ -1205,13 +1333,7 @@ impl<U: Upstreams> Requests<U> {
             peer,
             forward,
         };
-        let tail = Tail::new(
-            ReadAhead::through(body),
-            guard,
-            self.shared.clone(),
-            outing,
-            request_meter,
-        );
+        let tail = Tail::new(body, guard, self.shared.clone(), outing, request_meter);
         Ok(Response::from_parts(parts, tail.boxed()))
     }
 
@@ -3418,6 +3540,16 @@ const LOCAL_FILE_MISSING: &str = "The file a Map Local rule names cannot be read
 /// (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P18).
 const LOCAL_DATA_MISSING: &str = "The data a Map Local rule names has not been downloaded yet.";
 
+/// What the page of a 502 says when the upstream stopped sending the body a
+/// `[Body Rewrite]` rule was buffering (`phase 4 M3 design 9.3`, the phase 4 /
+/// M3b plan's P18).
+const UPSTREAM_BODY_STALLED: &str = "The upstream server stopped sending the response body.";
+
+/// What the page of a 502 says when the body a `[Body Rewrite]` rule was
+/// buffering ended with an error (`phase 4 M3 design 9.3`, the phase 4 / M3b
+/// plan's P18).
+const UPSTREAM_BODY_FAILED: &str = "The upstream server's response body failed.";
+
 /// Serves `client` as HTTP/1.1 (`phase 4 M1 design 8.1`): until the connection
 /// ends or `requests`' connection token fires, and then until the connection
 /// has let go.
@@ -3931,6 +4063,34 @@ mod tests {
         async fn until_close(&mut self) -> Vec<u8> {
             while self.fill().await {}
             std::mem::take(&mut self.buf)
+        }
+
+        /// One response whose body is chunked: its head and the body unwrapped
+        /// (`phase 4 M3 design 9.3`).
+        async fn response_chunked(&mut self) -> (String, Vec<u8>) {
+            let head = self.response_head().await;
+            let body = read_chunked(&mut self.buf, &mut self.stream)
+                .await
+                .expect("a chunked body before the connection closed");
+            (head, body)
+        }
+
+        /// One response whatever frames it: its head and the body, read by the
+        /// `Transfer-Encoding` when there is one and by the length otherwise.
+        async fn response_any(&mut self) -> (String, Vec<u8>) {
+            let head = self.response_head().await;
+            let body = if head
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked")
+            {
+                read_chunked(&mut self.buf, &mut self.stream)
+                    .await
+                    .expect("a chunked body before the connection closed")
+            } else {
+                let len = content_length(&head);
+                self.take(len).await
+            };
+            (head, body)
         }
     }
 
@@ -4560,7 +4720,11 @@ mod tests {
 
     /// Reads until at least `len` bytes are in `buf`; false when the
     /// connection ended first.
-    async fn fill_to(buf: &mut Vec<u8>, stream: &mut tokio::net::TcpStream, len: usize) -> bool {
+    async fn fill_to(
+        buf: &mut Vec<u8>,
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
+        len: usize,
+    ) -> bool {
         while buf.len() < len {
             let mut chunk = [0u8; 4096];
             match stream.read(&mut chunk).await {
@@ -4575,7 +4739,7 @@ mod tests {
     /// unwrapped; `None` when the connection ended before its end.
     async fn read_chunked(
         buf: &mut Vec<u8>,
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
     ) -> Option<Vec<u8>> {
         let mut body = Vec::new();
         loop {
@@ -4743,6 +4907,116 @@ mod tests {
         })
         .await
         .expect("the condition held within 5 s");
+    }
+
+    /// An origin that answers a chunked body of `body` with a trailer `x-t: 1`
+    /// and a plain `X-O: 1`, on a connection it keeps open (`the phase 4 /
+    /// M3b plan's task 5`): the manual has no such example, and what the cases
+    /// about chunked answers need is the framing.
+    async fn chunked_origin(body: Vec<u8>) -> SocketAddr {
+        let answer = {
+            let mut answer = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-O: 1\r\n\
+                 Trailer: x-t\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                body.len()
+            )
+            .into_bytes();
+            answer.extend_from_slice(&body);
+            answer.extend_from_slice(b"\r\n0\r\nx-t: 1\r\n\r\n");
+            answer
+        };
+        origin_answering(answer).await
+    }
+
+    /// As `chunked_origin`, with a `Content-Length` instead of the chunked
+    /// framing (`phase 4 M3 design 9.3`).
+    async fn fixed_origin(body: Vec<u8>) -> SocketAddr {
+        let mut answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(&body);
+        origin_answering(answer).await
+    }
+
+    /// An origin that answers the head of a ten-byte body and five of its
+    /// bytes, then stops talking (`phase 4 M3 design 9.3`).
+    async fn stalled_origin() -> SocketAddr {
+        origin_answering(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nxxxxx".to_vec()).await
+    }
+
+    /// An origin that answers `answer` to every request it reads, on a
+    /// connection it keeps open.
+    async fn origin_answering(answer: Vec<u8>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    loop {
+                        let at = loop {
+                            if let Some(at) = find(&buf, b"\r\n\r\n") {
+                                break at;
+                            }
+                            let mut chunk = [0u8; 4096];
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..at]).to_string();
+                        buf.drain(..at + 4);
+                        let len = content_length(&head);
+                        if !fill_to(&mut buf, &mut stream, len).await {
+                            return;
+                        }
+                        buf.drain(..len);
+                        if stream.write_all(&answer).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// `data` gzipped, for a body that arrives compressed (`phase 4 M3 design
+    /// 9.4`): the case makes it here, not in the repository.
+    fn gzipped(data: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).expect("a gzip body");
+        encoder.finish().expect("a gzip body")
+    }
+
+    /// A response body read to its end, with the trailers it ended with
+    /// (`the phase 4 / M3b plan's execution record row 20`).
+    async fn body_and_trailers(resp: Response<Incoming>) -> (Vec<u8>, Option<http::HeaderMap>) {
+        let mut body = resp.into_body();
+        let mut data = Vec::new();
+        let mut trailers = None;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+                .await
+                .expect("a frame within 5 s");
+            let Some(frame) = frame else { break };
+            let frame = frame.expect("a frame");
+            if let Some(chunk) = frame.data_ref() {
+                data.extend_from_slice(chunk);
+            }
+            if let Some(seen) = frame.trailers_ref() {
+                trailers = Some(seen.clone());
+            }
+        }
+        (data, trailers)
     }
 
     /// A listener a `[Map Local]` answer must never reach: it counts the
@@ -6162,6 +6436,10 @@ mod tests {
         /// it before its end (`the phase 4 / M2b plan's execution record row
         /// 52`).
         ResetMidBody,
+        /// Answer every stream with its path and a `content-length`, then a
+        /// trailer `x-t: 1` (`the phase 4 / M3b plan's execution record row
+        /// 20`).
+        Trailers,
     }
 
     /// An HTTP/2 origin of the case's own (`phase 4 / M2b plan P18`): it takes
@@ -6211,7 +6489,9 @@ mod tests {
                             accepted += 1;
                             if first && accepted > 1 {
                                 match script {
-                                    OriginScript::GoAwayAfterOne | OriginScript::ResetMidBody => {}
+                                    OriginScript::GoAwayAfterOne
+                                    | OriginScript::ResetMidBody
+                                    | OriginScript::Trailers => {}
                                     OriginScript::RefuseAfterOne => {
                                         respond.send_reset(h2::Reason::REFUSED_STREAM);
                                         continue;
@@ -6252,7 +6532,20 @@ mod tests {
                                 .body(())
                                 .expect("a response");
                             if let Ok(mut send) = respond.send_response(answer, false) {
-                                let _ = send.send_data(Bytes::from(path), true);
+                                let _ = send.send_data(
+                                    Bytes::from(path),
+                                    !matches!(script, OriginScript::Trailers),
+                                );
+                                if matches!(script, OriginScript::Trailers) {
+                                    // the data, then one trailer (`the phase 4 /
+                                    // M3b plan's execution record row 20`)
+                                    let mut trailers = http::HeaderMap::new();
+                                    trailers.insert(
+                                        header::HeaderName::from_static("x-t"),
+                                        HeaderValue::from_static("1"),
+                                    );
+                                    let _ = send.send_trailers(trailers);
+                                }
                             }
                             if first
                                 && accepted == 1
@@ -9062,6 +9355,484 @@ mod tests {
         assert_eq!(
             handle.outcome(),
             Some(SessionOutcome::Failed("killed".to_string()))
+        );
+    }
+
+    /// A rewritten answer loses its chunked framing and its trailers and gets
+    /// the length of what it became, and so does one rewritten to nothing
+    /// (`phase 4 M3 design 9.5` – `9.6`, the phase 4 / M3b plan's P13).
+    #[tokio::test]
+    async fn a_rewritten_chunked_response_gets_a_length() {
+        let addr = chunked_origin(b"<p>documents</p>".to_vec()).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ documents Surge",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /doc HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"<p>Surge</p>");
+        assert_eq!(
+            header_value(&head, "content-length").as_deref(),
+            Some("12"),
+            "{head}"
+        );
+        assert_eq!(header_value(&head, "transfer-encoding"), None, "{head}");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Body Rewrite: response by ^http://b\\.test/"]
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                body: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+        // the origin's trailer does not follow the body: the next answer's head
+        // starts where this one ended
+        rig.client
+            .send("GET /doc HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let next = rig.client.response_head().await;
+        assert!(
+            next.starts_with("HTTP/1.1 200"),
+            "a trailer came after the body: {next}"
+        );
+
+        // a body rewritten to nothing is framed by `Content-Length: 0`
+        let addr = chunked_origin(b"documents".to_vec()).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://e\\.test/ documents \"\"",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /e HTTP/1.1\r\nHost: e.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(
+            header_value(&head, "content-length").as_deref(),
+            Some("0"),
+            "{head}"
+        );
+        assert!(body.is_empty());
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                body: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+
+        // both directions changed one request's body: `body` counts it once
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\n\
+             http-request ^http://b\\.test/ documents Q\n\
+             http-response ^http://b\\.test/ ok gone",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("POST /both HTTP/1.1\r\nHost: b.test\r\nContent-Length: 9\r\n\r\ndocuments")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"gone", "the answer was rewritten too");
+        assert_eq!(records.lock().unwrap()[0].body, b"Q");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            rewrite_notes(&handle),
+            [
+                "Body Rewrite: request by ^http://b\\.test/",
+                "Body Rewrite: response by ^http://b\\.test/",
+            ]
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                body: 1,
+                ..counted(0, 0, 0, 0)
+            },
+            "one request, one count, both directions"
+        );
+    }
+
+    /// An answer no pair changed keeps its bytes and its framing, and a body
+    /// read whole keeps the trailers it came with (`phase 4 M3 design 8.4`,
+    /// `9.6`).
+    ///
+    /// The phase 4 / M3b plan's execution record row 20 halved this case: the
+    /// engine drops `Trailer` with the hop-by-hop headers, so hyper's HTTP/1.1
+    /// server never writes a trailer to a client. Only the HTTP/2 half can
+    /// assert one; the HTTP/1.1 half asserts the body, the chunked framing and
+    /// a plain header of the origin's, and no trailer.
+    #[tokio::test]
+    async fn an_unchanged_response_keeps_its_bytes_and_trailers() {
+        // HTTP/2: the data and the trailer the origin sent
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = h2_origin(&fixture, OriginScript::Trailers).await;
+        let rig = rig_tls_h2(origin_tls_h2(fixture.roots(), "target.test"), origin.addr).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^https://target\\.test/ nothing here",
+            roots_of("rurge test rewrite CA"),
+        );
+        rig.fake.rewrite(rules);
+        let (mut sender, conn) = h2_client(rig.client.stream).await;
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "https://target.test/one"))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_LENGTH)
+                .map(|value| value.as_bytes()),
+            Some(&b"4"[..]),
+            "the origin's own length"
+        );
+        let (data, trailers) = body_and_trailers(resp).await;
+        assert_eq!(data, b"/one", "the origin's own bytes");
+        assert_eq!(
+            trailers.as_ref().and_then(|t| t.get("x-t")),
+            Some(&HeaderValue::from_static("1")),
+            "the trailer the origin sent"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert!(
+            rewrite_notes(&handle).is_empty(),
+            "nothing was skipped and nothing was done: {:?}",
+            rewrite_notes(&handle)
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 0, 0));
+        drop(sender);
+        conn.abort();
+        served_within(rig.served, Duration::from_secs(5)).await;
+
+        // HTTP/1.1: the body, the framing the origin chose, and a plain header,
+        // but no trailer: `Trailer` is hop-by-hop
+        let addr = chunked_origin(b"documents".to_vec()).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ nothing here",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /doc HTTP/1.1\r\nHost: b.test\r\nTE: trailers\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response_chunked().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"documents");
+        assert_eq!(
+            header_value(&head, "transfer-encoding").as_deref(),
+            Some("chunked"),
+            "{head}"
+        );
+        assert_eq!(header_value(&head, "content-length"), None, "{head}");
+        assert_eq!(header_value(&head, "x-o").as_deref(), Some("1"), "{head}");
+        let handle = rig.fake.finished(0).await;
+        assert!(
+            rewrite_notes(&handle).is_empty(),
+            "{:?}",
+            rewrite_notes(&handle)
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 0, 0));
+    }
+
+    /// A compressed answer is decoded for the rule and sent plain, and the
+    /// `Content-Encoding` goes with the framing (`phase 4 M3 design 9.4`,
+    /// `9.6`).
+    #[tokio::test]
+    async fn a_rewritten_gzip_response_is_sent_plain() {
+        let gz = gzipped(b"documents");
+        let mut answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+             Content-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            gz.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(&gz);
+        let addr = origin_answering(answer).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ documents Surge",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /gz HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"Surge");
+        assert_eq!(header_value(&head, "content-encoding"), None, "{head}");
+        assert_eq!(
+            header_value(&head, "content-length").as_deref(),
+            Some("5"),
+            "{head}"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Body Rewrite: response by ^http://b\\.test/"]
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                body: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+    }
+
+    /// An answer over the limit is not rewritten: what was read goes out first
+    /// and the rest as it comes, and the client gets the origin's bytes
+    /// (`phase 4 M3 design 9.3`, the phase 4 / M3b plan's P14).
+    #[tokio::test]
+    async fn a_response_over_the_limit_streams_through() {
+        let big = {
+            let mut body = vec![b'x'; 10 * 1024 * 1024 + 1];
+            body[..9].copy_from_slice(b"documents");
+            body
+        };
+        let note = "Body Rewrite skipped: ^http://b\\.test/: the body is over 10 MiB";
+
+        // chunked: read as far as the limit, then the rest as it comes
+        let addr = chunked_origin(big.clone()).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ documents Surge",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /big HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response_any().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body.len(), big.len());
+        assert_eq!(body, big);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(rewrite_notes(&handle), [note]);
+        assert_eq!(
+            counters.snapshot(),
+            counted(0, 0, 1, 0),
+            "the reason is a skip, not a failure"
+        );
+
+        // with a length: not a frame is read before the answer streams
+        let addr = fixed_origin(big.clone()).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ documents Surge",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /big HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response_any().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, big);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(rewrite_notes(&handle), [note]);
+        assert_eq!(counters.snapshot(), counted(0, 0, 1, 0));
+    }
+
+    /// An upstream that stops sending a body being buffered answers 502, and
+    /// the connection it came on is not lent again (`phase 4 M3 design 9.3`,
+    /// the phase 4 / M3b plan's P14).
+    #[tokio::test]
+    async fn a_response_that_stalls_while_buffered_answers_502() {
+        let addr = stalled_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ x y",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = rig_timed(
+            Entry::Sniffed,
+            addr,
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /s HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert!(
+            String::from_utf8_lossy(&body)
+                .contains("The upstream server stopped sending the response body."),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("upstream body stalled".to_string()))
+        );
+        assert_eq!(
+            counters.snapshot(),
+            counted(0, 0, 0, 0),
+            "a stalled answer is no rewrite failure (`the phase 4 / M3b plan's P18`)"
+        );
+        rig.client
+            .send("GET /s HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, _) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert_eq!(
+            rig.fake.dials(),
+            2,
+            "a connection whose body stalled is not lent again"
+        );
+    }
+
+    /// A `HEAD` answer and a 204 are not buffered at all (`M3-D19`, the phase 4
+    /// / M3b plan's P10): a rule that would give an empty body one does not.
+    #[tokio::test]
+    async fn head_and_204_answers_are_not_buffered() {
+        // a HEAD: the length is the origin's and no body follows
+        let addr = origin_answering(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n".to_vec()).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ ^$ generated",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("HEAD /h HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(
+            header_value(&head, "content-length").as_deref(),
+            Some("2"),
+            "{head}"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert!(
+            rewrite_notes(&handle).is_empty(),
+            "{:?}",
+            rewrite_notes(&handle)
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 0, 0));
+
+        // a 204 has no body, and no length either
+        let addr = origin_answering(b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ ^$ generated",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /n HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 204"), "{head}");
+        assert_eq!(header_value(&head, "content-length"), None, "{head}");
+        // nothing follows the head: the next answer's head starts where this
+        // one ended
+        rig.client
+            .send("GET /n HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let next = rig.client.response_head().await;
+        assert!(
+            next.starts_with("HTTP/1.1 204"),
+            "a body came after the 204: {next}"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert!(
+            rewrite_notes(&handle).is_empty(),
+            "{:?}",
+            rewrite_notes(&handle)
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 0, 0));
+    }
+
+    /// A shared HTTP/2 connection has no meter of its own: the bytes a buffered
+    /// answer was read with count onto the request once, and not again when
+    /// they go out (`phase 4 M2 design 10.2`, the phase 4 / M2b plan's P11; the
+    /// phase 4 / M3b plan's P14).
+    #[tokio::test]
+    async fn the_down_bytes_of_a_buffered_response_count_once() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/first", "first");
+        origin.set("/second", "second");
+        // the origin does not read a request's body, and answers only after
+        // this delay: the 100 bytes are on the wire by then
+        origin.set_delay("/second", Duration::from_millis(100));
+        let mut rig = rig_tls(
+            origin_tls_h2(fixture.roots(), "target.test"),
+            addr_of(&origin),
+        )
+        .await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^https://target\\.test/second second X",
+            roots_of("rurge test rewrite CA"),
+        );
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /first HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"first", "the rule does not reach it");
+        let first = rig.fake.finished(0).await;
+        let (_, down) = first.bytes();
+        assert!(
+            down >= 5,
+            "the request that dialled carries the handshake: down {down}"
+        );
+        // the body goes in the same write as the head
+        let payload = vec![b'x'; 100];
+        let mut wire =
+            b"POST /second HTTP/1.1\r\nHost: target.test\r\nContent-Length: 100\r\n\r\n".to_vec();
+        wire.extend_from_slice(&payload);
+        rig.client.stream.write_all(&wire).await.unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"X", "the rule rewrote the answer");
+        let second = rig.fake.finished(1).await;
+        assert_eq!(
+            second.bytes(),
+            (100, 6),
+            "the origin's six bytes, counted once and not the one sent"
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                body: 1,
+                ..counted(0, 0, 0, 0)
+            }
         );
     }
 }
