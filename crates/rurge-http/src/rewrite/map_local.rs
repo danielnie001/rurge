@@ -55,7 +55,8 @@ impl MapRule {
         self.status
     }
 
-    /// The headers of the answer, in the order the line wrote them.
+    /// The headers of the answer: what the line wrote, less the hop-by-hop
+    /// ones, with a `Content-Type` (`phase 4 M3 design 10.4`).
     pub(crate) fn headers(&self) -> &HeaderMap {
         &self.headers
     }

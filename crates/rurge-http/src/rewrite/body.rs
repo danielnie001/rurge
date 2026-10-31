@@ -368,7 +368,8 @@ fn is_token(name: &str) -> bool {
 }
 
 /// One `[Body Rewrite]` line, ready to evaluate (`phase 4 M3 design 9.1`).
-/// Nothing in it can fail later: both expressions were compiled at load time.
+/// Both kinds of expression were compiled when the profile was read: running
+/// one can still hit its backtracking limit, and nothing else goes wrong.
 pub(crate) struct BodyRule {
     direction: rurge_config::rewrite::Direction,
     /// The expression for the URL the line takes effect on.
@@ -389,9 +390,8 @@ impl BodyRule {
     }
 
     /// Whether this rule may leave a WARN at `now` (`phase 4 M3 design 14`,
-    /// the phase 4 / M3b plan's P18): one within an hour of the last, and the
-    /// first one always. The clock of a `std::sync::Mutex` is the one thing
-    /// shared by the block and the callers a rule has.
+    /// the phase 4 / M3b plan's P18): the first time always, and after that
+    /// only once an hour has passed since the last one; a yes records `now`.
     pub(crate) fn should_warn(&self, now: Instant) -> bool {
         let mut warned = match self.warned.lock() {
             Ok(warned) => warned,
@@ -411,8 +411,8 @@ impl BodyRule {
 /// How long one rule's WARNs are kept apart (`phase 4 M3 design 14`).
 const WARN_EVERY: Duration = Duration::from_secs(3600);
 
-/// One `[Body Rewrite]` line, ready to evaluate; nothing of it was checked
-/// before, because the loader compiled both kinds of expression.
+/// The rule one `[Body Rewrite]` line evaluates as. Nothing is checked here:
+/// the loader compiled both kinds of expression.
 pub(super) fn body_rule(rule: &BodyRewrite) -> BodyRule {
     BodyRule {
         direction: rule.direction,
