@@ -406,9 +406,9 @@ impl RecordingOrigin {
 /// after the match, and the two names are pinned to the loopback by `[Host]`.
 ///
 /// The origin is a hand-written one because what this case has to show is the
-/// request line *with its query string*, and `TestServer` records the path
-/// alone (`rurge-net`'s `RecordingOrigin` stands beside it; `the phase 4 / M3a
-/// plan's execution record row 64`).
+/// request line *with its query string*: `TestServer` is `rurge-net`'s and
+/// records the path alone, so `RecordingOrigin` above is written here for it
+/// (`the phase 4 / M3a plan's execution record row 64`).
 #[tokio::test]
 async fn the_manual_url_rewrite_header_example() {
     let origin = RecordingOrigin::spawn("rewritten").await;
@@ -1514,7 +1514,7 @@ async fn an_absolute_form_request_on_a_sniffed_connection_is_not_rewritten() {
     let h = harness_with(
         Profile {
             general: &general,
-            hosts: "target.test = 127.0.0.1",
+            hosts: "target.test = 127.0.0.1\nelse.test = 127.0.0.1",
             rules: "DOMAIN,target.test,DIRECT",
             sections: "[URL Rewrite]\n^http://target\\.test http://else.test/ 302\n\
                        [Header Rewrite]\n^http://target\\.test header-add X-A 1",
@@ -1660,7 +1660,7 @@ async fn a_regex_that_backtracks_too_long_skips_the_rewrite() {
     let port = origin_addr(&origin).port();
     let h = harness_with(
         Profile {
-            hosts: "x.test = 127.0.0.1",
+            hosts: "x.test = 127.0.0.1\nb.test = 127.0.0.1",
             rules: "DOMAIN,x.test,DIRECT",
             sections: "[URL Rewrite]\n(?i)(a|b|ab)*(?=c) http://b.test header",
             ..Profile::default()
