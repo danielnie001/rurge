@@ -897,6 +897,7 @@ I0005 的消息
 | 57 | 6 | `a_redirect_carries_the_first_ipv4_gateway` 不另建守卫监听器：请求的 URL 就指向测试自己的源站，`302` 生效时源站一次也没有被连过（`connections() == 0`），这是同一件事；第二个引擎本来就要这个请求到源站（执行者的裁定） | 本提交 |
 | 58 | 6 | 用例里给网络经 `EngineShared::network.store(…)`，不手建 `NetworkCell`（与 P19 的写法同一件事，执行者的裁定） | 本提交 |
 | 59 | 6 | 门禁（任务 6 提交 a）：`df -h /d` 有 108 GiB 可用；`cargo fmt --all --check` exit=0（`gate-task-6a-fmt.log`）、`cargo clippy --all-targets -- -D warnings` exit=0（`gate-task-6a-clippy.log`）；全量测试第一次运行 exit=101，`udp_tls_family` 以 `STATUS_HEAP_CORRUPTION` 退出（本机已知的注入 DLL），那次日志里 91 / 5095 / 0 / 13，该二进制单独重跑三次全过（`rerun-task-6a-udp-tls-family.log`）；第二次全量运行 exit=0，92 / 5102 / 0 / 13（`gate-task-6a-test-2.log`），与基线 91 / 5098 / 0 / 13 加本提交的 4 条、1 个新测试二进制对得上 | 本提交 |
+| 60 | 6 | 门禁（任务 6 提交 b）：`df -h /d` 有 108 GiB 可用；`cargo fmt --all --check` exit=0（`gate-task-6b-fmt.log`）、`cargo clippy --all-targets -- -D warnings` exit=0（`gate-task-6b-clippy.log`）、全量测试 exit=0，92 / 5104 / 0 / 13（`gate-task-6b-test.log`），与派工单的期望一致 | 本提交 |
 
 ## 延后事项
 

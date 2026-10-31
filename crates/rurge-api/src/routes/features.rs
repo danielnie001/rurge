@@ -1,6 +1,6 @@
 //! `GET/POST /v1/features/{name}` (M4 design §5.2): `system_proxy`,
-//! `enhanced_mode` and, from phase 4 / M2a, `mitm` are live; the others read
-//! as off and cannot be switched.
+//! `enhanced_mode`, from phase 4 / M2a `mitm` and from phase 4 / M3a
+//! `rewrite` are live; the others read as off and cannot be switched.
 
 use crate::App;
 use crate::error::{ApiError, ApiResult, json_body};
@@ -62,6 +62,7 @@ pub async fn get_feature(
         "system_proxy" => json!({ "enabled": app.control.system_proxy_enabled() }),
         "enhanced_mode" => enhanced_json(app.control.enhanced_mode()),
         "mitm" => json!({ "enabled": app.engine.mitm_on() }),
+        "rewrite" => json!({ "enabled": app.engine.rewrite_on() }),
         _ => json!({ "enabled": false }),
     };
     Ok(Json(body))
@@ -100,6 +101,10 @@ pub async fn set_feature(
         "mitm" => {
             app.engine.set_mitm(body.enabled).await;
             tracing::info!(enabled = body.enabled, "mitm switched via http-api");
+        }
+        "rewrite" => {
+            app.engine.set_rewrite(body.enabled).await;
+            tracing::info!(enabled = body.enabled, "rewrite switched via http-api");
         }
         _ => {
             return Err(ApiError::not_implemented(format!(

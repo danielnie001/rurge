@@ -708,7 +708,7 @@ async fn features_collections_stop_and_unknown_paths() {
     assert_eq!(
         get(&api, "/v1/features/capture").await,
         (200, json!({ "enabled": false })),
-        "only system_proxy, enhanced_mode and mitm are live"
+        "only system_proxy, enhanced_mode, mitm and rewrite are live"
     );
     assert_eq!(
         post(
@@ -764,6 +764,40 @@ async fn features_collections_stop_and_unknown_paths() {
     assert_eq!((status, body), (401, json!({ "error": "unauthorized" })));
     assert_eq!(post(&api, "/v1/stop", json!({})).await, (200, json!({})));
     wait_until(async || api.control.stops.load(Ordering::SeqCst) == 1).await;
+}
+
+/// The `rewrite` switch (phase 4 M3 design 8.4, 11): on unless `state.json`
+/// said otherwise, switched through the API, and what is switched is written to
+/// the second version of that file.
+#[tokio::test]
+async fn the_rewrite_switch_is_read_switched_and_kept() {
+    let api = api().await;
+    assert_eq!(
+        get(&api, "/v1/features/rewrite").await,
+        (200, json!({ "enabled": true }))
+    );
+    assert_eq!(
+        post(&api, "/v1/features/rewrite", json!({ "enabled": false })).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/features/rewrite").await,
+        (200, json!({ "enabled": false }))
+    );
+    let saved: Value = std::fs::read_to_string(&api.state_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(saved["version"], 2);
+    assert_eq!(saved["features"]["rewrite"], false);
+    assert_eq!(
+        post(&api, "/v1/features/rewrite", json!({ "enabled": true })).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/features/rewrite").await,
+        (200, json!({ "enabled": true }))
+    );
 }
 
 /// The `mitm` switch (phase 4 M2 design 11.1): on unless `state.json` said
@@ -1443,7 +1477,8 @@ async fn rurge_http_counts_start_at_zero() {
             json!({
                 "sniffed": {"tls": 0, "http": 0, "other": 0, "timeout": 0, "closed": 0},
                 "requests": 0,
-                "mitm": {"decrypted": 0, "untrusted": 0, "failed": 0, "noRequest": 0}
+                "mitm": {"decrypted": 0, "untrusted": 0, "failed": 0, "noRequest": 0},
+                "rewrite": {"url": 0, "header": 0, "body": 0, "mapLocal": 0, "skipped": 0, "failed": 0}
             })
         )
     );
@@ -1451,7 +1486,7 @@ async fn rurge_http_counts_start_at_zero() {
     assert_eq!(status, 200);
     assert_eq!(
         bytes.as_ref(),
-        br#"{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0},"requests":0,"mitm":{"decrypted":0,"untrusted":0,"failed":0,"noRequest":0}}"#
+        br#"{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0},"requests":0,"mitm":{"decrypted":0,"untrusted":0,"failed":0,"noRequest":0},"rewrite":{"url":0,"header":0,"body":0,"mapLocal":0,"skipped":0,"failed":0}}"#
             .as_slice()
     );
     assert_eq!(

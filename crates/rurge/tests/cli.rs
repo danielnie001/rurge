@@ -4195,6 +4195,41 @@ loglevel = notify",
     }
 
     #[test]
+    fn a_daemon_restores_the_rewrite_switch_from_state_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join("state.json"),
+            r#"{"version":2,"features":{"rewrite":false}}"#,
+        )
+        .unwrap();
+        let mut daemon = spawn_daemon(&conf, &data);
+        let port = api_port(&daemon);
+        assert_eq!(
+            api_call(port, "GET", "/v1/features/rewrite", "k", None),
+            (200, r#"{"enabled":false}"#.to_string())
+        );
+        assert_eq!(
+            api_call(
+                port,
+                "POST",
+                "/v1/features/rewrite",
+                "k",
+                Some(r#"{"enabled":true}"#)
+            ),
+            (200, "{}".to_string())
+        );
+        assert_eq!(
+            api_call(port, "GET", "/v1/features/rewrite", "k", None),
+            (200, r#"{"enabled":true}"#.to_string())
+        );
+        assert_eq!(api_call(port, "POST", "/v1/stop", "k", Some("{}")).0, 200);
+        assert_eq!(wait_for_exit(&mut daemon, 10), Some(0));
+    }
+
+    #[test]
     fn run_reloads_and_stops_via_the_api() {
         let dir = tempfile::tempdir().unwrap();
         let conf = write_conf(dir.path(), API_GENERAL);

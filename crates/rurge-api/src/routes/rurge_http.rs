@@ -3,6 +3,7 @@
 //! `/v1/rurge/…` — the prefix phase 4's general design gives rurge's own
 //! interfaces. M1a has the five ways a sniff can end; M1b adds `requests`;
 //! M2a adds `mitm`, the outcomes of the decrypted TLS sessions.
+//! M3a adds `rewrite`, what the rewrites did (`phase 4 M3 design 12`).
 
 use crate::App;
 use axum::Json;
@@ -17,6 +18,22 @@ pub struct HttpJson {
     /// The TLS sessions `[MITM]` decrypted, and how the ones that did not go
     /// through ended (`phase 4 M2 design 12.3`).
     pub mitm: MitmJson,
+    /// What the rewrites of `[URL Rewrite]` and `[Header Rewrite]` did
+    /// (`phase 4 M3 design 12`), since the engine started.
+    pub rewrite: RewriteJson,
+}
+
+/// The rewrite counts. `body` and `mapLocal` stay at zero until M3b, which is
+/// why the shape has them from M3a on (`phase 4 M3 design 12`, `M3-D25`).
+#[derive(Serialize)]
+pub struct RewriteJson {
+    pub url: u64,
+    pub header: u64,
+    pub body: u64,
+    #[serde(rename = "mapLocal")]
+    pub map_local: u64,
+    pub skipped: u64,
+    pub failed: u64,
 }
 
 /// The outcomes of a handshake rurge answers as the server: the sessions it
@@ -62,6 +79,14 @@ pub async fn http(State(app): State<App>) -> Json<HttpJson> {
             untrusted: counts.mitm.untrusted,
             failed: counts.mitm.failed,
             no_request: counts.mitm.no_request,
+        },
+        rewrite: RewriteJson {
+            url: counts.rewrite.url,
+            header: counts.rewrite.header,
+            body: counts.rewrite.body,
+            map_local: counts.rewrite.map_local,
+            skipped: counts.rewrite.skipped,
+            failed: counts.rewrite.failed,
         },
     })
 }
