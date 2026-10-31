@@ -8,8 +8,9 @@
 //! as it came, and the rule is skipped with the reason kept. `read_ahead` reads
 //! a whole body up to a limit and a stall and the request's end
 //! (`phase 4 M3 design 9.3`); `ReadAhead` puts what was read back in front of
-//! the rest of the body, so a body that was not changed goes out with its
-//! bytes, its framing and its trailers as they came.
+//! the rest of the body, so a body that was not changed gives back the bytes
+//! and the trailers that came; read whole without trailers, it reports its
+//! exact length (the phase 4 / M3b plan's P9).
 //!
 //! `decode` undoes the `Content-Encoding` layers of a body up to the same
 //! limit (`phase 4 M3 design 9.4`); it does not put them back. Nothing here
@@ -179,7 +180,7 @@ pub(crate) enum Ahead<B: Body> {
 /// Reads a body ahead for a rewrite (`phase 4 M3 design 9.3`, the phase 4 /
 /// M3b plan's P9): a frame's wait is bounded by `idle` and races the request's
 /// end, a body whose length is already over `limit` is not read at all, and
-/// every byte read counts onto `meter`'s request (`phase 4 M3 design 9.2`).
+/// with a `meter` every byte read counts onto the request it is lent to.
 pub(crate) async fn read_ahead<B: Body<Data = Bytes> + Unpin>(
     mut body: B,
     limit: u64,
@@ -277,7 +278,10 @@ pub(crate) fn response_buffer(method: &Method, status: StatusCode) -> bool {
 /// A body with its `Content-Encoding` layers undone (`phase 4 M3 design 9.4`).
 /// `Ok` is the bytes to rewrite, which is `body` itself when there was nothing
 /// to undo; `Err` is the reason the rule is skipped, for the request's notes
-/// (the phase 4 / M3b plan's P11). No layer decodes past `limit`.
+/// (the phase 4 / M3b plan's P11). No layer decodes past `limit`, and a
+/// `gzip`, `x-gzip` or `deflate` layer whose input is empty decodes to empty
+/// without a decoder, which for gzip would call it a truncated header (the
+/// phase 4 / M3b plan's execution record row 40).
 pub(crate) fn decode(
     encodings: &[HeaderValue],
     body: &Bytes,
@@ -301,6 +305,13 @@ pub(crate) fn decode(
 
     let mut data = body.clone();
     for name in names.into_iter().rev() {
+        let empty_known = data.is_empty()
+            && (name.eq_ignore_ascii_case("gzip")
+                || name.eq_ignore_ascii_case("x-gzip")
+                || name.eq_ignore_ascii_case("deflate"));
+        if empty_known {
+            continue;
+        }
         let mut out = Vec::new();
         let bounded = limit.bytes.saturating_add(1);
         let read = if name.eq_ignore_ascii_case("gzip") || name.eq_ignore_ascii_case("x-gzip") {
@@ -558,7 +569,7 @@ mod tests {
     }
 
     /// Bytes read ahead count onto the request the meter is lent to right then,
-    /// and nothing counts without one (`phase 4 M3 design 9.2`, `9.3`).
+    /// and nothing counts without one (the phase 4 / M3b plan's P9).
     #[tokio::test]
     async fn read_ahead_counts_on_the_meter() {
         let handle = SessionHandle::new(1, SessionInfo::tcp(HostName::parse("a.test"), 80));
@@ -744,8 +755,9 @@ mod tests {
         }
     }
 
-    /// The layers of `Content-Encoding`, undone from the last one on
-    /// (`phase 4 M3 design 9.4`).
+    /// The layers of `Content-Encoding`, undone from the last one on, and an
+    /// empty body under them (`phase 4 M3 design 9.4`, the phase 4 / M3b
+    /// plan's execution record row 40).
     #[test]
     fn decoding_layers() {
         let body = Bytes::from_static(b"hello");
@@ -793,6 +805,20 @@ mod tests {
                 .expect("two lines, undone from the last"),
             body
         );
+
+        let empty = Bytes::new();
+        assert_eq!(
+            decode(&[encoding("gzip")], &empty, REQUEST),
+            Ok(Bytes::new())
+        );
+        assert_eq!(
+            decode(&[encoding("deflate")], &empty, REQUEST),
+            Ok(Bytes::new())
+        );
+        assert_eq!(
+            decode(&[encoding("deflate"), encoding("gzip")], &empty, REQUEST),
+            Ok(Bytes::new())
+        );
     }
 
     /// A layer nobody supports, and one that does not decode, are reasons for
@@ -808,6 +834,11 @@ mod tests {
             );
         }
         assert_eq!(
+            decode(&[encoding("br")], &Bytes::new(), REQUEST),
+            Err("content-encoding br is not supported".to_string()),
+            "an empty body under a layer nobody supports"
+        );
+        assert_eq!(
             decode(&[encoding("a b")], &body, REQUEST),
             Err("the content-encoding is not supported".to_string()),
             "a name that is no token is not written down"
@@ -822,8 +853,8 @@ mod tests {
         );
     }
 
-    /// A layer that decodes to far more than the limit stops at the limit and
-    /// is not buffered (`phase 4 M3 design 9.3`, `9.4`).
+    /// A layer that decodes to far more than the limit stops at the limit: the
+    /// body is not rewritten (`phase 4 M3 design 9.3`, `9.4`).
     #[test]
     fn a_decompression_bomb_stops_at_the_limit() {
         let bomb = gzipped(&vec![0u8; 1024 * 1024]);
