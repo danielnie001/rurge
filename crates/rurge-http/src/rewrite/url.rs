@@ -368,6 +368,7 @@ fn backtracking(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rewrite::rewrite_of;
     use rurge_config::HostName;
     use rurge_net::connector::Target;
     use std::cell::Cell;
@@ -540,19 +541,6 @@ mod tests {
         let mut req = request("http://a.test/a", Some("a.test"));
         retarget_request(&mut req, &parsed("wss://b.test/s"), false);
         assert_eq!(req.uri().to_string(), "https://b.test/s");
-    }
-
-    /// One generation built from the two sections of `lines`, trusted by a CA
-    /// made in memory.
-    fn rewrite_of(lines: &str) -> Rewrite {
-        Rewrite::build(
-            &crate::rewrite::config_of(lines),
-            &MitmConfig::default(),
-            crate::rewrite::test_roots(),
-            Arc::new(RewriteCounters::default()),
-        )
-        .expect("a generation")
-        .expect("the lines make rules")
     }
 
     /// The candidates of `url`, as the engine builds them for a plain

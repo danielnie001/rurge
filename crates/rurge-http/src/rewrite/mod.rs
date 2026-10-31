@@ -12,8 +12,6 @@
 //! `RewriteCounters` outlives every generation: one engine has one, reloads
 //! keep counting (`phase 4 M3 design 12`).
 
-#![allow(dead_code)] // the engine calls these from phase 4 / M3a task 5 on
-
 mod header;
 mod url;
 
@@ -173,6 +171,15 @@ impl HeaderRuleAction {
             HeaderRuleAction::ReplaceRegex { .. } => "header-replace-regex",
         }
     }
+
+    fn header(&self) -> &http::HeaderName {
+        match self {
+            HeaderRuleAction::Add { header, .. }
+            | HeaderRuleAction::Del { header }
+            | HeaderRuleAction::Replace { header, .. }
+            | HeaderRuleAction::ReplaceRegex { header, .. } => header,
+        }
+    }
 }
 
 impl Rewrite {
@@ -260,8 +267,7 @@ impl Rewrite {
         headers: &mut http::HeaderMap,
         notes: &mut Vec<Note>,
     ) -> Headers {
-        let _ = (direction, url, headers, notes);
-        Headers::default()
+        header::evaluate(self, direction, url, headers, notes)
     }
 }
 
@@ -375,6 +381,25 @@ fn header_value(name: &str, value: &str) -> Option<http::HeaderValue> {
 /// here, not a rule that quietly does nothing.
 #[cfg(test)]
 pub(crate) fn config_of(lines: &str) -> RewriteConfig {
+    let (cfg, diags) = read_rules(lines);
+    let unexpected: Vec<&str> = diags
+        .iter()
+        .filter(|d| d.code != "W0041")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "the rules read cleanly but for a framing warning: {lines}: {unexpected:?}"
+    );
+    cfg
+}
+
+/// The two sections of `lines` read as the loader reads them, with what it
+/// said about them. A rule on `Content-Length` or `Transfer-Encoding` brings a
+/// `W0041` and is kept (`phase 4 M3 design 13`), so a case about framing gets
+/// that one warning and no other.
+#[cfg(test)]
+fn read_rules(lines: &str) -> (RewriteConfig, Vec<rurge_config::Diagnostic>) {
     use rurge_config::text::{Origin, Section, parse_str};
     use std::path::Path;
 
@@ -396,11 +421,7 @@ pub(crate) fn config_of(lines: &str) -> RewriteConfig {
             &mut diags,
         ),
     };
-    assert!(
-        diags.into_vec().is_empty(),
-        "the rules read cleanly: {lines}"
-    );
-    cfg
+    (cfg, diags.into_vec())
 }
 
 /// A trust store holding one CA made in memory: the side of a case that checks
@@ -412,6 +433,20 @@ pub(crate) fn test_roots() -> Arc<RootCertStore> {
     let mut roots = RootCertStore::empty();
     roots.add(ca.cert.clone()).expect("a trust anchor");
     Arc::new(roots)
+}
+
+/// One generation built from the two sections of `lines`, trusted by a CA made
+/// in memory.
+#[cfg(test)]
+pub(crate) fn rewrite_of(lines: &str) -> Rewrite {
+    Rewrite::build(
+        &config_of(lines),
+        &MitmConfig::default(),
+        test_roots(),
+        Arc::new(RewriteCounters::default()),
+    )
+    .expect("a generation")
+    .expect("the lines make rules")
 }
 
 #[cfg(test)]
@@ -500,6 +535,38 @@ mod tests {
                 skipped: 1,
                 failed: 1,
             }
+        );
+    }
+
+    /// Notes name the rule that acted, never a header value and never a query
+    /// string (`phase 4 M3 design 8.5`, the phase 4 / M3a plan's P11).
+    #[test]
+    fn notes_never_carry_values_or_queries() {
+        use rurge_config::rewrite::Direction;
+
+        let rewrite = rewrite_of(
+            "[URL Rewrite]\n^http://a\\.test http://b.test header\n\
+             [Header Rewrite]\n\
+             ^http://a\\.test header-add X-Token v4lue-x\n\
+             ^http://a\\.test header-replace-regex X-Token v4lue t3mpl",
+        );
+        let url = "http://a.test/p?tok=q1";
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::HOST, http::HeaderValue::from_static("a.test"));
+        let mut notes = Vec::new();
+        // the request side of the headers comes first, then the URL rules
+        rewrite.headers(Direction::Request, url, &mut headers, &mut notes);
+        rewrite.url(&[url.to_string()], &|| None, &mut notes);
+        assert!(!notes.is_empty());
+        for note in &notes {
+            let text = note.text();
+            for leak in ["q1", "v4lue-x", "t3mpl"] {
+                assert!(!text.contains(leak), "{text}");
+            }
+        }
+        assert_eq!(
+            notes.last().map(Note::text),
+            Some("URL Rewrite: header by ^http://a\\.test -> http://b.test/p")
         );
     }
 }
