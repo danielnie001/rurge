@@ -197,13 +197,6 @@ fn framing_lines(headers: &HeaderMap) -> [Vec<HeaderValue>; 2] {
     ]
 }
 
-fn direction_name(direction: Direction) -> &'static str {
-    match direction {
-        Direction::Request => "request",
-        Direction::Response => "response",
-    }
-}
-
 /// The note a rule that ran into the expression's backtracking limit leaves
 /// (`the phase 4 / M3a plan's P11`). `source` is the URL's expression, or the
 /// `header-replace-regex` one when that is what ran out.

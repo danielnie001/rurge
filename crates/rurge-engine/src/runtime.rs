@@ -321,6 +321,8 @@ async fn build_rewrite(config: &Config, shared: &EngineShared) -> Option<Arc<Rew
         &config.mitm,
         roots,
         Arc::clone(&shared.rewrite),
+        // Map Local URLs get their data from the phase 4 / M3b plan's task 6 on.
+        &|_: &str| Arc::new(|| None),
     ) {
         Ok(rewrite) => rewrite.map(Arc::new),
         Err(e) => {

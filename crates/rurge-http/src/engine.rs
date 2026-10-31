@@ -6721,6 +6721,7 @@ mod tests {
             &MitmConfig::default(),
             roots,
             Arc::clone(&counters),
+            &crate::rewrite::no_url_data,
         )
         .expect("a generation")
         .expect("the lines make rules");

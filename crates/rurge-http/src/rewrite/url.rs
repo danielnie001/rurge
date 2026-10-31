@@ -736,6 +736,7 @@ mod tests {
             &MitmConfig::default(),
             crate::rewrite::test_roots(),
             Arc::new(RewriteCounters::default()),
+            &crate::rewrite::no_url_data,
         )
         .expect("a generation")
         .expect("the line makes a rule");

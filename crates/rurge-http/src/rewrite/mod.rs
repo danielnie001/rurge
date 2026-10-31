@@ -1,6 +1,7 @@
-//! `[URL Rewrite]` and `[Header Rewrite]` at a request (`phase 4 M3 design 6`,
-//! `7`): one generation's rules, what one request's evaluation of them came to,
-//! and the counts `/v1/rurge/http` reports.
+//! `[URL Rewrite]`, `[Header Rewrite]`, `[Body Rewrite]` and `[Map Local]` at a
+//! request (`phase 4 M3 design 6`, `7`, `9`, `10`): one generation's rules,
+//! what one request's evaluation of them came to, and the counts
+//! `/v1/rurge/http` reports.
 //!
 //! Nothing here touches the network or a session: `url` works out what a
 //! request's URL becomes or which answer a redirect or a rejection is,
@@ -17,6 +18,8 @@ mod header;
 mod url;
 
 use crate::mitm::OriginTls;
+use body::{BodyRule, body_rule};
+use bytes::Bytes;
 use rurge_config::HostName;
 use rurge_config::mitm::MitmConfig;
 use rurge_config::rewrite::RewriteConfig;
@@ -32,6 +35,18 @@ use std::time::Duration;
 
 pub(crate) use header::{Headers, HostChange, write_back_host};
 pub(crate) use url::{UrlOutcome, candidates, redirect, retarget_request};
+
+/// The data of one `[Map Local]` line's URL at this moment; `None` while the
+/// first download has not finished (`phase 4 M3 design 10.3`).
+pub type UrlData = Arc<dyn Fn() -> Option<Bytes> + Send + Sync>;
+
+/// The side a note names: `request` or `response`.
+fn direction_name(direction: rurge_config::rewrite::Direction) -> &'static str {
+    match direction {
+        rurge_config::rewrite::Direction::Request => "request",
+        rurge_config::rewrite::Direction::Response => "response",
+    }
+}
 
 /// How long a rewritten request waits for its origin's TLS handshake: the same
 /// 30 seconds `rurge-engine` gives a decrypted connection's origin side
@@ -59,7 +74,10 @@ impl Note {
 }
 
 /// The counts `/v1/rurge/http` reports under `rewrite` (`phase 4 M3 design
-/// 12`). `body` and `map_local` stay at zero until M3b.
+/// 12`). `body` counts the requests whose body a rule changed, once each
+/// however many rules acted and in both directions; `map_local` the requests a
+/// `[Map Local]` rule answered, the `HEAD`, 204 and 304 answers included and
+/// the ones it could not answer not.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RewriteCounts {
     pub url: u64,
@@ -104,6 +122,17 @@ impl RewriteCounters {
         self.header.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A request whose body a `[Body Rewrite]` rule changed, however many
+    /// rules of both directions acted on it.
+    pub(crate) fn body(&self) {
+        self.body.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A request a `[Map Local]` rule answered.
+    pub(crate) fn map_local(&self) {
+        self.map_local.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One rewrite that was skipped and left a note.
     pub(crate) fn skipped(&self) {
         self.skipped.fetch_add(1, Ordering::Relaxed);
@@ -121,6 +150,7 @@ impl RewriteCounters {
 pub struct Rewrite {
     url: Vec<UrlRule>,
     header: Vec<HeaderRule>,
+    body: Vec<BodyRule>,
     config: Arc<ClientConfig>,
     h1: Arc<ClientConfig>,
     counters: Arc<RewriteCounters>,
@@ -184,16 +214,19 @@ impl HeaderRuleAction {
 }
 
 impl Rewrite {
-    /// The rules of this generation, or `None` when neither section has a
-    /// usable line. `roots` is the trust of the origin side, as `Mitm::build`
-    /// takes it; the two configurations are `[MITM]`'s own, so a plain
-    /// `http://` rewritten to `https://` needs no certificate authority
-    /// (`phase 4 M3 design 8.2`).
+    /// The rules of this generation, or `None` when no section has a usable
+    /// line. `roots` is the trust of the origin side, as `Mitm::build` takes
+    /// it; the two configurations are `[MITM]`'s own, so a plain `http://`
+    /// rewritten to `https://` needs no certificate authority (`phase 4 M3
+    /// design 8.2`). `url_data` hands in what a `[Map Local]` line's URL holds
+    /// at the moment, so that this crate need not know how such data is
+    /// fetched (the phase 4 / M3b plan's P19).
     pub fn build(
         cfg: &RewriteConfig,
         mitm: &MitmConfig,
         roots: Arc<RootCertStore>,
         counters: Arc<RewriteCounters>,
+        _url_data: &dyn Fn(&str) -> UrlData,
     ) -> Result<Option<Rewrite>, BuildError> {
         if cfg.is_empty() {
             return Ok(None);
@@ -216,6 +249,7 @@ impl Rewrite {
         Ok(Some(Rewrite {
             url: cfg.url.iter().map(url_rule).collect(),
             header: cfg.header.iter().filter_map(header_rule).collect(),
+            body: cfg.body.iter().map(body_rule).collect(),
             config,
             h1,
             counters,
@@ -383,7 +417,15 @@ fn header_value(name: &str, value: &str) -> Option<http::HeaderValue> {
 /// here, not a rule that quietly does nothing.
 #[cfg(test)]
 pub(crate) fn config_of(lines: &str) -> RewriteConfig {
-    let (cfg, diags) = read_rules(lines);
+    config_in(lines, std::path::Path::new(""))
+}
+
+/// The same, with `base_dir` as the directory a relative `[Map Local]` path is
+/// joined to. `config_of` gives the empty one: the cases' profile is
+/// `rewrite.conf` in the working directory.
+#[cfg(test)]
+pub(crate) fn config_in(lines: &str, base_dir: &std::path::Path) -> RewriteConfig {
+    let (cfg, diags) = read_rules(lines, base_dir);
     let unexpected: Vec<&str> = diags
         .iter()
         .filter(|d| d.code != "W0041")
@@ -401,7 +443,10 @@ pub(crate) fn config_of(lines: &str) -> RewriteConfig {
 /// `W0041` and is kept (`phase 4 M3 design 13`), so a case about framing gets
 /// that one warning and no other.
 #[cfg(test)]
-fn read_rules(lines: &str) -> (RewriteConfig, Vec<rurge_config::Diagnostic>) {
+fn read_rules(
+    lines: &str,
+    base_dir: &std::path::Path,
+) -> (RewriteConfig, Vec<rurge_config::Diagnostic>) {
     use rurge_config::text::{Origin, Section, parse_str};
     use std::path::Path;
 
@@ -422,10 +467,30 @@ fn read_rules(lines: &str) -> (RewriteConfig, Vec<rurge_config::Diagnostic>) {
                 .flat_map(Section::active_entries),
             &mut diags,
         ),
-        body: Vec::new(),
-        map_local: Vec::new(),
+        body: rurge_config::rewrite::parse_body(
+            profile
+                .section("Body Rewrite")
+                .into_iter()
+                .flat_map(Section::active_entries),
+            &mut diags,
+        ),
+        map_local: rurge_config::rewrite::parse_map_local(
+            profile
+                .section("Map Local")
+                .into_iter()
+                .flat_map(Section::active_entries),
+            base_dir,
+            &mut diags,
+        ),
     };
     (cfg, diags.into_vec())
+}
+
+/// A `[Map Local]` URL's data in a case that has no resource manager: there is
+/// none yet (`the phase 4 / M3b plan's task 6`).
+#[cfg(test)]
+pub(crate) fn no_url_data(_url: &str) -> UrlData {
+    Arc::new(|| None)
 }
 
 /// A trust store holding one CA made in memory: the side of a case that checks
@@ -448,6 +513,7 @@ pub(crate) fn rewrite_of(lines: &str) -> Rewrite {
         &MitmConfig::default(),
         test_roots(),
         Arc::new(RewriteCounters::default()),
+        &no_url_data,
     )
     .expect("a generation")
     .expect("the lines make rules")
@@ -464,6 +530,7 @@ mod tests {
             &MitmConfig::default(),
             test_roots(),
             Arc::new(RewriteCounters::default()),
+            &no_url_data,
         )
         .expect("no rules read cleanly");
         assert!(rewritten.is_none());
@@ -481,6 +548,7 @@ mod tests {
             &mitm,
             test_roots(),
             Arc::new(RewriteCounters::default()),
+            &no_url_data,
         )
         .expect("a generation")
         .expect("the line makes a generation");
@@ -499,6 +567,7 @@ mod tests {
             &MitmConfig::default(),
             test_roots(),
             Arc::new(RewriteCounters::default()),
+            &no_url_data,
         )
         .expect("a generation")
         .expect("the line makes a generation");
@@ -515,7 +584,8 @@ mod tests {
                 &cfg,
                 &MitmConfig::default(),
                 empty,
-                Arc::new(RewriteCounters::default())
+                Arc::new(RewriteCounters::default()),
+                &no_url_data
             )
             .is_err()
         );
@@ -526,16 +596,17 @@ mod tests {
         let counters = RewriteCounters::default();
         counters.url();
         counters.header();
-        counters.header();
+        counters.body();
+        counters.map_local();
         counters.skipped();
         counters.failed();
         assert_eq!(
             counters.snapshot(),
             RewriteCounts {
                 url: 1,
-                header: 2,
-                body: 0,
-                map_local: 0,
+                header: 1,
+                body: 1,
+                map_local: 1,
                 skipped: 1,
                 failed: 1,
             }

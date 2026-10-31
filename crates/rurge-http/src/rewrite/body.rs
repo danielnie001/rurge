@@ -18,16 +18,20 @@
 //! an error text.
 
 use crate::pool::Meter;
+use crate::rewrite::{Note, Rewrite};
 use bytes::{BufMut, Bytes, BytesMut};
 use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 use http::header::{EXPECT, TRANSFER_ENCODING};
 use http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
+use rurge_config::dialect::{BodyPattern, Template};
+use rurge_config::rewrite::BodyRewrite;
 use std::io::Read;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// How large a body may be and still be buffered for a rewrite, and how that
@@ -363,12 +367,187 @@ fn is_token(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
+/// One `[Body Rewrite]` line, ready to evaluate (`phase 4 M3 design 9.1`).
+/// Nothing in it can fail later: both expressions were compiled at load time.
+pub(crate) struct BodyRule {
+    direction: rurge_config::rewrite::Direction,
+    /// The expression for the URL the line takes effect on.
+    pattern: rurge_config::rule::Pattern,
+    /// Each pair is a body pattern and the replacement it writes, applied in
+    /// the order written, one after the other (`phase 4 M3 design 9.5`).
+    pairs: Vec<(BodyPattern, Template)>,
+    /// When this rule's last WARN went out: one an hour, one a generation
+    /// (`phase 4 M3 design 14`, the phase 4 / M3b plan's P18).
+    warned: Mutex<Option<Instant>>,
+}
+
+impl BodyRule {
+    /// The rule's URL expression as the profile wrote it, which is what a note
+    /// or a log line names the rule by.
+    pub(crate) fn source(&self) -> &str {
+        &self.pattern.source
+    }
+
+    /// Whether this rule may leave a WARN at `now` (`phase 4 M3 design 14`,
+    /// the phase 4 / M3b plan's P18): one within an hour of the last, and the
+    /// first one always. The clock of a `std::sync::Mutex` is the one thing
+    /// shared by the block and the callers a rule has.
+    pub(crate) fn should_warn(&self, now: Instant) -> bool {
+        let mut warned = match self.warned.lock() {
+            Ok(warned) => warned,
+            // a panic elsewhere is no reason to stop rewriting bodies
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(last) = *warned
+            && now.saturating_duration_since(last) < WARN_EVERY
+        {
+            return false;
+        }
+        *warned = Some(now);
+        true
+    }
+}
+
+/// How long one rule's WARNs are kept apart (`phase 4 M3 design 14`).
+const WARN_EVERY: Duration = Duration::from_secs(3600);
+
+/// One `[Body Rewrite]` line, ready to evaluate; nothing of it was checked
+/// before, because the loader compiled both kinds of expression.
+pub(super) fn body_rule(rule: &BodyRewrite) -> BodyRule {
+    BodyRule {
+        direction: rule.direction,
+        pattern: rule.pattern.clone(),
+        pairs: rule.pairs.clone(),
+        warned: Mutex::new(None),
+    }
+}
+
+impl Rewrite {
+    /// The rules of `direction` whose URL expression matches `url`, by their
+    /// place among this generation's body rules, in the order written (`phase
+    /// 4 M3 design 9.5`, the phase 4 / M3b plan's P12). An expression that
+    /// runs into its backtracking limit matches nothing and leaves a note
+    /// (`the phase 4 / M3a plan's P11`).
+    pub(crate) fn body_rules(
+        &self,
+        direction: rurge_config::rewrite::Direction,
+        url: &str,
+        notes: &mut Vec<Note>,
+    ) -> Vec<usize> {
+        let mut matched = Vec::new();
+        for (i, rule) in self.body.iter().enumerate() {
+            if rule.direction != direction {
+                continue;
+            }
+            match rule.pattern.regex.is_match(url) {
+                Ok(true) => matched.push(i),
+                Ok(false) => {}
+                Err(_) => notes.push(Note::Skipped(backtracking(rule.source()))),
+            }
+        }
+        matched
+    }
+
+    /// The rule at `i` among this generation's body rules; `i` is one
+    /// `body_rules` gave back.
+    pub(crate) fn body_rule(&self, i: usize) -> &BodyRule {
+        &self.body[i]
+    }
+
+    /// The body the rules of `rules` rewrite `body` to, or `None` when they
+    /// leave it as it was (`phase 4 M3 design 9.4` – `9.5`, the phase 4 / M3b
+    /// plan's P12). `Some` is the bytes to send, their `Content-Encoding`
+    /// undone; the layers are not put back.
+    ///
+    /// This is the one place a body is decoded and rewritten, so the caller
+    /// runs it on a blocking thread (M3-D21). Nothing of the body reaches a
+    /// note: what a skipped rule leaves is the reason and the rule's own
+    /// expression.
+    pub(crate) fn rewrite_body(
+        &self,
+        rules: &[usize],
+        encodings: &[HeaderValue],
+        body: &Bytes,
+        limit: Limit,
+        notes: &mut Vec<Note>,
+    ) -> Option<Bytes> {
+        let decoded = match decode(encodings, body, limit) {
+            Ok(decoded) => decoded,
+            Err(reason) => {
+                for &i in rules {
+                    notes.push(Note::Skipped(skipped(self.body[i].source(), &reason)));
+                }
+                return None;
+            }
+        };
+        // the manual asks for strict UTF-8; a body that is not is left alone
+        // and every rule that matched it says why
+        let Ok(original) = std::str::from_utf8(&decoded) else {
+            for &i in rules {
+                notes.push(Note::Skipped(skipped(
+                    self.body[i].source(),
+                    "the body is not valid UTF-8",
+                )));
+            }
+            return None;
+        };
+        let mut text = original.to_string();
+        for &i in rules {
+            let rule = &self.body[i];
+            let Some(rewritten) = replaced(rule, &text) else {
+                // the rule gave up part way: its work is dropped, the text
+                // stays what the rules before it left
+                notes.push(Note::Skipped(backtracking(rule.source())));
+                continue;
+            };
+            if rewritten != text {
+                notes.push(Note::Done(format!(
+                    "Body Rewrite: {} by {}",
+                    super::direction_name(rule.direction),
+                    rule.source()
+                )));
+                text = rewritten;
+            }
+        }
+        if text == original {
+            None
+        } else {
+            Some(Bytes::from(text))
+        }
+    }
+}
+
+/// `text` with every pair of `rule` applied in order; `None` when one of them
+/// runs into its backtracking limit (`phase 4 M3 design 5.5`).
+fn replaced(rule: &BodyRule, text: &str) -> Option<String> {
+    let mut current = text.to_string();
+    for (pattern, template) in &rule.pairs {
+        current = pattern.replace_all(template, &current)?;
+    }
+    Some(current)
+}
+
+/// What a rule that could not act leaves in the request's notes: the rule's
+/// URL expression and the reason, never a byte of the body (`phase 4 M3 design
+/// 8.5`, the phase 4 / M3b plan's P18).
+fn skipped(source: &str, reason: &str) -> String {
+    format!("Body Rewrite skipped: {source}: {reason}")
+}
+
+/// The note a rule whose expression ran out of backtracking steps leaves.
+fn backtracking(source: &str) -> String {
+    skipped(source, "the regular expression hit its backtracking limit")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rewrite::{RewriteCounters, config_of, no_url_data, rewrite_of, test_roots};
     use flate2::Compression;
     use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
     use rurge_config::HostName;
+    use rurge_config::mitm::MitmConfig;
+    use rurge_config::rewrite::{Direction, RewriteConfig};
     use rurge_config::session::SessionInfo;
     use rurge_inbound::SessionHandle;
     use std::collections::VecDeque;
@@ -892,5 +1071,310 @@ mod tests {
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(data).expect("in memory");
         Bytes::from(encoder.finish().expect("in memory"))
+    }
+
+    /// A generation of the `[Body Rewrite]` section of `cfg`, trusted by a CA
+    /// made in memory, with no Map Local data (`rewrite_of` only takes the
+    /// lines).
+    fn generation(cfg: &RewriteConfig) -> Rewrite {
+        Rewrite::build(
+            cfg,
+            &MitmConfig::default(),
+            test_roots(),
+            Arc::new(RewriteCounters::default()),
+            &no_url_data,
+        )
+        .expect("a generation")
+        .expect("the lines make rules")
+    }
+
+    /// The rules of `lines` are matched against the URL of the moment, in the
+    /// order written, and one whose URL expression runs out of backtracking
+    /// steps is skipped with a note (`phase 4 M3 design 9.5`, the phase 4 /
+    /// M3b plan's P12).
+    #[test]
+    fn body_rules_match_the_current_url_in_order() {
+        let lines = "[Body Rewrite]\n\
+                     http-request ^http://a\\.test/ a b\n\
+                     http-response ^http://a\\.test/ a b\n\
+                     http-request ^http://a\\.test/ a b\n\
+                     http-request (?i)(a|b|ab)*(?=c) a b";
+        let rewrite = rewrite_of(lines);
+        let mut notes = Vec::new();
+        assert_eq!(
+            rewrite.body_rules(Direction::Request, "http://a.test/p", &mut notes),
+            [0, 2]
+        );
+        assert_eq!(
+            rewrite.body_rules(Direction::Response, "http://a.test/p", &mut notes),
+            [1]
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+
+        // the fourth rule's expression really does give up on this input
+        let url = format!("http://x.test/{}", "ab".repeat(40));
+        assert!(
+            config_of(lines).body[3]
+                .pattern
+                .regex
+                .is_match(&url)
+                .is_err(),
+            "the expression gives up on this input"
+        );
+        let mut notes = Vec::new();
+        assert!(
+            rewrite
+                .body_rules(Direction::Request, &url, &mut notes)
+                .is_empty()
+        );
+        assert_eq!(
+            notes,
+            [Note::Skipped(
+                "Body Rewrite skipped: (?i)(a|b|ab)*(?=c): the regular expression hit its backtracking limit"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// The rules act one after the other, and so do the pairs of one rule;
+    /// each rule that changed something leaves one `Done` (`phase 4 M3 design
+    /// 9.5`).
+    #[test]
+    fn rules_and_pairs_act_in_sequence() {
+        let rewrite = rewrite_of(
+            "[Body Rewrite]\n\
+             http-request ^http://a\\.test/ a b\n\
+             http-request ^http://a\\.test/ b c c d",
+        );
+        let mut notes = Vec::new();
+        let rules = rewrite.body_rules(Direction::Request, "http://a.test/p", &mut notes);
+        let body = rewrite.rewrite_body(&rules, &[], &Bytes::from("a"), REQUEST, &mut notes);
+        assert_eq!(body.as_deref(), Some(&b"d"[..]));
+        assert_eq!(
+            notes,
+            [
+                Note::Done("Body Rewrite: request by ^http://a\\.test/".to_string()),
+                Note::Done("Body Rewrite: request by ^http://a\\.test/".to_string()),
+            ]
+        );
+    }
+
+    /// A rule whose pairs match nothing leaves the body as it was, and says
+    /// nothing (`phase 4 M3 design 9.5`, the phase 4 / M3b plan's P12).
+    #[test]
+    fn a_rule_that_changes_nothing_leaves_no_note() {
+        let rewrite = rewrite_of("[Body Rewrite]\nhttp-request ^http://a\\.test/ zzz b");
+        let mut notes = Vec::new();
+        let rules = rewrite.body_rules(Direction::Request, "http://a.test/p", &mut notes);
+        assert_eq!(rules, [0]);
+        let body = rewrite.rewrite_body(&rules, &[], &Bytes::from("a"), REQUEST, &mut notes);
+        assert!(body.is_none());
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// A body that is not valid UTF-8 is left as it was, and every rule that
+    /// matched its URL says why (the manual's requirement, `phase 4 M3 design
+    /// 9.5`).
+    #[test]
+    fn a_body_that_is_not_utf8_is_left_as_it_was() {
+        let rewrite = rewrite_of(
+            "[Body Rewrite]\n\
+             http-request ^http://a\\.test/ a b\n\
+             http-request ^http://a\\.test/ b c",
+        );
+        let mut notes = Vec::new();
+        let rules = rewrite.body_rules(Direction::Request, "http://a.test/p", &mut notes);
+        let body = rewrite.rewrite_body(
+            &rules,
+            &[],
+            &Bytes::from_static(&[0xff, b'a']),
+            REQUEST,
+            &mut notes,
+        );
+        assert!(body.is_none());
+        assert_eq!(
+            notes,
+            [
+                Note::Skipped(
+                    "Body Rewrite skipped: ^http://a\\.test/: the body is not valid UTF-8"
+                        .to_string()
+                ),
+                Note::Skipped(
+                    "Body Rewrite skipped: ^http://a\\.test/: the body is not valid UTF-8"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    /// A pair that runs out of backtracking steps undoes its whole rule: the
+    /// text stays what the rules before it left (`phase 4 M3 design 9.5`, the
+    /// phase 4 / M3b plan's P12).
+    #[test]
+    fn a_backtracking_pair_undoes_its_rule() {
+        let lines = "[Body Rewrite]\n\
+                     http-request ^http://a\\.test/ x y\n\
+                     http-request ^http://a\\.test/ y z (a|b|ab)*(?=c) w";
+        let mut cfg = config_of(lines);
+        // a thousand steps is reached long before a body's worth of
+        // backtracking, so the case does not wait for it
+        cfg.body[1].pairs[1].0 =
+            rurge_config::dialect::BodyPattern::with_backtrack_limit(r"(a|b|ab)*(?=c)", 1000)
+                .expect("a body pattern");
+        let rewrite = generation(&cfg);
+        let mut notes = Vec::new();
+        let rules = rewrite.body_rules(Direction::Request, "http://a.test/p", &mut notes);
+        let text = format!("x{}", "ab".repeat(40));
+        let body = rewrite.rewrite_body(&rules, &[], &Bytes::from(text), REQUEST, &mut notes);
+        let expected = format!("y{}", "ab".repeat(40));
+        assert_eq!(body.as_deref(), Some(expected.as_bytes()));
+        assert_eq!(
+            notes,
+            [
+                Note::Done("Body Rewrite: request by ^http://a\\.test/".to_string()),
+                Note::Skipped(
+                    "Body Rewrite skipped: ^http://a\\.test/: the regular expression hit its backtracking limit"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    /// A compressed body is undone before a rule acts on it, and the bytes the
+    /// rule leaves are the plain text (`phase 4 M3 design 9.4` – `9.6`).
+    #[test]
+    fn a_compressed_body_is_decoded_first() {
+        let rewrite = rewrite_of("[Body Rewrite]\nhttp-request ^http://a\\.test/ value abc");
+        let mut notes = Vec::new();
+        let rules = rewrite.body_rules(Direction::Request, "http://a.test/p", &mut notes);
+        let body = rewrite.rewrite_body(
+            &rules,
+            &[encoding("gzip")],
+            &gzipped(b"value"),
+            REQUEST,
+            &mut notes,
+        );
+        assert_eq!(body.as_deref(), Some(&b"abc"[..]));
+        assert_eq!(
+            notes,
+            [Note::Done(
+                "Body Rewrite: request by ^http://a\\.test/".to_string()
+            )]
+        );
+    }
+
+    /// A body that cannot be decoded, or grows past the limit once it is,
+    /// skips every rule that matched its URL with the same reason (`phase 4 M3
+    /// design 9.3` – `9.4`).
+    #[test]
+    fn decoding_failures_skip_every_matching_rule() {
+        let rewrite = rewrite_of(
+            "[Body Rewrite]\n\
+             http-request ^http://a\\.test/ a b\n\
+             http-request ^http://a\\.test/ b c",
+        );
+        let mut notes = Vec::new();
+        let rules = rewrite.body_rules(Direction::Request, "http://a.test/p", &mut notes);
+        let body = rewrite.rewrite_body(
+            &rules,
+            &[encoding("br")],
+            &Bytes::from("a"),
+            REQUEST,
+            &mut notes,
+        );
+        assert!(body.is_none());
+        assert_eq!(
+            notes,
+            [
+                Note::Skipped(
+                    "Body Rewrite skipped: ^http://a\\.test/: content-encoding br is not supported"
+                        .to_string()
+                ),
+                Note::Skipped(
+                    "Body Rewrite skipped: ^http://a\\.test/: content-encoding br is not supported"
+                        .to_string()
+                ),
+            ]
+        );
+
+        // the limit here is a small one, so that the case does not hold a real
+        // 32 MiB of decoded bytes to check the same mechanism
+        let small = Limit {
+            bytes: 4,
+            text: "4 bytes",
+        };
+        let mut notes = Vec::new();
+        let body = rewrite.rewrite_body(
+            &rules,
+            &[encoding("gzip")],
+            &gzipped(b"abcde"),
+            small,
+            &mut notes,
+        );
+        assert!(body.is_none());
+        assert_eq!(
+            notes,
+            [
+                Note::Skipped(
+                    "Body Rewrite skipped: ^http://a\\.test/: the decoded body is over 4 bytes"
+                        .to_string()
+                ),
+                Note::Skipped(
+                    "Body Rewrite skipped: ^http://a\\.test/: the decoded body is over 4 bytes"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    /// An empty body can be given content: `^$` matches it, and an empty body
+    /// under `Content-Encoding: gzip` decodes to empty without a decoder (the
+    /// phase 4 / M3b plan's execution record row 40).
+    #[test]
+    fn an_empty_body_can_be_generated() {
+        let rewrite = rewrite_of("[Body Rewrite]\nhttp-request ^http://a\\.test/ ^$ generated");
+        let mut notes = Vec::new();
+        let rules = rewrite.body_rules(Direction::Request, "http://a.test/p", &mut notes);
+        let body = rewrite.rewrite_body(&rules, &[], &Bytes::new(), REQUEST, &mut notes);
+        assert_eq!(body.as_deref(), Some(&b"generated"[..]));
+
+        let mut notes = Vec::new();
+        let body = rewrite.rewrite_body(
+            &rules,
+            &[encoding("gzip")],
+            &Bytes::new(),
+            REQUEST,
+            &mut notes,
+        );
+        assert_eq!(body.as_deref(), Some(&b"generated"[..]));
+    }
+
+    /// One rule leaves at most one WARN an hour, and the first one always
+    /// (`phase 4 M3 design 14`, the phase 4 / M3b plan's P18). The clock is
+    /// `Instant`'s own, so nothing waits.
+    #[test]
+    fn warnings_come_at_most_once_an_hour() {
+        let rewrite = rewrite_of("[Body Rewrite]\nhttp-request ^http://a\\.test/ a b");
+        let rule = rewrite.body_rule(0);
+        let start = Instant::now();
+        assert!(rule.should_warn(start));
+        assert!(!rule.should_warn(start + Duration::from_secs(59 * 60 + 59)));
+        assert!(rule.should_warn(start + Duration::from_secs(3600)));
+        assert!(!rule.should_warn(start + Duration::from_secs(3601)));
+    }
+
+    /// Notes name a rule and a reason, never a byte of the body and never a
+    /// query string (`phase 4 M3 design 8.5`, the phase 4 / M3b plan's P18).
+    #[test]
+    fn notes_never_carry_bodies() {
+        let rewrite = rewrite_of("[Body Rewrite]\nhttp-request ^http://a\\.test/ s3cr3t-b changed");
+        let mut notes = Vec::new();
+        let rules = rewrite.body_rules(Direction::Request, "http://a.test/p?tok=q1", &mut notes);
+        let body = rewrite.rewrite_body(&rules, &[], &Bytes::from("s3cr3t-b"), REQUEST, &mut notes);
+        assert!(body.is_some());
+        let text = format!("{notes:?}");
+        for leak in ["s3cr3t-b", "q1"] {
+            assert!(!text.contains(leak), "{text}");
+        }
     }
 }

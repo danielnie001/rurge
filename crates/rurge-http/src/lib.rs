@@ -37,6 +37,6 @@ pub use engine::{
 pub use headers::{Keep, host_port, strip};
 pub use pool::{Meter, Metered, Pool, Reusable};
 pub use prefix::Prefixed;
-pub use rewrite::{Rewrite, RewriteCounters, RewriteCounts};
+pub use rewrite::{Rewrite, RewriteCounters, RewriteCounts, UrlData};
 pub use sniff::{Judged, MAX_PREFIX, SNIFF_WAIT, Sniffed, judge, sniff};
 pub use tls::ClientHello;
