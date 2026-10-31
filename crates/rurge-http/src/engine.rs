@@ -15,6 +15,9 @@ use super::exec::Exec;
 use super::headers::{self, Keep};
 use super::mitm::OriginTls;
 use super::pool::{Meter, Metered, Pool, Reusable};
+use super::rewrite::{
+    HostChange, Rewrite, UrlOutcome, candidates, redirect, retarget_request, write_back_host,
+};
 use super::version::{Form, fit};
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri, header};
@@ -26,17 +29,18 @@ use hyper::client::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rurge_config::HostName;
+use rurge_config::rewrite::Direction;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::SessionInfo;
 use rurge_inbound::responses::{self, BoxError, ResponseBody};
 use rurge_inbound::{Close, FailKind, SessionHandle, SessionOutcome};
 use rurge_net::BoxFuture;
-use rurge_net::connector::BoxedStream;
+use rurge_net::connector::{BoxedStream, Target};
 use rurge_proto::RejectKind;
 use rustls::pki_types::ServerName;
 use std::error::Error as StdError;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -113,8 +117,17 @@ pub enum Named<L> {
 /// What `route` worked out (`phase 4 M1 design 8.2`).
 pub enum Routed<R, K> {
     /// The rules and the policy: `route` is what `dial` needs, `key` what the
-    /// pool keeps upstream connections under (`design 8.5`).
-    Go { route: R, key: K, pages: Pages },
+    /// pool keeps upstream connections under (`design 8.5`), and `rewrite` what
+    /// the request is rewritten by before it is dialled.
+    Go {
+        route: R,
+        key: K,
+        pages: Pages,
+        /// The rewrite rules of the generation the request was routed by;
+        /// `None` when the switch is off, this generation has no rules, or the
+        /// policy the rules chose is one of REJECT's (`phase 4 M3 design 8.4`).
+        rewrite: Option<Arc<Rewrite>>,
+    },
     /// A refusal, unanswered: the HTTP engine answers it and finishes the
     /// handle (`P4`).
     Refused { refusal: Refusal, pages: Pages },
@@ -181,6 +194,22 @@ pub trait Upstreams: Send + Sync + 'static {
         handle: &'a Arc<SessionHandle>,
         route: Self::Route,
     ) -> BoxFuture<'a, Result<Upstream, Refusal>>;
+    /// What the request's upstream is once a rewrite chose another target
+    /// (`phase 4 M3 design 8.2`): the route and the key follow the new target
+    /// and the rules are not asked again, because a rewrite retargets a request
+    /// without choosing its policy anew. `forwardable` is whether an upstream
+    /// HTTP proxy may take the request in absolute form.
+    fn retarget(
+        &self,
+        route: Self::Route,
+        key: Self::Key,
+        target: Target,
+        forwardable: bool,
+    ) -> (Self::Route, Self::Key);
+    /// The IPv4 gateway that `{{{GATEWAY_ADDRESS}}}` in a `302` / `307`
+    /// replacement stands for (`phase 4 M3 design 8.2`), as the network the
+    /// engine last saw names it.
+    fn gateway(&self) -> Option<Ipv4Addr>;
     /// Relays an upgraded exchange to its end and finishes `handle` (design
     /// 8.9).
     fn relay<'a>(
@@ -450,11 +479,16 @@ impl<U: Upstreams> Requests<U> {
         if handle.token().is_cancelled() {
             return Err(Close);
         }
-        let (route, key, pages) = match routed {
+        let (mut route, mut key, pages, rewrite) = match routed {
             Routed::Refused { refusal, pages } => {
                 return self.answer(&guard, refusal, pages).await;
             }
-            Routed::Go { route, key, pages } => (route, key, pages),
+            Routed::Go {
+                route,
+                key,
+                pages,
+                rewrite,
+            } => (route, key, pages, rewrite),
         };
         if prepared.unknown {
             let refusal = Refusal::Fail {
@@ -469,14 +503,129 @@ impl<U: Upstreams> Requests<U> {
         // phase 4 / M2b plan's P12`). Read before the hop-by-hop headers go:
         // `Upgrade` and `Connection` are two of them.
         let sniffed = self.shared.conn.entry == Entry::Sniffed;
+        // A `CONNECT` on a sniffed connection is a tunnel of the client's, and
+        // an absolute request line on one is the request it already made:
+        // neither is a URL this engine rewrites (`phase 4 M3 design 8.1`,
+        // `M3-D29`).
+        let mut rewrite = rewrite;
+        if sniffed
+            && (req.method() == http::Method::CONNECT
+                || (!self.shared.conn.h2 && req.uri().scheme().is_some()))
+        {
+            rewrite = None;
+        }
+        // The URL the request's rules see (`phase 4 M3 design 6.2`).
+        let url = handle.session().url.clone();
+        // What the request's upstream is on the origin side (`phase 4 M3 design
+        // 8.2`): what the connection came with unless a rewrite changed the
+        // target.
+        let mut origin = self.shared.conn.origin.clone();
+        let mut retargeted = false;
+        let mut host_change = HostChange::Same;
+        // 3. the request's headers (`phase 4 M3 design 7`, `the phase 4 / M3a
+        // plan's P15`): before the URL rules, so that each sees what the ones
+        // before it left, and before the hop-by-hop headers go.
+        if let (Some(rules), Some(text)) = (rewrite.as_deref(), url.as_deref()) {
+            let mut notes = Vec::new();
+            let out = rules.headers(Direction::Request, text, req.headers_mut(), &mut notes);
+            note_rewrites(&handle, rules, notes);
+            if out.changed {
+                rules.counters().header();
+            }
+            if out.framing {
+                // no rewrite changes how a message is framed (`phase 4 M3
+                // design 7.3`): the request is not sent at all
+                rules.counters().failed();
+                return self.failed(
+                    &guard,
+                    pages,
+                    "Header Rewrite changed Content-Length or Transfer-Encoding".to_string(),
+                    "A Header Rewrite rule changed Content-Length or Transfer-Encoding, so the request was not sent."
+                        .to_string(),
+                );
+            }
+            host_change = out.host;
+        }
+        // 4. the URL (`phase 4 M3 design 6`, `the phase 4 / M3a plan's P15`):
+        // the first rule that matches answers a redirect or a rejection, or
+        // sends the request to the target it names without asking the rules for
+        // a policy again (`M3-D15`).
+        if let (Some(rules), Some(text)) = (rewrite.as_deref(), url.as_deref()) {
+            let session = handle.session();
+            let urls = candidates(
+                scheme,
+                text,
+                req.headers().get(header::HOST),
+                path_and_query(req.uri()),
+                &session.dst_host,
+                session.dst_port,
+            );
+            let mut notes = Vec::new();
+            let outcome = rules.url(&urls, &|| self.shared.upstreams.gateway(), &mut notes);
+            note_rewrites(&handle, rules, notes);
+            match outcome {
+                UrlOutcome::Go(Some(new)) => {
+                    rules.counters().url();
+                    retarget_request(&mut req, &new, self.shared.conn.h2);
+                    // only a listener's request may go to an upstream HTTP proxy,
+                    // and only a plain target may be forwarded to one
+                    let forwardable = self.shared.conn.entry == Entry::Listener && !new.tls();
+                    (route, key) =
+                        self.shared
+                            .upstreams
+                            .retarget(route, key, new.target(), forwardable);
+                    retargeted = true;
+                    // a decrypted connection's TLS is its own, under the new
+                    // name; any other request's is the generation's
+                    origin = match new.server_name() {
+                        Some(name) => {
+                            let name = name.clone();
+                            match &self.shared.conn.origin {
+                                Some(tls) => Some(OriginTls {
+                                    name,
+                                    ..tls.clone()
+                                }),
+                                None => Some(rules.origin_tls(name)),
+                            }
+                        }
+                        None => None,
+                    };
+                }
+                UrlOutcome::Redirect { status, location } => {
+                    rules.counters().url();
+                    handle.set_status(status.as_u16());
+                    handle.finish(SessionOutcome::Completed);
+                    return Ok(redirect(status, location));
+                }
+                UrlOutcome::Reject => {
+                    rules.counters().url();
+                    if pages.reject {
+                        let page = self.page(
+                            &handle,
+                            StatusCode::FORBIDDEN,
+                            "Request rejected",
+                            "The request was rejected by a URL Rewrite rule.".to_string(),
+                        );
+                        handle.set_status(StatusCode::FORBIDDEN.as_u16());
+                        handle.finish(SessionOutcome::Rejected(RejectKind::Reject));
+                        return Ok(page);
+                    }
+                    handle.finish(SessionOutcome::Rejected(RejectKind::Reject));
+                    return Err(Close);
+                }
+                UrlOutcome::Go(None) => {}
+            }
+        }
+
         // Only an upgrade keeps `Upgrade` and `Connection: upgrade`; every
-        // other request drops them (design 8.7, 8.9).
+        // other request drops them (design 8.7, 8.9). Read after the rewrite:
+        // a rule that deletes `Upgrade` leaves a plain request.
         let upgrade = wants_upgrade(&req);
         // a `CONNECT` on a sniffed connection, whose 2xx answer becomes a
         // tunnel (design 8.9)
         let tunnel = sniffed && req.method() == http::Method::CONNECT;
         let needs_h1 = upgrade || tunnel;
-        // 4. an upstream connection (`phase 4 M2 design 10.2`, `the phase 4 /
+        // 5. an upstream connection (`phase 4 M2 design 10.2`, `the phase 4 /
         // M2b plan's P10`): one shared under this key if what carries this
         // request may speak HTTP/2 and such a connection is open, then one
         // idle in the pool under this key, then a fresh dial in this task
@@ -487,7 +636,6 @@ impl<U: Upstreams> Requests<U> {
         // chose: a request whose upstream is under TLS and one whose upstream
         // is plain are not lent each other's connection, nor are two names'
         // (`phase 4 M3 design 8.3`, `the phase 4 / M3a plan's P14`).
-        let origin = self.shared.conn.origin.clone();
         let mut key = Some((key, OriginKey::of(origin.as_ref())));
         let mut route = Some(route);
         let borrowed_h2 = if needs_h1 {
@@ -564,7 +712,10 @@ impl<U: Upstreams> Requests<U> {
             req.headers_mut(),
             Keep {
                 upgrade,
-                proxy_authorization: sniffed,
+                // the credentials a client gave rurge's own proxy go to the
+                // target the client asked for, not to one a rewrite chose
+                // (`phase 4 M3 design 8.1`)
+                proxy_authorization: sniffed && !retargeted,
             },
         );
         if !sniffed {
@@ -600,6 +751,25 @@ impl<U: Upstreams> Requests<U> {
             handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
             return Ok(responses::bad_request("malformed request URI"));
         }
+        // A `Host` a rule rewrote goes on once the form is settled
+        // (`phase 4 M3 design 7.4`): for an HTTP/1.1 upstream as it was
+        // rewritten, for an HTTP/2 one as the authority of the request target.
+        // A request a rewrite retargeted or one an HTTP proxy forwards in
+        // absolute form names its target another way, and a request sent again
+        // writes the same value back, so its note is left once.
+        let rewritten_host = match (&host_change, retargeted, &forward) {
+            (HostChange::Changed(value), false, None) => Some(value.clone()),
+            _ => None,
+        };
+        let mut host_noted = false;
+        write_host(
+            &mut req,
+            rewritten_host.as_ref(),
+            sender.version(),
+            rewrite.as_deref().map(Rewrite::counters),
+            &mut host_noted,
+            &handle,
+        );
         // The client's side of an upgrade is taken before the request is
         // split: a request that asked for one, and a `CONNECT` on a sniffed
         // connection, whose 2xx answer becomes a tunnel (design 8.9).
@@ -661,6 +831,9 @@ impl<U: Upstreams> Requests<U> {
                             origin: origin.as_ref(),
                             h1_only: needs_h1,
                             body: &request_meter,
+                            host: rewritten_host.as_ref(),
+                            noted: &mut host_noted,
+                            rewrite: rewrite.as_deref(),
                         },
                     )
                     .await
@@ -712,6 +885,9 @@ impl<U: Upstreams> Requests<U> {
                             origin: origin.as_ref(),
                             h1_only: needs_h1,
                             body: &request_meter,
+                            host: rewritten_host.as_ref(),
+                            noted: &mut host_noted,
+                            rewrite: rewrite.as_deref(),
                         },
                     )
                     .await
@@ -1212,6 +1388,9 @@ impl<U: Upstreams> Requests<U> {
             origin,
             h1_only,
             body,
+            host,
+            noted,
+            rewrite,
         } = resend;
         let (mut sender, meter, forward, peer) =
             match self.redial(guard, pages, route, key, origin, h1_only).await {
@@ -1245,6 +1424,16 @@ impl<U: Upstreams> Requests<U> {
             handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
             return Err(Ok(responses::bad_request("malformed request URI")));
         }
+        // the rewritten `Host` goes back on this send as on the first, and the
+        // note a value that is no authority needs is left once per request
+        write_host(
+            &mut req,
+            host,
+            sender.version(),
+            rewrite.map(Rewrite::counters),
+            noted,
+            handle,
+        );
         let sent = tokio::select! {
             biased;
             _ = handle.token().cancelled() => return Err(Err(Close)),
@@ -1458,6 +1647,17 @@ struct Resend<'a, K> {
     /// What the request counts its own body and answer as, once it is sent on
     /// a shared HTTP/2 connection (`the phase 4 / M2b plan's P11`).
     body: &'a Meter,
+    /// The `Host` a header rule rewrote, for the send that follows the one it
+    /// was rewritten before (`phase 4 M3 design 7.4`, `the phase 4 / M3a
+    /// plan's P15`).
+    host: Option<&'a HeaderValue>,
+    /// Whether the note a `Host` that cannot be an HTTP/2 authority needs was
+    /// left already, so that one request leaves one
+    /// (`the phase 4 / M3a plan's execution record row 43`).
+    noted: &'a mut bool,
+    /// The generation's rules, for the count a note leaves
+    /// (`the phase 4 / M3a plan's P11`).
+    rewrite: Option<&'a Rewrite>,
 }
 
 /// The upstream connection one request is sent on, in the version it speaks
@@ -1527,6 +1727,45 @@ fn is_idempotent(method: &http::Method) -> bool {
             | http::Method::PUT
             | http::Method::DELETE
     )
+}
+
+/// Hands the notes one rewrite left to the request's record, counting the ones
+/// that were skipped (`the phase 4 / M3a plan's P11`): the record says which
+/// rule acted, and nothing of a header value, a query string or the gateway's
+/// address is in them (`phase 4 M3 design 8.5`).
+fn note_rewrites(handle: &Arc<SessionHandle>, rewrite: &Rewrite, notes: Vec<crate::rewrite::Note>) {
+    for note in notes {
+        if matches!(note, crate::rewrite::Note::Skipped(_)) {
+            rewrite.counters().skipped();
+        }
+        handle.add_note(note.text().to_string());
+    }
+}
+
+/// Writes a `Host` a header rule rewrote back once the request's form is
+/// settled (`phase 4 M3 design 7.4`, `the phase 4 / M3a plan's P15`), leaving
+/// the note a value that cannot be an HTTP/2 authority needs. `noted` keeps
+/// that note to one per request: the first send and a send after it write the
+/// same value back.
+fn write_host<B>(
+    req: &mut Request<B>,
+    host: Option<&HeaderValue>,
+    version: http::Version,
+    counters: Option<&crate::rewrite::RewriteCounters>,
+    noted: &mut bool,
+    handle: &Arc<SessionHandle>,
+) {
+    let Some(host) = host else { return };
+    if write_back_host(req, host, version) || *noted {
+        return;
+    }
+    *noted = true;
+    if let Some(counters) = counters {
+        counters.skipped();
+    }
+    handle.add_note(
+        "Header Rewrite skipped: the rewritten Host is not a valid HTTP/2 authority".to_string(),
+    );
 }
 
 /// Whether a request asks for an upgrade (WebSocket, `phase 4 M1 design 8.9`):
@@ -2653,10 +2892,12 @@ async fn serve_h2<U: Upstreams>(client: BoxedStream, requests: Requests<U>) -> S
 mod tests {
     use super::*;
     use crate::mitm::testing::generated;
+    use crate::rewrite::RewriteCounts;
     use http_body_util::Full;
     use hyper::client::conn::http2;
     use hyper_util::rt::TokioExecutor;
     use rcgen::PKCS_ECDSA_P256_SHA256;
+    use rurge_config::mitm::MitmConfig;
     use rurge_net::testing::TestServer;
     use rurge_proto::testing::TlsFixture;
     use rurge_proto::transport::tls::origin_client_config;
@@ -2695,6 +2936,19 @@ mod tests {
         seen: Mutex<Vec<Seen>>,
         routed: AtomicUsize,
         relayed: AtomicUsize,
+        /// The generation's rules, `Routed::Go` hands back whatever was put
+        /// here: `None` for none.
+        rewrite: Mutex<Option<Arc<Rewrite>>>,
+        /// What `retarget` was given, in order: the target and whether an
+        /// upstream HTTP proxy may take the request in absolute form.
+        retargets: Mutex<Vec<(Target, bool)>>,
+        /// The IPv4 gateway `gateway` answers.
+        gateway: Mutex<Option<Ipv4Addr>>,
+        /// The pages a `Step::Go` hands back.
+        go_pages: Mutex<Pages>,
+        /// The headers `dial` says an upstream HTTP proxy takes the request
+        /// with: `Some` is a forward, `None` is no proxy.
+        forward: Mutex<Option<Vec<(String, String)>>>,
     }
 
     /// The engine side of `Upstreams`, scripted by the path of each request’s
@@ -2716,6 +2970,14 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
                 routed: AtomicUsize::new(0),
                 relayed: AtomicUsize::new(0),
+                rewrite: Mutex::new(None),
+                retargets: Mutex::new(Vec::new()),
+                gateway: Mutex::new(None),
+                go_pages: Mutex::new(Pages {
+                    error: true,
+                    reject: true,
+                }),
+                forward: Mutex::new(None),
             }))
         }
 
@@ -2738,6 +3000,32 @@ mod tests {
 
         fn dials(&self) -> usize {
             self.0.dials.load(Ordering::Relaxed)
+        }
+
+        /// What `retarget` was given, in order.
+        fn retargets(&self) -> Vec<(Target, bool)> {
+            self.0.retargets.lock().unwrap().clone()
+        }
+
+        /// The generation's rules, as `route` hands them back.
+        fn rewrite(&self, rewrite: Arc<Rewrite>) {
+            *self.0.rewrite.lock().unwrap() = Some(rewrite);
+        }
+
+        /// What `gateway` answers.
+        fn gateway(&self, address: Ipv4Addr) {
+            *self.0.gateway.lock().unwrap() = Some(address);
+        }
+
+        /// The pages a `Step::Go` hands back.
+        fn go_pages(&self, pages: Pages) {
+            *self.0.go_pages.lock().unwrap() = pages;
+        }
+
+        /// Makes `dial` hand back the headers an upstream HTTP proxy takes the
+        /// request with, so that the request goes to it in absolute form.
+        fn forward(&self, headers: Vec<(String, String)>) {
+            *self.0.forward.lock().unwrap() = Some(headers);
         }
 
         fn seen(&self) -> Vec<Seen> {
@@ -2812,15 +3100,14 @@ mod tests {
                 .cloned()
                 .unwrap_or(Step::Go(1));
             Box::pin(async move {
-                let pages = Pages {
-                    error: true,
-                    reject: true,
-                };
+                let pages = *self.0.go_pages.lock().unwrap();
+                let rewrite = self.0.rewrite.lock().unwrap().clone();
                 match step {
                     Step::Go(key) => Routed::Go {
                         route: key,
                         key,
                         pages,
+                        rewrite,
                     },
                     Step::Refused { refusal, pages } => Routed::Refused { refusal, pages },
                 }
@@ -2845,12 +3132,25 @@ mod tests {
                     })?;
                 let peer = stream.peer_addr().ok();
                 handle.mark_connected();
+                let forward = self.0.forward.lock().unwrap().clone();
                 Ok(Upstream {
                     stream: Box::new(stream),
-                    forward: None,
+                    forward,
                     peer,
                 })
             })
+        }
+
+        fn retarget(&self, route: u32, key: u32, target: Target, forwardable: bool) -> (u32, u32) {
+            self.0.retargets.lock().unwrap().push((target, forwardable));
+            // the key does not follow the target here: what tells two upstream
+            // connections of one key apart is the origin side they reached
+            // (`the phase 4 / M3a plan's P14`)
+            (route, key)
+        }
+
+        fn gateway(&self) -> Option<Ipv4Addr> {
+            *self.0.gateway.lock().unwrap()
         }
 
         fn relay<'a>(
@@ -6337,5 +6637,732 @@ mod tests {
         // the same name, dialled with another configuration: still one key
         let other = tls("a.test", &[b"http/1.1"]);
         assert_eq!(OriginKey::of(Some(&a)), OriginKey::of(Some(&other)));
+    }
+
+    /// The rewrite rules of `lines` as one generation, trusted by `roots`, with
+    /// the counters a case checks. A generation needs a store of roots even
+    /// when no request of the case uses TLS (`the phase 4 / M3a plan's
+    /// execution record row 20`), which is why every case hands one in.
+    fn rewrite_of(
+        lines: &str,
+        roots: Arc<RootCertStore>,
+    ) -> (Arc<Rewrite>, Arc<crate::rewrite::RewriteCounters>) {
+        let counters = Arc::new(crate::rewrite::RewriteCounters::default());
+        let rules = Rewrite::build(
+            &crate::rewrite::config_of(lines),
+            &MitmConfig::default(),
+            roots,
+            Arc::clone(&counters),
+        )
+        .expect("a generation")
+        .expect("the lines make rules");
+        (Arc::new(rules), counters)
+    }
+
+    /// What a case expects `/v1/rurge/http` to say it counted: `body` and
+    /// `map_local` stay at zero until M3b (`the phase 4 / M3a plan's P11`).
+    fn counted(url: u64, header: u64, skipped: u64, failed: u64) -> RewriteCounts {
+        RewriteCounts {
+            url,
+            header,
+            body: 0,
+            map_local: 0,
+            skipped,
+            failed,
+        }
+    }
+
+    /// The notes the request's record keeps that a rewrite left.
+    fn rewrite_notes(handle: &SessionHandle) -> Vec<String> {
+        handle
+            .notes()
+            .into_iter()
+            .filter(|note| note.starts_with("URL Rewrite") || note.starts_with("Header Rewrite"))
+            .collect()
+    }
+
+    /// The value of the first `name` line of a recorded request head.
+    fn header_value(head: &str, name: &str) -> Option<String> {
+        head.lines().skip(1).find_map(|line| {
+            line.split_once(':')
+                .filter(|(field, _)| field.trim().eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.trim().to_string())
+        })
+    }
+
+    /// An origin that accepts a connection and ends it at once: a handshake
+    /// with one fails instead of waiting for an answer that never comes.
+    async fn closing_origin() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        addr
+    }
+
+    /// The request's headers are rewritten before the hop-by-hop ones go
+    /// (`phase 4 M3 design 8.1`, `the phase 4 / M3a plan's P15`): a rule that
+    /// adds `Keep-Alive` adds it, `strip` takes it again, and the record says
+    /// the rule acted.
+    #[tokio::test]
+    async fn request_headers_are_rewritten_before_the_hop_by_hop_ones_go() {
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Header Rewrite]\n\
+             ^http://target\\.test header-add X-A 1\n\
+             ^http://target\\.test header-add Keep-Alive x",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /a HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one request reached the origin");
+        assert_eq!(
+            header_value(&seen[0].head, "x-a").as_deref(),
+            Some("1"),
+            "{}",
+            seen[0].head
+        );
+        assert_eq!(
+            header_value(&seen[0].head, "keep-alive"),
+            None,
+            "a hop-by-hop header the rule added was forwarded: {}",
+            seen[0].head
+        );
+        let handle = rig.fake.finished(0).await;
+        let notes = rewrite_notes(&handle);
+        assert!(
+            notes.contains(
+                &"Header Rewrite: request header-add X-A by ^http://target\\.test".to_string()
+            ),
+            "{notes:?}"
+        );
+        assert_eq!(counters.snapshot(), counted(0, 1, 0, 0));
+    }
+
+    /// A `302` and a `307` are answered by rurge itself, and the request is
+    /// never dialled (`the phase 4 / M3a plan's P13`); so is one whose
+    /// `Location` names `{{{GATEWAY_ADDRESS}}}` (`M3-D10`).
+    #[tokio::test]
+    async fn a_redirect_is_answered_without_a_dial() {
+        let origin = TestServer::spawn().await;
+        for mode in ["302", "307"] {
+            let (rules, counters) = rewrite_of(
+                &format!("[URL Rewrite]\n^http://target\\.test/a http://b.test/login {mode}"),
+                roots_of("rurge test rewrite CA"),
+            );
+            let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+            rig.fake.rewrite(rules);
+            rig.client
+                .send("GET /a HTTP/1.1\r\nHost: target.test\r\n\r\n")
+                .await
+                .unwrap();
+            let (head, body) = rig.client.response().await;
+            assert!(head.starts_with(&format!("HTTP/1.1 {mode}")), "{head}");
+            assert_eq!(
+                header_value(&head, "location").as_deref(),
+                Some("http://b.test/login"),
+                "{head}"
+            );
+            assert_eq!(header_value(&head, "content-length").as_deref(), Some("0"));
+            assert!(body.is_empty(), "a redirect carries no body");
+            assert_eq!(rig.fake.dials(), 0, "a redirect is not dialled");
+            let handle = rig.fake.finished(0).await;
+            assert_eq!(handle.status(), Some(mode.parse().unwrap()));
+            assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+            assert!(
+                rewrite_notes(&handle)
+                    .contains(&format!("URL Rewrite: {mode} by ^http://target\\.test/a")),
+                "{:?}",
+                rewrite_notes(&handle)
+            );
+            assert_eq!(counters.snapshot(), counted(1, 0, 0, 0));
+        }
+
+        // the gateway is the network's IPv4 one, and only a `302` / `307` rule
+        // asks for it
+        let (rules, counters) = rewrite_of(
+            "[URL Rewrite]\n\
+             ^http://target\\.test/gw http://{{{GATEWAY_ADDRESS}}}/login 302",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.gateway(Ipv4Addr::new(127, 0, 0, 2));
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /gw HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 302"), "{head}");
+        assert_eq!(
+            header_value(&head, "location").as_deref(),
+            Some("http://127.0.0.2/login"),
+            "{head}"
+        );
+        assert!(body.is_empty());
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(302));
+        assert_eq!(rig.fake.dials(), 0);
+        assert_eq!(counters.snapshot(), counted(1, 0, 0, 0));
+    }
+
+    /// A `reject` rule answers as the `REJECT` policy does, with a page that
+    /// says a URL Rewrite rule rejected the request (`the phase 4 / M3a plan's
+    /// P12`).
+    #[tokio::test]
+    async fn a_url_rewrite_reject_answers_like_reject() {
+        let origin = TestServer::spawn().await;
+        let lines = "[URL Rewrite]\n^http://target\\.test/no http://b.test/ reject";
+
+        let (rules, counters) = rewrite_of(lines, roots_of("rurge test rewrite CA"));
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /no HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        let page = String::from_utf8_lossy(&body);
+        assert!(
+            page.contains("Request rejected")
+                && page.contains("The request was rejected by a URL Rewrite rule."),
+            "{page}"
+        );
+        assert_eq!(rig.fake.dials(), 0, "a rejected request is not dialled");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(403));
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Rejected(RejectKind::Reject))
+        );
+        assert_eq!(counters.snapshot(), counted(1, 0, 0, 0));
+
+        // no rejection page: the connection closes with no answer at all
+        let (rules, counters) = rewrite_of(lines, roots_of("rurge test rewrite CA"));
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.go_pages(Pages {
+            error: true,
+            reject: false,
+        });
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /no HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(rig.client.until_eof().await, "");
+        assert_eq!(rig.fake.dials(), 0);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), None, "no answer, no status");
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Rejected(RejectKind::Reject))
+        );
+        assert_eq!(counters.snapshot(), counted(1, 0, 0, 0));
+    }
+
+    /// A `header` rule sends the request to the new target without choosing
+    /// the policy again (`phase 4 M3 design 8.2`, `M3-D15`): the request line
+    /// and `Host` follow it, and the record keeps the URL the rules saw.
+    #[tokio::test]
+    async fn header_mode_sends_the_request_to_the_new_target() {
+        let (addr, records) = recording_origin().await;
+        let port = addr.port();
+        let (rules, counters) = rewrite_of(
+            &format!("[URL Rewrite]\n^http://a\\.test http://b.test:{port} header"),
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /a HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        assert_eq!(
+            rig.fake.retargets(),
+            [(Target::new(HostName::parse("b.test"), port), false)],
+            "a sniffed request may never be forwarded in absolute form"
+        );
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one request reached the origin");
+        assert!(
+            seen[0].head.starts_with("GET /a HTTP/1.1"),
+            "{}",
+            seen[0].head
+        );
+        assert_eq!(
+            header_value(&seen[0].head, "host").as_deref(),
+            Some(format!("b.test:{port}").as_str()),
+            "{}",
+            seen[0].head
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.session().url.as_deref(), Some("http://a.test/a"));
+        assert_eq!(counters.snapshot(), counted(1, 0, 0, 0));
+    }
+
+    /// A listener request keeps the absolute form it came in when a rewrite
+    /// retargets it, and only a plain target stays forwardable to an upstream
+    /// HTTP proxy (`phase 4 M3 design 6.3`, `8.2`).
+    #[tokio::test]
+    async fn a_listener_request_keeps_its_absolute_uri_when_retargeted() {
+        let (addr, records) = recording_origin().await;
+        let port = addr.port();
+        let line = "GET http://a.test/a HTTP/1.1\r\nHost: a.test\r\n\r\n";
+
+        let (rules, counters) = rewrite_of(
+            &format!("[URL Rewrite]\n^http://a\\.test http://b.test:{port} header"),
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Listener, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client.send(line).await.unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        assert_eq!(
+            rig.fake.retargets(),
+            [(Target::new(HostName::parse("b.test"), port), true)],
+            "a plain target of a listener request may be forwarded"
+        );
+        assert_eq!(counters.snapshot(), counted(1, 0, 0, 0));
+        assert_eq!(rig.fake.finished(0).await.status(), Some(200));
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one request reached the origin");
+
+        // to a target under TLS: no upstream HTTP proxy may take it in
+        // absolute form, and the origin that ends the connection at once is
+        // no TLS server, so the request fails
+        let closing = closing_origin().await;
+        let (rules, _counters) = rewrite_of(
+            &format!(
+                "[URL Rewrite]\n^http://a\\.test https://b.test:{}/ header",
+                closing.port()
+            ),
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Listener, closing).await;
+        rig.fake.rewrite(rules);
+        rig.client.send(line).await.unwrap();
+        let (head, _) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert_eq!(
+            rig.fake.retargets(),
+            [(
+                Target::new(HostName::parse("b.test"), closing.port()),
+                false
+            )],
+            "a target under TLS may not be forwarded"
+        );
+    }
+
+    /// A request a rewrite retargeted drops `Proxy-Authorization`: the
+    /// credentials rurge's client gave its proxy are for that proxy, not for a
+    /// target the rules chose (`phase 4 M3 design 8.1`, `the phase 4 / M3a
+    /// plan's P15`).
+    #[tokio::test]
+    async fn a_retargeted_sniffed_request_drops_proxy_authorization() {
+        let (addr, records) = recording_origin().await;
+        let port = addr.port();
+        let (rules, counters) = rewrite_of(
+            &format!("[URL Rewrite]\n^http://target\\.test/p http://b.test:{port}/q header"),
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        for path in ["/p", "/kept"] {
+            rig.client
+                .send(&format!(
+                    "GET {path} HTTP/1.1\r\nHost: target.test\r\n\
+                     Proxy-Authorization: Basic dXA=\r\n\r\n"
+                ))
+                .await
+                .unwrap();
+            let (head, _) = rig.client.response().await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        }
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "two requests reached the origin");
+        assert_eq!(
+            header_value(&seen[0].head, "proxy-authorization").as_deref(),
+            None,
+            "a retargeted request kept the proxy's credentials: {}",
+            seen[0].head
+        );
+        assert_eq!(
+            header_value(&seen[1].head, "proxy-authorization").as_deref(),
+            Some("Basic dXA="),
+            "a request that stayed kept them: {}",
+            seen[1].head
+        );
+        assert_eq!(counters.snapshot(), counted(1, 0, 0, 0));
+        assert_eq!(rig.fake.finished(1).await.status(), Some(200));
+    }
+
+    /// The `Host` a header rule rewrote is written back once the request's form
+    /// is settled (`phase 4 M3 design 7.4`, `the phase 4 / M3a plan's P15`),
+    /// except for a request an upstream HTTP proxy takes in absolute form, whose
+    /// `Host` is the authority of its request line.
+    #[tokio::test]
+    async fn a_changed_host_is_written_back() {
+        let (addr, records) = recording_origin().await;
+        let port = addr.port();
+        let line = format!("GET http://a.test:{port}/a HTTP/1.1\r\nHost: a.test:{port}\r\n\r\n");
+        let lines = "[Header Rewrite]\n^http://a\\.test header-replace Host h.test";
+
+        let (rules, counters) = rewrite_of(lines, roots_of("rurge test rewrite CA"));
+        let mut rig = connected(Entry::Listener, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client.send(&line).await.unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one request reached the origin");
+        assert_eq!(
+            header_value(&seen[0].head, "host").as_deref(),
+            Some("h.test"),
+            "the rewritten Host was not written back: {}",
+            seen[0].head
+        );
+        assert_eq!(counters.snapshot(), counted(0, 1, 0, 0));
+        assert_eq!(rig.fake.finished(0).await.status(), Some(200));
+
+        // an upstream HTTP proxy names the target in the request line: `Host`
+        // follows it, and the rewritten one is not written back
+        let (rules, counters) = rewrite_of(lines, roots_of("rurge test rewrite CA"));
+        let mut rig = connected(Entry::Listener, addr).await;
+        rig.fake.rewrite(rules);
+        rig.fake.forward(Vec::new());
+        rig.client.send(&line).await.unwrap();
+        let (head, _) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let seen = records.lock().unwrap().clone();
+        let forwarded = seen.last().expect("a forwarded request");
+        assert_eq!(
+            header_value(&forwarded.head, "host").as_deref(),
+            Some(format!("a.test:{port}").as_str()),
+            "a forwarded request kept the rewritten Host: {}",
+            forwarded.head
+        );
+        assert_eq!(counters.snapshot(), counted(0, 1, 0, 0));
+        assert_eq!(rig.fake.finished(0).await.status(), Some(200));
+    }
+
+    /// A rule that would leave a request without `Host` does not take: the
+    /// lines come back and the record says why (`the phase 4 / M3a plan's
+    /// P9`, execution record row 36).
+    #[tokio::test]
+    async fn deleting_host_does_not_take() {
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Header Rewrite]\n^http://target\\.test header-del Host",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /a HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(
+            header_value(&seen[0].head, "host").as_deref(),
+            Some("target.test"),
+            "the request was left without Host: {}",
+            seen[0].head
+        );
+        let handle = rig.fake.finished(0).await;
+        let notes = rewrite_notes(&handle);
+        assert!(
+            notes.contains(&"Header Rewrite skipped: Host cannot be removed".to_string()),
+            "{notes:?}"
+        );
+        // the rule took effect and one rewrite was skipped (execution record
+        // row 36)
+        assert_eq!(counters.snapshot(), counted(0, 1, 1, 0));
+    }
+
+    /// A rewrite that changes how the request is framed fails it before the
+    /// dial, with the page or with no answer at all (`phase 4 M3 design 7.3`,
+    /// `the phase 4 / M3a plan's P15`).
+    #[tokio::test]
+    async fn a_request_whose_framing_changes_fails_before_the_dial() {
+        let origin = TestServer::spawn().await;
+        let lines = "[Header Rewrite]\n\
+                     ^http://target\\.test header-replace Content-Length 1";
+        let request = "POST /a HTTP/1.1\r\nHost: target.test\r\nContent-Length: 4\r\n\r\nbody";
+
+        let (rules, counters) = rewrite_of(lines, roots_of("rurge test rewrite CA"));
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.rewrite(rules);
+        rig.client.send(request).await.unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        let page = String::from_utf8_lossy(&body);
+        assert!(
+            page.contains("Connection failed")
+                && page.contains(
+                    "A Header Rewrite rule changed Content-Length or Transfer-Encoding, so the request was not sent."
+                ),
+            "{page}"
+        );
+        assert_eq!(rig.fake.dials(), 0, "the request was not dialled");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(
+                "Header Rewrite changed Content-Length or Transfer-Encoding".to_string()
+            ))
+        );
+        assert_eq!(handle.status(), Some(502));
+        let notes = rewrite_notes(&handle);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("Header Rewrite failed: ")),
+            "{notes:?}"
+        );
+        assert_eq!(counters.snapshot(), counted(0, 1, 0, 1));
+
+        // no failure page: the connection closes with no answer
+        let (rules, counters) = rewrite_of(lines, roots_of("rurge test rewrite CA"));
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.go_pages(Pages {
+            error: false,
+            reject: true,
+        });
+        rig.fake.rewrite(rules);
+        rig.client.send(request).await.unwrap();
+        assert_eq!(rig.client.until_eof().await, "");
+        assert_eq!(rig.fake.dials(), 0);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(
+                "Header Rewrite changed Content-Length or Transfer-Encoding".to_string()
+            ))
+        );
+        assert_eq!(handle.status(), None, "no answer, no status");
+        assert_eq!(counters.snapshot(), counted(0, 1, 0, 1));
+    }
+
+    /// A `CONNECT` on a sniffed connection is a tunnel and an absolute request
+    /// line there is the request the client already made: neither is rewritten
+    /// (`phase 4 M3 design 8.1`, `M3-D29`).
+    #[tokio::test]
+    async fn connect_and_absolute_form_on_a_sniffed_connection_are_not_rewritten() {
+        let lines = "[URL Rewrite]\n^http://a\\.test http://b.test/ reject\n\
+                     [Header Rewrite]\n^http://a\\.test header-add X-A 1";
+
+        let (addr, _, _, heads) =
+            upgrading_origin(b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        let (rules, counters) = rewrite_of(lines, roots_of("rurge test rewrite CA"));
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("CONNECT a.test:443 HTTP/1.1\r\nHost: a.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        rig.client.stream.shutdown().await.unwrap();
+        while rig.client.fill().await {}
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert!(
+            rewrite_notes(&handle).is_empty(),
+            "a tunnel was rewritten: {:?}",
+            rewrite_notes(&handle)
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 0, 0));
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(header_value(&heads[0], "x-a"), None, "{}", heads[0]);
+
+        // an absolute request line on a sniffed connection came in that way
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(lines, roots_of("rurge test rewrite CA"));
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET http://a.test/a HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        let handle = rig.fake.finished(0).await;
+        assert!(
+            rewrite_notes(&handle).is_empty(),
+            "an absolute request line was rewritten: {:?}",
+            rewrite_notes(&handle)
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 0, 0));
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(header_value(&seen[0].head, "x-a"), None, "{}", seen[0].head);
+    }
+
+    /// `wants_upgrade` is read after the rewrite (`the phase 4 / M3a plan's
+    /// P15`): a rule that deletes `Upgrade` leaves a request with no upgrade at
+    /// all.
+    #[tokio::test]
+    async fn deleting_upgrade_makes_a_plain_request() {
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Header Rewrite]\n^http://target\\.test header-del Upgrade",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send(
+                "GET /a HTTP/1.1\r\nHost: target.test\r\n\
+                 Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "the answer of a plain request: {head}"
+        );
+        assert_eq!(body, b"ok");
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(
+            header_value(&seen[0].head, "upgrade"),
+            None,
+            "{}",
+            seen[0].head
+        );
+        assert_eq!(counters.snapshot(), counted(0, 1, 0, 0));
+        assert_eq!(rig.fake.finished(0).await.status(), Some(200));
+    }
+
+    /// A plain connection's request a rewrite sends to `https` is dialled and
+    /// verified with the generation's own TLS (`phase 4 M3 design 8.2`).
+    #[tokio::test]
+    async fn https_on_a_plain_connection_uses_the_rewrite_tls() {
+        let fixture = TlsFixture::new(&["localhost"]);
+        let origin = TestServer::spawn_tls_with(fixture.acceptor(false)).await;
+        origin.set("/secure", "secret");
+        let port = addr_of(&origin).port();
+        let (rules, counters) = rewrite_of(
+            &format!(
+                "[URL Rewrite]\n^http://target\\.test/a https://localhost:{port}/secure header"
+            ),
+            fixture.roots(),
+        );
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /a HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"secret");
+        assert_eq!(origin.hits("/secure"), 1, "the request reached the origin");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(counters.snapshot(), counted(1, 0, 0, 0));
+    }
+
+    /// The pool keeps a plain connection and one under TLS apart, so a request
+    /// a rewrite sent to `https` does not borrow the plain connection of the
+    /// request before it (`phase 4 M3 design 8.3`, `the phase 4 / M3a plan's
+    /// P14`).
+    #[tokio::test]
+    async fn the_pool_keeps_plain_and_tls_apart() {
+        let origin = TestServer::spawn().await;
+        origin.set("/plain", "plain");
+        let port = addr_of(&origin).port();
+        let (rules, counters) = rewrite_of(
+            &format!(
+                "[URL Rewrite]\n^http://target\\.test/tls https://target.test:{port}/plain header"
+            ),
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /plain HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"plain");
+        rig.client
+            .send("GET /tls HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        let page = String::from_utf8_lossy(&body);
+        assert!(page.contains("Upstream TLS handshake failed"), "{page}");
+        assert_eq!(
+            origin.connections(),
+            2,
+            "the plain connection was lent to the request that needs TLS"
+        );
+        let handle = rig.fake.finished(1).await;
+        match handle.outcome() {
+            Some(SessionOutcome::Failed(reason)) => assert!(
+                reason.starts_with("upstream TLS handshake failed: "),
+                "{reason}"
+            ),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(counters.snapshot(), counted(1, 0, 0, 0));
+    }
+
+    /// A rule whose expression backtracks too long is skipped with a note, and
+    /// the request goes on (`phase 4 M3 design 5.5`, `the phase 4 / M3a plan's
+    /// P11`).
+    #[tokio::test]
+    async fn a_backtracking_rule_does_not_stop_the_request() {
+        let origin = TestServer::spawn().await;
+        let path = format!("/{}", "ab".repeat(40));
+        origin.set(&path, "ok");
+        let (rules, counters) = rewrite_of(
+            "[URL Rewrite]\n(?i)(a|b|ab)*(?=c) http://b.test header",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send(&format!("GET {path} HTTP/1.1\r\nHost: x.test\r\n\r\n"))
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        let handle = rig.fake.finished(0).await;
+        let notes = rewrite_notes(&handle);
+        assert_eq!(
+            notes,
+            [
+                "URL Rewrite skipped: (?i)(a|b|ab)*(?=c): the regular expression hit its backtracking limit"
+            ],
+            "{notes:?}"
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 1, 0));
     }
 }

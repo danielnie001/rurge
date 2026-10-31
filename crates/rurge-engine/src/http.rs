@@ -13,6 +13,7 @@ use rurge_http::{Named, Pages, Refusal, Routed, Upstream, Upstreams};
 use rurge_inbound::{Close, ProcessSlot, ResponseBody, SessionHandle};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, Route, Target};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -150,6 +151,10 @@ impl Upstreams for ConnUpstreams {
                         route: way,
                         key,
                         pages,
+                        // the switch, the generation's rules and the policy the
+                        // rules chose are phase 4 / M3a task 6's to bring in
+                        // (`the phase 4 / M3a plan's P16`, `M3-D27`)
+                        rewrite: None,
                     }
                 }
                 Err(refused) => {
@@ -184,6 +189,33 @@ impl Upstreams for ConnUpstreams {
                     Err(refused.into())
                 }
             }
+        })
+    }
+
+    fn retarget(
+        &self,
+        way: Way,
+        key: PoolKey,
+        target: Target,
+        forwardable: bool,
+    ) -> (Way, PoolKey) {
+        let (mut way, mut key) = (way, key);
+        way.target = target.clone();
+        way.may_forward = forwardable;
+        key.target = target;
+        key.may_forward = forwardable;
+        // the attempts, the book and the generation are the ones the rules
+        // gave this request: a rewrite retargets it without asking them again
+        // (`phase 4 M3 design 8.2`)
+        (way, key)
+    }
+
+    fn gateway(&self) -> Option<Ipv4Addr> {
+        let network = self.engine.network();
+        let primary = network.primary.as_ref()?;
+        primary.routers.iter().find_map(|router| match router {
+            IpAddr::V4(gateway) => Some(*gateway),
+            IpAddr::V6(_) => None,
         })
     }
 

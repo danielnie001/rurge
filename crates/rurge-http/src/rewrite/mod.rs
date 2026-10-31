@@ -29,8 +29,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-pub(crate) use header::Headers;
-pub(crate) use url::UrlOutcome;
+pub(crate) use header::{Headers, HostChange, write_back_host};
+pub(crate) use url::{UrlOutcome, candidates, redirect, retarget_request};
 
 /// How long a rewritten request waits for its origin's TLS handshake: the same
 /// 30 seconds `rurge-engine` gives a decrypted connection's origin side
