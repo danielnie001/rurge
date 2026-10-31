@@ -965,6 +965,7 @@ async fn the_sniffs_are_counted() {
             },
             requests: 1,
             mitm: MitmCounts::default(),
+            rewrite: rurge_http::RewriteCounts::default(),
         }
     );
 }

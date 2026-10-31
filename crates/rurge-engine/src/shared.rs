@@ -211,6 +211,10 @@ pub struct EngineShared {
     /// 5.4): a generation built with the same material takes it on, so that
     /// the leaves and the TLS sessions it cached go on being used.
     pub mitm: Arc<MitmShared>,
+    /// What the rewrites of every generation did (`phase 4 M3 design 12`):
+    /// each generation's `Rewrite` counts into this one, so a reload keeps
+    /// the counts.
+    pub rewrite: Arc<rurge_http::RewriteCounters>,
 }
 
 impl EngineShared {
@@ -228,6 +232,7 @@ impl EngineShared {
             owners: None,
             sniff_wait: rurge_http::sniff::SNIFF_WAIT,
             mitm: Arc::new(MitmShared::new()),
+            rewrite: Arc::new(rurge_http::RewriteCounters::default()),
         }
     }
 }

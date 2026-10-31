@@ -80,7 +80,8 @@ pub struct SniffedCounts {
 
 /// The HTTP engine's counters (phase 4 M1 design 11), as `GET /v1/rurge/http`
 /// reads them: the sniffs of M1a, the requests that reached the rules since
-/// M1b, and what the decrypted connections did (`phase 4 M2 design 8.5`).
+/// M1b, what the decrypted connections did (`phase 4 M2 design 8.5`), and what
+/// the rewrites did (`phase 4 M3 design 12`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HttpCounts {
     pub sniffed: SniffedCounts,
@@ -88,6 +89,9 @@ pub struct HttpCounts {
     pub requests: u64,
     /// The MITM counts of the engine (`phase 4 M2 design 12.3`).
     pub mitm: crate::mitm::MitmCounts,
+    /// The rewrite counts of the engine (`phase 4 M3 design 12`): the
+    /// generation in use counts into them, and a reload keeps them.
+    pub rewrite: rurge_http::RewriteCounts,
 }
 
 /// The parts of one client connection that `serve_http` and `serve_mitm` set

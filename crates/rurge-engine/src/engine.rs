@@ -200,6 +200,11 @@ pub struct Engine {
     /// Unlike the mode it is not part of a generation: it takes effect for the
     /// next session and does not end the decrypted connections that are open.
     mitm_on: AtomicBool,
+    /// Whether this generation's rewrites act (`phase 4 M3 design 8.4`): on
+    /// unless `state.json` says otherwise. As `mitm_on`, it is not part of a
+    /// generation: it is read when a request is routed, so it takes effect for
+    /// the next request and does not end the requests that are open.
+    rewrite_on: AtomicBool,
     /// The pool of fake addresses of the TUN that runs, if one does (phase 3
     /// M3 design 13): the proxy listeners turn the fake addresses that come in
     /// at them back into names with it (`turn_back`). Set by `start_tun` and
@@ -284,6 +289,7 @@ impl Engine {
             suspended: ArcSwap::from_pointee(None),
             global_warned: AtomicBool::new(false),
             mitm_on: AtomicBool::new(true),
+            rewrite_on: AtomicBool::new(true),
             fake_pool: ArcSwapOption::empty(),
             sniff_counts: crate::serve::SniffCounts::default(),
             mitm_counts: crate::mitm::MitmCounters::default(),
@@ -754,6 +760,24 @@ impl Engine {
         }
     }
 
+    /// Whether this generation's `[URL Rewrite]` and `[Header Rewrite]` act
+    /// (`phase 4 M3 design 8.4`). On unless `state.json` said otherwise at
+    /// start.
+    pub fn rewrite_on(&self) -> bool {
+        self.rewrite_on.load(Ordering::Relaxed)
+    }
+
+    /// Sets the `rewrite` switch, and keeps it in `state.json` when one is
+    /// attached (the shape of `set_mitm`). A request that is already being
+    /// served goes on with the rules it was routed with; the next one reads
+    /// this.
+    pub async fn set_rewrite(&self, on: bool) {
+        self.rewrite_on.store(on, Ordering::Relaxed);
+        if let Some(store) = self.state.get() {
+            store.update(|s| s.features.rewrite = Some(on)).await;
+        }
+    }
+
     /// The switches `state.json` recorded at start (the plan's P20): only what
     /// was set is taken, and nothing is written — a start does not write the
     /// file, so a file of the first version stays as it is until something is
@@ -761,6 +785,9 @@ impl Engine {
     pub fn restore_switches(&self, features: &Features) {
         if let Some(on) = features.mitm {
             self.mitm_on.store(on, Ordering::Relaxed);
+        }
+        if let Some(on) = features.rewrite {
+            self.rewrite_on.store(on, Ordering::Relaxed);
         }
     }
 
@@ -1490,6 +1517,7 @@ impl Engine {
             sniffed: self.sniff_counts.snapshot(),
             requests: self.request_count.load(Ordering::Relaxed),
             mitm: self.mitm_counts.snapshot(),
+            rewrite: self.shared.rewrite.snapshot(),
         }
     }
     /// Kills an in-flight session by id (M4 `POST /v1/requests/{id}/kill`).

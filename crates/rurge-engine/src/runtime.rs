@@ -6,6 +6,7 @@ use crate::shared::{EngineShared, OwnResolve};
 use crate::stack::{DnsOverride, Stack, StackOptions, build_stack};
 use crate::subscriptions::Subscriptions;
 use rurge_config::{Config, Diagnostics};
+use rurge_http::Rewrite;
 use rurge_http::mitm::{Authority, Mitm};
 use rurge_net::connector::SystemResolve;
 use rurge_policy::PolicyRegistry;
@@ -59,6 +60,12 @@ pub struct Runtime {
     /// when `[MITM]` names no CA, when it cannot be used, or when TLS cannot
     /// be set up. Only the entries and the hand-over read it.
     pub(crate) mitm: Option<Arc<Mitm>>,
+    /// What this generation rewrites with (`phase 4 M3 design 8.4`): `None`
+    /// when neither section has a usable line, when the roots of the origin
+    /// side cannot be read, or when the TLS configurations cannot be built.
+    /// The switch of the engine and the policy a request took are asked
+    /// elsewhere (`M3-D27`).
+    pub(crate) rewrite: Option<Arc<Rewrite>>,
 }
 
 impl Runtime {
@@ -166,6 +173,7 @@ impl Runtime {
         // last: it reads the authority the previous generation left, and the
         // profile is not needed after it
         let mitm = build_mitm(&config, &opts.shared).await;
+        let rewrite = build_rewrite(&config, &opts.shared).await;
         Ok(Runtime {
             config: Arc::new(config),
             stack,
@@ -183,6 +191,7 @@ impl Runtime {
             pre_matched: Recorded::default(),
             dns_override,
             mitm,
+            rewrite,
         })
     }
 
@@ -273,6 +282,49 @@ async fn build_mitm(config: &Config, shared: &EngineShared) -> Option<Arc<Mitm>>
         Ok(mitm) => Some(Arc::new(mitm)),
         Err(e) => {
             tracing::warn!("MITM is off: cannot set up TLS: {e}");
+            None
+        }
+    }
+}
+
+/// This generation's rewrites (`phase 4 M3 design 8.4`, the phase 4 / M3a
+/// plan's P17).
+///
+/// Neither section with a usable line means `None`, and the roots of the
+/// origin side are not read at all then. They are read from the same place
+/// `build_mitm` reads them: the shared trust the caller brought when there is
+/// one, the operating system's otherwise, on a blocking thread.
+///
+/// A failure — the roots cannot be read, or the TLS configurations cannot be
+/// built — turns the rewrites of this generation off, not the engine: the
+/// next generation builds its own (`phase 4 M3 design 8.4`), and what says so
+/// is the log line the failure leaves.
+async fn build_rewrite(config: &Config, shared: &EngineShared) -> Option<Arc<Rewrite>> {
+    if config.rewrite.is_empty() {
+        return None;
+    }
+    let roots = match &shared.roots {
+        Some(roots) => Arc::clone(roots),
+        None => match tokio::task::spawn_blocking(rurge_net::tls::union_root_store).await {
+            Ok(roots) => roots,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "the roots of the origin side cannot be read; rewrites are off for this generation"
+                );
+                return None;
+            }
+        },
+    };
+    match Rewrite::build(
+        &config.rewrite,
+        &config.mitm,
+        roots,
+        Arc::clone(&shared.rewrite),
+    ) {
+        Ok(rewrite) => rewrite.map(Arc::new),
+        Err(e) => {
+            tracing::warn!("rewrites are off: cannot set up TLS: {e}");
             None
         }
     }

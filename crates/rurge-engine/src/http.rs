@@ -13,6 +13,7 @@ use rurge_http::{Named, Pages, Refusal, Routed, Upstream, Upstreams};
 use rurge_inbound::{Close, ProcessSlot, ResponseBody, SessionHandle};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, Route, Target};
+use rurge_policy::TerminalKind;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -147,14 +148,21 @@ impl Upstreams for ConnUpstreams {
                         may_forward: way.may_forward,
                         egress: rt.factory.egress_route(),
                     };
+                    // The switch of the engine and the policy the rules chose
+                    // (`phase 4 M3 design 8.4`, `M3-D27`): a request routed to
+                    // a REJECT keeps no rewrite at all, and one routed while
+                    // the switch is off gets none either.
+                    let rewrite =
+                        if self.engine.rewrite_on() && first.terminal != TerminalKind::Reject {
+                            rt.rewrite.clone()
+                        } else {
+                            None
+                        };
                     Routed::Go {
                         route: way,
                         key,
                         pages,
-                        // the switch, the generation's rules and the policy the
-                        // rules chose are phase 4 / M3a task 6's to bring in
-                        // (`the phase 4 / M3a plan's P16`, `M3-D27`)
-                        rewrite: None,
+                        rewrite,
                     }
                 }
                 Err(refused) => {
