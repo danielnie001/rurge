@@ -1,14 +1,18 @@
-//! `[URL Rewrite]` and `[Header Rewrite]` (manual: Features › URL Rewrite and
-//! Features › Header Rewrite): the lines as written, read once at load time.
+//! `[URL Rewrite]`, `[Header Rewrite]` and `[Body Rewrite]` (manual: Features ›
+//! URL Rewrite, Features › Header Rewrite and Features › Body Rewrite): the
+//! lines as written, read once at load time.
 //!
 //! A `[URL Rewrite]` line is `<regex> <replacement> [header | 302 | 307 |
 //! reject]`; a `[Header Rewrite]` line is `[http-request | http-response]
 //! <regex> <action> <name> …` with an action of `header-add`, `header-del`,
-//! `header-replace` or `header-replace-regex`. Both sections are read here the
-//! way the manual describes them (phase 4 M3 design 6.1 and 7.1, the phase 4 /
-//! M3a plan's P6): the engine only evaluates the rules this module keeps, and
-//! each rule keeps the span of its line so that the engine can name it in the
-//! request's notes.
+//! `header-replace` or `header-replace-regex`; a `[Body Rewrite]` line is
+//! `[http-request | http-response] <regex> <body pattern> <replacement>
+//! [<body pattern> <replacement> …]`, each pair applied in turn. A jq line
+//! (`http-request-jq` / `http-response-jq`) gives `W0042` and is not read. The
+//! three sections are read here the way the manual describes them (phase 4 M3
+//! design 6.1, 7.1 and 9.1, the phase 4 / M3a plan's P6): the engine only
+//! evaluates the rules this module keeps, and each rule keeps the span of its
+//! line so that the engine can name it in the request's notes.
 //!
 //! A `[URL Rewrite]` replacement may hold `{{{GATEWAY_ADDRESS}}}`. Whether it
 //! does is recorded here, at load time; the engine puts the gateway in only
@@ -16,23 +20,28 @@
 //! (phase 4 M3 design 6.4).
 
 use crate::diagnostic::{Diagnostic, Diagnostics, codes};
-use crate::dialect::Template;
+use crate::dialect::{BodyPattern, Template};
 use crate::rule::Pattern;
 use crate::span::Span;
 use crate::text::Entry;
 use crate::value::split_words;
 
-/// `[URL Rewrite]` and `[Header Rewrite]`: the rules as written, in order.
+/// `[URL Rewrite]`, `[Header Rewrite]` and `[Body Rewrite]`: the rules as
+/// written, in order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RewriteConfig {
     pub url: Vec<UrlRewrite>,
     pub header: Vec<HeaderRewrite>,
+    /// The lines of `[Body Rewrite]` that can be read, in the order written
+    /// (phase 4 M3 design 9.1); a jq line gives `W0042` and is not one of
+    /// them.
+    pub body: Vec<BodyRewrite>,
 }
 
 impl RewriteConfig {
-    /// Whether neither section has a usable line.
+    /// Whether no section has a usable line.
     pub fn is_empty(&self) -> bool {
-        self.url.is_empty() && self.header.is_empty()
+        self.url.is_empty() && self.header.is_empty() && self.body.is_empty()
     }
 }
 
@@ -76,6 +85,18 @@ pub struct HeaderRewrite {
     pub span: Span,
 }
 
+/// One `[Body Rewrite]` line (phase 4 M3 design 9.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BodyRewrite {
+    pub direction: Direction,
+    /// The expression for the URL the line takes effect on.
+    pub pattern: Pattern,
+    /// The body pattern and the replacement of each consecutive replacement,
+    /// in order.
+    pub pairs: Vec<(BodyPattern, Template)>,
+    pub span: Span,
+}
+
 /// The placeholder a `[URL Rewrite]` replacement may hold: the IPv4 default
 /// gateway, put in by the engine only for the `302` and `307` modes (phase 4
 /// M3 design 6.4).
@@ -109,6 +130,19 @@ const HEADER_REGEX: &str =
 const FRAMING: &str = "[Header Rewrite]: a rule on Content-Length or Transfer-Encoding fails every request whose framing it changes; the line is kept";
 /// `W0041`'s hint: why such a rule is kept but does what it does.
 const FRAMING_HINT: &str = "rurge lets no rewrite change how a message is framed: remove the line unless failing those requests is what it is for";
+/// A `[Body Rewrite]` line with no direction, fewer than a URL expression and
+/// a pair, or an odd number of items after the expression (phase 4 M3 design
+/// 9.1).
+const BODY_SHAPE: &str = "[Body Rewrite]: a line that is not `http-request | http-response <regex> <pattern> <replacement> [<pattern> <replacement> …]` is ignored";
+/// A `[Body Rewrite]` URL expression that does not compile; `{reason}` is why.
+const BODY_REGEX: &str =
+    "[Body Rewrite]: the regular expression cannot be used ({reason}); the line is ignored";
+/// A body pattern that neither engine compiles; `{reason}` is why.
+const BODY_PATTERN: &str =
+    "[Body Rewrite]: a body pattern cannot be used ({reason}); the line is ignored";
+/// `W0042`: a `[Body Rewrite]` line in the jq form (phase 4 M3 design 13).
+const JQ_UNAVAILABLE: &str =
+    "[Body Rewrite]: jq body rewrite is not available in this build of rurge; the line is ignored";
 
 /// What a `[Header Rewrite]` line does to the headers whose URL matches.
 #[derive(Clone, PartialEq, Eq)]
@@ -368,6 +402,83 @@ pub fn parse_header<'a>(
     rules
 }
 
+/// Reads the section's active lines in order.
+pub fn parse_body<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+    diags: &mut Diagnostics,
+) -> Vec<BodyRewrite> {
+    let mut rules = Vec::new();
+    for entry in entries {
+        let words = split_words(&entry.raw);
+        let first = words.first().map(|word| word.text.as_str());
+        let direction = if first.is_some_and(|word| word.eq_ignore_ascii_case("http-request")) {
+            Direction::Request
+        } else if first.is_some_and(|word| word.eq_ignore_ascii_case("http-response")) {
+            Direction::Response
+        } else if first.is_some_and(|word| word.eq_ignore_ascii_case("http-request-jq"))
+            || first.is_some_and(|word| word.eq_ignore_ascii_case("http-response-jq"))
+        {
+            diags.push(
+                Diagnostic::warning(codes::W_JQ_REWRITE_UNAVAILABLE, JQ_UNAVAILABLE)
+                    .at(entry.span.clone()),
+            );
+            continue;
+        } else {
+            diags.push(
+                Diagnostic::warning(codes::W_INVALID_VALUE, BODY_SHAPE).at(entry.span.clone()),
+            );
+            continue;
+        };
+        if words.len() < 4 || (words.len() - 2) % 2 != 0 {
+            diags.push(
+                Diagnostic::warning(codes::W_INVALID_VALUE, BODY_SHAPE).at(entry.span.clone()),
+            );
+            continue;
+        }
+        let pattern = match Pattern::new(&words[1].text) {
+            Ok(pattern) => pattern,
+            Err(reason) => {
+                diags.push(
+                    Diagnostic::warning(
+                        codes::W_INVALID_VALUE,
+                        BODY_REGEX.replace("{reason}", &reason),
+                    )
+                    .at(entry.span.clone()),
+                );
+                continue;
+            }
+        };
+        let mut pairs = Vec::new();
+        let mut ok = true;
+        for pair in words[2..].chunks(2) {
+            match BodyPattern::new(&pair[0].text) {
+                Ok(body) => pairs.push((body, Template::parse(&pair[1].text))),
+                Err(reason) => {
+                    diags.push(
+                        Diagnostic::warning(
+                            codes::W_INVALID_VALUE,
+                            BODY_PATTERN.replace("{reason}", &reason),
+                        )
+                        .at(entry.span.clone()),
+                    );
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        rules.push(BodyRewrite {
+            direction,
+            pattern,
+            pairs,
+            span: entry.span.clone(),
+        });
+    }
+    rules
+}
+
 /// RFC 9110's token: ASCII letters, digits and the fifteen punctuation
 /// characters the field-name grammar lists (`!`, `#`, `$`, `%`, `&`, `'`, `*`,
 /// `+`, `-`, `.`, `^`, `_`, the backtick, `|`, `~`).
@@ -440,6 +551,27 @@ mod tests {
 
     fn said(diags: &[Diagnostic]) -> Vec<(&'static str, &str)> {
         diags.iter().map(|d| (d.code, d.message.as_str())).collect()
+    }
+
+    /// The `[Body Rewrite]` rules of `lines`, read the same way.
+    fn read_body(lines: &str) -> (Vec<BodyRewrite>, Vec<Diagnostic>) {
+        let text = format!("[Body Rewrite]\n{lines}\n");
+        let (profile, mut diags) = parse_str(&text, Arc::from(Path::new("b.conf")), Origin::Main);
+        let found = parse_body(
+            profile
+                .section("Body Rewrite")
+                .into_iter()
+                .flat_map(Section::active_entries),
+            &mut diags,
+        );
+        (found, diags.into_vec())
+    }
+
+    /// `template` expanded with no groups.
+    fn expanded(template: &Template) -> String {
+        let mut out = String::new();
+        template.expand(&|_| None, 0, &mut out);
+        out
     }
 
     /// The lines the manual's URL Rewrite page writes.
@@ -722,5 +854,148 @@ http-response ^http://example.com header-replace-regex Date 2022 2023
         assert!(!shown.contains("s3cr3t-v"), "{shown}");
         assert!(!shown.contains("t3mpl"), "{shown}");
         assert!(shown.contains("X-Token"), "{shown}");
+    }
+
+    /// The lines the manual's Body Rewrite page writes (phase 4 M3 design
+    /// 9.1).
+    #[test]
+    fn body_rewrite_reads_the_manual_examples() {
+        let text = "\
+http-request ^http(s)?://example\\.com value abc
+\
+http-response ^http(s)?://example\\.com documents Surge
+\
+http-response ^https?://example\\.com/ regex1 replacement1 regex2 replacement2
+";
+        let (rules, diags) = read_body(text);
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(rules.len(), 3);
+        let directions: Vec<Direction> = rules.iter().map(|r| r.direction).collect();
+        assert_eq!(
+            directions,
+            [Direction::Request, Direction::Response, Direction::Response]
+        );
+        let sources: Vec<&str> = rules.iter().map(|r| r.pattern.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            [
+                r"^http(s)?://example\.com",
+                r"^http(s)?://example\.com",
+                r"^https?://example\.com/",
+            ]
+        );
+        let first: Vec<(&str, String)> = rules[0]
+            .pairs
+            .iter()
+            .map(|(pattern, template)| (pattern.source.as_str(), expanded(template)))
+            .collect();
+        assert_eq!(first, [("value", "abc".to_string())]);
+        let second: Vec<(&str, String)> = rules[1]
+            .pairs
+            .iter()
+            .map(|(pattern, template)| (pattern.source.as_str(), expanded(template)))
+            .collect();
+        assert_eq!(second, [("documents", "Surge".to_string())]);
+        let third: Vec<(&str, String)> = rules[2]
+            .pairs
+            .iter()
+            .map(|(pattern, template)| (pattern.source.as_str(), expanded(template)))
+            .collect();
+        assert_eq!(
+            third,
+            [
+                ("regex1", "replacement1".to_string()),
+                ("regex2", "replacement2".to_string()),
+            ]
+        );
+    }
+
+    /// A body rewrite line is a direction, a URL expression and one or more
+    /// pattern and replacement pairs (phase 4 M3 design 9.1).
+    #[test]
+    fn body_rewrite_shapes() {
+        let (rules, diags) = read_body("HTTP-REQUEST ^a b c");
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].direction, Direction::Request);
+        assert_eq!(rules[0].pattern.source, "^a");
+        assert_eq!(rules[0].pairs.len(), 1);
+        assert_eq!(rules[0].pairs[0].0.source, "b");
+        assert_eq!(expanded(&rules[0].pairs[0].1), "c");
+
+        let shape = "[Body Rewrite]: a line that is not `http-request | http-response <regex> <pattern> <replacement> [<pattern> <replacement> …]` is ignored";
+        for line in [
+            "http-response ^a b",
+            "http-response ^a",
+            "http-put ^a b c",
+            "http-response ^a b c d",
+        ] {
+            let (rules, diags) = read_body(line);
+            assert!(rules.is_empty(), "{line}");
+            assert_eq!(said(&diags), [("W0012", shape)], "{line}");
+        }
+
+        let (rules, diags) = read_body("http-response ^a b c d e");
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pairs.len(), 2);
+        assert_eq!(rules[0].pairs[1].0.source, "d");
+        assert_eq!(expanded(&rules[0].pairs[1].1), "e");
+
+        let (rules, diags) = read_body("http-request ( b c");
+        assert!(rules.is_empty());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "W0012");
+        assert!(
+            diags[0]
+                .message
+                .starts_with("[Body Rewrite]: the regular expression cannot be used ("),
+            "{}",
+            diags[0].message
+        );
+
+        let (rules, diags) = read_body("http-request ^a ( c");
+        assert!(rules.is_empty());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "W0012");
+        assert!(
+            diags[0]
+                .message
+                .starts_with("[Body Rewrite]: a body pattern cannot be used ("),
+            "{}",
+            diags[0].message
+        );
+
+        let (rules, diags) = read_body("http-request ^a \"x y\" \"1 2\"");
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(rules[0].pairs.len(), 1);
+        assert_eq!(rules[0].pairs[0].0.source, "x y");
+        assert_eq!(expanded(&rules[0].pairs[0].1), "1 2");
+    }
+
+    /// A `[Body Rewrite]` line in the jq form is ignored with `W0042`,
+    /// whatever it writes after the direction (phase 4 M3 design 13).
+    #[test]
+    fn jq_lines_are_ignored_with_w0042() {
+        let text = "\
+http-response-jq ^http://httpbingo.org/anything '.headers |= with_entries(select(.key | test(\"^X-\") | not))'
+\
+HTTP-REQUEST-JQ ^a .
+";
+        let (rules, diags) = read_body(text);
+        assert!(rules.is_empty());
+        assert_eq!(diags.len(), 2, "{:?}", said(&diags));
+        for (index, d) in diags.iter().enumerate() {
+            assert_eq!(d.code, "W0042");
+            assert_eq!(d.severity, Severity::Warning);
+            assert_eq!(
+                d.message,
+                "[Body Rewrite]: jq body rewrite is not available in this build of rurge; the line is ignored"
+            );
+            assert_eq!(
+                d.span.as_ref().map(|span| span.line),
+                Some(index as u32 + 2)
+            );
+        }
     }
 }

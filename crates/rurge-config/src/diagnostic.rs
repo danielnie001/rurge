@@ -285,6 +285,10 @@ pub mod codes {
     /// `[Map Local]` `header` are not used and the same code says so; the two
     /// places mean different things, so each carries a hint of its own.
     pub const W_REWRITE_FRAMING: &str = "W0041";
+    /// A `[Body Rewrite]` line in the jq form: this build has no jq, so the
+    /// line is ignored (phase 4 M3 design 13; M3c waits for the owner's
+    /// answer on new dependencies).
+    pub const W_JQ_REWRITE_UNAVAILABLE: &str = "W0042";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.
@@ -340,6 +344,8 @@ pub mod codes {
     /// - `W0031`: the cipher of an imported line is not the reader's to
     ///   change, and the message of the profile's own line says to use an AEAD
     ///   cipher.
+    /// - `W0042`: the message already says the line has no effect, and nothing
+    ///   in the profile but removing the line changes that.
     /// - `W0039`: no one sentence fits every problem it reports — each of
     ///   them says its own remedy in the message.
     /// - `I0001`, `I0002`, `I0003`, `I0004`, `I0005`: they inform.
@@ -508,6 +514,7 @@ mod tests {
         codes::W_PARAM_NOT_EFFECTIVE,
         codes::W_STREAM_CIPHER,
         codes::W_MITM_CA_UNUSABLE,
+        codes::W_JQ_REWRITE_UNAVAILABLE,
         codes::I_LEGACY_MIGRATED,
         codes::I_LINE_DISABLED,
         codes::I_GEOIP_DB_MISSING,

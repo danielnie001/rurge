@@ -247,9 +247,9 @@ pub struct Config {
     pub ssid_settings: Vec<SsidSetting>,
     /// `[IP Rewrite]`: the lines that can be read, in the order written.
     pub ip_rewrite: IpRewrite,
-    /// `[URL Rewrite]` and `[Header Rewrite]`: the lines that can be read,
-    /// in the order written (phase 4 M3 design 6.1 and 7.1). `[Body Rewrite]`
-    /// and `[Map Local]` follow in M3b.
+    /// `[URL Rewrite]`, `[Header Rewrite]` and `[Body Rewrite]`: the lines
+    /// that can be read, in the order written (phase 4 M3 design 6.1, 7.1 and
+    /// 9.1). `[Map Local]` follows in M3b.
     pub rewrite: RewriteConfig,
     pub deferred: DeferredSections,
     /// The `#!MANAGED-CONFIG` line of the text in effect: none when it is a
@@ -945,6 +945,13 @@ pub fn from_profile(
         header: rewrite::parse_header(
             profile
                 .section("Header Rewrite")
+                .into_iter()
+                .flat_map(Section::active_entries),
+            &mut diags,
+        ),
+        body: rewrite::parse_body(
+            profile
+                .section("Body Rewrite")
                 .into_iter()
                 .flat_map(Section::active_entries),
             &mut diags,
@@ -2768,6 +2775,34 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
             assert!(l.config.deferred.get("Header Rewrite").is_none(), "{url}");
             assert_eq!(l.config.rewrite.url.len(), 1, "{url}");
             assert_eq!(l.config.rewrite.header.len(), 1, "{url}");
+        }
+    }
+
+    /// `[Body Rewrite]` is a section rurge reads; a jq line is a warning of
+    /// its own, not a reason to defer the section (phase 4 M3 design 9.1).
+    #[test]
+    fn body_rewrite_is_read_and_no_longer_deferred() {
+        for section in ["Body Rewrite", "body rewrite"] {
+            let l = load_text(&format!(
+                "[{section}]\nhttp-response ^https?://example\\.com/ documents Surge\n\
+[Rule]\nFINAL,DIRECT\n"
+            ));
+            assert!(
+                !l.diagnostics.has_errors(),
+                "{section}: {:?}",
+                l.diagnostics.iter().collect::<Vec<_>>()
+            );
+            let c = codes_of(&l);
+            for unwanted in [
+                codes::W_DEFERRED_SECTION,
+                codes::W_UNKNOWN_SECTION,
+                codes::W_INVALID_VALUE,
+            ] {
+                assert!(!c.contains(&unwanted), "{section}: {c:?}");
+            }
+            assert!(l.config.unknown_sections.is_empty(), "{section}");
+            assert!(l.config.deferred.get("Body Rewrite").is_none(), "{section}");
+            assert_eq!(l.config.rewrite.body.len(), 1, "{section}");
         }
     }
 

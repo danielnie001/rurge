@@ -41,7 +41,7 @@ pub use config::{
 };
 pub use deferred::DeferredSections;
 pub use diagnostic::{Diagnostic, Diagnostics, ParseError, Severity, codes};
-pub use dialect::Template;
+pub use dialect::{BodyPattern, Template};
 pub use general::{
     BlockQuicGlobal, ControllerAccess, DnsServer, EncryptedDns, EncryptedDnsScheme, General,
     HijackTarget, Ipv6Vif, Listener, LogLevel, UdpFallback, UdpTest, UnknownKey,
@@ -58,7 +58,9 @@ pub use policy::{Builtin, GroupKind, NetType, PolicyGroup, PolicyKind, ProxyPoli
 pub use reach::Reach;
 pub use remote::{Remote, RemoteRef, RemoteRole, RemoteSource};
 pub use requirement::Environment;
-pub use rewrite::{Direction, HeaderAction, HeaderRewrite, RewriteConfig, UrlMode, UrlRewrite};
+pub use rewrite::{
+    BodyRewrite, Direction, HeaderAction, HeaderRewrite, RewriteConfig, UrlMode, UrlRewrite,
+};
 pub use rule::{
     HostnameType, InternalSet, ParseCtx, Pattern, PolicyRef, PortExpr, ProcessPattern,
     ProtocolKind, ResourceRef, Rule, RuleKind, RuleParams, SubRule,
