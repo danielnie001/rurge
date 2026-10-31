@@ -982,8 +982,7 @@ impl<U: Upstreams> Requests<U> {
                         &guard,
                         pages,
                         "Header Rewrite changed Content-Length or Transfer-Encoding".to_string(),
-                        "A Header Rewrite rule changed Content-Length or Transfer-Encoding, so the request was not sent."
-                            .to_string(),
+                        RESPONSE_FRAMING_LOST.to_string(),
                     );
                 }
             }
@@ -1019,8 +1018,7 @@ impl<U: Upstreams> Requests<U> {
                     &guard,
                     pages,
                     "Header Rewrite changed Content-Length or Transfer-Encoding".to_string(),
-                    "A Header Rewrite rule changed Content-Length or Transfer-Encoding, so the request was not sent."
-                        .to_string(),
+                    RESPONSE_FRAMING_LOST.to_string(),
                 );
             }
         }
@@ -2818,6 +2816,13 @@ const GOAWAY_GRACE: Duration = Duration::from_secs(1);
 /// (`phase 4 M2 design 10.1`, `the phase 4 / M2b plan's P6`): the tunnel of
 /// RFC 9113 §8.5 is not something rurge carries.
 const CONNECT_NOT_SUPPORTED: &str = "CONNECT over HTTP/2 is not supported";
+
+/// What the page of an answer a rewrite lost says (`phase 4 M3 design 7.3`,
+/// `the phase 4 / M3a plan's P15`, `execution record row 51`): the request went
+/// out and the origin answered, so what did not reach the client is the answer.
+/// The record keeps `Header Rewrite changed Content-Length or
+/// Transfer-Encoding` on both sides.
+const RESPONSE_FRAMING_LOST: &str = "A Header Rewrite rule changed Content-Length or Transfer-Encoding of the response, so the response was not passed on.";
 
 /// Serves `client` as HTTP/1.1 (`phase 4 M1 design 8.1`): until the connection
 /// ends or `requests`' connection token fires, and then until the connection
@@ -7491,9 +7496,15 @@ mod tests {
         let page = String::from_utf8_lossy(&body);
         assert!(
             page.contains(
-                "A Header Rewrite rule changed Content-Length or Transfer-Encoding, so the request was not sent."
+                "A Header Rewrite rule changed Content-Length or Transfer-Encoding of the response, so the response was not passed on."
             ),
             "{page}"
+        );
+        // the request went out and the origin answered: what did not is the
+        // response
+        assert!(
+            !page.contains("so the request was not sent"),
+            "a lost response says the request was not sent: {page}"
         );
         let handle = rig.fake.finished(0).await;
         assert_eq!(handle.status(), Some(502));
@@ -7518,5 +7529,62 @@ mod tests {
             "the connection of the failed answer was handed back"
         );
         assert_eq!(counters.snapshot(), counted(0, 1, 0, 1));
+    }
+
+    /// A rewritten `Host` that cannot be an HTTP/2 authority leaves the request
+    /// its own target and one note, however many times it is sent (`phase 4 M3
+    /// design 7.4`, `the phase 4 / M3a plan's P15`, execution record row 44).
+    ///
+    /// `a/b` is a value a header carries and no authority: `/` ends an
+    /// authority, so parsing the whole value as one fails. `Form::of` falls
+    /// back to the connection's target, `fit` succeeds, and only the write-back
+    /// fails — on the first send and on the one that follows the origin's
+    /// refusal.
+    #[tokio::test]
+    async fn a_host_that_is_no_authority_is_noted_once_across_a_resend() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = h2_origin(&fixture, OriginScript::RefuseAfterOne).await;
+        let mut rig = rig_tls(origin_tls_h2(fixture.roots(), "target.test"), origin.addr).await;
+        let (rules, counters) = rewrite_of(
+            "[Header Rewrite]\n\
+             http-request ^https://target\\.test/two header-replace Host a/b",
+            roots_of("rurge test rewrite CA"),
+        );
+        rig.fake.rewrite(rules);
+        // the first request dials the connection and the rule does not reach it
+        rig.client
+            .send("GET /one HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"/one");
+        // the second borrows it, is refused on it, and goes again on a
+        // connection of its own (`phase 4 / M2b plan P13`)
+        rig.client
+            .send("GET /two HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"/two", "the request went again, whole");
+        assert_eq!(rig.fake.dials(), 2, "a second connection for the retry");
+        let second = rig.fake.finished(1).await;
+        // two notes and no more: the rule acted, and the one write-back that
+        // could not be made was noted once although the request went twice
+        assert_eq!(
+            rewrite_notes(&second),
+            [
+                "Header Rewrite: request header-replace Host by ^https://target\\.test/two",
+                "Header Rewrite skipped: the rewritten Host is not a valid HTTP/2 authority"
+            ],
+            "the value no authority is leaves one note, not one per send"
+        );
+        let first = rig.fake.finished(0).await;
+        assert!(
+            rewrite_notes(&first).is_empty(),
+            "a request the rule does not reach leaves none"
+        );
+        assert_eq!(counters.snapshot(), counted(0, 1, 1, 0));
     }
 }
