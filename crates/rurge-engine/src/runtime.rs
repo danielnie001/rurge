@@ -8,7 +8,11 @@ use crate::subscriptions::Subscriptions;
 use rurge_config::{Config, Diagnostics};
 use rurge_http::Rewrite;
 use rurge_http::mitm::{Authority, Mitm};
+use rurge_http::rewrite::UrlData;
 use rurge_net::connector::SystemResolve;
+use rurge_net::resource::{
+    ResourceKind, ResourceManager, ResourceSource, ResourceSpec, resource_key,
+};
 use rurge_policy::PolicyRegistry;
 use rurge_rules::{OutboundMode, RuleEngine};
 use rurge_tun::TunSettings;
@@ -173,7 +177,7 @@ impl Runtime {
         // last: it reads the authority the previous generation left, and the
         // profile is not needed after it
         let mitm = build_mitm(&config, &opts.shared).await;
-        let rewrite = build_rewrite(&config, &opts.shared).await;
+        let rewrite = build_rewrite(&config, &opts.shared, &stack.resources).await;
         Ok(Runtime {
             config: Arc::new(config),
             stack,
@@ -298,8 +302,15 @@ async fn build_mitm(config: &Config, shared: &EngineShared) -> Option<Arc<Mitm>>
 /// A failure — the roots cannot be read, or the TLS configurations cannot be
 /// built — turns the rewrites of this generation off, not the engine: the
 /// next generation builds its own (`phase 4 M3 design 8.2`), and what says so
-/// is the log line the failure leaves.
-async fn build_rewrite(config: &Config, shared: &EngineShared) -> Option<Arc<Rewrite>> {
+/// is the log line the failure leaves. The data of a `[Map Local]` line that
+/// names a URL hangs on this generation's resource manager, so it is
+/// downloaded even while the `rewrite` switch is off (`phase 4 M3 design
+/// 10.3`); a generation that cannot go to the network never downloads it.
+async fn build_rewrite(
+    config: &Config,
+    shared: &EngineShared,
+    resources: &ResourceManager,
+) -> Option<Arc<Rewrite>> {
     if config.rewrite.is_empty() {
         return None;
     }
@@ -316,13 +327,40 @@ async fn build_rewrite(config: &Config, shared: &EngineShared) -> Option<Arc<Rew
             }
         },
     };
+    // The URL is a credential: neither the log line nor a label says more of
+    // it than `rurge_config::remote::origin`.
+    let url_data = |text: &str| -> UrlData {
+        let Ok(url) = url::Url::parse(text) else {
+            // The text came from a `MapData::Url`, which is a URL when it is
+            // read, so this cannot happen; a line that gets here has no data.
+            tracing::debug!("a Map Local URL cannot be read back as a URL");
+            return Arc::new(|| None);
+        };
+        let spec = ResourceSpec {
+            source: ResourceSource::Url(url.clone()),
+            update_interval: None,
+            kind: ResourceKind::MapLocal,
+        };
+        let key = resource_key(&spec.source);
+        let label = format!(
+            "map local data {} ({})",
+            key.get(..8).unwrap_or(&key),
+            rurge_config::remote::origin(&url)
+        );
+        let handle = resources.get_labelled(&spec, &label);
+        Arc::new(move || {
+            handle
+                .current()
+                .data()
+                .map(|(data, _)| data.as_ref().clone())
+        })
+    };
     match Rewrite::build(
         &config.rewrite,
         &config.mitm,
         roots,
         Arc::clone(&shared.rewrite),
-        // Map Local URLs get their data from the phase 4 / M3b plan's task 6 on.
-        &|_: &str| Arc::new(|| None),
+        &url_data,
     ) {
         Ok(rewrite) => rewrite.map(Arc::new),
         Err(e) => {

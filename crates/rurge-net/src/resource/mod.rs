@@ -59,6 +59,8 @@ pub enum ResourceKind {
     Profile,
     /// A file a profile includes from a URL.
     Include,
+    /// The data of a `[Map Local]` line that names a URL (phase 4 M3 design 10.3).
+    MapLocal,
     /// What the system keeps and rurge only watches: the hosts file.
     System,
 }

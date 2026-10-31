@@ -14,6 +14,7 @@ use hyper::client::conn::http2;
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rurge_config::{NetKind, NetworkFacts, Primary};
+use rurge_engine::ExternalResource;
 
 /// The engine's trust and the network it is on. Every engine here brings its
 /// own CA: a generation with any rewrite rule reads the roots of the origin
@@ -1843,4 +1844,184 @@ async fn notes_and_counts_reach_the_api_shape() {
         0,
         "the 302 answered the request without an upstream"
     );
+}
+
+// ---- the data of a `[Map Local]` line that names a URL (`phase 4 M3 design
+// ---- 10.3`; the phase 4 / M3b plan's P19): a resource of the generation.
+
+/// As `harness_with`, with downloads on: the GeoIP databases and the data of a
+/// `[Map Local]` URL ask `server`, and the listeners are bound as there. A
+/// name a case catches is pinned to `127.0.0.1` by `[Host]`.
+async fn online_harness(p: Profile<'_>, shared: EngineShared, server: &TestServer) -> Harness {
+    let dns = MockDns::spawn().await;
+    for name in ["target.test", "alt.test", "m.test"] {
+        dns.set(name, &["127.0.0.1"], &[], 60);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let text = p.text(dns.addr());
+    let engine = Engine::new(online_runtime_with(dir.path(), &text, server, shared, |_| {}).await);
+    let listeners = engine.bind_listeners().await.unwrap();
+    Harness {
+        dir,
+        engine,
+        listeners,
+        dns,
+    }
+}
+
+/// The items of the listing that are the data of a `[Map Local]` URL.
+fn map_local_data(h: &Harness) -> Vec<ExternalResource> {
+    h.engine
+        .external_resources(None)
+        .into_iter()
+        .filter(|resource| resource.kind == "data")
+        .collect()
+}
+
+/// The data of a `[Map Local]` line that names a URL is listed by the control
+/// plane as `data`, under a label that says where it comes from, and the
+/// request is answered from it once it is in: the origin the policy chose is
+/// never dialled, and the `Content-Type` follows the path's extension.
+#[tokio::test]
+async fn map_local_urls_are_listed_as_data() {
+    let server = TestServer::spawn().await;
+    server.set("/m.json", "{\"a\":1}");
+    let data = server.url("/m.json");
+    let origin = rurge_config::remote::origin(&data);
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let sections = format!("[Map Local]\n^http://m\\.test/ data=\"{data}\"");
+    let h = online_harness(
+        Profile {
+            proxies: &proxies,
+            hosts: "m.test = 127.0.0.1",
+            rules: "DOMAIN,m.test,guard",
+            sections: &sections,
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+        &server,
+    )
+    .await;
+
+    wait_until("the Map Local data to be downloaded", || {
+        map_local_data(&h).iter().any(|resource| resource.ready)
+    })
+    .await;
+    let listed = map_local_data(&h);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].kind, "data");
+    assert!(listed[0].path.starts_with("map local data "), "{listed:?}");
+    assert!(
+        listed[0].path.ends_with(&format!("({origin})")),
+        "{listed:?}"
+    );
+
+    let answer = plain_get(h.http(), "http://m.test/", "m.test").await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert_eq!(
+        header_value(&answer, "content-type").as_deref(),
+        Some("application/json"),
+        "{answer}"
+    );
+    assert!(answer.ends_with("{\"a\":1}"), "{answer}");
+    assert_eq!(
+        guard.connections(),
+        0,
+        "Map Local answered the request without an upstream"
+    );
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Completed, "{records:?}");
+    assert_eq!(
+        records[0].notes,
+        ["Map Local: file by ^http://m\\.test/".to_string()],
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.map_local, counts.failed), (1, 0), "{counts:?}");
+}
+
+/// A `[Map Local]` URL whose download failed answers 502, with the origin and
+/// not the data in the record; the policy is not dialled either.
+#[tokio::test]
+async fn map_local_url_data_that_never_came_answers_502() {
+    let server = TestServer::spawn().await;
+    let data = server.url("/m.json");
+    let origin = rurge_config::remote::origin(&data);
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let sections = format!("[Map Local]\n^http://m\\.test/ data=\"{data}\"");
+    let h = online_harness(
+        Profile {
+            proxies: &proxies,
+            hosts: "m.test = 127.0.0.1",
+            rules: "DOMAIN,m.test,guard",
+            sections: &sections,
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+        &server,
+    )
+    .await;
+
+    wait_until("the Map Local data to fail its first download", || {
+        map_local_data(&h)
+            .iter()
+            .any(|resource| resource.error.is_some())
+    })
+    .await;
+
+    let answer = plain_get(h.http(), "http://m.test/", "m.test").await;
+    assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+    assert_eq!(
+        guard.connections(),
+        0,
+        "a Map Local failure does not dial the policy"
+    );
+
+    let records = the_records(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    let unavailable = format!("Map Local: the data from {origin} is not available yet");
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some(unavailable.as_str()),
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.map_local, counts.failed), (0, 1), "{counts:?}");
+}
+
+/// Two `[Map Local]` lines that name the same URL are one resource: the first
+/// registration fixes the kind and the label (`phase 4 M3 design 10.3`).
+#[tokio::test]
+async fn the_same_map_local_url_is_one_resource() {
+    let server = TestServer::spawn().await;
+    server.set("/m.json", "{\"a\":1}");
+    let data = server.url("/m.json");
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let sections = format!(
+        "[Map Local]\n^http://m\\.test/a data=\"{data}\"\n^http://m\\.test/b data=\"{data}\""
+    );
+    let h = online_harness(
+        Profile {
+            proxies: &proxies,
+            hosts: "m.test = 127.0.0.1",
+            rules: "DOMAIN,m.test,guard",
+            sections: &sections,
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+        &server,
+    )
+    .await;
+
+    wait_until("the Map Local data to be downloaded", || {
+        map_local_data(&h).iter().any(|resource| resource.ready)
+    })
+    .await;
+    let listed = map_local_data(&h);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(server.hits("/m.json"), 1, "the URL is downloaded once");
 }

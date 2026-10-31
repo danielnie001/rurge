@@ -34,7 +34,8 @@ const DID_NOT_FINISH: &str = "the update did not finish";
 pub struct ExternalResource {
     /// How it is called: `ResourceStatus::shown()`.
     pub path: String,
-    /// `ruleset`, `domainset`, `policy-group`, `geoip`, `profile` or `include`.
+    /// `ruleset`, `domainset`, `policy-group`, `geoip`, `profile`, `include` or
+    /// `data`.
     pub kind: &'static str,
     pub key: String,
     pub local: bool,
@@ -85,6 +86,7 @@ fn type_name(kind: ResourceKind) -> Option<&'static str> {
         ResourceKind::GeoIp => Some("geoip"),
         ResourceKind::Profile => Some("profile"),
         ResourceKind::Include => Some("include"),
+        ResourceKind::MapLocal => Some("data"),
         ResourceKind::System => None,
     }
 }
@@ -423,6 +425,7 @@ mod tests {
             ResourceKind::GeoIp,
             ResourceKind::Profile,
             ResourceKind::Include,
+            ResourceKind::MapLocal,
             ResourceKind::System,
         ] {
             assert_eq!(set_kind(kind), None, "{kind:?}");
