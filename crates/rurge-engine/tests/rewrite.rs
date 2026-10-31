@@ -2040,6 +2040,7 @@ async fn the_same_map_local_url_is_one_resource() {
 struct ScriptedOrigin {
     addr: SocketAddr,
     heard: Heard,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// What a `ScriptedOrigin` keeps of the requests it was asked: each one's head
@@ -2068,11 +2069,14 @@ impl ScriptedOrigin {
         let addr = listener.local_addr().unwrap();
         let heard: Heard = Arc::default();
         let kept = heard.clone();
+        let accepted: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+        let counted = accepted.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let answer = answer.clone();
                 let kept = kept.clone();
                 let acceptor = acceptor.clone();
@@ -2093,7 +2097,11 @@ impl ScriptedOrigin {
                 });
             }
         });
-        ScriptedOrigin { addr, heard }
+        ScriptedOrigin {
+            addr,
+            heard,
+            accepted,
+        }
     }
 
     fn port(&self) -> u16 {
@@ -2104,6 +2112,14 @@ impl ScriptedOrigin {
     /// of a chunked request is its data, with the framing taken off.
     fn heard(&self) -> Vec<(String, Vec<u8>)> {
         self.heard.lock().unwrap().clone()
+    }
+
+    /// How many connections it took, whether a request came on them or not. A
+    /// case whose request must not even dial the origin asks after it waited
+    /// for the records: the accept loop runs on the case's own runtime, and has
+    /// taken any connection made by then.
+    fn connections(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -2771,7 +2787,7 @@ async fn the_manual_map_local_empty_result() {
 /// The manual's `[Body Rewrite]` page, "Limitations": "A request body may be
 /// buffered up to 32 MB; if it exceeds the limit, the connection is dropped".
 /// A body of exactly the limit is rewritten; one byte more and the connection
-/// is closed before a byte of the body is read and before the origin is asked
+/// is closed before a byte of the body is read and before the origin is dialled
 /// (`phase 4 M3 design 9.3`, `the phase 4 / M3b plan's P14`).
 #[tokio::test]
 async fn the_request_limit_is_thirty_two_mib() {
@@ -2794,18 +2810,16 @@ http-request ^http://big\.test:\d+/ ^a b",
     let limit = 32 * 1024 * 1024;
 
     // exactly the limit: the body is rewritten, and the length it goes out with
-    // is the one it came in with
-    let mut s = TcpStream::connect(h.http()).await.unwrap();
-    let head = format!(
+    // is the one it came in with. The head and the body go in one write, as
+    // `CLAUDE.md` asks of every request a case writes by hand.
+    let mut request = format!(
         "POST http://big.test:{port}/ HTTP/1.1\r\nHost: big.test:{port}\r\n\
          Content-Length: {limit}\r\nConnection: close\r\n\r\n"
-    );
-    s.write_all(head.as_bytes()).await.unwrap();
-    // the head and the body are not one write here (`CLAUDE.md`'s exception for
-    // a body of this size): the body goes in blocks of 64 KiB
-    for block in vec![b'a'; limit].chunks(64 * 1024) {
-        s.write_all(block).await.unwrap();
-    }
+    )
+    .into_bytes();
+    request.resize(request.len() + limit, b'a');
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    s.write_all(&request).await.unwrap();
     let mut buf = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(60), s.read_to_end(&mut buf)).await;
     let (answer, body) = answer_parts(&buf);
@@ -2857,6 +2871,13 @@ http-request ^http://big\.test:\d+/ ^a b",
                 .to_string()
         ],
         "{records:?}"
+    );
+    // the record is in, so the session is over: a dial it made for the request
+    // over the limit would have been taken by now
+    assert_eq!(
+        origin.connections(),
+        1,
+        "the origin was dialled for the first request only"
     );
     let counts = h.engine.http_counts().rewrite;
     assert_eq!(
@@ -3097,8 +3118,8 @@ http-request ^http://b\.test:\d+/ value abc",
     assert_eq!((counts.body, counts.skipped), (0, 1), "{counts:?}");
 }
 
-/// A body that says nothing about its length, for the an HTTP/2 client sends
-/// when it does not name one (`phase 4 M3 design 9.2`, `the phase 4 / M3b
+/// A body that says nothing about its length, as a request an HTTP/2 client
+/// sends without naming one has (`phase 4 M3 design 9.2`, `the phase 4 / M3b
 /// plan's P10`): hyper's client writes no `content-length` for a body whose
 /// size it cannot tell in advance, and this one tells nothing.
 struct Unmeasured(Bytes);
@@ -3308,12 +3329,15 @@ async fn an_http2_request_over_the_limit_resets_its_stream() {
             sent: false,
         })
         .expect("a request");
-    let answer = tokio::time::timeout(Duration::from_secs(5), sender.send_request(over)).await;
-    match answer {
-        // the stream was reset before an answer could come
-        Ok(Err(_)) | Err(_) => {}
-        Ok(Ok(response)) => panic!("the stream is reset, not answered: {}", response.status()),
-    }
+    // the stream is reset before an answer could come, and within the bound
+    let answer = tokio::time::timeout(Duration::from_secs(5), sender.send_request(over))
+        .await
+        .expect("the stream is reset within the bound");
+    assert!(
+        answer.is_err(),
+        "the stream is reset, not answered: {:?}",
+        answer.map(|response| response.status())
+    );
 
     // the same connection still answers the request after it
     let next = Request::builder()
@@ -3346,6 +3370,16 @@ async fn an_http2_request_over_the_limit_resets_its_stream() {
     assert_eq!(records.len(), 2, "{records:?}");
     assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
     assert_eq!(records[1].status, RecordStatus::Completed, "{records:?}");
+    // the request over the limit was never dialled: the origin heard the one
+    // after it alone, on the one connection it took
+    let heard = origin.heard();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0].0.starts_with("GET /next HTTP/1.1"),
+        "{}",
+        heard[0].0
+    );
+    assert_eq!(origin.connections(), 1, "{heard:?}");
     let counts = h.engine.http_counts().rewrite;
     assert_eq!(
         (counts.body, counts.skipped, counts.failed),
