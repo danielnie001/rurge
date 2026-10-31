@@ -179,8 +179,8 @@ pub fn split_list(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// One word of a line cut at the blanks outside quotes (design 4.1, the
-/// phase 4 / M3a plan's P2).
+/// One word of a line cut at the blanks outside quotes (phase 4 M3 design
+/// 4.1, the phase 4 / M3a plan's P2).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Word {
     /// The word with the quotes taken off when the whole of it is in them.
@@ -203,11 +203,11 @@ impl std::fmt::Debug for Word {
     }
 }
 
-/// The words of a line, cut at the spaces and tabs outside quotes (design
-/// 4.1, the phase 4 / M3a plan's P2). A quote opens where a word starts or
-/// right after the word's first `=`; a quote without a partner runs to the
-/// end of the line; anywhere else a quote is a character. A blank line has no
-/// words.
+/// The words of a line, cut at the spaces and tabs outside quotes (phase 4
+/// M3 design 4.1, the phase 4 / M3a plan's P2). A quote opens where a word
+/// starts or right after the word's first `=`; a quote without a partner runs
+/// to the end of the line; anywhere else a quote is a character. A blank line
+/// has no words.
 pub fn split_words(text: &str) -> Vec<Word> {
     let bytes = text.as_bytes();
     let mut words = Vec::new();
@@ -826,8 +826,8 @@ mod tests {
         assert!(split_words("   ").is_empty());
     }
 
-    /// Both quotes hold a blank: inside them the line does not cut (design
-    /// 4.1).
+    /// Both quotes hold a blank: inside them the line does not cut (phase 4
+    /// M3 design 4.1).
     #[test]
     fn split_words_reads_both_quotes() {
         let words = split_words(r#""a b" 'c d' e"#);
@@ -847,7 +847,7 @@ mod tests {
     }
 
     /// Inside `"` a backslash takes the next character with it, inside `'`
-    /// nothing escapes (line-splitting design LS-D4, design 4.1).
+    /// nothing escapes (line-splitting design LS-D4, phase 4 M3 design 4.1).
     #[test]
     fn split_words_unescapes_only_inside_double_quotes() {
         let words = split_words(r#""a\"b\\c\d" 'x\y'"#);
@@ -857,8 +857,8 @@ mod tests {
     }
 
     /// A value in quotes right after the word's first `=` is the word's
-    /// parameter, while the word itself is still the text as written (design
-    /// 4.1, the phase 4 / M3a plan's P2).
+    /// parameter, while the word itself is still the text as written (phase 4
+    /// M3 design 4.1, the phase 4 / M3a plan's P2).
     #[test]
     fn split_words_reads_a_quoted_value_after_the_first_equals() {
         let words = split_words(r#"data="a b" k=v x"#);
@@ -876,7 +876,7 @@ mod tests {
     }
 
     /// A quote with no partner runs to the end of the line, and the word is
-    /// the text as written, the quote included (design 4.1).
+    /// the text as written, the quote included (phase 4 M3 design 4.1).
     #[test]
     fn an_unpaired_quote_runs_to_the_end() {
         let text = r#"a "b c"#;
@@ -888,7 +888,7 @@ mod tests {
     }
 
     /// A quote anywhere but the start of a word or right after its first `=`
-    /// is an ordinary character (design 4.1).
+    /// is an ordinary character (phase 4 M3 design 4.1).
     #[test]
     fn a_quote_inside_a_word_is_a_character() {
         let words = split_words(r#"a"b c"d"#);
@@ -898,8 +898,8 @@ mod tests {
         assert!(words.iter().all(|w| !w.quoted));
     }
 
-    /// An empty quoted word is a word: `header-add X ""` needs one (design
-    /// 4.1, the phase 4 / M3a plan's P2).
+    /// An empty quoted word is a word: `header-add X ""` needs one (phase 4
+    /// M3 design 4.1, the phase 4 / M3a plan's P2).
     #[test]
     fn an_empty_quoted_word_is_kept() {
         let words = split_words(r#"x """#);
