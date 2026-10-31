@@ -201,6 +201,9 @@ cargo test -j 8 --workspace --lib -- dialect   # 阶段 4 / M3a，`rurge-config`
 cargo test -j 8 --workspace --lib -- rewrite   # 阶段 4 / M3a：这个过滤词一共选中 58 条（一台机器上的一次运行，`-- --list` 数）——`rurge-config` 14 条（`rewrite::tests::` 7 条：两个节的读法与每一种诊断、`header-replace` 换成一行、框架头的 `W0041`、值的两种写法、`Debug`；`dialect::tests::translate_rewrites_the_icu_escapes`、`redact::tests::rewrite_lines_are_shown_as_written`、`config::tests::rewrite_sections_are_read_and_no_longer_deferred` 各 1 条；`[IP Rewrite]` 的 4 条）、`rurge-http` 21 条（`rewrite::tests::` 4 条、`rewrite::url::tests::` 9 条、`rewrite::header::tests::` 6 条，另加 `engine::tests::` 里名字带 `rewrite` 的 2 条）、`rurge-policy` 1 条、`rurge-rules` 1 条、`rurge-tun` 21 条（阶段 3 / M5 的 `tests::rewrite::`，与 M3a 无关）
 cargo test -j 8 --workspace --lib -- headers_are_rewritten not_rewritten head_is_rewritten redirect_is_answered rewrite_reject header_mode_sends retargeted changed_host_is_written_back deleting_ request_whose_framing response_whose_framing plain_connection_uses_the_rewrite pool_keeps_plain backtracking_rule origin_keys host_that_is_no_authority   # 阶段 4 / M3a，`rurge-http` 的引擎里 M3a 加的 18 条：它们没有共同的词，这 16 个过滤词正好选中这 18 条（一条不多、一条不少）。M3a 之后 `--lib -- engine::tests::` 一共选中 151 条（`rurge-http` 79、`rurge-engine` 9、`rurge-rules` 63）
 cargo test -j 8 --workspace --test rewrite   # 阶段 4 / M3a，经引擎的端到端（23 条）：手册的两页黄金用例（`header`、`302`、`307`、`reject`、"Matching details"、Header Rewrite 页的四种动作与省略方向、`header-del` 与 `header-add` 连用、改框架头而失败）、开关、被拒的请求不重写、`302` 带网关、计数跨重载，以及解密的 `https://` 请求、解密的 HTTP/2 请求改写到明文、`http://` 改写成 `https://`、明文与 TLS 不共用连接、经转发的代理、`Host` 的写回与删除、嗅探到的连接上的绝对形式、`Proxy-Authorization`、回溯超限、头的值与查询串不进备注与日志、六个计数
+cargo test -j 8 --workspace --lib -- body   # 阶段 4 / M3b：这个过滤词一共选中 90 条（一台机器上的一次运行，`-- --list` 数）——`rurge-http` 34 条（`rewrite::body::tests::` 的 23 条是任务 3、4 的全部单元用例，另有 `engine::tests::` 里名字带 `body` 的 11 条）、`rurge-config` 9 条（`dialect::tests::` 里 `BodyPattern` 的 5 条、`rewrite::tests::` 2 条、`config::tests::` 1 条、`keystore::tests::` 1 条）、`rurge-net` 27 条（大多是名字里带 `nobody` 的，与正文无关）、`rurge-engine` 7 条、`rurge-dns` 4 条、`rurge-policy` 3 条、`rurge-proto-quic` 2 条、`rurge-tun` 2 条、`rurge-platform` 与 `rurge-rules` 各 1 条；`body` 也命中 `nobody`，所以 90 条不是 Body Rewrite 的条数
+cargo test -j 8 --workspace --lib -- map_local   # 阶段 4 / M3b：20 条（一台机器上的一次运行，`-- --list` 数）——`rurge-config` 11 条（`rewrite::tests::` 8 条、`config::tests::` 2 条、`reach::tests::` 1 条）、`rurge-http` 9 条（`rewrite::map_local::tests::` 5 条、`engine::tests::` 4 条）
+cargo test -j 8 --workspace --test rewrite   # 阶段 4 / M3b 之后 50 条：M3a 的 23 条，加 M3b 的 27 条（任务 6 的 3 条与任务 7 的 24 条）
 # 阶段 3 / M5 重跑的基准读数（一台机器上的一次运行、**不是 CI**；release，`TUN_BENCH_FAR=memory`；命令仍是上面 B1 / B2 / b3 那三条）：B1 八个量出来的行都过 0.7 Gbit/s 的线（最低的一行 4.065，是线的 5.8 倍），四个计数都是 0，中位数上行 8.03、下行 4.84 Gbit/s（两个 MTU 混在一起，只作量级）；同设置（MTU 1500、`tx_max` 256 KiB）的 5.717 / 5.172 是上一次的 79.7% 与 94.7%。B2 门槛读数（峰值减去全部测试一侧的项）403,671,140 字节（403.7 MB / 385.0 MiB），在线 429,000,000 字节以内、余量 25.3 MB；保守读数（只减去准的应用端套接字缓冲）445,333,604 字节（445.3 MB），超线 16.3 MB——这个读数照旧归项目所有者，这里只记数。b3 中位数 0.9 微秒、p99 2.9 微秒，最大 4542.2 微秒（4.5 ms，落在第 28,673 个查询上，是线的 22.7 倍，两处都是池的 `HashMap` 的翻倍处，读代码与算术得出）。细节与上一次不同的原因见计划「执行期修正记录」第 61 ～ 63 行
 cargo insta test -p rurge-config --review       # 语料库快照有变化时审阅
 cargo clippy --all-targets -- -D warnings       # 零警告（CI 设 RUSTUP_TOOLCHAIN=1.89.0，与本机的 MSRV 工具链一致；更新的 clippy 会多出 lint）
@@ -490,3 +493,39 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 十、**手写的上游代理收到 `CONNECT` 记下之后立刻关连接**（`tests/rewrite.rs` 的 `RecordingProxy`）：否则对它的 TLS 握手要等 `REWRITE_HANDSHAKE` 的 30 秒。
 
 十一、**带等待的 M3a 用例提交前各自单独循环跑二十次以上**（全过才算数）：任务 5 的 14 条一圈、应答一侧的 2 条一圈、修正轮 1 的 2 条一圈；任务 6 的 `tests/rewrite.rs` 4 条、`--test api` 的 1 条与 `--test cli` 的 1 条各一圈；任务 7 的两批（7 条与 12 条）各一圈。日志与命令行在工作区（git 忽略）：`task-5-loop-a.log`、`task-5-loop-b.log`、`task-5-fix-1-loop.log`、`loop-task-6a.log`、`loop-task-6b-api.log`、`loop-task-6b-cli.log`、`loop-task-7a.log`、`loop-task-7b.log`。
+
+### 阶段 4 / M3b 起：Body Rewrite 与 Map Local
+
+阶段 4 / M3b 起另有几条（计划 `docs/superpowers/plans/2026-10-31-phase4-m3b-body-rewrite-map-local-plan.md`，下面写“M3b 记录第 N 行”指它末尾的「执行期修正记录」，写“延后事项第 N 行”指同一份计划的另一张表；M1a、M1b、M2a、M2b、M2c、M3a 与 M3b 的提交都在本地，CI 都没有见过）：
+
+一、**大正文在用例里生成，上限用真的**（P9、P11）：32 MiB 与 10 MiB 的边界用例（`crates/rurge-engine/tests/rewrite.rs` 的 `the_request_limit_is_thirty_two_mib` 与 `the_response_limit_is_ten_mib`）在内存里写重复的 ASCII，不写磁盘上的大文件；超过上限而不该读的请求正文只发头。验机制的单元用例用小上限（第 46 行第 (2) 条：`crates/rurge-http/src/rewrite/body.rs` 的 `Limit { bytes: 4, text: "4 bytes" }`），解压炸弹的输入当场压出来；回溯超限的式子用 `BodyPattern::with_backtrack_limit(.., 1000)` 造（第 46 行第 (1) 条）。
+
+二、**Map Local 的文件只在 `tempfile` 的临时目录里**（`Harness.dir` 就是 Profile 所在的目录，手册的相对路径 `data/map-local.json` 接在那里）；URL 的数据只经回环上的 `TestServer` 与在线的一代（`crates/rurge-engine/tests/rewrite.rs` 的 `online_harness`，经 `common` 的 `online_runtime_with`）。等下载好或失败用 `wait_until` 看外部资源列表里那一项的 `ready` 或 `error`，不用固定的等待（第 67 行）。
+
+三、**抓日志的用例用 `LogCapture`，断言的写法照 `tracing` 缺省格式器**（第 74 行第 ⑤ 条）：字段的值是 `Debug`，带引号、反斜杠成双，例如 `pattern="^http://b\\.test:\\d+/"`、`host="b.test"`。数 WARN 的用例也用它——一条规则一小时至多一行，`warnings_come_at_most_once_an_hour` 是 `rurge-http` 的单元用例。
+
+四、**断言一组头的名字时排序之后比、不断言次序**（第 46 行第 (3) 条）：`HeaderMap::keys()` 的次序不是插入的次序。
+
+五、**Map Local 的答复“已经开始”以客户端读到应答头为准，不看 `handle.bytes()`**（第 53 行第 (1) 条）：它没有上游连接，下行字节始终是 0。
+
+六、**测试客户端读整个 chunked 正文以 10 秒为限，`fill` 每次读以 5 秒为限**（第 65 行第 ③ 条）：`crates/rurge-http/src/engine.rs` 测试模块的 `Client::response_chunked` 与 `response_any` 给整份正文套 10 秒，`fill` 限的是一次读（5 秒）；`crates/rurge-engine/tests/rewrite.rs` 的 `answer_bytes` 是前一种的同一写法。
+
+七、**trailer 只在两端都讲 HTTP/2 时断言**（第 20、60 行）：客户端经 `rig_tls_h2`、源站是 `h2_origin` 的 `OriginScript::Trailers`（`crates/rurge-http/src/engine.rs` 测试模块的 `an_unchanged_response_keeps_its_bytes_and_trailers`）；HTTP/1.1 的那一半只断言正文的字节与头不变、照旧 chunked 分帧，不断言 trailer——到 HTTP/1.1 客户端的 trailer 一个也不转。
+
+八、**要断言源站收到的请求，或要源站答一段指定的字节（chunked、压缩过、发到一半停住），用 `crates/rurge-engine/tests/rewrite.rs` 的 `ScriptedOrigin`**（第 73 行、第 74 行第 ③ 条）：`spawn` / `spawn_tls`，`heard()` 是每个请求的头与去掉分帧的正文，`connections()` 数它接过几条连接；TLS 的源站只给 `http/1.1`，用例才读得回它收到的东西。只读头的用 `RecordingOrigin`（第 76 行订正了 P20 里说用 `RecordingOrigin` 的那一句）。
+
+九、**超过 10 MiB 的应答原样流过：只断言客户端收到的字节**（照它收到的分帧取正文，`answer_parts`），不断言分帧（第 64 行把它留给任务 7；就是 `the_response_limit_is_ten_mib`）。
+
+十、**手写的请求连 32 MiB 的正文也一次写出**（第 76 行第 ① 条、第 77 行）：`CLAUDE.md` 那一条没有为大正文开的例外；超过上限的请求只发头。
+
+十一、**“源站没有被连过”用 `connections()` 断言，读在记录落定之后**（第 76 行第 ②、③ 条，第 77 行）。
+
+十二、**讲 HTTP/2 的客户端**（第 74 行第 ①、② 条，第 75 行）：请求的 `:authority` 带源站的端口（引擎照它拨号，不带就拨 443）；长度不知道的正文与头里说了长度的正文各用一个自己的 body 类型，`is_end_stream` 照实写（缺省是 `false`，引擎会把没有正文的请求当成“没有长度”）；连接任务要 `tokio::spawn`。
+
+十三、**gzip 的字节由用例当场写**（第 74 行第 ④ 条）：`gzipped` 与 `crc32`（stored 块），`rurge-engine` 的测试没有 `flate2` 开发依赖。
+
+十四、**手册的 `[Body Rewrite]` 行把 `/` 紧接在主机后**（第 73 行）：测试源站的端口插在中间，带斜杠的式子写 `:\d+`（M6 写进验收文档）。
+
+十五、**`rurge-net` 的单元测试要关着的端口时用 `rurge_net::testing` 的 `closed_udp_port` / `closed_tcp_port`**（第 69 ～ 71 行；同 `rurge-engine` 测试 `common` 里的那两个），不要取 0 号端口、放掉再用；全工作区还没改的五处在延后事项第 1 行。
+
+十六、**带等待的 M3b 用例提交前各自单独循环跑二十次以上**（全过才算数）：任务 5 的 `tests::map_local` 3 条一圈、请求正文的 3 条一圈、应答正文的 4 条一圈；任务 6 的 `the_same_map_local_url_is_one_resource` 一条 20 次；任务 6a 的整个 `rurge_net` 测试二进制 20 次（每次 336 条全过）；任务 7 的 10 条各 20 次、修正轮 1 的 2 条各 20 次。日志与命令行在工作区（git 忽略）：`loop-task-5b-map-local.log`、`loop-task-5c-body-request.log`、`loop-task-5d-body-response.log`、`loop-task-6.log`、`loop-task-6a.log`、`loop-task-7.log`、`loop-task-7-fix1.log`。

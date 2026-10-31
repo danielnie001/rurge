@@ -2,11 +2,11 @@
 
 需要真实的浏览器、真实的网站、真实的手机与真实的信任库的项目。自动化测试只用回环地址：源站是测试自己的 TLS 服务器，客户端是 rustls 的客户端，MITM 的 CA 在内存里或用例的临时目录里生成，**从不装进任何信任库**（总设计 P4-D26、M2-D24），`rurge mitm ca generate` 打印的装 CA 命令与 `curl --pinnedpubkey` 一类只有真客户端才有的行为都没有执行过。所以下面这些覆盖不了：真浏览器与真站点的握手与 ALPN、真源站的证书链（过期的、自签的）、浏览器与操作系统怎么看待 rurge 装的 CA、证书固定的真实表现、Android 与 iOS 上的信任设置、局域网里别的设备经 rurge 上网。由项目所有者在自己的机器上验收；每一项记下日期、系统版本与结果。**一项也没有做过。**
 
-清单随里程碑逐节增加：下面是 M1（会话入口与明文 HTTP 引擎）与 M2（MITM：M2a 的 HTTP/1.1、M2b 的 HTTP/2 与 M2c 的 CA 工具与 `http-api-tls`，合成一节），M3 ～ M6 的项随各自的里程碑加。M1 的设计见 `docs/superpowers/specs/2026-10-29-phase4-m1-session-entry-http-engine-design.md`，M2 的设计见 `docs/superpowers/specs/2026-10-30-phase4-m2-mitm-design.md`（先读它第 23 节，第 22 ～ 27 条是 M2c 对正文的订正）；API、记录字段与日志行见 `docs/api/phase4.md`，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 2.1、7.1、7.2、10.4 节。**M1 的项在 `rurge run` 上就能做（增强模式那三条除外：W2、M2、L2）；M2 的项都要先装 CA 并让浏览器信任它，做完要把 CA 卸掉。**
+清单随里程碑逐节增加：下面是 M1（会话入口与明文 HTTP 引擎）与 M2（MITM：M2a 的 HTTP/1.1、M2b 的 HTTP/2 与 M2c 的 CA 工具与 `http-api-tls`，合成一节），M3 ～ M6 的项随各自的里程碑加。M1 的设计见 `docs/superpowers/specs/2026-10-29-phase4-m1-session-entry-http-engine-design.md`，M2 的设计见 `docs/superpowers/specs/2026-10-30-phase4-m2-mitm-design.md`（先读它第 23 节，第 22 ～ 27 条是 M2c 对正文的订正）；API、记录字段与日志行见 `docs/api/phase4.md`，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 2.1、7.1、7.2、10.4 节。**M1 的项在 `rurge run` 上就能做（增强模式那三条除外：W2、M2、L2）；M2 的项都要先装 CA 并让浏览器信任它，做完要把 CA 卸掉。**M3（重写与 Map Local）的项 2026-10-31 加在这一份里，四级表的编号接着 M2 的数（W6、M6、L6 与 P7 起）。
 
 ## 怎么用
 
-**先做哪一节。** 建议的次序是 M1 → M2：M1 不需要 CA，先把三种入口与明文 HTTP 的记录认下来；M2 先做「生成与安装 CA」那一条，其余都是拿着这份 CA 做。每一节里先做不改系统设置的项，再做装 CA、开增强模式、改系统代理的项；做完一项就恢复一次（卸 CA、关增强模式、把系统代理改回去），别把几项叠在一起做。
+**先做哪一节。** 建议的次序是 M1 → M2：M1 不需要 CA，先把三种入口与明文 HTTP 的记录认下来；M2 先做「生成与安装 CA」那一条，其余都是拿着这份 CA 做。每一节里先做不改系统设置的项，再做装 CA、开增强模式、改系统代理的项；做完一项就恢复一次（卸 CA、关增强模式、把系统代理改回去），别把几项叠在一起做。M3 一节接在 M2 之后：先做它明文的三项与 P7 ～ P9，再做要 CA 的 W7、M7、L7 与 P10；CA 照样做完就卸。
 
 **共用的前置条件。**
 - `cargo build --release`，用得到的二进制（`target/release/rurge`，Windows 下是 `target\release\rurge.exe`）。下文按平台写作 `rurge.exe`（Windows）或 `./rurge`（macOS / Linux）。
@@ -23,7 +23,7 @@
   FINAL,DIRECT
   ```
 
-  M2 的 Profile 在这一份之后多一个 `[MITM]` 节，内容见 M2 一节的前置条件。每一项要加的规则写在 `[Rule]` 里 `FINAL,DIRECT` 的前面；改完重启 `rurge run`（`[General]` 里的 `http-api` 与 `http-api-tls` 只在重启时才生效，见 M2 一节的 W4）。
+  M2 的 Profile 在这一份之后多一个 `[MITM]` 节，内容见 M2 一节的前置条件。每一项要加的规则写在 `[Rule]` 里 `FINAL,DIRECT` 的前面；改完重启 `rurge run`（`[General]` 里的 `http-api` 与 `http-api-tls` 只在重启时才生效，见 M2 一节的 W4）。M3 的 Profile 在 M2 那一份之后再多四个节（`[URL Rewrite]`、`[Header Rewrite]`、`[Body Rewrite]` 与 `[Map Local]`），内容见 M3 一节的前置条件。
 - 你自己的浏览器（M1 用惯用的那个即可；M2 每个平台用两个：Windows 的 Edge 与 Chrome、macOS 的 Safari 与 Chrome、Linux 的 Firefox 与 Chromium）与 `curl`（Windows 用 `curl.exe`）。
 - 让浏览器走 rurge 的代理，按浏览器分三种写法（前两种不改系统设置）：
   - **Edge、Chrome 与 Chromium**：带参数另起一个实例，把 `--user-data-dir=<一个新的空目录>` 与 `--proxy-server="http://127.0.0.1:6152"`（HTTP 代理那一次）或 `--proxy-server="socks5://127.0.0.1:6153"`（SOCKS5 那一次）一起给；这样主机名由 rurge 解析。Chromium 带参数启动之前要退出正在运行的实例，新的数据目录就是另起一个实例；关掉窗口就没了。程序名：Windows 的 `msedge.exe` / `chrome.exe`，macOS 的 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`（路径带空格，要引号），Linux 的 `chromium` / `google-chrome`。
@@ -77,10 +77,10 @@ to trust it (rurge does not install it; run these where the files are):
 
 | 第 7 节 | 要看到什么 | Windows | macOS | Linux | 与平台无关 |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 手册中每个重写示例有对应测试 | — | — | — | 重写（URL / Header / Body）与 Map Local 是 M3 的事，那时才有项；这些项的形态是用例，不是手工项 |
+| 1 | 手册中每个重写示例有对应测试 | — | — | — | 由任务 7 的黄金用例证明、不是手工项：`crates/rurge-engine/tests/rewrite.rs` 的 `the_manual_url_rewrite_header_example`、`the_manual_url_rewrite_302_and_307_examples`、`the_manual_url_rewrite_reject_example`、`the_manual_matching_details_example`、`the_manual_header_rewrite_examples` 与 Body Rewrite、Map Local 的那六条逐条照手册的示例行；手工项 W6、M6、L6 拿真实浏览器的流量与它们对照 |
 | 2 | 主流站点 MITM 解密成功且证书固定站点给出提示 | W2、W3 | M2、M3 | L2、L3 | P1（证书固定的提示）、P2 ～ P5 |
-| 3 | Body Rewrite 与 jq 用例通过 | — | — | — | M3 之后才有项 |
-| 4 | 大小限制行为与手册一致 | — | — | — | M3 之后才有项 |
+| 3 | Body Rewrite 与 jq 用例通过 | — | — | — | Body Rewrite 的正则形式有了项（W7、M7、L7）；jq 等 M3c——这一构建里 jq 的行是 `W0042`、那一行跳过（P10 的一处） |
+| 4 | 大小限制行为与手册一致 | — | — | — | P9（32 MiB 与 10 MiB 的边界）；回环上的用例是 `the_request_limit_is_thirty_two_mib` 与 `the_response_limit_is_ten_mib` |
 | 5 | 抓包可通过 API 读取 | — | — | — | M4 之后才有项 |
 
 ---
@@ -192,3 +192,75 @@ M2a（HTTP/1.1）、M2b（HTTP/2）与 M2c（`rurge mitm ca generate` / `export`
 | P4 | **端口：`:0` 与写明的端口。** `<站点 1>` 在 443 上。(a) `hostname = <站点 1>`（不带端口），打开 `https://<站点 1>/`。(b) 改成 `hostname = <站点 1>:8443`，再打开同一个站点的 443。(c) 改成 `hostname = <站点 1>:0`，再打开。有自己那台 `<服务器>:8443` 上的 TLS 服务器时，把它也写进 `hostname`（例如 `hostname = <站点 1>:0, <服务器>:0`）再各打开一次 | (a) 443 上解密。(b) 443 上**不**解密（写明的端口要与连接相同，8443 的项不命中 443）；写了 `<服务器>:8443` 时它解密。(c) 443 上解密；`<服务器>:8443` 也解密（`:0` 让它命中的目标的全部端口可嗅探）。另外：不带端口的项**不让别的端口可嗅探**——`hostname = <站点 1>` 时 `<服务器>:8443` 上的连接不被嗅探、不解密，要解密就得写明端口或写 `:0`（登记的行为） | 浏览器的证书；`recent`；`mitm.decrypted` | | | |
 | P5 | **Android 与 iOS 经局域网里的 rurge 上网。（有了设备才做。）** `<conf>` 的 `http-listen` 改成 `0.0.0.0:6152`（否则只监听回环），`[MITM] hostname` 里有要打开的站点，重启。在设备上按 `generate` 打印的说明装 CA（Android 是「设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书」，iOS 是装上描述文件再到「设置 → 通用 → 关于本机 → 证书信任设置」里打开完全信任）；把设备 Wi-Fi 的 HTTP 代理指向运行 rurge 的那台机器的局域网地址与 6152 端口；在设备上用浏览器打开 `https://<站点 1>/`；读记录 | 页面打得开。记录里 `listener` 是 `http`、`src` 是设备的局域网地址（不是 `127.0.0.1`）、`protocol` 是 `https`、`url` 以 `https://` 开头、`sni` 是 `<站点 1>`。`[MITM]` 写了 `client-source-address` 时，设备的地址要在其中（本机应用按它连进来的地址比）。iOS 上没有打开「完全信任」时打不开，日志里有「不信任」那一行 WARN、`mitm.untrusted` 加一。做完把设备上的证书、Wi-Fi 的代理与 `http-listen` 都改回去（见「改系统设置的项与恢复」里 P5 那一行） | 设备上的浏览器；`recent`；日志 | | | |
 | P6 | **`rurge check` 的 `W0039` / `W0040`，与没有 CA 时的 API。** (a) `<conf>` 的 `[MITM]` 写了 `hostname`、没有 `ca-p12` 与 `ca-keystore-name`：`rurge check -c <conf>`；同时 `rurge run` 起来，`curl -s -H "X-Key: testkey" http://127.0.0.1:6171/v1/mitm/ca`。(b) `[MITM]` 写一个打不开的 `ca-p12`（例如 `ca-p12 = QUJDRA`）：再 `check`。(c) `[General]` 写 `http-api-tls = true` 与 `http-api = testkey@127.0.0.1:6171`，`[MITM]` 的 CA 仍然是坏的（(b) 那个）：再 `check`；`rurge run -c <conf>` 看标准输出与标准错误；`curl -x http://127.0.0.1:6152 http://<明文站点>/ -s -o NUL -w "%{http_code}\n"`；`rurge status -c <conf>` 看消息与退出码。(d) 删掉 `ca-p12` 与 `ca-passphrase`（`hostname` 与 `http-api-tls = true` 留着）：再 `check`，再 `rurge status -c <conf>` | `check` 的输出都在**标准输出**，每条诊断一行（有位置的带 `<文件>:<行>`），末尾一行 `<conf>: N error(s), N warning(s), N note(s)`。位置就是诊断报的那一行：`hostname` 那一行或 `ca-p12` 那一行。次序按位置排，没有位置的（`W0040`）排在前面。(a) 一条 ``warning[W0039] <conf>:<hostname 那一行>: MITM is off: `hostname` lists hosts to decrypt but `[MITM]` sets no CA (`ca-p12` or `ca-keystore-name`)``，`check` 以 0 退出（警告不是错误）；`GET /v1/mitm/ca` 是 `404`，正文 `{"error":"no usable MITM CA"}`；代理照常可用。(b) 一条 `warning[W0039]`，位置是 `ca-p12` 那一行，消息以 `MITM is off:` 开头，说的是哪一种问题（Base64 坏了、口令错了、不是 CA 之类）。(c) `check` 给两条，**`W0040` 在前**：`warning[W0040]: http-api-tls is on but there is no usable MITM CA: the API does not start with this profile` 与它下面一行 `  hint: configure a usable MITM CA, or turn http-api-tls off`；`W0039` 在后，带 `ca-p12` 那一行的位置。次序是这样：`check` 按位置排，没有位置的排在前面（`W0040` 没有位置）。`rurge run` 启动时标准错误上也是这个次序，两条都**不带位置**（`warning[W0040]: …`、`warning[W0039]: …`），`W0040` 下面同样有 `  hint: …`；标准输出上是 WARN `http-api-tls is on but there is no usable MITM CA: the API is not started (it never falls back to plain HTTP)`、**没有** `api on` 那一行，进程照常跑、`curl` 经 6152 打印 `200`（API 不会退回明文）。`rurge status -c <conf>` 以 `2` 退出，标准错误以 `error:` 开头，后面是 **`MITM is off: …`**（即 (b) 那一句）：CA 读不出来时，它给的是 CA 的那一句，不是 `W0040`。(d) `check` 也是 `W0040` 在前（带 `hint` 那一行），`W0039` 在后、带 `hostname` 那一行的位置，消息仍是 ``MITM is off: `hostname` lists hosts to decrypt but `[MITM]` sets no CA (`ca-p12` or `ca-keystore-name`)``；`rurge status -c <conf>` 以 `2` 退出，标准错误以 `error:` 开头，后面是 `W0040` 那一句 `http-api-tls is on but there is no usable MITM CA: the API does not start with this profile`——`[MITM]` 一个 CA 也没写时，`status` 给的是这一句。修好 CA 之后 `check` 不再有 `W0039` / `W0040`，`status` 也读得到 | 两个命令的输出流与退出码；`rurge run` 两个流上的输出；`curl` 的输出；记录 | | | |
+
+## M3　重写与 Map Local
+
+M3a（`[URL Rewrite]` 与 `[Header Rewrite]`）与 M3b（`[Body Rewrite]` 的正则形式与 `[Map Local]`）的行为都已经有用例：`302` / `307` / `reject` 三种模式的答复、`header` 换掉拨号的目标、Header Rewrite 的四种动作与改过的 `Host` 写回、Body Rewrite 的式子与解压（`gzip`、`x-gzip`、`deflate`）与严格的 UTF-8、两页手册的示例逐字、Map Local 的四种数据与 502、两个上限、`rewrite` 开关与 `body` / `mapLocal` 两个数。那些用例的客户端是测试自己写的 HTTP 客户端与 rustls 客户端，源站是回环上的测试服务器。下面是它们验不了的：真浏览器真的发出去的 URL、头与正文长什么样，浏览器怎么处理 rurge 答的 `302` 与 `Location`，真站点对改写过的正文的反应（缓存、`Content-Encoding`、压缩前后的大小、`Vary`、`ETag`），真站点的应答是不是 `br` 或 `zstd` 压的（这一构建不改写，只留备注），CDN 与代理对 Map Local 的替换的看法，以及真站点上改写正文之后页面还对不对。**一项也没有做过。**
+
+M3 的明文项在 `rurge run` 上就能做；解密的项（W7、M7、L7 与 P10）要先装 M2 那份 CA（做完照 M2 一节卸掉）。
+
+### 前置条件
+
+- M1 的 `[General]`、`[Rule]` 与日志、记录的命令；M2 的 `[MITM]`、`<CA 目录>` 与装 CA 的三条（只有解密的项要它）。
+- `<conf>` 在 M2 那一份之后多四个节，下面是这一节要用的样子（`<明文站点>`、`<回显站点>`、`<站点 1>`、`<服务器>:8080` 与 `<那个词>` 见下）：
+
+  ```ini
+  [URL Rewrite]
+  ^http://<明文站点>/m3-redirect 302 http://<明文站点>/new
+  ^https://<站点 1>/m3-redirect 302 https://<站点 1>/new
+
+  [Header Rewrite]
+  http-request header-add X-M3 yes
+
+  [Body Rewrite]
+  http-request ^https?://<回显站点>/ value rurge
+  http-request ^http://<明文站点>/m3-upload value rurge
+  http-response ^https://<站点 1>/ <那个词> rurge
+  http-response ^http://<服务器>:8080/m3-big <那个词> rurge
+
+  [Map Local]
+  ^http://<明文站点>/m3-file data-type=file data="data/map-local.json"
+  ^http://<明文站点>/m3-url data-type=file data="http://<服务器>:8080/data.json"
+  ```
+
+  改完重启 `rurge run`。要关掉整条重写：`curl -s -X POST -H "X-Key: testkey" -d '{"enabled":false}' http://127.0.0.1:6171/v1/features/rewrite`。`[URL Rewrite]` 的两行里 `Location` 的路径换成你选中的那个站点上真有的路径；第二行要 `<站点 1>` 在 `[MITM]` 的 `hostname` 里。
+- 一个回显请求头与请求正文的真实站点（下文写作 `<回显站点>`，例如 `httpbingo.org` 的 `/anything`）：请求正文的那一半与 Header Rewrite 的那一行都靠它看出效果。它在 `[MITM]` 的 `hostname` 里时，解密的项看得到；明文的 Header 那一半改用自己那台 `<服务器>:8080` 上的 `echo`（回显请求头的小脚本）。
+- 自己那台 `<服务器>:8080` 上的三个文件：`echo`（回显请求头）、`data.json`（内容随意，例如 `{"from":"url"}`）、`m3-big`（20 MiB 的 ASCII，里面放一个 `<那个词>`）。`<conf>` 同目录下建一个 `data/`，在那里写一个 `map-local.json`（内容随意，例如 `{"mapped":true}`）——Map Local 的相对路径接在 Profile 所在的目录后面。
+- `<那个词>` 是 `<站点 1>` 某个页面里真实出现的一个词（挑一个去掉也不坏布局的，例如页面标题里的一个词）；改写之后它会变成 `rurge`。
+- `<明文站点>` 同 M1 的前置条件（只讲明文 HTTP 的站点）；`<站点 1>` 同 M2（你真会打开的一个 HTTPS 站点）。
+- 每一项执行后填「结果」「日期」「系统版本」三栏；做完把 `[MITM]`、四个节、Map Local 的文件与 `data/` 恢复。
+
+---
+
+### Windows
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| W6 | **URL Rewrite 与 Header Rewrite（明文的站点）。** 先读一次 `GET /v1/rurge/http` 的 `rewrite` 与 `requests`。浏览器照「共用的前置条件」带 `--proxy-server="http://127.0.0.1:6152"` 另起一个实例，打开 `http://<明文站点>/m3-redirect`，看地址栏最后停在哪里；再用同一实例打开 `http://<服务器>:8080/echo`，看页面里有没有 `X-M3`；读记录与计数 | `/m3-redirect` 由 rurge 当场答复：浏览器落到 `/new` 并把它打开；记录里那一条 `statusCode` 是 `302`、`remoteAddr` 是 `null`（一个字节也没有拨），`url` 加一，备注是 `URL Rewrite: 302 by ^http://<明文站点>/m3-redirect`。`/new` 那一条照常到源站、`status` 是 `completed`。`echo` 页面上 `X-M3` 是 `yes`，备注是 `Header Rewrite: request header-add X-M3 by http-request header-add X-M3 yes`，`header` 对每个经 rurge 的请求各加一（设计第 6、7 节；用例 `the_manual_url_rewrite_302_and_307_examples`、`the_manual_header_rewrite_examples`、`header_mode_sends_the_request_to_the_new_target`） | 浏览器的地址栏；`echo` 页面；`recent` 的 `notes`、`statusCode`、`remoteAddr`；`rewrite` 的 `url` 与 `header` | | | |
+| W7 | **解密站点上的 Body Rewrite：应答与请求。** 照 M2 一节装好 CA，`[MITM]` 写 `hostname = <站点 1>, <回显站点>`；浏览器打开 `https://<站点 1>/`，看 `<那个词>` 原先在的地方，并在开发者工具的 Network 里看那一条应答的头；再用 `curl.exe -s -x http://127.0.0.1:6152 --data "value abc" https://<回显站点>/anything`（curl 要信 rurge 的 CA，见 M2 一节的 W3；不信时加 `--cacert <CA 目录>/rurge-ca.pem`），看应答里回显的正文；读记录、计数与日志 | 页面上 `<那个词>` 变成了 `rurge`，证书是 `<CN>` 签的（连接解密了）；`curl` 的应答里回显的正文是 `rurge abc`（`value` 换成了 `rurge`）。两条记录都是 `protocol` `https`、`status` `completed`，备注分别是 `Body Rewrite: response by ^https://<站点 1>/` 与 `Body Rewrite: request by ^https?://<回显站点>/`；改过正文的应答 `Content-Length` 是新长度、没有 `Content-Encoding`（设计第 9.6 节）。`body` 每个请求只加一（同一个请求两个方向都改也只一）。日志里没有正文（`value abc` 一个字也搜不到） | 浏览器的页面、证书面板与开发者工具；`curl` 的应答；`recent` 的 `notes`；`rewrite.body`；`rurge run` 的日志 | | | |
+| W8 | **Map Local 的文件与 URL。** 浏览器经同一个实例各打开一次 `http://<明文站点>/m3-file` 与 `http://<明文站点>/m3-url`；再看 `GET /v1/external_resources`；把 `<conf>` 同目录的 `data/map-local.json` 改一个值，页面刷新一次 | 两个地址显示的都是 rurge 答的数据（第一个是 `{"mapped":true}`，第二个是服务器上 `data.json` 的内容），`Content-Type` 是 `application/json`（按扩展名补的，没有 `charset`）；记录里两条的 `statusCode` 都是 `200`、`remoteAddr` 是 `null`、备注分别是 `Map Local: file by ^http://<明文站点>/m3-file` 与 `… /m3-url`，`mapLocal` 加二。`/v1/external_resources` 里多一项：`type` 是 `data`、`path` 是 `map local data <键的前 8 位> (http://<服务器>:8080)`、`ready` 是 `true`。改了文件之后下一次请求显示的是新值（每个请求都重读文件；用例 `the_file_is_read_on_every_request`） | 浏览器的页面与开发者工具；`recent`；`GET /v1/external_resources`；`rewrite.mapLocal` | | | |
+
+### macOS
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| M6 | **URL Rewrite 与 Header Rewrite（明文的站点）。** 照 W6 做：Chrome 照前置条件带 `--proxy-server=…`，Safari 只能用系统代理（见「改系统设置的项与恢复」，做完把三栏改回去）；`./rurge run -c <conf> --log-level debug` | 同 W6 | 同 W6；Safari 的系统代理原值与恢复 | | | |
+| M7 | **解密站点上的 Body Rewrite：应答与请求。** 照 W7 做（装 CA 照 M2 一节的 M1；`curl.exe` 换成 `curl`） | 同 W7 | 同 W7 | | | |
+| M8 | **Map Local 的文件与 URL。** 照 W8 做 | 同 W8 | 同 W8 | | | |
+
+### Linux
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| L6 | **URL Rewrite 与 Header Rewrite（明文的站点）。** 照 W6 做，浏览器用 Firefox 与 Chromium（Firefox 在它自己的设置里，Chromium 带 `--proxy-server=…`）；`./rurge run -c <conf> --log-level debug` | 同 W6 | 同 W6；Firefox 改过的代理选项要改回「使用系统代理设置」 | | | |
+| L7 | **解密站点上的 Body Rewrite：应答与请求。** 照 W7 做（装 CA 照 M2 一节的 L1；`curl.exe` 换成 `curl`） | 同 W7 | 同 W7 | | | |
+| L8 | **Map Local 的文件与 URL。** 照 W8 做 | 同 W8 | 同 W8 | | | |
+
+### 与平台无关
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| P7 | **`rewrite` 开关关着时四个节一概不生效。** 先按 W6 与 W8 各做一次、记下 `rewrite` 的六个数；`curl -s -X POST -H "X-Key: testkey" -d '{"enabled":false}' http://127.0.0.1:6171/v1/features/rewrite`，再打开 `/m3-redirect`、`/m3-file` 与 `<服务器>:8080/echo`；再 `POST` 回 `{"enabled":true}`，重复一次 | 关着时：`/m3-redirect` 显示站点自己的内容（没有 302、浏览器不跳），`/m3-file` 显示站点的 404 或那一页自己的内容（不是 Map Local 的数据），`echo` 页面上没有 `X-M3`；`rewrite` 的六个数一个也不动，`notes` 一条也没有。开着时回到 W6 与 W8 的样子。切回去对下一个请求立刻生效（设计第 11 节；用例 `the_switch_turns_body_rewrite_and_map_local_off`、`the_rewrite_switch_turns_every_rewrite_off`） | 浏览器；`recent` 的 `notes`；`GET /v1/rurge/http` 的前后两次 | | | |
+| P8 | **Map Local 的两种失败。** (a) 把 `<conf>` 同目录的 `data/map-local.json` 改名，浏览器打开 `/m3-file`。(b) 把 URL 的那一条改成 `data="http://<服务器>:8080/missing.json"`（那个文件不存在），重载或重启，打开 `/m3-url`；再读 `GET /v1/external_resources` 里那一项的 `error`。做完改回去 | 两个都是 502 的错误页（`show-error-page` 缺省开着；关着时不答就关连接）：(a) 的标题是 `Connection failed`，页里写着 `The file a Map Local rule names cannot be read.`，记录里 `status` 是 `failed`、`error` 是 `Map Local: cannot read <路径>`，备注是 `Map Local failed: ^http://<明文站点>/m3-file: the file cannot be read`，`failed` 加一、`mapLocal` 不动；(b) 的页里写着 `The data a Map Local rule names has not been downloaded yet.`，记录是 `Map Local: the data from http://<服务器>:8080 is not available yet`，备注的原因是 `the data is not available yet`，那一项在外部资源的列表里有 `error`（设计第 10.3 节；用例 `a_missing_file_answers_502`、`a_missing_map_local_file_answers_502`、`url_data_that_is_not_there_answers_502`、`map_local_url_data_that_never_came_answers_502`） | 浏览器的错误页；`recent` 的 `status`、`error`、`notes`；`rewrite.failed`；`/v1/external_resources` | | | |
+| P9 | **32 MiB 与 10 MiB 的边界。** 请求那一半：`curl -x http://127.0.0.1:6152 --data-binary @<40 MiB 的文件> http://<明文站点>/m3-upload`。应答那一半：`curl -x http://127.0.0.1:6152 -o <落盘的文件> http://<服务器>:8080/m3-big`。各读一次记录与计数 | 请求那一条：连接被关掉（`curl` 以错误结束、没有应答），记录里 `status` 是 `failed`、`error` 是 `Body Rewrite: the request body is over 32 MiB`，`failed` 加一。应答那一条：20 MiB 一个字节不少地到了客户端（落盘的字节数与内容一致），`statusCode` 是 `200`、`status` 是 `completed`，备注是 `Body Rewrite skipped: ^http://<服务器>:8080/m3-big: the body is over 10 MiB`，`failed` 不动（读到的先发、其余接着流过；设计第 9.3 节；用例 `the_request_limit_is_thirty_two_mib`、`the_response_limit_is_ten_mib`、`a_response_over_the_limit_streams_through`） | `curl` 的输出与退出码；落盘文件的大小；`recent`；`rewrite.failed` 与 `body` | | | |
+| P10 | **正文、数据与头的值不进备注与日志；jq 的行给 `W0042`。** 把请求规则里那个 `value` 换成一个只有你知道的词（例如 `s3cr3t-m3`），打开 `<回显站点>` 让它出现在正文里，跑完在 `rurge run` 的日志里搜它（`--log-file` 那一份也搜）；再读那一条记录的 `notes`；最后在 `[Body Rewrite]` 加一行 `http-response-jq ^https://<站点 1>/ .`，`rurge check -c <conf>` | 日志里一个也搜不到 `s3cr3t-m3`，`notes` 里只有规则的式子与原因，没有正文、头的值、Map Local 的数据与 URL 的查询串。`check` 给一条 ``warning[W0042] <conf>:<那一行>: [Body Rewrite]: jq body rewrite is not available in this build of rurge; the line is ignored``（警告不是错误，`check` 以 0 退出，那一行跳过；设计第 13 节、第 8.5 与 14 节；用例 `no_body_or_data_reaches_the_notes_or_the_log`、`notes_never_carry_bodies`、`jq_lines_are_ignored_with_w0042`） | `rurge run` 的日志（两个流与 `--log-file`）；`recent` 的 `notes`；`rurge check` 的输出与退出码 | | | |

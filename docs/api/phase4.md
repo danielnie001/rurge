@@ -480,3 +480,139 @@ Header Rewrite skipped: the rewritten Host is not a valid HTTP/2 authority
 - 没有手工验收：`docs/acceptance/phase4-manual.md` 一项也没有做过，M3a 没有往里加条目（M3b 收尾时加）。
 - 没有观察过 Surge 在下面这些地方的实际行为，照设计写：换目标的请求仍走选定的策略、新的主机不进 fake 地址池；`header` 模式的 `{{{GATEWAY_ADDRESS}}}` 是普通的字；`wss` 也算合法。
 - 全部证据是回环上的用例：没有经真浏览器、没有对真实的站点试过。**M3a 的提交都在本地，CI 没有见过。**
+
+## M3b　Body Rewrite 与 Map Local
+
+`[Body Rewrite]` 的正则形式与 `[Map Local]` 生效了（设计第 9、10 节，计划 P9 ～ P19）：每个请求在 URL Rewrite 之后先过 Map Local（命中就由 rurge 答复、一个字节也不拨，第 6 步），再过请求一侧的 Body Rewrite（第 7 步）；应答在应答一侧的 Header Rewrite 之后过 Body Rewrite（第 12 步）。两个节的读法在 `rurge-config`：式子先用 `regex` 的多行与 CRLF 编、编不了再用 fancy-regex，jq 的行给 `W0042` 并跳过那一行，Map Local 的路径来自下载到的文本时是 `W0033`，两节也从 `W0016` 的名单拿掉了。正文这一侧：请求至多 32 MiB、应答至多 10 MiB 才缓冲，`gzip`、`x-gzip` 与 `deflate` 解压之后才改，正文必须是严格的 UTF-8；chunked、带 `Expect: 100-continue` 的与 HTTP/2 上没有长度的请求原样转发。Map Local 的数据有文件、URL、`text`、`base64` 与 `tiny-gif` 五种，URL 的那种在控制面是外部资源的新一类 `data`。计数 `body` 与 `mapLocal` 开始计（两个键 M3a 就定下了，M3-D25）。jq 的 Body Rewrite 只有 `W0042`；`br` 与 `zstd` 的解码、对上游收窄 `Accept-Encoding` 都不在这一构建里（M3c 等总设计 Q4）。
+
+**这一节写的是本地提交的行为：M3b 的提交在本地，M1a、M1b、M2a、M2b、M2c 与 M3a 的也一样，CI 都没有见过。**
+
+本节订正上面「M3a」一节的三句（规矩是历史的段落不逐处改、由后写的段落订正）：`/v1/features/rewrite` 那一节里"（后两个到 M3b 才有效果）"（第 386 行），以及 `body` 与 `mapLocal` 两条后面各一句"（到 M3b 之前一直是 0）"（第 402、403 行）。从 M3b 起，`[Body Rewrite]` 与 `[Map Local]` 也随 `rewrite` 开关（关着时四个节一概不生效，见「M3a」一节的 `/v1/features/rewrite`），`body` 与 `mapLocal` 照下面数。
+
+### 请求记录的备注
+
+每个起作用的与每个跳过的重写各留一条备注（`notes`）。备注里只有规则的 URL 式子（`{式子}` 是 `Pattern::source` 照写的原文），没有 URL、查询串、正文、头的值，也没有 Map Local 的数据、路径与来源。
+
+**起作用的（`Done`）**
+
+```
+Body Rewrite: {request|response} by {式子}
+Map Local: {file|text|base64|tiny-gif} by {式子}
+```
+
+`Body Rewrite` 那一句里的中段是规则的方向（`request` 或 `response`）；一条规则真的改了正文才留这一条，配上而没有改动的不留。`Map Local` 那一句里的类型是 `MapData::kind()`：文件与 URL 的数据都是 `file`，其余照写 `text`、`base64`、`tiny-gif`。
+
+**跳过的（`Skipped`，每一条 `skipped` 加一）**
+
+```
+Body Rewrite skipped: {式子}: {原因}
+Map Local skipped: {式子}: the regular expression hit its backtracking limit
+```
+
+`{原因}` 是下面之一（照 `crates/rurge-http/src/rewrite/body.rs` 的字面）：
+
+```
+the body is not valid UTF-8
+the body is over 10 MiB
+the decoded body is over 32 MiB
+the decoded body is over 10 MiB
+content-encoding {名字} is not supported
+the content-encoding is not supported
+the body cannot be decoded as {名字}
+the request body is chunked
+the request expects 100-continue
+the request body has no length
+the regular expression hit its backtracking limit
+```
+
+解码失败时**每一条**配上的规则各留一条同样的原因；正文不是严格的 UTF-8 时同样每条一条。一条规则里有几对时，有一对回溯超限就整条作废（正文回到这一条规则之前的样子）、留一条 `the regular expression hit its backtracking limit`，接着求下一条规则。Map Local 的式子在比 URL 时回溯超限的那一条也留一句、接着比下一行。
+
+**失败的（`Failed`）**
+
+```
+Body Rewrite failed: {式子}: the request body is over 32 MiB
+Map Local failed: {式子}: the file cannot be read
+Map Local failed: {式子}: the data is not available yet
+```
+
+请求正文超过 32 MiB 时只有**第一条**配上的规则留一条，`failed` 加一。Map Local 的两种各有一条记录，见「记录里 Map Local 的失败」。
+
+### `GET /v1/rurge/http` 的 `rewrite` 里的 `body` 与 `mapLocal`
+
+两个数都自进程启动起累计、重载不清零（同 M3a 那一节的四个）：
+
+- `body`：正文被 Body Rewrite 改过的请求。一个请求只数一次——请求与应答两个方向都改也只数一次（设计第 12 节，计划 P13）。
+- `mapLocal`：由 Map Local 答复的请求，`HEAD` 与 204、304 的答复在内；打不开数据、答 502 的不算。
+
+`skipped` 照旧是每一条 `Skipped` 加一（M3b 的这些也算在其中）。`failed` 多两种：请求正文超过 32 MiB、Map Local 的数据读不到（答 502 的那两种）。下面这些**不算** `failed`：缓冲应答时源站停住或出错（那是上游正文的失败，一条 502 的记录）、读 Map Local 的文件读到一半出错（这个请求已经算在 `mapLocal` 里）、缓冲请求时客户端停住或出错（一条失败的记录）。
+
+两个键的形状与 M3a 那一节的例子一字不差（`{"url":0,"header":0,"body":0,"mapLocal":0,"skipped":0,"failed":0}`），只有 `body` 与 `mapLocal` 从这里起会有非零值（`skipped` 与 `failed` 从 M3a 起就在数）；用例 `body_and_map_local_counts_reach_the_api_shape`（`crates/rurge-engine/tests/rewrite.rs`）、`counters_count_and_snapshot`（`crates/rurge-http/src/rewrite/mod.rs`）。
+
+### 记录里 Map Local 的失败
+
+Map Local 的规则命中了、数据却给不出来时，答 502 的错误页（`show-error-page` 关着时什么也不答、关掉连接；HTTP/2 上是重置这个流），会话以失败结束，`failed` 加一，这一条 `Failed` 备注的 `{原因}` 与记录是同一件事的两种说法：
+
+- **文件打不开、读不到元数据或不是普通文件**（例如是个目录）：记录是 `Map Local: cannot read {路径}`（`{路径}` 是 `Path::display`），备注的原因写 `the file cannot be read`，错误页的说明是 `The file a Map Local rule names cannot be read.`
+- **URL 的数据还没下载好**：记录是 `Map Local: the data from {来源} is not available yet`，备注的原因写 `the data is not available yet`，错误页的说明是 `The data a Map Local rule names has not been downloaded yet.` `{来源}` 是 `rurge_config::remote::origin` 的结果（`scheme://host[:port]`），登录信息与会话之后的路径都不出现。
+
+**读到一半出错**不是 502：答复已经开始，文件在那之后读不了、变短了或停住了。记录是 `Map Local: reading {路径} failed: {错误}`、`Map Local: {路径} became shorter while it was read` 或 `Map Local: reading {路径} stalled`（`{错误}` 是那次读的错误），会话以失败结束，客户端收到的正文以错误终止；`map_local` 已经数过这个请求，`failed` **不再**加，也不另留备注（计划 P15、P16，设计第 22 节第 21 条）。
+
+### 那一行 WARN 与一行 DEBUG
+
+只有请求一侧、只有正文**不能缓冲**时才有（三种原因见「正文不缓冲、缓冲不成与 trailer」）。每条配上的规则：
+
+- 一定有一行 DEBUG，消息 `request body not rewritten: {原因}`，字段 `host`（会话的目标主机）与 `pattern`（规则的 URL 式子）；
+- 另有一行 WARN，消息相同、只有字段 `pattern`，只在 `should_warn` 放行时出现：同一条规则（这一代里的这一行）第一次总是放行，之后一小时之内不再放行（`crates/rurge-http/src/rewrite/body.rs` 的 `BodyRule` 里 `warned` 一格记着上一次的时刻，`WARN_EVERY` 是 3600 秒）。它属于一代的重写，重载之后重新计时。
+
+日志里没有 URL、查询串、正文与头的值。正文的改写跑在阻塞线程上（M3-D21），那个任务 panic 时另有一行 ERROR `body rewrite task failed: {错误}`，正文照原样发出去、不留备注、不计数。
+
+### 外部资源的 `data`
+
+`[Map Local]` 的 `data` 以 `http://` 或 `https://` 开头时是一个 URL：加载时就读成 `url::Url`，挂在这一代的资源管理器上，种类是新的一类 `data`（`ResourceKind::MapLocal`，设计第 10.3 节，计划 P19）。`GET /v1/external_resources` 照常列出它（字段与别的种类一样，`type` 是 `data`），`POST /v1/external_resources/update` 可以按键更新它，`"all"` 也更新它。
+
+- 列表里那一项的 `path`（标签）是 `map local data {键的前 8 位} ({来源})`，`{来源}` 只到 `rurge_config::remote::origin`（`crates/rurge-engine/src/runtime.rs` 的 `build_rewrite`，修正记录第 67 行）。URL 是凭据，不进日志、不进标签的其余部分。
+- 同一个 URL 写在几行里只有一项：第一次登记定下种类与标签（用例 `the_same_map_local_url_is_one_resource`）。
+- 它挂在这一代的资源管理器上，所以 `rewrite` 开关关着时照样下载（`build_rewrite` 的文档注释，设计第 10.3 节）；不联网的一代（资源管理器是 offline 的）从不下载，它的 URL 一律答 `Map Local: the data from {来源} is not available yet`。
+- 更新间隔是 `None`（不自动刷新），大小上限照资源管理器的缺省（64 MiB）。
+
+用例 `map_local_urls_are_listed_as_data`、`map_local_url_data_that_never_came_answers_502`、`the_same_map_local_url_is_one_resource`（都在 `crates/rurge-engine/tests/rewrite.rs`）。
+
+### 大小的边界与超过时的样子
+
+两个上限都按二进制的兆字节算（M3-D20）：请求 32 MiB（33,554,432 字节）、应答 10 MiB（10,485,760 字节），备注里写的就是 `32 MiB` 与 `10 MiB`（`crates/rurge-http/src/rewrite/body.rs` 的 `REQUEST` 与 `RESPONSE`）。
+
+- **请求超过上限**：`Content-Length` 的下界已经超过时一个帧也不读；否则一帧一帧读、越过上限即停。两种都关掉连接（HTTP/2 上重置这个流），`failed` 加一，记录 `Body Rewrite: the request body is over 32 MiB`，第一条配上的规则留 `Body Rewrite failed: {式子}: the request body is over 32 MiB`。
+- **应答超过 10 MiB 不算失败**：每条配上的规则留 `Body Rewrite skipped: {式子}: the body is over 10 MiB`，已经读到的字节先发出去、其余照原样接着流过（`ReadAhead::resumed`），没有 WARN，`failed` 不动。
+- **解压**：每一层都以"上限加一个字节"为界地读，解开之后越过上限是 `the decoded body is over 32 MiB` 或 `the decoded body is over 10 MiB`（请求与应答各用各的上限文字）。
+
+### 空的正文与解压
+
+`Content-Encoding` 每一行以 `,` 分项、去掉首尾空白，空的项与 `identity` 去掉，从最后一项往前逐层解（设计第 9.4 节）。名字不分大小写：`gzip` 与 `x-gzip` 用 `MultiGzDecoder`，`deflate` 看头两个字节是不是 zlib 头（是就 `ZlibDecoder`，否则 `DeflateDecoder`）。
+
+一层 `gzip`、`x-gzip` 或 `deflate` 的输入是空的时解成空的、不经解码器（`decode` 的文档注释；修正记录第 40 行，协调者的裁定）：`MultiGzDecoder` 会把零字节叫作截断的头，而手册的 `^$` 写法本来就该在这种空正文上成立。`br`、`zstd`、`compress` 与别的名字照旧以 `content-encoding {名字} is not supported` 跳过，空不空都一样；名字不是 RFC 9110 的 token（或那一行不是可见的 ASCII）时是 `the content-encoding is not supported`。解不开的层是 `the body cannot be decoded as {名字}`。
+
+### 正文不缓冲、缓冲不成与 trailer
+
+**不配请求正文的规则**：要升级的请求与嗅探的连接上客户端发来的 `CONNECT` 不求请求正文的规则，也没有备注（`crates/rurge-http/src/engine.rs` 的 `needs_h1` 那一段）。配上之后的三种不缓冲，各留一条 `Skipped`、一行 DEBUG、可能一行 WARN：
+
+- 带 `Transfer-Encoding` 头的（不论它的值是什么）：`the request body is chunked`；
+- 带值是 `100-continue`（不分大小写）的 `Expect` 头：`the request expects 100-continue`；
+- 客户端讲 HTTP/2、正文没有结束、`size_hint().exact()` 是 `None`：`the request body has no length`。
+
+这三种的正文照原样转发。缓冲的请求读到客户端停住或出错时，记录是 `request body stalled` 或 `request body failed: {错误}`，连接关掉（HTTP/2 上重置这个流），不另留备注、`failed` 不动。
+
+**不配应答正文的规则**：`HEAD` 的应答、1xx、204 与 304 不求应答正文的规则，也没有备注。缓冲应答时源站停住或出错，经 `failed` 答 502（错误页的说明分别是 `The upstream server stopped sending the response body.` 与 `The upstream server's response body failed.`），记录是 `upstream body stalled` 或 `upstream body failed: {错误}`；这一代的错误页关着时不答、关掉连接（HTTP/2 上是重置这个流）。这两种都不算 `failed`，那条上游连接也不回池。
+
+**改了正文之后**（两个方向一样）：去掉 `Content-Encoding` 与 `Transfer-Encoding`，写新的 `Content-Length`（改成空的也是，`0`），trailer 不要；不把正文压回去（设计第 9.6 节）。配上而没有改动的，照原样交回读到的字节与 trailer（连同压缩）。
+
+**trailer**：到 HTTP/1.1 客户端的 trailer 一个也不转，有没有规则都一样——引擎把 `Trailer` 当逐跳的头去掉（`crates/rurge-http/src/headers.rs` 的 `HOP_BY_HOP`），hyper 的 HTTP/1.1 编码器只写 `Trailer` 里声明过的；两端都讲 HTTP/2 时照转。这从 M1b 起就是这样，不是 M3b 加的（修正记录第 20 行；兼容性清单那一句的订正是任务 9 的事）。
+
+**Map Local 的 204 与 304**：数据不读（文件不开、URL 的数据不问），也不带 `Content-Length`。`HEAD` 照样开文件或取数据、量出 `Content-Length`，不发正文。
+
+### 没有覆盖的
+
+- **jq、`br`、`zstd`**：jq 的 Body Rewrite 只有 `W0042`（这一行跳过），`br` 与 `zstd` 的应答不改写（留 `the content-encoding … is not supported` 一类备注）；对上游收窄 `Accept-Encoding`、fancy-regex 的升级都归项目所有者（设计第 21 节 Q4、M3c）。
+- **不把改写过的正文压回去**：改过的应答是明文，`Content-Encoding` 去掉了（设计第 9.6 节）。
+- **没有手工验收**：`docs/acceptance/phase4-manual.md` 的 M3 一节一项也没有做过（M3b 任务 8 加的）；**M3b 的提交都在本地，CI 没有见过**。
+- **全部证据是回环上的用例**：源站是测试自己的 HTTP / TLS 服务器，客户端是测试自己写的；没有经真浏览器、没有对真实的站点试过。
+- **没有观察过 Surge 在这些地方的实际行为**，照设计与手册写：`deflate` 的两种头怎么判、空的 `Content-Encoding` 层怎么算、改写过的正文的 `Content-Length` 与 trailer 的形状、Map Local 的 `Content-Type` 表之外的名字（一律 `application/octet-stream`）。
