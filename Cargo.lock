@@ -3275,6 +3275,7 @@ dependencies = [
  "idna",
  "insta",
  "ipnet",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

@@ -252,6 +252,136 @@ impl Template {
     }
 }
 
+/// The limit on the steps fancy-regex's backtracking engine may take for one
+/// pattern of a `[Body Rewrite]` line (`phase 4 M3 design 5.4`).
+///
+/// fancy-regex 0.14 counts a backtrack for every start that fails, so its
+/// default of one million is spent on a body of about a megabyte whatever the
+/// pattern is; a hundred million is about three times the largest body a
+/// request may have (32 MiB), with room left for an expression that really
+/// backtracks.
+pub const BODY_BACKTRACK_LIMIT: usize = 100_000_000;
+
+/// A `[Body Rewrite]` expression (`phase 4 M3 design 5.4`).
+///
+/// Two engines compile it. `regex` reads the start and end of a line the way
+/// the manual wants: `\r` and `\n` both end a line, neither is matched in the
+/// middle of one, and `.` matches neither. fancy-regex reads the lookarounds
+/// and back references `regex` refuses, but its multi-line mode knows only
+/// `\n`, so a pattern that lands there counts the `\r` of a CRLF line into the
+/// line — a difference rurge registers (phase 4 M3 design 5.4).
+#[derive(Clone)]
+pub struct BodyPattern {
+    /// The expression as the profile wrote it.
+    pub source: String,
+    engine: Engine,
+}
+
+/// The compiled form of a body pattern: which crate compiled it.
+#[derive(Clone)]
+enum Engine {
+    Plain(regex::Regex),
+    Fancy(fancy_regex::Regex),
+}
+
+impl BodyPattern {
+    /// Compiles `source` with the limit a body rewrite uses.
+    pub fn new(source: &str) -> Result<BodyPattern, String> {
+        BodyPattern::with_backtrack_limit(source, BODY_BACKTRACK_LIMIT)
+    }
+
+    /// Compiles `source` with `limit` as fancy-regex's backtracking limit.
+    ///
+    /// `regex` compiles it first, with the ICU spellings rewritten; what that
+    /// crate refuses is handed to fancy-regex with `(?m)` in front, and its
+    /// reason is what comes back when that fails too (phase 4 M3 design 5.4).
+    pub fn with_backtrack_limit(source: &str, limit: usize) -> Result<BodyPattern, String> {
+        let translated = translate(source)?;
+        if let Ok(regex) = regex::RegexBuilder::new(&translated)
+            .multi_line(true)
+            .crlf(true)
+            .build()
+        {
+            return Ok(BodyPattern {
+                source: source.to_string(),
+                engine: Engine::Plain(regex),
+            });
+        }
+        match fancy_regex::RegexBuilder::new(&format!("(?m){translated}"))
+            .backtrack_limit(limit)
+            .build()
+        {
+            Ok(regex) => Ok(BodyPattern {
+                source: source.to_string(),
+                engine: Engine::Fancy(regex),
+            }),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Whether fancy-regex compiled this pattern rather than `regex`.
+    pub fn is_fancy(&self) -> bool {
+        matches!(self.engine, Engine::Fancy(_))
+    }
+
+    /// `text` with every non-overlapping match replaced by `template`'s
+    /// expansion, from left to right; `None` when fancy-regex hits its
+    /// backtracking limit.
+    ///
+    /// The work is done here rather than by either crate's `replace_all`:
+    /// fancy-regex's panics on a runtime error (phase 4 M3 design 5.5).
+    pub fn replace_all(&self, template: &Template, text: &str) -> Option<String> {
+        let mut out = String::with_capacity(text.len());
+        let mut end = 0;
+        match &self.engine {
+            Engine::Plain(regex) => {
+                let groups = regex.captures_len() - 1;
+                for captures in regex.captures_iter(text) {
+                    let whole = captures.get(0).expect("every match is group zero");
+                    out.push_str(&text[end..whole.start()]);
+                    template.expand(
+                        &|group| captures.get(group).map(|found| found.as_str()),
+                        groups,
+                        &mut out,
+                    );
+                    end = whole.end();
+                }
+            }
+            Engine::Fancy(regex) => {
+                let groups = regex.captures_len() - 1;
+                for captures in regex.captures_iter(text) {
+                    let captures = captures.ok()?;
+                    let whole = captures.get(0).expect("every match is group zero");
+                    out.push_str(&text[end..whole.start()]);
+                    template.expand(
+                        &|group| captures.get(group).map(|found| found.as_str()),
+                        groups,
+                        &mut out,
+                    );
+                    end = whole.end();
+                }
+            }
+        }
+        out.push_str(&text[end..]);
+        Some(out)
+    }
+}
+
+impl PartialEq for BodyPattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+impl Eq for BodyPattern {}
+
+/// A body pattern shows its expression, which is not a secret, and nothing
+/// of the engine.
+impl std::fmt::Debug for BodyPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("BodyPattern").field(&self.source).finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +541,116 @@ mod tests {
         assert_eq!(format!("{:?}", Template::parse("s3cr3t")), "Template(***)");
         let words = crate::value::split_words("s3cr3t");
         assert_eq!(format!("{:?}", words[0]), "Word(***)");
+    }
+
+    /// `pattern` with every match in `text` replaced by `template`.
+    fn replaced(pattern: &BodyPattern, template: &str, text: &str) -> Option<String> {
+        pattern.replace_all(&Template::parse(template), text)
+    }
+
+    /// A body pattern reads a line the way the manual reads it: `^` and `$`
+    /// end a line at a CRLF pair, and the `\r` stays out of the line (`phase
+    /// 4 M3 design 5.4`).
+    #[test]
+    fn body_patterns_read_lines_by_crlf() {
+        let pattern = BodyPattern::new(r"^foo=(.*)$").unwrap();
+        assert!(!pattern.is_fancy());
+        assert_eq!(
+            replaced(&pattern, "[$1]", "foo=1\r\nfoo=2\nbar"),
+            Some("[1]\r\n[2]\nbar".to_string())
+        );
+    }
+
+    /// What `regex` refuses is compiled with fancy-regex (phase 4 M3 design
+    /// 5.4).
+    #[test]
+    fn a_lookahead_falls_to_fancy_regex() {
+        let pattern = BodyPattern::new(r"a(?=b)").unwrap();
+        assert!(pattern.is_fancy());
+        assert_eq!(replaced(&pattern, "x", "ab ac"), Some("xb ac".to_string()));
+    }
+
+    /// A pattern fancy-regex compiles reads a line by `\n` alone, so the `\r`
+    /// of a CRLF pair is part of the line and `.` matches it (the difference
+    /// the phase 4 M3 design 5.4 registers).
+    #[test]
+    fn fancy_patterns_count_a_carriage_return_into_the_line() {
+        let pattern = BodyPattern::new(r"^a(.)(?=\n)").unwrap();
+        assert!(pattern.is_fancy());
+        assert_eq!(
+            replaced(&pattern, "[$1]", "a\r\n"),
+            Some("[\r]\n".to_string())
+        );
+    }
+
+    /// An empty match goes where each engine allows one: a `^$` matches the
+    /// empty body, every empty line, and not the middle of a CRLF pair (phase
+    /// 4 M3 design 5.5).
+    #[test]
+    fn empty_matches_insert_where_the_engine_allows() {
+        let pattern = BodyPattern::new(r"^$").unwrap();
+        assert!(!pattern.is_fancy());
+        assert_eq!(replaced(&pattern, "new", ""), Some("new".to_string()));
+        assert_eq!(
+            replaced(&pattern, "new", "a\n\nb"),
+            Some("a\nnew\nb".to_string())
+        );
+        assert_eq!(
+            replaced(&pattern, "new", "a\r\n\r\nb"),
+            Some("a\r\nnew\r\nb".to_string())
+        );
+    }
+
+    /// A body pattern reads the ICU escapes `translate` rewrites (phase 4 M3
+    /// design 5.2).
+    #[test]
+    fn body_patterns_translate_icu_spellings() {
+        let pattern = BodyPattern::new(r"a\hb").unwrap();
+        assert!(!pattern.is_fancy());
+        assert_eq!(replaced(&pattern, "x", "a b"), Some("x".to_string()));
+    }
+
+    /// A pattern neither crate compiles is refused, with the reason fancy-regex
+    /// gave; `translate`'s own refusal comes back as it is (phase 4 M3 design
+    /// 5.4).
+    #[test]
+    fn body_patterns_that_compile_nowhere_are_refused() {
+        let error = BodyPattern::new("(").err().unwrap();
+        assert!(!error.is_empty());
+        assert_eq!(
+            BodyPattern::new(r"[\H]").err(),
+            Some("`\\H` cannot be used inside a character class".to_string())
+        );
+    }
+
+    /// A pattern that backtracks past fancy-regex's limit gives `None` rather
+    /// than a panic, and `new` uses `BODY_BACKTRACK_LIMIT` rather than
+    /// fancy-regex's default (phase 4 M3 design 5.4, 5.5).
+    #[test]
+    fn a_backtracking_body_pattern_gives_none() {
+        let star = r"(a|b|ab)*(?=c)";
+        let forty = "ab".repeat(40);
+        let pattern = BodyPattern::with_backtrack_limit(star, 1000).unwrap();
+        assert_eq!(replaced(&pattern, "x", &forty), None);
+
+        let twenty = "ab".repeat(20);
+        let small = BodyPattern::with_backtrack_limit(star, 1_000_000).unwrap();
+        assert_eq!(replaced(&small, "x", &twenty), None);
+        let pattern = BodyPattern::new(star).unwrap();
+        assert!(replaced(&pattern, "x", &twenty).is_some());
+    }
+
+    /// A body pattern is compared and shown by its expression alone, not by
+    /// which crate compiled it (the phase 4 / M3b plan's P2).
+    #[test]
+    fn body_patterns_compare_and_show_by_source() {
+        assert_eq!(
+            BodyPattern::new("a+").unwrap(),
+            BodyPattern::new("a+").unwrap()
+        );
+        assert_eq!(
+            format!("{:?}", BodyPattern::new("a+").unwrap()),
+            "BodyPattern(\"a+\")"
+        );
     }
 }
