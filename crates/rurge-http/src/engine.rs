@@ -16,7 +16,8 @@ use super::headers::{self, Keep};
 use super::mitm::OriginTls;
 use super::pool::{Meter, Metered, Pool, Reusable};
 use super::rewrite::{
-    HostChange, Rewrite, UrlOutcome, candidates, redirect, retarget_request, write_back_host,
+    HostChange, ReadAhead, Rewrite, UrlOutcome, candidates, redirect, retarget_request,
+    write_back_host,
 };
 use super::version::{Form, fit};
 use bytes::Bytes;
@@ -1038,7 +1039,13 @@ impl<U: Upstreams> Requests<U> {
             peer,
             forward,
         };
-        let tail = Tail::new(body, guard, self.shared.clone(), outing, request_meter);
+        let tail = Tail::new(
+            ReadAhead::through(body),
+            guard,
+            self.shared.clone(),
+            outing,
+            request_meter,
+        );
         Ok(Response::from_parts(parts, tail.boxed()))
     }
 
@@ -2000,7 +2007,7 @@ struct Outing<K> {
 /// can let the upstream go — a client that stopped reading, a killed request,
 /// a stop — and the other one then stops polling a body whose upstream is gone.
 struct UpstreamBody<K> {
-    inner: Incoming,
+    inner: ReadAhead<Incoming>,
     outing: Box<Outing<K>>,
 }
 
@@ -2260,6 +2267,89 @@ where
     }
 }
 
+/// Watches the client while a body is on its way to it (`design 8.10, 8.11`):
+/// a client that stopped reading never polls the body again, so `kill`, a stop
+/// and the idle timeout could not be seen from `poll_frame`. The watchdog ends
+/// them: the connection goes at once, and the guard says how the request
+/// ended.
+///
+/// On HTTP/2 a request ends with its stream, not the client's connection
+/// (`phase 4 M2 design 10.5`, `the phase 4 / M2b plan's P14`): what is in
+/// `slot` is let go and `abort` is left alone — except for a stop, which takes
+/// the whole connection anyway, and must not wait for a stream nobody reads.
+///
+/// It takes the body's slot rather than the body: `Tail` keeps an upstream
+/// connection there, and a `[Map Local]` answer keeps the file it reads (the
+/// phase 4 / M3b plan's P16).
+fn watch_the_client<T: Send + 'static>(
+    conn: &Conn,
+    handle: &Arc<SessionHandle>,
+    left: &'static str,
+    progress: Arc<Progress>,
+    idle: Duration,
+    slot: Arc<Mutex<Option<T>>>,
+    done: CancellationToken,
+) {
+    let handle = handle.clone();
+    let request = handle.token().clone();
+    let abort = conn.abort.clone();
+    let tracker = conn.tracker.clone();
+    let h2 = conn.h2;
+    let connection = conn.token.clone();
+    tracker.spawn(async move {
+        let inner = tokio::spawn(async move {
+            loop {
+                // What to sleep for, and whether that sleep is a deadline at
+                // all: a body waiting for upstream is the body's own to time,
+                // so the watchdog only sleeps and looks again.
+                let sleep_for = if progress.is_waiting() {
+                    idle
+                } else {
+                    let remaining = progress.remaining(idle);
+                    if remaining.is_zero() {
+                        handle.finish(SessionOutcome::Failed("client stopped reading".to_string()));
+                        tracing::debug!("a client stopped reading its response");
+                        if h2 {
+                            // the body is let go, and the client's stream is
+                            // reset when hyper polls the body again (`the phase
+                            // 4 / M2b plan's P14`)
+                            let held = slot.lock().expect("upstream body").take();
+                            drop(held);
+                        } else {
+                            abort.cancel();
+                        }
+                        return;
+                    }
+                    remaining
+                };
+                tokio::select! {
+                    biased;
+                    _ = done.cancelled() => return,
+                    _ = request.cancelled() => {
+                        // A stop takes every stream of the connection, so the
+                        // connection goes; a kill ends this stream alone
+                        // (`phase 4 M2 design 10.5`).
+                        if h2 && !connection.is_cancelled() {
+                            let held = slot.lock().expect("upstream body").take();
+                            handle.finish(outcome_of(&handle, &connection, left));
+                            drop(held);
+                        } else {
+                            abort.cancel();
+                        }
+                        return;
+                    }
+                    _ = tokio::time::sleep(sleep_for) => {}
+                }
+            }
+        });
+        if let Err(e) = inner.await
+            && e.is_panic()
+        {
+            tracing::error!("response watchdog panicked: {e}");
+        }
+    });
+}
+
 /// The body of a response on its way to the client (`phase 4 M1 design 8.2,
 /// 8.10`): it ends the request when the body is read, puts the upstream
 /// connection back into the pool, and ends both when the body stalls or the
@@ -2298,7 +2388,7 @@ struct Tail<U: Upstreams> {
 
 impl<U: Upstreams> Tail<U> {
     fn new(
-        inner: Incoming,
+        inner: ReadAhead<Incoming>,
         guard: Guard,
         shared: Arc<Shared<U>>,
         outing: Outing<UpstreamKey<U>>,
@@ -2348,82 +2438,18 @@ impl<U: Upstreams> Tail<U> {
         self.up.lock().expect("upstream body").take()
     }
 
-    /// Watches the client while this body is on its way to it (`design 8.10,
-    /// 8.11`): a client that stopped reading never polls the body again, so
-    /// `kill`, a stop and the idle timeout could not be seen from `poll_frame`.
-    /// The watchdog ends them: the connection goes at once, and the guard says
-    /// how the request ended.
-    ///
-    /// On HTTP/2 a request ends with its stream, not the client's connection
-    /// (`phase 4 M2 design 10.5`, `the phase 4 / M2b plan's P14`): the upstream
-    /// is let go and `abort` is left alone — except for a stop, which takes the
-    /// whole connection anyway, and must not wait for a stream nobody reads.
+    /// Starts the watchdog of the free `watch_the_client` (`phase 4 M1 design
+    /// 8.10`, 8.11), with this body's slot for the upstream it may let go.
     fn watch_the_client(&self) {
-        let progress = self.progress.clone();
-        let handle = self.guard.handle().clone();
-        let request = handle.token().clone();
-        let abort = self.shared.conn.abort.clone();
-        let done = self.watchdog.clone();
-        let idle = self.idle;
-        let tracker = self.shared.conn.tracker.clone();
-        let h2 = self.shared.conn.h2;
-        let connection = self.shared.conn.token.clone();
-        let left = self.guard.left;
-        let up = self.up.clone();
-        tracker.spawn(async move {
-            let inner = tokio::spawn(async move {
-                loop {
-                    // What to sleep for, and whether that sleep is a deadline
-                    // at all: a body waiting for upstream is `Tail`'s to time,
-                    // so the watchdog only sleeps and looks again.
-                    let sleep_for = if progress.is_waiting() {
-                        idle
-                    } else {
-                        let remaining = progress.remaining(idle);
-                        if remaining.is_zero() {
-                            handle.finish(SessionOutcome::Failed(
-                                "client stopped reading".to_string(),
-                            ));
-                            tracing::debug!("a client stopped reading its response");
-                            if h2 {
-                                // the upstream is let go, and the client's
-                                // stream is reset when hyper polls the body
-                                // again (`the phase 4 / M2b plan's P14`)
-                                let upstream = up.lock().expect("upstream body").take();
-                                drop(upstream);
-                            } else {
-                                abort.cancel();
-                            }
-                            return;
-                        }
-                        remaining
-                    };
-                    tokio::select! {
-                        biased;
-                        _ = done.cancelled() => return,
-                        _ = request.cancelled() => {
-                            // A stop takes every stream of the connection, so
-                            // the connection goes; a kill ends this stream
-                            // alone (`phase 4 M2 design 10.5`).
-                            if h2 && !connection.is_cancelled() {
-                                let upstream = up.lock().expect("upstream body").take();
-                                handle.finish(outcome_of(&handle, &connection, left));
-                                drop(upstream);
-                            } else {
-                                abort.cancel();
-                            }
-                            return;
-                        }
-                        _ = tokio::time::sleep(sleep_for) => {}
-                    }
-                }
-            });
-            if let Err(e) = inner.await
-                && e.is_panic()
-            {
-                tracing::error!("response watchdog panicked: {e}");
-            }
-        });
+        watch_the_client(
+            &self.shared.conn,
+            self.guard.handle(),
+            self.guard.left,
+            self.progress.clone(),
+            self.idle,
+            self.up.clone(),
+            self.watchdog.clone(),
+        );
     }
 
     /// The body was read to its end: the request is complete, and the
@@ -2505,7 +2531,7 @@ impl<U: Upstreams> Drop for Tail<U> {
 /// done with it (`the phase 4 / M2b plan's P14`): the frame and whether it was
 /// the last one, the error, the end, `Pending`, or a slot the watchdog emptied.
 enum PolledUpstream {
-    Frame(Frame<Bytes>, bool),
+    Frame(Frame<Bytes>, bool, bool),
     Failed(hyper::Error),
     End,
     Pending,
@@ -2535,9 +2561,15 @@ impl<U: Upstreams> Body for Tail<U> {
                     if up.inner.is_end_stream() {
                         PolledUpstream::End
                     } else {
+                        // Bytes read ahead of a rewrite are not the upstream's
+                        // own here: `read_ahead` counted them onto the request
+                        // already, and a rewritten body was never the
+                        // upstream's at all (`phase 4 M3 design 9.3`, the phase
+                        // 4 / M3b plan's P14).
+                        let counted = !up.inner.has_ahead();
                         match Pin::new(&mut up.inner).poll_frame(cx) {
                             Poll::Ready(Some(Ok(frame))) => {
-                                PolledUpstream::Frame(frame, up.inner.is_end_stream())
+                                PolledUpstream::Frame(frame, up.inner.is_end_stream(), counted)
                             }
                             Poll::Ready(Some(Err(e))) => PolledUpstream::Failed(e),
                             Poll::Ready(None) => PolledUpstream::End,
@@ -2548,14 +2580,16 @@ impl<U: Upstreams> Body for Tail<U> {
             }
         };
         match polled {
-            PolledUpstream::Frame(frame, ended) => {
+            PolledUpstream::Frame(frame, ended, counted) => {
                 this.deadline
                     .as_mut()
                     .reset(tokio::time::Instant::now() + this.idle);
                 this.progress.moved();
                 // a data frame is this request's answer; trailers are not
                 // bytes of it (`the phase 4 / M2b plan's P11`)
-                if let Some(data) = frame.data_ref() {
+                if let Some(data) = frame.data_ref()
+                    && counted
+                {
                     this.body.count_down(data.len() as u64);
                 }
                 // the frame just handed out was the last one: hyper will drop
