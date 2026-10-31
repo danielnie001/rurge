@@ -2025,3 +2025,1952 @@ async fn the_same_map_local_url_is_one_resource() {
     assert_eq!(listed.len(), 1, "{listed:?}");
     assert_eq!(server.hits("/m.json"), 1, "the URL is downloaded once");
 }
+
+// ---- the manual's two pages end to end (`the phase 4 / M3b plan's task 7`):
+// ---- the origin whose answer a case writes whole, the client side that reads
+// ---- a body as bytes, and the cases themselves.
+
+/// An origin that answers every request with the bytes a case wrote, and keeps
+/// the head and the body of every request it read (`the phase 4 / M3b plan's
+/// P20`): the manual has no example of a chunked body, a compressed one, one
+/// with a trailer or one that stops half way, and `TestServer` writes the
+/// framing of its own answers, so a case that needs a particular answer writes
+/// it whole here. `RecordingOrigin` above keeps the heads alone, for the cases
+/// that need only those.
+struct ScriptedOrigin {
+    addr: SocketAddr,
+    heard: Heard,
+}
+
+/// What a `ScriptedOrigin` keeps of the requests it was asked: each one's head
+/// and its body.
+type Heard = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+impl ScriptedOrigin {
+    /// Serves `answer` to every request, and keeps the connection open after
+    /// it: an answer that stops half way is exactly that.
+    async fn spawn(answer: Vec<u8>) -> ScriptedOrigin {
+        ScriptedOrigin::spawn_with(None, answer).await
+    }
+
+    /// As `spawn`, behind the TLS the acceptor speaks: for the cases whose
+    /// request reaches its origin over TLS (`[Map Local]`'s and Body Rewrite's
+    /// decrypted requests).
+    async fn spawn_tls(acceptor: tokio_rustls::TlsAcceptor, answer: Vec<u8>) -> ScriptedOrigin {
+        ScriptedOrigin::spawn_with(Some(acceptor), answer).await
+    }
+
+    async fn spawn_with(
+        acceptor: Option<tokio_rustls::TlsAcceptor>,
+        answer: Vec<u8>,
+    ) -> ScriptedOrigin {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let heard: Heard = Arc::default();
+        let kept = heard.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let answer = answer.clone();
+                let kept = kept.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    match acceptor {
+                        // nothing was said if the handshake failed: the
+                        // connection is gone
+                        Some(acceptor) => {
+                            if let Ok(mut stream) = acceptor.accept(stream).await {
+                                serve(&mut stream, &answer, &kept).await;
+                            }
+                        }
+                        None => {
+                            let mut stream = stream;
+                            serve(&mut stream, &answer, &kept).await;
+                        }
+                    }
+                });
+            }
+        });
+        ScriptedOrigin { addr, heard }
+    }
+
+    fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    /// The head and the body of every request it was asked, in order; the body
+    /// of a chunked request is its data, with the framing taken off.
+    fn heard(&self) -> Vec<(String, Vec<u8>)> {
+        self.heard.lock().unwrap().clone()
+    }
+}
+
+/// The request loop of a `ScriptedOrigin`: every request read whole, its head
+/// and its body kept, and `answer` written to it.
+async fn serve<S>(stream: &mut S, answer: &[u8], kept: &Heard)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let Some(head) = read_until(stream, b"\r\n\r\n").await else {
+            return;
+        };
+        let head = String::from_utf8_lossy(&head).into_owned();
+        // a request that expects the interim answer waits for it before it
+        // sends its body
+        let expects_continue = header_value(&head, "expect")
+            .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"));
+        if expects_continue
+            && stream
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .is_err()
+        {
+            return;
+        }
+        let Some(body) = read_body(stream, &head).await else {
+            return;
+        };
+        kept.lock().unwrap().push((head, body));
+        if stream.write_all(answer).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The bytes of `s` up to and including `mark`, or `None` when the far end
+/// closes or says nothing for five seconds.
+async fn read_until<S>(s: &mut S, mark: &[u8]) -> Option<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut got = Vec::new();
+    let mut byte = [0u8; 1];
+    while !got.ends_with(mark) {
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut byte))
+            .await
+            .ok()?
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        got.push(byte[0]);
+    }
+    Some(got)
+}
+
+/// The body of the request whose head is `head`: by its `Content-Length`, by
+/// the chunks of its `Transfer-Encoding`, or nothing.
+async fn read_body<S>(s: &mut S, head: &str) -> Option<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    if let Some(length) = header_value(head, "content-length") {
+        let length: usize = length.trim().parse().ok()?;
+        let mut body = vec![0u8; length];
+        tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut body))
+            .await
+            .ok()?
+            .ok()?;
+        return Some(body);
+    }
+    let chunked = header_value(head, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+    if !chunked {
+        return Some(Vec::new());
+    }
+    let mut body = Vec::new();
+    loop {
+        let line = read_until(s, b"\r\n").await?;
+        let size = std::str::from_utf8(&line[..line.len() - 2]).ok()?;
+        let size = usize::from_str_radix(size.split(';').next()?.trim(), 16).ok()?;
+        if size == 0 {
+            // the trailers, if the request wrote any, then a blank line
+            while read_until(s, b"\r\n").await? != b"\r\n" {}
+            return Some(body);
+        }
+        let mut chunk = vec![0u8; size + 2];
+        tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut chunk))
+            .await
+            .ok()?
+            .ok()?;
+        body.extend_from_slice(&chunk[..size]);
+    }
+}
+
+/// One request written whole — its head and its body in one write, as
+/// `CLAUDE.md` asks — and the answer read until the far end closes it.
+async fn answer_bytes(proxy: SocketAddr, request: &[u8]) -> Vec<u8> {
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    s.write_all(request).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), s.read_to_end(&mut buf)).await;
+    buf
+}
+
+/// An answer split into its head and its body: the body is read by its
+/// framing — the chunks of a `Transfer-Encoding: chunked`, the
+/// `Content-Length`, or everything up to the end.
+fn answer_parts(raw: &[u8]) -> (String, Vec<u8>) {
+    let at = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or_else(|| panic!("an answer head: {:?}", String::from_utf8_lossy(raw)));
+    let head = String::from_utf8_lossy(&raw[..at]).into_owned();
+    let mut rest = &raw[at + 4..];
+    let chunked = header_value(&head, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+    if chunked {
+        let mut body = Vec::new();
+        while let Some(end) = rest.windows(2).position(|window| window == b"\r\n") {
+            let size = String::from_utf8_lossy(&rest[..end]).into_owned();
+            let size = usize::from_str_radix(size.split(';').next().unwrap().trim(), 16)
+                .expect("a chunk size");
+            if size == 0 {
+                break;
+            }
+            body.extend_from_slice(&rest[end + 2..end + 2 + size]);
+            rest = &rest[end + 2 + size + 2..];
+        }
+        return (head, body);
+    }
+    if let Some(length) = header_value(&head, "content-length") {
+        let length: usize = length.trim().parse().expect("a Content-Length");
+        let body = rest[..length.min(rest.len())].to_vec();
+        return (head, body);
+    }
+    (head, rest.to_vec())
+}
+
+/// `data` as one gzip member: the two pages have no compressed example of
+/// their own, and the case makes the bytes here, not in the repository
+/// (`the phase 4 / M3b plan's P20`). The deflate blocks are stored ones, so
+/// the bytes are the case's own and nothing has to be computed but the CRC.
+fn gzipped(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+    let mut left = data;
+    loop {
+        let take = left.len().min(0xffff);
+        let last = take == left.len();
+        out.push(u8::from(last));
+        out.extend_from_slice(&(take as u16).to_le_bytes());
+        out.extend_from_slice(&(!(take as u16)).to_le_bytes());
+        out.extend_from_slice(&left[..take]);
+        left = &left[take..];
+        if last {
+            break;
+        }
+    }
+    out.extend_from_slice(&crc32(data).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out
+}
+
+/// The CRC-32 of `data` that a gzip member ends with.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// The manual's `[Body Rewrite]` page, its first example's request line, word
+/// for word (`http/body-rewrite.html`; `the phase 4 / M3b plan's P20`): the
+/// body's `value` becomes `abc` before the origin is asked, and the field that
+/// says how long the body is follows. The request carries the test origin's
+/// port, which the manual's `^http(s)?://example\.com` still matches as a
+/// prefix, and `example.com` is pinned to the loopback by `[Host]`.
+#[tokio::test]
+async fn the_manual_body_rewrite_request_example() {
+    let origin = ScriptedOrigin::spawn(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    )
+    .await;
+    let port = origin.port();
+    let general = format!("force-http-engine-hosts = example.com:{port}");
+    let h = harness_with(
+        Profile {
+            general: &general,
+            hosts: "example.com = 127.0.0.1",
+            rules: "DOMAIN,example.com,DIRECT",
+            sections: "[Body Rewrite]\nhttp-request ^http(s)?://example\\.com value abc",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let body = "key=value&value=1";
+
+    // through the HTTP listener, whose request line is absolute
+    let request = format!(
+        "POST http://example.com:{port}/ HTTP/1.1\r\nHost: example.com:{port}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (head, _) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    // through SOCKS5, on a sniffed connection: the request line names a path
+    let mut tunnel = connect_via_socks5(h.socks(), "example.com", port).await;
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: example.com:{port}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let answer = exchange_over(&mut tunnel, &request).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+
+    let heard = origin.heard();
+    assert_eq!(heard.len(), 2, "{heard:?}");
+    for (head, sent) in &heard {
+        assert_eq!(sent, b"key=abc&abc=1", "the rewritten body: {head}");
+        assert_eq!(
+            header_value(head, "content-length").as_deref(),
+            Some("13"),
+            "the length follows the rewritten body: {head}"
+        );
+    }
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    for record in &records {
+        assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+        assert_eq!(
+            record.notes,
+            ["Body Rewrite: request by ^http(s)?://example\\.com"],
+            "{record:?}"
+        );
+    }
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.body, counts.failed), (2, 0), "{counts:?}");
+}
+
+/// The manual's `[Body Rewrite]` page, its first example's response line, word
+/// for word: the answer's `documents` becomes `Surge`, and so does the length
+/// that frames it. The answer's `Content-Type` and the port in the request are
+/// not the manual's; the pattern still matches the URL as a prefix.
+#[tokio::test]
+async fn the_manual_body_rewrite_response_example() {
+    let answer = b"<p>documents</p>".to_vec();
+    let mut raw = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        answer.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(&answer);
+    let origin = ScriptedOrigin::spawn(raw).await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "example.com = 127.0.0.1",
+            rules: "DOMAIN,example.com,DIRECT",
+            sections: "[Body Rewrite]\nhttp-response ^http(s)?://example\\.com documents Surge",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+
+    let request = format!(
+        "GET http://example.com:{port}/ HTTP/1.1\r\nHost: example.com:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (head, body) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"<p>Surge</p>", "{head}");
+    assert_eq!(
+        header_value(&head, "content-length").as_deref(),
+        Some("12"),
+        "the length follows the rewritten body: {head}"
+    );
+    assert_eq!(
+        header_value(&head, "content-type").as_deref(),
+        Some("text/html"),
+        "a field the rule did not touch stays: {head}"
+    );
+    let records = the_records(&h, 1).await;
+    assert_eq!(
+        records[0].notes,
+        ["Body Rewrite: response by ^http(s)?://example\\.com"],
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.body, counts.failed), (1, 0), "{counts:?}");
+}
+
+/// The manual's `[Body Rewrite]` page, its two consecutive-replacement lines,
+/// one engine each: the pairs of a line act one after another, and the second
+/// line's third pair does too. The manual's lines end their host with `/`,
+/// which the test origin's port sits in front of here: the pattern carries
+/// `:\d+` so that it still matches (`the phase 4 / M3b plan's P20`).
+#[tokio::test]
+async fn the_manual_body_rewrite_pairs_example() {
+    for (line, before, after) in [
+        (
+            "http-response ^https?://example\\.com:\\d+/ regex1 replacement1 regex2 replacement2",
+            "regex1 regex2",
+            "replacement1 replacement2",
+        ),
+        (
+            "http-response ^https?://example\\.com:\\d+/ regex1 replacement1 regex2 replacement2 \
+             regex3 replacement3",
+            "regex1 regex2 regex3",
+            "replacement1 replacement2 replacement3",
+        ),
+    ] {
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{before}",
+            before.len()
+        )
+        .into_bytes();
+        let origin = ScriptedOrigin::spawn(raw).await;
+        let port = origin.port();
+        let sections = format!("[Body Rewrite]\n{line}");
+        let h = harness_with(
+            Profile {
+                hosts: "example.com = 127.0.0.1",
+                rules: "DOMAIN,example.com,DIRECT",
+                sections: &sections,
+                ..Profile::default()
+            },
+            shared_on(NetworkFacts::default()),
+        )
+        .await;
+        let request = format!(
+            "GET http://example.com:{port}/ HTTP/1.1\r\nHost: example.com:{port}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let (head, body) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, after.as_bytes(), "{line}: {head}");
+        let records = the_records(&h, 1).await;
+        assert_eq!(
+            records[0].notes,
+            [format!(
+                "Body Rewrite: response by {}",
+                line.split_once(' ').unwrap().1.split_once(' ').unwrap().0
+            )],
+            "{records:?}"
+        );
+    }
+}
+
+/// The manual's `[Body Rewrite]` page: "The replacement supports capture group
+/// references such as `$1`". The manual gives no line for it, so the line is
+/// written here; like the page's own lines it ends its host with `/`, and the
+/// test origin's port sits in front of it here (`:\d+`), as above.
+#[tokio::test]
+async fn the_manual_body_rewrite_capture_example() {
+    let body = "a@b c@d";
+    let origin = ScriptedOrigin::spawn(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes(),
+    )
+    .await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "example.com = 127.0.0.1",
+            rules: "DOMAIN,example.com,DIRECT",
+            sections: r"[Body Rewrite]
+http-response ^http://example\.com:\d+/ (\w+)@(\w+) $2@$1",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let request = format!(
+        "GET http://example.com:{port}/ HTTP/1.1\r\nHost: example.com:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (head, answer) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(answer, b"b@a d@c", "{head}");
+}
+
+/// The manual's `[Body Rewrite]` page: "The `^` and `$` anchors match at the
+/// beginning and end of each line of the body". The manual gives no line for
+/// it, so the line is written here; the body has a `\r\n` line, a `\n` line and
+/// a line of two `x`, of which the anchors catch the first two only.
+#[tokio::test]
+async fn the_manual_body_rewrite_anchors_example() {
+    let body: &[u8] = b"x\r\nx\nxx";
+    let mut raw = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(body);
+    let origin = ScriptedOrigin::spawn(raw).await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "example.com = 127.0.0.1",
+            rules: "DOMAIN,example.com,DIRECT",
+            sections: r"[Body Rewrite]
+http-response ^http://example\.com:\d+/ ^x$ y",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let request = format!(
+        "GET http://example.com:{port}/ HTTP/1.1\r\nHost: example.com:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (head, answer) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(answer, b"y\r\ny\nxx", "{head}");
+}
+
+/// The manual's `[Body Rewrite]` page: "Even if the original request does not
+/// contain a body, new content may still be generated through body rewrite,
+/// such as using the `^$` expression". The manual gives no line for it, so the
+/// line is written here; `:\d+` is the test origin's port, as in the pages'
+/// own lines above.
+#[tokio::test]
+async fn the_manual_body_rewrite_empty_body_example() {
+    let origin = ScriptedOrigin::spawn(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    )
+    .await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "example.com = 127.0.0.1",
+            rules: "DOMAIN,example.com,DIRECT",
+            sections: r"[Body Rewrite]
+http-request ^http://example\.com:\d+/ ^$ generated",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    // a `GET` with no body at all
+    let request = format!(
+        "GET http://example.com:{port}/ HTTP/1.1\r\nHost: example.com:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (head, _) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let heard = origin.heard();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(heard[0].1, b"generated", "{}", heard[0].0);
+    assert_eq!(
+        header_value(&heard[0].0, "content-length").as_deref(),
+        Some("9"),
+        "the body's length is written: {}",
+        heard[0].0
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.body, counts.failed), (1, 0), "{counts:?}");
+}
+
+/// The manual's `[Body Rewrite]` page: "The body must be valid UTF-8 text for
+/// regex-based rewriting. If it is not, the rule is skipped and a note is added
+/// to the request journal". The case's answer is the pattern's first word plus
+/// bytes that start no UTF-8 sequence: the rule would hit it if the body were
+/// text, so what this shows is the rule skipping it.
+#[tokio::test]
+async fn the_manual_utf8_requirement() {
+    let body: &[u8] = b"documents [\xff][\xfe] ";
+    let mut raw = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(body);
+    let origin = ScriptedOrigin::spawn(raw).await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "example.com = 127.0.0.1",
+            rules: "DOMAIN,example.com,DIRECT",
+            sections: "[Body Rewrite]\nhttp-response ^http(s)?://example\\.com documents Surge",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let request = format!(
+        "GET http://example.com:{port}/ HTTP/1.1\r\nHost: example.com:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (head, answer) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(answer, body, "the bytes are left as they were: {head}");
+    assert_eq!(
+        header_value(&head, "content-encoding"),
+        None,
+        "nothing was decoded, so nothing changed: {head}"
+    );
+    let records = the_records(&h, 1).await;
+    assert_eq!(
+        records[0].notes,
+        [
+            "Body Rewrite skipped: ^http(s)?://example\\.com: the body is not valid UTF-8"
+                .to_string()
+        ],
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.body, counts.skipped), (0, 1), "{counts:?}");
+}
+
+/// The manual's `[Map Local]` page, its four lines word for word
+/// (`http/map-local.html`; `the phase 4 / M3b plan's P20`): the status, the
+/// data and the `Content-Type` each line names, the file read from the
+/// profile's own directory, and the headers the third line writes. No request
+/// here needs a port: the lines answer it themselves, and the policy they
+/// choose is a guard, so the case also shows that nothing was dialled.
+#[tokio::test]
+async fn the_manual_map_local_examples() {
+    let file = "{\"ok\":true}";
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let h = harness_with(
+        Profile {
+            proxies: &proxies,
+            hosts: "surgetest.com = 127.0.0.1",
+            rules: "DOMAIN,surgetest.com,guard",
+            sections: "[Map Local]\n\
+                       ^http://surgetest\\.com/json data-type=text data=\"{}\" status-code=500\n\
+                       ^http://surgetest\\.com/gif data-type=tiny-gif status-code=200\n\
+                       ^http://surgetest\\.com/file data-type=file data=\"data/map-local.json\" \
+                       header=\"a:b|foo:bar\"\n\
+                       ^http://surgetest\\.com/base64 data=\"dGVzdA==\" data-type=base64",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    // the manual's relative path is relative to the profile's directory
+    std::fs::create_dir_all(h.dir.path().join("data")).unwrap();
+    std::fs::write(h.dir.path().join("data/map-local.json"), file).unwrap();
+
+    let tags = ["/json", "/gif", "/file", "/base64"];
+    let mut answers = Vec::new();
+    for path in tags {
+        let request = format!(
+            "GET http://surgetest.com{path} HTTP/1.1\r\nHost: surgetest.com\r\n\
+             Connection: close\r\n\r\n"
+        );
+        answers.push(answer_parts(
+            &answer_bytes(h.http(), request.as_bytes()).await,
+        ));
+    }
+
+    let (head, body) = &answers[0];
+    assert!(head.starts_with("HTTP/1.1 500"), "{head}");
+    assert_eq!(body, b"{}", "{head}");
+    assert_eq!(
+        header_value(head, "content-type").as_deref(),
+        Some("text/plain"),
+        "a `text` answer is text/plain: {head}"
+    );
+
+    let (head, body) = &answers[1];
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body.len(), 43, "a 1x1 GIF is 43 bytes: {head}");
+    assert!(body.starts_with(b"GIF89a"), "{head}");
+    assert_eq!(
+        header_value(head, "content-type").as_deref(),
+        Some("image/gif"),
+        "{head}"
+    );
+
+    let (head, body) = &answers[2];
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, file.as_bytes(), "{head}");
+    assert_eq!(header_value(head, "a").as_deref(), Some("b"), "{head}");
+    assert_eq!(header_value(head, "foo").as_deref(), Some("bar"), "{head}");
+    assert_eq!(
+        header_value(head, "content-type").as_deref(),
+        Some("application/json"),
+        "the file's extension says what it is: {head}"
+    );
+
+    let (head, body) = &answers[3];
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"test", "{head}");
+    assert_eq!(
+        header_value(head, "content-type").as_deref(),
+        Some("application/octet-stream"),
+        "{head}"
+    );
+
+    assert_eq!(
+        guard.connections(),
+        0,
+        "every line answered its request without an upstream"
+    );
+    let records = the_records(&h, 4).await;
+    assert_eq!(records.len(), 4, "{records:?}");
+    let kinds = ["text", "tiny-gif", "file", "base64"];
+    for (record, (path, kind)) in records.iter().zip(tags.iter().zip(kinds)) {
+        assert_eq!(
+            record.notes,
+            [format!(
+                "Map Local: {kind} by ^http://surgetest\\.com{path}"
+            )],
+            "{record:?}"
+        );
+    }
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.map_local, counts.failed), (4, 0), "{counts:?}");
+}
+
+/// The manual's `[Map Local]` page: "You can use `data-type=text data=\"\"` to
+/// return an empty result". The page gives no whole line for it, so the line is
+/// written here; its answer has a length and no body.
+#[tokio::test]
+async fn the_manual_map_local_empty_result() {
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let h = harness_with(
+        Profile {
+            proxies: &proxies,
+            hosts: "surgetest.com = 127.0.0.1",
+            rules: "DOMAIN,surgetest.com,guard",
+            sections: "[Map Local]\n^http://surgetest\\.com/empty data-type=text data=\"\"",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let request = "GET http://surgetest.com/empty HTTP/1.1\r\nHost: surgetest.com\r\n\
+                   Connection: close\r\n\r\n";
+    let (head, body) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        header_value(&head, "content-length").as_deref(),
+        Some("0"),
+        "an empty answer still says how long it is: {head}"
+    );
+    assert!(body.is_empty(), "{head}");
+    assert_eq!(
+        header_value(&head, "content-type").as_deref(),
+        Some("text/plain"),
+        "{head}"
+    );
+    assert_eq!(guard.connections(), 0);
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.map_local, counts.failed), (1, 0), "{counts:?}");
+}
+
+/// The manual's `[Body Rewrite]` page, "Limitations": "A request body may be
+/// buffered up to 32 MB; if it exceeds the limit, the connection is dropped".
+/// A body of exactly the limit is rewritten; one byte more and the connection
+/// is closed before a byte of the body is read and before the origin is asked
+/// (`phase 4 M3 design 9.3`, `the phase 4 / M3b plan's P14`).
+#[tokio::test]
+async fn the_request_limit_is_thirty_two_mib() {
+    let origin = ScriptedOrigin::spawn(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    )
+    .await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "big.test = 127.0.0.1",
+            rules: "DOMAIN,big.test,DIRECT",
+            sections: r"[Body Rewrite]
+http-request ^http://big\.test:\d+/ ^a b",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let limit = 32 * 1024 * 1024;
+
+    // exactly the limit: the body is rewritten, and the length it goes out with
+    // is the one it came in with
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    let head = format!(
+        "POST http://big.test:{port}/ HTTP/1.1\r\nHost: big.test:{port}\r\n\
+         Content-Length: {limit}\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(head.as_bytes()).await.unwrap();
+    // the head and the body are not one write here (`CLAUDE.md`'s exception for
+    // a body of this size): the body goes in blocks of 64 KiB
+    for block in vec![b'a'; limit].chunks(64 * 1024) {
+        s.write_all(block).await.unwrap();
+    }
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(60), s.read_to_end(&mut buf)).await;
+    let (answer, body) = answer_parts(&buf);
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert_eq!(body, b"ok", "{answer}");
+    let heard = origin.heard();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(heard[0].1.len(), limit, "the whole body reached the origin");
+    assert_eq!(
+        heard[0].1[0], b'b',
+        "the `a` at the start of the line became `b`"
+    );
+    assert!(
+        heard[0].1[1..].iter().all(|&byte| byte == b'a'),
+        "nothing else changed"
+    );
+    assert_eq!(
+        header_value(&heard[0].0, "content-length").as_deref(),
+        Some("33554432"),
+        "{}",
+        heard[0].0
+    );
+
+    // one byte over: the head alone is enough, and the connection is closed
+    let over = format!(
+        "POST http://big.test:{port}/ HTTP/1.1\r\nHost: big.test:{port}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        limit + 1
+    );
+    let answer = answer_bytes(h.http(), over.as_bytes()).await;
+    assert!(
+        answer.is_empty(),
+        "the connection is closed without an answer: {}",
+        String::from_utf8_lossy(&answer)
+    );
+    assert_eq!(origin.heard().len(), 1, "the origin was not asked again");
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(
+        records[1].error.as_deref(),
+        Some("Body Rewrite: the request body is over 32 MiB"),
+        "{records:?}"
+    );
+    assert_eq!(
+        records[1].notes,
+        [
+            "Body Rewrite failed: ^http://big\\.test:\\d+/: the request body is over 32 MiB"
+                .to_string()
+        ],
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!(
+        (counts.body, counts.skipped, counts.failed),
+        (1, 0, 1),
+        "{counts:?}"
+    );
+}
+
+/// The manual's `[Body Rewrite]` page, "Limitations": "A response body may be
+/// modified only up to 1 MB on iOS and 10 MB on macOS. If the response exceeds
+/// the limit, Surge gives up the modification and streams the response through
+/// unmodified".
+///
+/// A body of exactly the limit is rewritten; one byte more and every byte of it
+/// reaches the client as it came, with the rule's note saying why. The case
+/// asserts the bytes, not the framing: an answer that stops growing past the
+/// limit is handed over with the read-ahead the case already read
+/// (`the phase 4 / M3b plan's execution record row 64`), and the framing of a
+/// `ReadAhead` is each hop's own.
+#[tokio::test]
+async fn the_response_limit_is_ten_mib() {
+    let limit = 10 * 1024 * 1024;
+    for (size, rewritten) in [(limit, true), (limit + 1, false)] {
+        let body = vec![b'a'; size];
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{size:x}\r\n"
+        )
+        .into_bytes();
+        raw.extend_from_slice(&body);
+        raw.extend_from_slice(b"\r\n0\r\n\r\n");
+        let origin = ScriptedOrigin::spawn(raw).await;
+        let port = origin.port();
+        let h = harness_with(
+            Profile {
+                hosts: "b.test = 127.0.0.1",
+                rules: "DOMAIN,b.test,DIRECT",
+                sections: r"[Body Rewrite]
+http-response ^http://b\.test:\d+/ ^a b",
+                ..Profile::default()
+            },
+            shared_on(NetworkFacts::default()),
+        )
+        .await;
+        let request = format!(
+            "GET http://b.test:{port}/ HTTP/1.1\r\nHost: b.test:{port}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let (head, answer) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(answer.len(), size, "every byte reached the client: {head}");
+        let first = if rewritten { b'b' } else { b'a' };
+        assert_eq!(answer[0], first, "{size}: {head}");
+        assert!(
+            answer[1..].iter().all(|&byte| byte == b'a'),
+            "nothing else changed: {head}"
+        );
+        let records = the_records(&h, 1).await;
+        if rewritten {
+            assert_eq!(
+                records[0].notes,
+                ["Body Rewrite: response by ^http://b\\.test:\\d+/".to_string()],
+                "{records:?}"
+            );
+            let counts = h.engine.http_counts().rewrite;
+            assert_eq!((counts.body, counts.skipped), (1, 0), "{counts:?}");
+        } else {
+            assert_eq!(
+                records[0].notes,
+                [
+                    "Body Rewrite skipped: ^http://b\\.test:\\d+/: the body is over 10 MiB"
+                        .to_string()
+                ],
+                "{records:?}"
+            );
+            let counts = h.engine.http_counts().rewrite;
+            assert_eq!((counts.body, counts.skipped), (0, 1), "{counts:?}");
+        }
+    }
+}
+
+/// The manual's `[Body Rewrite]` page, "Limitations": "Request body rewrite is
+/// not supported when the request uses `Transfer-Encoding: chunked` or
+/// `Expect: 100-continue`. Surge logs a warning and forwards the request
+/// unmodified". Two chunked requests over one rule: both reach the origin as
+/// they came, and the log has one WARN for the rule and a DEBUG for each
+/// request (`phase 4 M3 design 14`, `the phase 4 / M3b plan's P18`).
+#[tokio::test]
+async fn a_chunked_request_is_forwarded_with_one_warning() {
+    let log = LogCapture::start();
+    let origin = ScriptedOrigin::spawn(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    )
+    .await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "b.test = 127.0.0.1",
+            rules: "DOMAIN,b.test,DIRECT",
+            sections: r"[Body Rewrite]
+http-request ^http://b\.test:\d+/ value abc",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+
+    for _ in 0..2 {
+        let request = format!(
+            "POST http://b.test:{port}/ HTTP/1.1\r\nHost: b.test:{port}\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+             5\r\nvalue\r\n0\r\n\r\n"
+        );
+        let (head, _) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    }
+
+    let heard = origin.heard();
+    assert_eq!(heard.len(), 2, "{heard:?}");
+    for (head, sent) in &heard {
+        assert_eq!(sent, b"value", "the body reached the origin unchanged");
+        assert!(
+            header_value(head, "transfer-encoding")
+                .is_some_and(|value| value.to_ascii_lowercase().contains("chunked")),
+            "it is still the chunked body it came as: {head}"
+        );
+    }
+
+    let lines = log.lines();
+    let said: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains("request body not rewritten:"))
+        .collect();
+    let warns: Vec<&&String> = said
+        .iter()
+        .filter(|line| line.starts_with("WARN"))
+        .collect();
+    assert_eq!(warns.len(), 1, "one WARN an hour for the rule: {said:?}");
+    assert!(
+        warns[0].contains("request body not rewritten: the request body is chunked")
+            && warns[0].contains(r#"pattern="^http://b\\.test:\\d+/""#)
+            && !warns[0].contains("host="),
+        "the WARN names the rule and no host: {}",
+        warns[0]
+    );
+    let debugs: Vec<&&String> = said
+        .iter()
+        .filter(|line| line.starts_with("DEBUG"))
+        .collect();
+    assert_eq!(debugs.len(), 2, "one DEBUG for each request: {said:?}");
+    for line in debugs {
+        assert!(
+            line.contains(r#"host="b.test""#),
+            "the DEBUG names the host: {line}"
+        );
+        assert!(
+            line.contains(r#"pattern="^http://b\\.test:\\d+/""#),
+            "and the rule: {line}"
+        );
+    }
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    for record in &records {
+        assert_eq!(
+            record.notes,
+            [
+                "Body Rewrite skipped: ^http://b\\.test:\\d+/: the request body is chunked"
+                    .to_string()
+            ],
+            "{record:?}"
+        );
+    }
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.body, counts.skipped), (0, 2), "{counts:?}");
+}
+
+/// The manual's `[Body Rewrite]` page, "Limitations": a request that expects
+/// `100-continue` is forwarded unmodified, with a note that says why
+/// (`phase 4 M3 design 9.2`, `the phase 4 / M3b plan's P10`).
+#[tokio::test]
+async fn an_expect_request_is_forwarded_unmodified() {
+    let origin = ScriptedOrigin::spawn(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    )
+    .await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "b.test = 127.0.0.1",
+            rules: "DOMAIN,b.test,DIRECT",
+            sections: r"[Body Rewrite]
+http-request ^http://b\.test:\d+/ value abc",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let request = format!(
+        "POST http://b.test:{port}/ HTTP/1.1\r\nHost: b.test:{port}\r\n\
+         Content-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\nvalue"
+    );
+    let mut raw = answer_bytes(h.http(), request.as_bytes()).await;
+    // hyper's server writes the interim answer when the body is read
+    if raw.starts_with(b"HTTP/1.1 100") {
+        let at = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("an interim answer");
+        raw.drain(..at + 4);
+    }
+    let (head, answer) = answer_parts(&raw);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(answer, b"ok", "{head}");
+
+    let heard = origin.heard();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(
+        heard[0].1, b"value",
+        "the body reached the origin unchanged"
+    );
+    assert_eq!(
+        header_value(&heard[0].0, "expect").as_deref(),
+        Some("100-continue"),
+        "it is still the request that expected one: {}",
+        heard[0].0
+    );
+    let records = the_records(&h, 1).await;
+    assert_eq!(
+        records[0].notes,
+        [
+            "Body Rewrite skipped: ^http://b\\.test:\\d+/: the request expects 100-continue"
+                .to_string()
+        ],
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.body, counts.skipped), (0, 1), "{counts:?}");
+}
+
+/// A body that says nothing about its length, for the an HTTP/2 client sends
+/// when it does not name one (`phase 4 M3 design 9.2`, `the phase 4 / M3b
+/// plan's P10`): hyper's client writes no `content-length` for a body whose
+/// size it cannot tell in advance, and this one tells nothing.
+struct Unmeasured(Bytes);
+
+/// A body that says in its head how long it is and then sends one byte: the
+/// request over the limit sends its head and no body at all (`the phase 4 /
+/// M3b plan's task 7`), and hyper's client writes the length it was told down
+/// as the request's `content-length`. One byte rather than nothing is what the
+/// client's own writing needs: a body that never ends would leave the stream
+/// it belongs to open for good. A body of zero is a request with none.
+struct Promised {
+    size: u64,
+    sent: bool,
+}
+
+impl hyper::body::Body for Promised {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.size == 0 || this.sent {
+            return std::task::Poll::Ready(None);
+        }
+        this.sent = true;
+        std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from_static(b"x")))))
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.size)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // the default is `false`, and a client that says it may still send a
+        // body would leave the engine waiting for a length it has none of
+        self.size == 0 || self.sent
+    }
+}
+
+impl hyper::body::Body for Unmeasured {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        let data = std::mem::take(&mut this.0);
+        if data.is_empty() {
+            std::task::Poll::Ready(None)
+        } else {
+            std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(data))))
+        }
+    }
+}
+
+/// A request of no length on a decrypted HTTP/2 connection cannot be buffered,
+/// so it reaches the origin as it came, with a note that says why (`phase 4 M3
+/// design 9.2`, `the phase 4 / M3b plan's P10`). The origin speaks HTTP/1.1 so
+/// that the case can read what arrived.
+#[tokio::test]
+async fn an_http2_request_without_a_length_is_forwarded_unmodified() {
+    let fixture = TlsFixture::new(&["origin.test"]);
+    let origin = ScriptedOrigin::spawn_tls(
+        fixture.acceptor_with_alpn(false, &[b"http/1.1"]),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    )
+    .await;
+    let port = origin.port();
+    let mitm = mitm_ca();
+    let sections = format!(
+        "{}\nh2 = true\n\
+         [Body Rewrite]\n\
+         http-request ^https://origin\\.test:\\d+/ value abc",
+        mitm_section(&format!("origin.test:{port}"), &mitm.ca_p12_base64("pw"))
+    );
+    let h = harness_mitm(
+        Profile {
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,DIRECT",
+            sections: &sections,
+            ..Profile::default()
+        },
+        fixture.roots(),
+    )
+    .await;
+
+    let (settled, tls) = decrypted(&h, mitm.roots(), port, &[b"h2"]).await;
+    assert_eq!(settled.as_deref(), Some("h2"), "{settled:?}");
+    // the connection is made here, not by `h2_over`: that one carries a body
+    // whose length hyper can tell, and this case needs one it cannot
+    let (sender, conn): (http2::SendRequest<Unmeasured>, _) =
+        http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(tls))
+            .await
+            .expect("an HTTP/2 handshake over the decrypted stream");
+    // the connection moves only while its own task runs (`h2_over`)
+    let conn = tokio::spawn(conn);
+    let mut sender = sender;
+    // the authority carries the test origin's port: it is what makes the URL of
+    // the request here, and the engine dials what it names
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("https://origin.test:{port}/up"))
+        .body(Unmeasured(Bytes::from_static(b"value")))
+        .expect("a request");
+    let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+        .await
+        .expect("the answer comes within the bound")
+        .expect("the request goes through");
+    assert_eq!(response.status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+        .await
+        .expect("the body comes within the bound")
+        .expect("a response body");
+    drop(sender);
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the connection ends within the bound")
+        .expect("the connection's task did not panic")
+        .expect("the client's side of the connection ends cleanly");
+
+    let heard = origin.heard();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(
+        heard[0].1, b"value",
+        "the body reached the origin unchanged"
+    );
+    assert!(
+        heard[0].0.starts_with("POST /up HTTP/1.1"),
+        "{}",
+        heard[0].0
+    );
+    assert_eq!(
+        header_value(&heard[0].0, "content-length"),
+        None,
+        "it went out with no length, as it came: {}",
+        heard[0].0
+    );
+    let records = the_records(&h, 1).await;
+    assert_eq!(
+        records[0].notes,
+        [
+            "Body Rewrite skipped: ^https://origin\\.test:\\d+/: the request body has no length"
+                .to_string()
+        ],
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.body, counts.skipped), (0, 1), "{counts:?}");
+}
+
+/// A request whose head says it is over the limit is closed on HTTP/1.1 and
+/// its stream is reset on HTTP/2, and the connection goes on serving the
+/// requests after it (`phase 4 M3 design 9.3`, `the phase 4 / M3b plan's
+/// P14`): the manual's "the connection is dropped" is the HTTP/1.1 shape of
+/// it, and `M2-D11`'s "reset this stream" is the HTTP/2 one.
+#[tokio::test]
+async fn an_http2_request_over_the_limit_resets_its_stream() {
+    let fixture = TlsFixture::new(&["origin.test"]);
+    let origin = ScriptedOrigin::spawn_tls(
+        fixture.acceptor_with_alpn(false, &[b"http/1.1"]),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    )
+    .await;
+    let port = origin.port();
+    let mitm = mitm_ca();
+    let sections = format!(
+        "{}\nh2 = true\n\
+         [Body Rewrite]\n\
+         http-request ^https://origin\\.test:\\d+/ ^a b",
+        mitm_section(&format!("origin.test:{port}"), &mitm.ca_p12_base64("pw"))
+    );
+    let h = harness_mitm(
+        Profile {
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,DIRECT",
+            sections: &sections,
+            ..Profile::default()
+        },
+        fixture.roots(),
+    )
+    .await;
+
+    let (settled, tls) = decrypted(&h, mitm.roots(), port, &[b"h2"]).await;
+    assert_eq!(settled.as_deref(), Some("h2"), "{settled:?}");
+    // the connection is made here, not by `h2_over`: the first request's head
+    // promises a body it never sends, which needs a body type of its own
+    let (sender, conn): (http2::SendRequest<Promised>, _) =
+        http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(tls))
+            .await
+            .expect("an HTTP/2 handshake over the decrypted stream");
+    let conn = tokio::spawn(conn);
+    let mut sender = sender;
+
+    // the head alone promises 32 MiB and one byte, and no body follows
+    let over = Request::builder()
+        .method(Method::POST)
+        .uri(format!("https://origin.test:{port}/big"))
+        .body(Promised {
+            size: 32 * 1024 * 1024 + 1,
+            sent: false,
+        })
+        .expect("a request");
+    let answer = tokio::time::timeout(Duration::from_secs(5), sender.send_request(over)).await;
+    match answer {
+        // the stream was reset before an answer could come
+        Ok(Err(_)) | Err(_) => {}
+        Ok(Ok(response)) => panic!("the stream is reset, not answered: {}", response.status()),
+    }
+
+    // the same connection still answers the request after it
+    let next = Request::builder()
+        .method(Method::GET)
+        .uri(format!("https://origin.test:{port}/next"))
+        .body(Promised {
+            size: 0,
+            sent: false,
+        })
+        .expect("a request");
+    let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(next))
+        .await
+        .expect("the answer comes within the bound")
+        .expect("the request after the reset goes through");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+        .await
+        .expect("the body comes within the bound")
+        .expect("a response body")
+        .to_bytes();
+    assert_eq!(&body[..], b"ok");
+    drop(sender);
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the connection ends within the bound")
+        .expect("the connection's task did not panic")
+        .expect("the client's side of the connection ends cleanly");
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(records[1].status, RecordStatus::Completed, "{records:?}");
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!(
+        (counts.body, counts.skipped, counts.failed),
+        (0, 0, 1),
+        "{counts:?}"
+    );
+}
+
+/// The manual's `[Body Rewrite]` page: "the body is decompressed first if
+/// necessary, and `Content-Length` is recalculated". A gzip answer a rule
+/// changes goes out plain, with no `Content-Encoding`; one the rule matches
+/// but leaves as it was goes out as the compressed bytes it came as, with the
+/// field that says so (`phase 4 M3 design 9.4`, `9.6`; the phase 4 / M3b
+/// plan's P11, P13).
+#[tokio::test]
+async fn a_rewritten_gzip_response_and_an_unchanged_one() {
+    for (plain, rewritten) in [("<p>documents</p>", true), ("<p>other</p>", false)] {
+        let compressed = gzipped(plain.as_bytes());
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            compressed.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&compressed);
+        let origin = ScriptedOrigin::spawn(raw).await;
+        let port = origin.port();
+        let h = harness_with(
+            Profile {
+                hosts: "b.test = 127.0.0.1",
+                rules: "DOMAIN,b.test,DIRECT",
+                sections: r"[Body Rewrite]
+http-response ^http://b\.test:\d+/ documents Surge",
+                ..Profile::default()
+            },
+            shared_on(NetworkFacts::default()),
+        )
+        .await;
+        let request = format!(
+            "GET http://b.test:{port}/ HTTP/1.1\r\nHost: b.test:{port}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let (head, body) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let records = the_records(&h, 1).await;
+        if rewritten {
+            assert_eq!(body, b"<p>Surge</p>", "the body went out as it became");
+            assert_eq!(
+                header_value(&head, "content-encoding"),
+                None,
+                "a rewritten body is sent plain: {head}"
+            );
+            assert_eq!(
+                header_value(&head, "content-length").as_deref(),
+                Some("12"),
+                "{head}"
+            );
+            assert_eq!(
+                records[0].notes,
+                ["Body Rewrite: response by ^http://b\\.test:\\d+/".to_string()],
+                "{records:?}"
+            );
+        } else {
+            assert_eq!(body, compressed, "the compressed bytes, as they came");
+            assert_eq!(
+                header_value(&head, "content-encoding").as_deref(),
+                Some("gzip"),
+                "a body left as it was keeps its field: {head}"
+            );
+            assert!(records[0].notes.is_empty(), "{records:?}");
+        }
+        let counts = h.engine.http_counts().rewrite;
+        assert_eq!(
+            (counts.body, counts.skipped, counts.failed),
+            (u64::from(rewritten), 0, 0),
+            "{counts:?}"
+        );
+    }
+}
+
+/// A body compressed with something rurge does not decode is left as it came,
+/// with a note that names the coding and never a byte of the body (`phase 4 M3
+/// design 9.4`, `the phase 4 / M3b plan's P11`): M3c's `br` and `zstd` are not
+/// this plan's, and the page M3-D8 wrote down is the one this case holds to.
+#[tokio::test]
+async fn a_brotli_response_is_not_rewritten() {
+    let body: &[u8] = b"\x1b\x2b\xff\x02xyzw";
+    let mut raw = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: br\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(body);
+    let origin = ScriptedOrigin::spawn(raw).await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "b.test = 127.0.0.1",
+            rules: "DOMAIN,b.test,DIRECT",
+            sections: r"[Body Rewrite]
+http-response ^http://b\.test:\d+/ xyzw Surge",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let request = format!(
+        "GET http://b.test:{port}/ HTTP/1.1\r\nHost: b.test:{port}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (head, answer) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(answer, body, "the bytes are left as they came: {head}");
+    assert_eq!(
+        header_value(&head, "content-encoding").as_deref(),
+        Some("br"),
+        "{head}"
+    );
+    let records = the_records(&h, 1).await;
+    assert_eq!(
+        records[0].notes,
+        [
+            "Body Rewrite skipped: ^http://b\\.test:\\d+/: content-encoding br is not supported"
+                .to_string()
+        ],
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.body, counts.skipped), (0, 1), "{counts:?}");
+}
+
+/// The manual's `[Map Local]` page: the `file` type's data is "the path to the
+/// data file"; a file's answer is read when the request arrives, so the next
+/// request reads what the file says now, without the profile being loaded
+/// again (`phase 4 M3 design 10.2`; the phase 4 / M3b plan's P15).
+#[tokio::test]
+async fn the_file_is_read_on_every_request() {
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let h = harness_with(
+        Profile {
+            proxies: &proxies,
+            hosts: "surgetest.com = 127.0.0.1",
+            rules: "DOMAIN,surgetest.com,guard",
+            sections: "[Map Local]\n\
+                       ^http://surgetest\\.com/file data-type=file data=\"data/map-local.json\"",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let file = h.dir.path().join("data/map-local.json");
+    std::fs::create_dir_all(h.dir.path().join("data")).unwrap();
+    let request = "GET http://surgetest.com/file HTTP/1.1\r\nHost: surgetest.com\r\n\
+                   Connection: close\r\n\r\n";
+
+    std::fs::write(&file, "{\"n\":1}").unwrap();
+    let (head, body) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"{\"n\":1}", "{head}");
+
+    std::fs::write(&file, "{\"n\":22}").unwrap();
+    let (head, body) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"{\"n\":22}", "the second request read the new file");
+
+    assert_eq!(guard.connections(), 0);
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.map_local, counts.failed), (2, 0), "{counts:?}");
+}
+
+/// A `[Map Local]` file that is not there answers 502, with the path in the
+/// record and no byte of it in the answer (`phase 4 M3 design 10.3`, `8.5`;
+/// the phase 4 / M3b plan's P15, P18): the policy the line chose is never
+/// dialled either.
+#[tokio::test]
+async fn a_missing_map_local_file_answers_502() {
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let h = harness_with(
+        Profile {
+            proxies: &proxies,
+            hosts: "surgetest.com = 127.0.0.1",
+            rules: "DOMAIN,surgetest.com,guard",
+            sections: "[Map Local]\n\
+                       ^http://surgetest\\.com/file data-type=file data=\"data/missing.json\"",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let request = "GET http://surgetest.com/file HTTP/1.1\r\nHost: surgetest.com\r\n\
+                   Connection: close\r\n\r\n";
+    let (head, _) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+    assert_eq!(
+        guard.connections(),
+        0,
+        "a Map Local failure does not dial the policy"
+    );
+    let records = the_records(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    let path = h.dir.path().join("data/missing.json");
+    assert_eq!(
+        records[0].error.as_deref(),
+        Some(format!("Map Local: cannot read {}", path.display()).as_str()),
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.map_local, counts.failed), (0, 1), "{counts:?}");
+}
+
+/// A request whose policy is one of REJECT's is not mapped either: `Map Local`
+/// is a step of the engine's HTTP path, and a rejected request never reaches
+/// it (`phase 4 M3 design 8.4`, `10.2`; `M3-D27`).
+#[tokio::test]
+async fn a_rejected_request_is_not_mapped() {
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let h = harness_with(
+        Profile {
+            general: "show-error-page-for-reject = true",
+            proxies: &proxies,
+            hosts: "surgetest.com = 127.0.0.1\nother.test = 127.0.0.1",
+            rules: "DOMAIN,surgetest.com,REJECT\nDOMAIN,other.test,guard",
+            sections: "[Map Local]\n\
+                       ^http://surgetest\\.com/ json2json data-type=text data=\"{}\"",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let answer = plain_get(h.http(), "http://surgetest.com/json2json", "surgetest.com").await;
+    assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+    assert!(
+        !answer.ends_with("{}"),
+        "the answer is the reject page, not the line's data: {answer}"
+    );
+    assert_eq!(guard.connections(), 0);
+    let records = the_records(&h, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0].status,
+        RecordStatus::Rejected("REJECT".into()),
+        "{records:?}"
+    );
+    assert!(records[0].notes.is_empty(), "{:?}", records[0].notes);
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!(
+        (
+            counts.url,
+            counts.header,
+            counts.body,
+            counts.map_local,
+            counts.skipped,
+            counts.failed
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "{counts:?}"
+    );
+}
+
+/// Both steps act on a decrypted `https://` request: one line answers one
+/// request without an upstream, and a body rule changes the answer of the
+/// next one (`phase 4 M3 design 10.2`, `9.5`; the manual's `[Map Local]` page:
+/// "HTTPS requests can only be matched if MITM is enabled for the hostname").
+#[tokio::test]
+async fn map_local_and_body_rewrite_on_a_decrypted_https_request() {
+    let fixture = TlsFixture::new(&["origin.test"]);
+    let body = "<p>documents</p>";
+    let origin = ScriptedOrigin::spawn_tls(
+        fixture.acceptor_with_alpn(false, &[b"http/1.1"]),
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes(),
+    )
+    .await;
+    let port = origin.port();
+    let mitm = mitm_ca();
+    let sections = format!(
+        "{}\n\
+         [Map Local]\n\
+         ^https://origin\\.test:\\d+/mapped data-type=text data=\"mapped\"\n\
+         [Body Rewrite]\n\
+         http-response ^https://origin\\.test:\\d+/rewritten documents Surge",
+        mitm_section(&format!("origin.test:{port}"), &mitm.ca_p12_base64("pw"))
+    );
+    let h = harness_mitm(
+        Profile {
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,DIRECT",
+            sections: &sections,
+            ..Profile::default()
+        },
+        fixture.roots(),
+    )
+    .await;
+
+    let (settled, mut tls) = decrypted(&h, mitm.roots(), port, &[b"http/1.1"]).await;
+    assert_eq!(settled.as_deref(), Some("http/1.1"), "{settled:?}");
+    let host = format!("origin.test:{port}");
+
+    let answer = decrypted_get(&mut tls, &host, "/mapped").await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert!(answer.ends_with("mapped"), "{answer}");
+
+    let answer = decrypted_get(&mut tls, &host, "/rewritten").await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert!(answer.ends_with("<p>Surge</p>"), "{answer}");
+
+    let heard = origin.heard();
+    assert_eq!(
+        heard.len(),
+        1,
+        "only the second request was dialled: {heard:?}"
+    );
+    assert!(
+        heard[0].0.starts_with("GET /rewritten HTTP/1.1"),
+        "{}",
+        heard[0].0
+    );
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(
+        records[0].notes,
+        ["Map Local: text by ^https://origin\\.test:\\d+/mapped".to_string()],
+        "{records:?}"
+    );
+    assert_eq!(
+        records[1].notes,
+        ["Body Rewrite: response by ^https://origin\\.test:\\d+/rewritten".to_string()],
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.map_local, counts.body), (1, 1), "{counts:?}");
+}
+
+/// The `rewrite` switch (`phase 4 M3 design 11`) turns both steps off with the
+/// ones M3a and M3b added: with it off a `[Map Local]` line does not answer and
+/// a body rule changes nothing, neither leaves a note, and no count moves; with
+/// it on again both act. The pages say the same of Map Local: "only when the
+/// Rewrite feature is enabled".
+#[tokio::test]
+async fn the_switch_turns_body_rewrite_and_map_local_off() {
+    let body = "documents";
+    let origin = ScriptedOrigin::spawn(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes(),
+    )
+    .await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "surgetest.com = 127.0.0.1",
+            rules: "DOMAIN,surgetest.com,DIRECT",
+            sections: "[Map Local]\n\
+                       ^http://surgetest\\.com:\\d+/mapped data-type=text data=\"mapped\"\n\
+                       [Body Rewrite]\n\
+                       http-response ^http://surgetest\\.com:\\d+/origin documents Surge",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let mapped = format!("http://surgetest.com:{port}/mapped");
+    let rewritten = format!("http://surgetest.com:{port}/origin");
+    let host = format!("surgetest.com:{port}");
+
+    // on: the line answers, the rule changes the answer
+    let answer = plain_get(h.http(), &mapped, &host).await;
+    assert!(answer.ends_with("mapped"), "{answer}");
+    let answer = plain_get(h.http(), &rewritten, &host).await;
+    assert!(answer.ends_with("Surge"), "{answer}");
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.map_local, counts.body), (1, 1), "{counts:?}");
+
+    // off: neither acts, and nothing is counted
+    h.engine.set_rewrite(false).await;
+    assert!(!h.engine.rewrite_on());
+    let answer = plain_get(h.http(), &mapped, &host).await;
+    assert!(
+        answer.ends_with("documents"),
+        "the origin answered: {answer}"
+    );
+    let answer = plain_get(h.http(), &rewritten, &host).await;
+    assert!(answer.ends_with("documents"), "{answer}");
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!(
+        (counts.map_local, counts.body),
+        (1, 1),
+        "a switch off changes no count: {counts:?}"
+    );
+
+    // on again: both act again
+    h.engine.set_rewrite(true).await;
+    let answer = plain_get(h.http(), &mapped, &host).await;
+    assert!(answer.ends_with("mapped"), "{answer}");
+    let answer = plain_get(h.http(), &rewritten, &host).await;
+    assert!(answer.ends_with("Surge"), "{answer}");
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.map_local, counts.body), (2, 2), "{counts:?}");
+
+    // the origin answered the two `/origin` requests and the two the switch
+    // off let through, and those last two left no note
+    let heard = origin.heard();
+    assert_eq!(heard.len(), 4, "{heard:?}");
+    let records = the_records(&h, 6).await;
+    assert_eq!(records.len(), 6, "{records:?}");
+    assert!(records[2].notes.is_empty(), "{:?}", records[2].notes);
+    assert!(records[3].notes.is_empty(), "{:?}", records[3].notes);
+}
+
+/// Neither a body nor a `[Map Local]` line's data nor a query string reaches
+/// the notes or the log, which this case keeps down to TRACE (`phase 4 M3
+/// design 8.5`, `14`; `M3-D18`, the phase 4 / M3b plan's P2, P5, P18).
+#[tokio::test]
+async fn no_body_or_data_reaches_the_notes_or_the_log() {
+    let log = LogCapture::everything();
+    let answer_body = "s3cr3t-b in the answer";
+    let origin = ScriptedOrigin::spawn(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{answer_body}",
+            answer_body.len()
+        )
+        .into_bytes(),
+    )
+    .await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "b.test = 127.0.0.1",
+            rules: "DOMAIN,b.test,DIRECT",
+            sections: r#"[Body Rewrite]
+http-request ^http://b\.test:\d+/in = abc
+http-response ^http://b\.test:\d+/out answer Surge
+[Map Local]
+^http://b\.test:\d+/mapped data-type=text data="s3cr3t-m""#,
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let host = format!("b.test:{port}");
+
+    // 1. a request whose body is rewritten: the body is not in any note
+    let body = "s3cr3t-b=1";
+    let request = format!(
+        "POST http://b.test:{port}/in HTTP/1.1\r\nHost: {host}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (head, _) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        origin.heard()[0].1,
+        b"s3cr3t-babc1",
+        "the rewritten body did reach the origin"
+    );
+
+    // 2. a response whose body is rewritten
+    let (head, answer) = answer_parts(
+        &answer_bytes(
+            h.http(),
+            format!(
+                "GET http://b.test:{port}/out HTTP/1.1\r\nHost: {host}\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await,
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(answer.ends_with(b"in the Surge"), "{head}");
+
+    // 3. a `[Map Local]` line whose data is the secret, under a query string
+    let (head, answer) = answer_parts(
+        &answer_bytes(
+            h.http(),
+            format!(
+                "GET http://b.test:{port}/mapped?tok=q1 HTTP/1.1\r\nHost: {host}\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await,
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(answer, b"s3cr3t-m", "the data did reach the client");
+
+    let records = the_records(&h, 3).await;
+    assert_eq!(records.len(), 3, "{records:?}");
+    for record in &records {
+        for note in &record.notes {
+            for secret in ["s3cr3t-b", "s3cr3t-m", "q1"] {
+                assert!(
+                    !note.contains(secret),
+                    "a note carries {secret}: {note} ({record:?})"
+                );
+            }
+        }
+    }
+    for line in log.lines() {
+        for secret in ["s3cr3t-b", "s3cr3t-m", "q1"] {
+            assert!(
+                !line.contains(secret),
+                "a log line carries {secret}: {line}"
+            );
+        }
+    }
+}
+
+/// The six counts of `/v1/rurge/http`'s `rewrite` after M3b's two steps it
+/// adds (`phase 4 M3 design 12`, the phase 4 / M3b plan's P18): every one of
+/// them moved by the requests that make it, and none by the others.
+#[tokio::test]
+async fn body_and_map_local_counts_reach_the_api_shape() {
+    let answer_body = "the answer";
+    let origin = ScriptedOrigin::spawn(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{answer_body}",
+            answer_body.len()
+        )
+        .into_bytes(),
+    )
+    .await;
+    let port = origin.port();
+    let h = harness_with(
+        Profile {
+            hosts: "b.test = 127.0.0.1\nlocalhost = 127.0.0.1",
+            rules: "DOMAIN,b.test,DIRECT",
+            sections: "[URL Rewrite]\n\
+                       ^http://b\\.test:\\d+/moved https://localhost/ 302\n\
+                       [Header Rewrite]\n\
+                       http-response ^http://b\\.test:\\d+/out header-add X-A 1\n\
+                       [Body Rewrite]\n\
+                       http-request ^http://b\\.test:\\d+/(in|big) value abc\n\
+                       http-request ^http://b\\.test:\\d+/chunked value abc\n\
+                       http-response ^http://b\\.test:\\d+/out answer Surge\n\
+                       [Map Local]\n\
+                       ^http://b\\.test:\\d+/mapped data-type=text data=\"mapped\"\n\
+                       ^http://b\\.test:\\d+/missing data-type=file data=\"data/none.json\"",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let host = format!("b.test:{port}");
+    let get = |path: &str| {
+        format!(
+            "GET http://b.test:{port}{path} HTTP/1.1\r\nHost: {host}\r\n\
+             Connection: close\r\n\r\n"
+        )
+    };
+
+    // mapLocal 1: the line answers
+    let answer = plain_get(h.http(), &format!("http://b.test:{port}/mapped"), &host).await;
+    assert!(answer.ends_with("mapped"), "{answer}");
+    // failed 1: the line's file is not there
+    let answer = plain_get(h.http(), &format!("http://b.test:{port}/missing"), &host).await;
+    assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+    // body 1: the request's body changes
+    let (head, _) = answer_parts(
+        &answer_bytes(
+            h.http(),
+            format!(
+                "POST http://b.test:{port}/in HTTP/1.1\r\nHost: {host}\r\n\
+                 Content-Length: 5\r\nConnection: close\r\n\r\nvalue"
+            )
+            .as_bytes(),
+        )
+        .await,
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    // header 1 and body 1: the field is added and the answer changes
+    let (head, body) = answer_parts(&answer_bytes(h.http(), get("/out").as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(body.ends_with(b"the Surge"), "{head}");
+    assert_eq!(header_value(&head, "x-a").as_deref(), Some("1"), "{head}");
+    // skipped 1: a chunked request is forwarded, and its rule says why
+    let (head, _) = answer_parts(
+        &answer_bytes(
+            h.http(),
+            format!(
+                "POST http://b.test:{port}/chunked HTTP/1.1\r\nHost: {host}\r\n\
+                 Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                 5\r\nvalue\r\n0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await,
+    );
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    // url 1: the redirect answers
+    let answer = plain_get(h.http(), &format!("http://b.test:{port}/moved"), &host).await;
+    assert!(answer.starts_with("HTTP/1.1 302"), "{answer}");
+    // failed 2: a request whose head is over the limit
+    let over = format!(
+        "POST http://b.test:{port}/big HTTP/1.1\r\nHost: {host}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        32 * 1024 * 1024 + 1
+    );
+    assert!(answer_bytes(h.http(), over.as_bytes()).await.is_empty());
+
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!(
+        (
+            counts.url,
+            counts.header,
+            counts.body,
+            counts.map_local,
+            counts.skipped,
+            counts.failed
+        ),
+        (1, 1, 2, 1, 1, 2),
+        "{counts:?}"
+    );
+    let records = the_records(&h, 7).await;
+    assert_eq!(records.len(), 7, "{records:?}");
+}
