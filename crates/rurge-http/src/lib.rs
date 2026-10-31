@@ -21,6 +21,8 @@ pub mod headers;
 pub mod mitm;
 pub mod pool;
 pub mod prefix;
+// The engine uses the body and Map Local items from the phase 4 / M3b plan's task 5 on.
+#[allow(dead_code)]
 pub mod rewrite;
 pub mod sniff;
 pub mod tls;

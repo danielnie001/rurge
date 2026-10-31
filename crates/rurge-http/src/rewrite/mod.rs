@@ -12,6 +12,7 @@
 //! `RewriteCounters` outlives every generation: one engine has one, reloads
 //! keep counting (`phase 4 M3 design 12`).
 
+mod body;
 mod header;
 mod url;
 
