@@ -4505,7 +4505,7 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
     /// (phase 4 M3 design 4.3; `docs/api/phase1.md`, the lines kept as they
     /// stand). The new word split changes nothing about what is hidden, and
     /// this pins it down; whether these values should be hidden is the project
-    /// owner's question (phase 4 M3 design Q2).
+    /// owner's question (phase 4 design Q2).
     #[test]
     fn rewrite_lines_are_shown_as_written() {
         let input = concat!(

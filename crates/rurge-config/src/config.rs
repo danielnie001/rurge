@@ -16,6 +16,7 @@ use crate::policy::{
 use crate::reach::Reach;
 use crate::remote::{Memo, RemoteRef, RemoteRole, RemoteSource};
 use crate::requirement::{self, Environment};
+use crate::rewrite::{self, RewriteConfig};
 use crate::rule::{
     ParseCtx, PolicyRef, ResourceRef, Rule, RuleKind, SubRule, parse_rule, parse_subrule,
 };
@@ -246,6 +247,10 @@ pub struct Config {
     pub ssid_settings: Vec<SsidSetting>,
     /// `[IP Rewrite]`: the lines that can be read, in the order written.
     pub ip_rewrite: IpRewrite,
+    /// `[URL Rewrite]` and `[Header Rewrite]`: the lines that can be read,
+    /// in the order written (phase 4 M3 design 6.1 and 7.1). `[Body Rewrite]`
+    /// and `[Map Local]` follow in M3b.
+    pub rewrite: RewriteConfig,
     pub deferred: DeferredSections,
     /// The `#!MANAGED-CONFIG` line of the text in effect: none when it is a
     /// downloaded copy that carries no line.
@@ -928,6 +933,24 @@ pub fn from_profile(
         &mut diags,
     );
 
+    // [URL Rewrite] and [Header Rewrite].
+    let rewrite = RewriteConfig {
+        url: rewrite::parse_url(
+            profile
+                .section("URL Rewrite")
+                .into_iter()
+                .flat_map(Section::active_entries),
+            &mut diags,
+        ),
+        header: rewrite::parse_header(
+            profile
+                .section("Header Rewrite")
+                .into_iter()
+                .flat_map(Section::active_entries),
+            &mut diags,
+        ),
+    };
+
     // Deferred and unknown sections.
     let deferred = DeferredSections::collect(&profile);
     if !deferred.sections.is_empty() {
@@ -962,6 +985,18 @@ pub fn from_profile(
         }
     }
 
+    // [Replica]: a section rurge knows and ignores (phase 4 M3 design 4.4).
+    // Only the first section of the name is reported, as `W0002` does it.
+    if let Some(sec) = profile.section("Replica") {
+        diags.push(
+            Diagnostic::info(
+                codes::I_REPLICA_REMOVED,
+                "[Replica] was removed in Surge Mac 5.4.0; the section is ignored",
+            )
+            .at(sec.span.clone()),
+        );
+    }
+
     // The local files the profile took in. A line of a downloaded text is in
     // a file of the cache, which nobody edits and a watcher has no use for;
     // and a downloaded text takes in no local file.
@@ -992,6 +1027,7 @@ pub fn from_profile(
         wireguard,
         ssid_settings,
         ip_rewrite,
+        rewrite,
         deferred,
         managed,
         unknown_sections,
@@ -1715,6 +1751,7 @@ fn own_listener(general: &General, port: u16) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::Severity;
     use crate::ip_rewrite::IpRewriteAction;
     use crate::network::{NetKind, NetworkFacts, Primary, WifiLink};
     use crate::remote::fake::{Fake, hours};
@@ -2697,6 +2734,71 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         assert_eq!(table.action(ip("10.0.0.1")), Some(IpRewriteAction::Reflect));
         assert_eq!(table.action(ip("10.0.0.2")), Some(IpRewriteAction::Drop));
         assert_eq!(table.action(ip("10.0.0.3")), Some(IpRewriteAction::Reject));
+    }
+
+    /// `[URL Rewrite]` and `[Header Rewrite]` are in effect (phase 4 M3a):
+    /// their active lines are typed into `Config::rewrite`, and the two
+    /// sections are no longer ones waiting for a later version.
+    #[test]
+    fn rewrite_sections_are_read_and_no_longer_deferred() {
+        for (url, header) in [
+            ("URL Rewrite", "Header Rewrite"),
+            ("url rewrite", "HEADER REWRITE"),
+        ] {
+            let l = load_text(&format!(
+                "[{url}]\n^http://a\\.test http://b.test 302\n\
+[{header}]\n^http://a\\.test header-add X 1\n\
+[Rule]\nFINAL,DIRECT\n"
+            ));
+            assert!(
+                !l.diagnostics.has_errors(),
+                "{url}: {:?}",
+                l.diagnostics.iter().collect::<Vec<_>>()
+            );
+            let c = codes_of(&l);
+            for unwanted in [
+                codes::W_DEFERRED_SECTION,
+                codes::W_UNKNOWN_SECTION,
+                codes::W_INVALID_VALUE,
+            ] {
+                assert!(!c.contains(&unwanted), "{url}: {c:?}");
+            }
+            assert!(l.config.unknown_sections.is_empty(), "{url}");
+            assert!(l.config.deferred.get("URL Rewrite").is_none(), "{url}");
+            assert!(l.config.deferred.get("Header Rewrite").is_none(), "{url}");
+            assert_eq!(l.config.rewrite.url.len(), 1, "{url}");
+            assert_eq!(l.config.rewrite.header.len(), 1, "{url}");
+        }
+    }
+
+    /// `[Replica]` is a section rurge knows and ignores, and one `I0005` says
+    /// so at its first section header (phase 4 M3 design 4.4).
+    #[test]
+    fn replica_is_known_and_ignored() {
+        let l =
+            load_text("[Replica]\nhide-apple-request=true\n[Replica]\nx=1\n[Rule]\nFINAL,DIRECT\n");
+        let c = codes_of(&l);
+        assert_eq!(
+            c.iter()
+                .filter(|code| **code == codes::I_REPLICA_REMOVED)
+                .count(),
+            1,
+            "{c:?}"
+        );
+        let d = l
+            .diagnostics
+            .iter()
+            .find(|d| d.code == codes::I_REPLICA_REMOVED)
+            .expect("one I0005");
+        assert_eq!(d.severity, Severity::Info);
+        assert_eq!(
+            d.message,
+            "[Replica] was removed in Surge Mac 5.4.0; the section is ignored"
+        );
+        assert_eq!(d.span.as_ref().map(|s| s.line), Some(1));
+        assert!(!c.contains(&codes::W_UNKNOWN_SECTION), "{c:?}");
+        assert!(!c.contains(&codes::W_DEFERRED_SECTION), "{c:?}");
+        assert!(l.config.unknown_sections.is_empty());
     }
 
     #[test]

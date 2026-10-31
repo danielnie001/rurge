@@ -177,6 +177,7 @@ const KEY_VALUE_SECTIONS: &[&str] = &[
     "DHCP",
     "Snell Server",
     "MTProto",
+    "Replica",
 ];
 const ORDERED_SECTIONS: &[&str] = &[
     "Rule",

@@ -279,6 +279,12 @@ pub mod codes {
     /// `http-api-tls` is on and `http-api` is set, but `[MITM]` has no usable
     /// CA: the API does not start with this profile (phase 4 M2 design 14.1).
     pub const W_API_TLS_NO_CA: &str = "W0040";
+    /// A `[Header Rewrite]` line names `Content-Length` or `Transfer-Encoding`.
+    /// The line is kept, and every request whose framing it changes fails
+    /// (phase 4 M3 design 13). From phase 4 M3b the two names in a
+    /// `[Map Local]` `header` are not used and the same code says so; the two
+    /// places mean different things, so each carries a hint of its own.
+    pub const W_REWRITE_FRAMING: &str = "W0041";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
     /// GeoIP / ASN database file not present yet.
@@ -287,6 +293,10 @@ pub mod codes {
     /// file alone: the downloaded copy, or the local file changed since the
     /// last update.
     pub const I_MANAGED_SOURCE: &str = "I0004";
+    /// `[Replica]` is a section rurge knows and ignores: its lines are read as
+    /// a section of key-value lines and no one uses them. Surge Mac 5.4.0
+    /// removed the section (phase 4 M3 design 4.4).
+    pub const I_REPLICA_REMOVED: &str = "I0005";
 
     /// What to do about a diagnostic of `code`, when there is one thing to say
     /// for every place that emits it. The constructors of `Diagnostic` take
@@ -302,7 +312,10 @@ pub mod codes {
     /// each of its four places carries a hint of its own, `W0033` because each
     /// of its four places (an `#!include`, a set, a `policy-path`, an
     /// `external` policy) carries one for each kind of text, and `W0034`
-    /// because each of its two does. The other codes without one:
+    /// because each of its two does, and `W0041` because its two places, a
+    /// `[Header Rewrite]` line and (from phase 4 M3b) a `[Map Local]`
+    /// `header`, mean different things and each carries one. The other codes
+    /// without one:
     ///
     /// - `E0009`: no place emits it any more.
     /// - `E0017`: the message is the shape to write, a different one at each
@@ -329,7 +342,7 @@ pub mod codes {
     ///   cipher.
     /// - `W0039`: no one sentence fits every problem it reports — each of
     ///   them says its own remedy in the message.
-    /// - `I0001`, `I0002`, `I0003`, `I0004`: they inform.
+    /// - `I0001`, `I0002`, `I0003`, `I0004`, `I0005`: they inform.
     pub fn hint(code: &str) -> Option<&'static str> {
         Some(match code {
             E_SYNTAX => "compare the line with the syntax the Surge manual gives for this section",
@@ -467,6 +480,7 @@ mod tests {
         codes::E_NOT_ALLOWED_HERE,
         codes::W_REMOTE_LOCAL_ACCESS,
         codes::W_MANAGED_NOT_UPDATED,
+        codes::W_REWRITE_FRAMING,
     ];
 
     /// The codes without a hint; `codes::hint` says why beside its table.
@@ -498,6 +512,7 @@ mod tests {
         codes::I_LINE_DISABLED,
         codes::I_GEOIP_DB_MISSING,
         codes::I_MANAGED_SOURCE,
+        codes::I_REPLICA_REMOVED,
     ];
 
     /// The codes of `codes`, read off the source, so that a constant added

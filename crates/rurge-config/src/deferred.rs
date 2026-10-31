@@ -4,8 +4,6 @@ use crate::text::{Entry, Profile};
 use crate::value::starts_with_ci;
 
 const DEFERRED: &[&str] = &[
-    "URL Rewrite",
-    "Header Rewrite",
     "Body Rewrite",
     "Map Local",
     "Script",
@@ -66,6 +64,12 @@ mod tests {
         // typed since phase 4 M2
         assert!(!is_deferred("MITM"));
         assert!(!is_deferred("mitm"));
+        // typed since phase 4 M3a
+        assert!(!is_deferred("URL Rewrite"));
+        assert!(!is_deferred("header rewrite"));
+        // still deferred: phase 4 M3b types them
+        assert!(is_deferred("Body Rewrite"));
+        assert!(is_deferred("Map Local"));
         assert!(is_deferred("Tailscale home"));
         assert!(is_deferred("Tailscale "));
         assert!(!is_deferred("Tailscale"));

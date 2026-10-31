@@ -24,6 +24,7 @@ pub mod reach;
 pub mod redact;
 pub mod remote;
 pub mod requirement;
+pub mod rewrite;
 pub mod rule;
 pub mod session;
 pub mod span;
@@ -57,6 +58,7 @@ pub use policy::{Builtin, GroupKind, NetType, PolicyGroup, PolicyKind, ProxyPoli
 pub use reach::Reach;
 pub use remote::{Remote, RemoteRef, RemoteRole, RemoteSource};
 pub use requirement::Environment;
+pub use rewrite::{Direction, HeaderAction, HeaderRewrite, RewriteConfig, UrlMode, UrlRewrite};
 pub use rule::{
     HostnameType, InternalSet, ParseCtx, Pattern, PolicyRef, PortExpr, ProcessPattern,
     ProtocolKind, ResourceRef, Rule, RuleKind, RuleParams, SubRule,
