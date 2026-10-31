@@ -1,6 +1,7 @@
-//! `[URL Rewrite]`, `[Header Rewrite]` and `[Body Rewrite]` (manual: Features ›
-//! URL Rewrite, Features › Header Rewrite and Features › Body Rewrite): the
-//! lines as written, read once at load time.
+//! `[URL Rewrite]`, `[Header Rewrite]`, `[Body Rewrite]` and `[Map Local]`
+//! (manual: Features › URL Rewrite, Features › Header Rewrite, Features ›
+//! Body Rewrite and Features › Map Local): the lines as written, read once at
+//! load time.
 //!
 //! A `[URL Rewrite]` line is `<regex> <replacement> [header | 302 | 307 |
 //! reject]`; a `[Header Rewrite]` line is `[http-request | http-response]
@@ -8,11 +9,14 @@
 //! `header-replace` or `header-replace-regex`; a `[Body Rewrite]` line is
 //! `[http-request | http-response] <regex> <body pattern> <replacement>
 //! [<body pattern> <replacement> …]`, each pair applied in turn. A jq line
-//! (`http-request-jq` / `http-response-jq`) gives `W0042` and is not read. The
-//! three sections are read here the way the manual describes them (phase 4 M3
-//! design 6.1, 7.1 and 9.1, the phase 4 / M3a plan's P6): the engine only
-//! evaluates the rules this module keeps, and each rule keeps the span of its
-//! line so that the engine can name it in the request's notes.
+//! (`http-request-jq` / `http-response-jq`) gives `W0042` and is not read. A
+//! `[Map Local]` line is `<regex> [data-type=…] [data=…] [header=…]
+//! [status-code=…]`, answered here instead of by an upstream server; a path it
+//! names in text rurge downloaded is refused with `W0033`. The four sections
+//! are read here the way the manual describes them (phase 4 M3 design 6.1,
+//! 7.1, 9.1 and 10.1, the phase 4 / M3a plan's P6): the engine only evaluates
+//! the rules this module keeps, and each rule keeps the span of its line so
+//! that the engine can name it in the request's notes.
 //!
 //! A `[URL Rewrite]` replacement may hold `{{{GATEWAY_ADDRESS}}}`. Whether it
 //! does is recorded here, at load time; the engine puts the gateway in only
@@ -23,11 +27,13 @@ use crate::diagnostic::{Diagnostic, Diagnostics, codes};
 use crate::dialect::{BodyPattern, Template};
 use crate::rule::Pattern;
 use crate::span::Span;
+use crate::spec::reader::is_plain_name;
 use crate::text::Entry;
-use crate::value::split_words;
+use crate::value::{split_words, starts_with_ci};
+use std::path::{Path, PathBuf};
 
-/// `[URL Rewrite]`, `[Header Rewrite]` and `[Body Rewrite]`: the rules as
-/// written, in order.
+/// `[URL Rewrite]`, `[Header Rewrite]`, `[Body Rewrite]` and `[Map Local]`:
+/// the rules as written, in order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RewriteConfig {
     pub url: Vec<UrlRewrite>,
@@ -36,12 +42,19 @@ pub struct RewriteConfig {
     /// (phase 4 M3 design 9.1); a jq line gives `W0042` and is not one of
     /// them.
     pub body: Vec<BodyRewrite>,
+    /// The lines of `[Map Local]` that can be read, in the order written
+    /// (phase 4 M3 design 10.1); a path written relative joins the directory
+    /// of the main profile.
+    pub map_local: Vec<MapLocal>,
 }
 
 impl RewriteConfig {
     /// Whether no section has a usable line.
     pub fn is_empty(&self) -> bool {
-        self.url.is_empty() && self.header.is_empty() && self.body.is_empty()
+        self.url.is_empty()
+            && self.header.is_empty()
+            && self.body.is_empty()
+            && self.map_local.is_empty()
     }
 }
 
@@ -97,6 +110,82 @@ pub struct BodyRewrite {
     pub span: Span,
 }
 
+/// What a `[Map Local]` line answers with (manual: Features › Map Local,
+/// phase 4 M3 design 10.2). `data-type` picks it, and a `file` line names
+/// either a local file or a URL whose data rurge downloads.
+#[derive(Clone, PartialEq, Eq)]
+pub enum MapData {
+    File(PathBuf),
+    Url(url::Url),
+    Text(String),
+    Base64(Vec<u8>),
+    TinyGif,
+}
+
+impl MapData {
+    /// The `data-type` a note names it by: `File` and `Url` are both `file`,
+    /// the two forms the manual gives that one name (its `file` type returns
+    /// "the content of a specific file or URL").
+    pub fn kind(&self) -> &'static str {
+        match self {
+            MapData::File(_) | MapData::Url(_) => "file",
+            MapData::Text(_) => "text",
+            MapData::Base64(_) => "base64",
+            MapData::TinyGif => "tiny-gif",
+        }
+    }
+}
+
+/// The data as a `Debug` shows it: the bytes and the text a line answers with
+/// are the user's traffic, so only a file's path, an origin and the kind are
+/// shown (phase 4 M3 design 8.5 and 14).
+impl std::fmt::Debug for MapData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MapData::File(path) => write!(f, "File({path:?})"),
+            MapData::Url(url) => write!(f, "Url({})", crate::remote::origin(url)),
+            MapData::Text(_) => f.write_str("Text(***)"),
+            MapData::Base64(_) => f.write_str("Base64(***)"),
+            MapData::TinyGif => f.write_str("TinyGif"),
+        }
+    }
+}
+
+/// One `[Map Local]` line (phase 4 M3 design 10.1): the request whose URL
+/// matches is answered here, without an upstream server.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MapLocal {
+    /// The expression for the URL the line answers.
+    pub pattern: Pattern,
+    pub data: MapData,
+    pub status: u16,
+    /// The headers of the answer, in the order written.
+    pub headers: Vec<(String, String)>,
+    pub span: Span,
+}
+
+/// The answer as a `Debug` shows it: the names of the headers, never their
+/// values (phase 4 M3 design 8.5 and 14).
+impl std::fmt::Debug for MapLocal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let MapLocal {
+            pattern,
+            data,
+            status,
+            headers,
+            span,
+        } = self;
+        let names: Vec<&str> = headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("MapLocal")
+            .field("pattern", pattern)
+            .field("data", data)
+            .field("status", status)
+            .field("headers", &names)
+            .field("span", span)
+            .finish()
+    }
+}
+
 /// The placeholder a `[URL Rewrite]` replacement may hold: the IPv4 default
 /// gateway, put in by the engine only for the `302` and `307` modes (phase 4
 /// M3 design 6.4).
@@ -143,6 +232,36 @@ const BODY_PATTERN: &str =
 /// `W0042`: a `[Body Rewrite]` line in the jq form (phase 4 M3 design 13).
 const JQ_UNAVAILABLE: &str =
     "[Body Rewrite]: jq body rewrite is not available in this build of rurge; the line is ignored";
+/// A `[Map Local]` expression that does not compile; `{reason}` is why.
+const MAP_REGEX: &str =
+    "[Map Local]: the regular expression cannot be used ({reason}); the line is ignored";
+/// A `[Map Local]` item after the expression that is not a parameter.
+const MAP_PARAMETER: &str = "[Map Local]: every item after the regular expression is a key=value parameter; the line is ignored";
+/// A `data-type` other than the four the manual names.
+const MAP_TYPE: &str =
+    "[Map Local]: data-type is file, text, tiny-gif or base64; the line is ignored";
+/// A `file` line without a data, or with an empty one.
+const MAP_FILE: &str =
+    "[Map Local]: data-type=file takes a path or a URL in data; the line is ignored";
+/// `file` data that is not a URL rurge can download.
+const MAP_URL: &str = "[Map Local]: data is not a URL rurge can download; the line is ignored";
+/// `base64` data that is not base64.
+const MAP_BASE64: &str = "[Map Local]: data is not valid base64; the line is ignored";
+/// A `header` value that is neither pairs of a valid name and value nor the
+/// base64 of lines that are. The value is not shown.
+const MAP_HEADER: &str = "[Map Local]: header is `name:value|name:value` or base64 of header lines, with valid names and values; the line is ignored";
+/// A `status-code` that is not a whole number from 200 to 999.
+const MAP_STATUS: &str =
+    "[Map Local]: status-code is a whole number from 200 to 999; the line is ignored";
+/// `W0041`: the two names are dropped and the rest of the line is kept.
+const MAP_FRAMING: &str = "[Map Local]: Content-Length and Transfer-Encoding in header are not used; the rest of the line is kept";
+/// `W0041`'s hint where a `[Map Local]` `header` names the two.
+const MAP_FRAMING_HINT: &str =
+    "rurge frames the answer by the length of its data: remove the two names from header";
+/// `W0001` where the key is written the way a parameter name is.
+const MAP_UNKNOWN_KEY: &str = "[Map Local]: unknown parameter `{key}` ignored";
+/// `W0001` where nothing of the line may be repeated.
+const MAP_UNKNOWN_KEY_UNNAMED: &str = "[Map Local]: unknown parameter ignored";
 
 /// What a `[Header Rewrite]` line does to the headers whose URL matches.
 #[derive(Clone, PartialEq, Eq)]
@@ -402,6 +521,259 @@ pub fn parse_header<'a>(
     rules
 }
 
+/// Reads the section's active lines in order. `base_dir` is the directory of
+/// the main profile: a path written relative joins it, whichever file the line
+/// itself stands in (phase 4 M3 design 10.1).
+pub fn parse_map_local<'a>(
+    entries: impl IntoIterator<Item = &'a Entry>,
+    base_dir: &Path,
+    diags: &mut Diagnostics,
+) -> Vec<MapLocal> {
+    entries
+        .into_iter()
+        .filter_map(|entry| read_map_local(entry, base_dir, diags))
+        .collect()
+}
+
+/// One `[Map Local]` line, or nothing when it cannot be read; whatever is not
+/// kept is said with `W0012`, `W0001`, `W0033` or `W0041` (phase 4 M3 design
+/// 10.2, the phase 4 / M3b plan's P5).
+fn read_map_local(entry: &Entry, base_dir: &Path, diags: &mut Diagnostics) -> Option<MapLocal> {
+    let words = split_words(&entry.raw);
+    // the first item is the expression for the URL, whether or not it looks
+    // like a parameter: a query holds `=` often enough
+    let first = words.first()?;
+    let pattern = match Pattern::new(&first.text) {
+        Ok(pattern) => pattern,
+        Err(reason) => {
+            diags.push(
+                Diagnostic::warning(
+                    codes::W_INVALID_VALUE,
+                    MAP_REGEX.replace("{reason}", &reason),
+                )
+                .at(entry.span.clone()),
+            );
+            return None;
+        }
+    };
+    // each of the four parameters, the later of two written values winning
+    let (mut kind, mut data, mut header, mut status) = (None, None, None, None);
+    for word in &words[1..] {
+        let Some((key, value)) = &word.param else {
+            diags.push(
+                Diagnostic::warning(codes::W_INVALID_VALUE, MAP_PARAMETER).at(entry.span.clone()),
+            );
+            return None;
+        };
+        if key.eq_ignore_ascii_case("data-type") {
+            kind = Some(value.clone());
+        } else if key.eq_ignore_ascii_case("data") {
+            data = Some(value.clone());
+        } else if key.eq_ignore_ascii_case("header") {
+            header = Some(value.clone());
+        } else if key.eq_ignore_ascii_case("status-code") {
+            status = Some(value.clone());
+        } else {
+            // a key written the way a parameter name is can be named; nothing
+            // else of the line is, so the message leaves it out
+            let message = if is_plain_name(key) {
+                MAP_UNKNOWN_KEY.replace("{key}", key)
+            } else {
+                MAP_UNKNOWN_KEY_UNNAMED.to_string()
+            };
+            diags.push(Diagnostic::warning(codes::W_UNKNOWN_KEY, message).at(entry.span.clone()));
+        }
+    }
+
+    let kind = kind.unwrap_or_else(|| "file".to_string());
+    let data = if kind.eq_ignore_ascii_case("file") {
+        read_map_file(
+            data.filter(|value| !value.is_empty()),
+            entry,
+            base_dir,
+            diags,
+        )?
+    } else if kind.eq_ignore_ascii_case("text") {
+        MapData::Text(data.unwrap_or_default())
+    } else if kind.eq_ignore_ascii_case("base64") {
+        // no data at all is an empty answer, not a line to refuse
+        match data {
+            None => MapData::Base64(Vec::new()),
+            Some(value) => match decode_base64(&value) {
+                Some(bytes) => MapData::Base64(bytes),
+                None => {
+                    diags.push(
+                        Diagnostic::warning(codes::W_INVALID_VALUE, MAP_BASE64)
+                            .at(entry.span.clone()),
+                    );
+                    return None;
+                }
+            },
+        }
+    } else if kind.eq_ignore_ascii_case("tiny-gif") {
+        // the manual gives this type's data no meaning, so it is not read
+        MapData::TinyGif
+    } else {
+        diags.push(Diagnostic::warning(codes::W_INVALID_VALUE, MAP_TYPE).at(entry.span.clone()));
+        return None;
+    };
+
+    let headers = match header {
+        None => Vec::new(),
+        Some(value) => read_map_headers(&value, entry, diags)?,
+    };
+
+    let status = match status {
+        None => 200,
+        Some(value) => match value.parse::<u16>() {
+            Ok(code) if (200..=999).contains(&code) => code,
+            _ => {
+                diags.push(
+                    Diagnostic::warning(codes::W_INVALID_VALUE, MAP_STATUS).at(entry.span.clone()),
+                );
+                return None;
+            }
+        },
+    };
+
+    Some(MapLocal {
+        pattern,
+        data,
+        status,
+        headers,
+        span: entry.span.clone(),
+    })
+}
+
+/// The data of a `file` line: a URL rurge downloads, or a path. A path from
+/// downloaded text is refused with `W0033`: such text names nothing on this
+/// machine, and the line is dropped so that nothing downstream opens it.
+fn read_map_file(
+    data: Option<String>,
+    entry: &Entry,
+    base_dir: &Path,
+    diags: &mut Diagnostics,
+) -> Option<MapData> {
+    let Some(value) = data else {
+        diags.push(Diagnostic::warning(codes::W_INVALID_VALUE, MAP_FILE).at(entry.span.clone()));
+        return None;
+    };
+    if starts_with_ci(&value, "http://") || starts_with_ci(&value, "https://") {
+        return match url::Url::parse(&value) {
+            Ok(url) => Some(MapData::Url(url)),
+            Err(_) => {
+                diags.push(
+                    Diagnostic::warning(codes::W_INVALID_VALUE, MAP_URL).at(entry.span.clone()),
+                );
+                None
+            }
+        };
+    }
+    if let Some(refusal) = entry.origin.reach().map_local_refusal() {
+        diags.push(
+            Diagnostic::warning(
+                codes::W_REMOTE_LOCAL_ACCESS,
+                format!("[Map Local]: {}", refusal.message),
+            )
+            .with_hint(refusal.hint)
+            .at(entry.span.clone()),
+        );
+        return None;
+    }
+    let path = Path::new(&value);
+    Some(MapData::File(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }))
+}
+
+/// The headers of a `[Map Local]` line: `name:value|name:value`, or, when the
+/// value holds no `:`, the base64 of newline-separated header lines. A pair
+/// with a name or a value a header cannot carry drops the line; the two names
+/// that frame a message are dropped from it with one `W0041`.
+fn read_map_headers(
+    value: &str,
+    entry: &Entry,
+    diags: &mut Diagnostics,
+) -> Option<Vec<(String, String)>> {
+    let mut pairs: Vec<String> = Vec::new();
+    if value.contains(':') {
+        for pair in value.split('|') {
+            let pair = pair.trim();
+            if !pair.is_empty() {
+                pairs.push(pair.to_string());
+            }
+        }
+    } else {
+        let Some(text) = decode_base64(value) else {
+            diags.push(
+                Diagnostic::warning(codes::W_INVALID_VALUE, MAP_HEADER).at(entry.span.clone()),
+            );
+            return None;
+        };
+        let Ok(text) = String::from_utf8(text) else {
+            diags.push(
+                Diagnostic::warning(codes::W_INVALID_VALUE, MAP_HEADER).at(entry.span.clone()),
+            );
+            return None;
+        };
+        for line in text.split('\n') {
+            let line = line.trim_end_matches('\r').trim();
+            if !line.is_empty() {
+                pairs.push(line.to_string());
+            }
+        }
+    }
+    let mut headers = Vec::new();
+    let mut framing = false;
+    for pair in &pairs {
+        let Some((name, value)) = read_map_header(pair) else {
+            diags.push(
+                Diagnostic::warning(codes::W_INVALID_VALUE, MAP_HEADER).at(entry.span.clone()),
+            );
+            return None;
+        };
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            framing = true;
+            continue;
+        }
+        headers.push((name, value));
+    }
+    if framing {
+        diags.push(
+            Diagnostic::warning(codes::W_REWRITE_FRAMING, MAP_FRAMING)
+                .with_hint(MAP_FRAMING_HINT)
+                .at(entry.span.clone()),
+        );
+    }
+    Some(headers)
+}
+
+/// One `name: value` pair, split at its first `:` and trimmed; nothing when
+/// either side is not what a header field carries.
+fn read_map_header(pair: &str) -> Option<(String, String)> {
+    let (name, value) = pair.split_once(':')?;
+    let (name, value) = (name.trim(), value.trim());
+    if !is_field_name(name) || !value.chars().all(can_be_a_value) {
+        return None;
+    }
+    Some((name.to_string(), value.to_string()))
+}
+
+/// The bytes `text` stands for as base64, padded or not: the same two engines
+/// a keystore value is decoded with.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+    STANDARD
+        .decode(text)
+        .or_else(|_| STANDARD_NO_PAD.decode(text))
+        .ok()
+}
+
 /// Reads the section's active lines in order.
 pub fn parse_body<'a>(
     entries: impl IntoIterator<Item = &'a Entry>,
@@ -517,6 +889,7 @@ mod tests {
     use super::*;
     use crate::diagnostic::{Diagnostic, Severity};
     use crate::text::{Origin, Section, parse_str};
+    use base64::Engine as _;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -565,6 +938,34 @@ mod tests {
             &mut diags,
         );
         (found, diags.into_vec())
+    }
+
+    /// The `[Map Local]` rules of `lines`, read the same way. `base_dir` is
+    /// the directory of the main profile, which a relative path joins;
+    /// nothing read here opens a file.
+    fn read_map_local_from(
+        lines: &str,
+        base_dir: &Path,
+        origin: Origin,
+    ) -> (Vec<MapLocal>, Vec<Diagnostic>) {
+        let text = format!("[Map Local]\n{lines}\n");
+        let (profile, mut diags) = parse_str(&text, Arc::from(Path::new("m.conf")), origin);
+        let found = parse_map_local(
+            profile
+                .section("Map Local")
+                .into_iter()
+                .flat_map(Section::active_entries),
+            base_dir,
+            &mut diags,
+        );
+        (found, diags.into_vec())
+    }
+
+    /// `read_map_local_from` for the user's own profile, whose directory is a
+    /// temporary one.
+    fn read_map_local(lines: &str) -> (Vec<MapLocal>, Vec<Diagnostic>) {
+        let dir = tempfile::tempdir().unwrap();
+        read_map_local_from(lines, dir.path(), Origin::Main)
     }
 
     /// `template` expanded with no groups.
@@ -992,5 +1393,334 @@ HTTP-REQUEST-JQ ^a .
                 Some(index as u32 + 2)
             );
         }
+    }
+
+    /// The lines the manual's Map Local page writes (phase 4 M3 design 10.1).
+    #[test]
+    fn map_local_reads_the_manual_example() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"^http://surgetest\.com/json data-type=text data="{}" status-code=500
+^http://surgetest\.com/gif data-type=tiny-gif status-code=200
+^http://surgetest\.com/file data-type=file data="data/map-local.json" header="a:b|foo:bar"
+^http://surgetest\.com/base64 data="dGVzdA==" data-type=base64
+^http://surgetest\.com/empty data-type=text data=""
+"#;
+        let (rules, diags) = read_map_local_from(text, dir.path(), Origin::Main);
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(rules.len(), 5);
+        let sources: Vec<&str> = rules.iter().map(|r| r.pattern.source.as_str()).collect();
+        assert_eq!(
+            sources,
+            [
+                r"^http://surgetest\.com/json",
+                r"^http://surgetest\.com/gif",
+                r"^http://surgetest\.com/file",
+                r"^http://surgetest\.com/base64",
+                r"^http://surgetest\.com/empty",
+            ]
+        );
+        assert_eq!(rules[0].data, MapData::Text("{}".to_string()));
+        assert_eq!(rules[0].status, 500);
+        assert!(rules[0].headers.is_empty());
+        assert_eq!(rules[1].data, MapData::TinyGif);
+        assert_eq!(rules[1].status, 200);
+        assert_eq!(
+            rules[2].data,
+            MapData::File(dir.path().join("data/map-local.json"))
+        );
+        assert_eq!(rules[2].status, 200);
+        assert_eq!(
+            rules[2].headers,
+            [
+                ("a".to_string(), "b".to_string()),
+                ("foo".to_string(), "bar".to_string()),
+            ]
+        );
+        assert_eq!(rules[3].data, MapData::Base64(b"test".to_vec()));
+        assert_eq!(rules[3].status, 200);
+        assert_eq!(rules[4].data, MapData::Text(String::new()));
+        assert_eq!(rules[4].status, 200);
+    }
+
+    /// `data-type` is optional and `file` by default; a `file` line may name a
+    /// URL instead, an absolute path stays as written, and each of the other
+    /// three types fills its data in its own way (phase 4 M3 design 10.2).
+    #[test]
+    fn map_local_data_types_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        for line in [r#"^a data="x.bin""#, r#"^a data="x.bin" data-type=FILE"#] {
+            let (rules, diags) = read_map_local_from(line, base, Origin::Main);
+            assert!(diags.is_empty(), "{line}: {:?}", said(&diags));
+            assert_eq!(rules.len(), 1, "{line}");
+            assert_eq!(rules[0].data, MapData::File(base.join("x.bin")), "{line}");
+            assert_eq!(rules[0].status, 200, "{line}");
+            assert!(rules[0].headers.is_empty(), "{line}");
+        }
+
+        for (line, url) in [
+            (
+                r#"^a data="https://a.test/x.json""#,
+                "https://a.test/x.json",
+            ),
+            (r#"^a data="HTTP://a.test/x""#, "http://a.test/x"),
+        ] {
+            let (rules, diags) = read_map_local_from(line, base, Origin::Main);
+            assert!(diags.is_empty(), "{line}: {:?}", said(&diags));
+            assert_eq!(
+                rules[0].data,
+                MapData::Url(url::Url::parse(url).unwrap()),
+                "{line}"
+            );
+        }
+
+        // an absolute path is the file itself, not one under `base_dir`
+        let absolute = std::env::temp_dir().join("abs.json");
+        let line = format!(r#"^a data="{}""#, absolute.display());
+        let (rules, diags) = read_map_local_from(&line, base, Origin::Main);
+        assert!(diags.is_empty(), "{line}: {:?}", said(&diags));
+        assert_eq!(rules[0].data, MapData::File(absolute), "{line}");
+
+        // a type written without its data answers with nothing
+        for (line, data) in [
+            ("^a data-type=text", MapData::Text(String::new())),
+            ("^a data-type=base64", MapData::Base64(Vec::new())),
+        ] {
+            let (rules, diags) = read_map_local_from(line, base, Origin::Main);
+            assert!(diags.is_empty(), "{line}: {:?}", said(&diags));
+            assert_eq!(rules[0].data, data, "{line}");
+        }
+
+        // `tiny-gif` does not read its data, and does not complain of it
+        let (rules, diags) =
+            read_map_local_from("^a data-type=tiny-gif data=whatever", base, Origin::Main);
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(rules[0].data, MapData::TinyGif);
+    }
+
+    /// A `header` value is `name:value|name:value`, or the base64 of
+    /// newline-separated header lines when it holds no `:` (manual: Features ›
+    /// Map Local, phase 4 M3 design 10.2).
+    #[test]
+    fn map_local_reads_both_header_forms() {
+        let (rules, diags) = read_map_local(r#"^a data=x header="a: b | c:d|""#);
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(
+            rules[0].headers,
+            [
+                ("a".to_string(), "b".to_string()),
+                ("c".to_string(), "d".to_string()),
+            ]
+        );
+
+        // base64 of "x-a: 1\r\nx-b: 2\n\n", with and without padding
+        let lines = "x-a: 1\r\nx-b: 2\n\n";
+        for encoded in [
+            base64::engine::general_purpose::STANDARD.encode(lines),
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(lines),
+        ] {
+            assert!(!encoded.contains(':'), "{encoded}");
+            let (rules, diags) = read_map_local(&format!(r#"^a data=x header="{encoded}""#));
+            assert!(diags.is_empty(), "{encoded}: {:?}", said(&diags));
+            assert_eq!(
+                rules[0].headers,
+                [
+                    ("x-a".to_string(), "1".to_string()),
+                    ("x-b".to_string(), "2".to_string()),
+                ],
+                "{encoded}"
+            );
+        }
+    }
+
+    /// Every way a `[Map Local]` line can be wrong gives `W0012` with the
+    /// message of its own, and the line is not kept (phase 4 M3 design 10.2,
+    /// the phase 4 / M3b plan's P5 and P7).
+    #[test]
+    fn map_local_refuses() {
+        const REGEX: &str = "[Map Local]: the regular expression cannot be used (";
+        const PARAMETER: &str = "[Map Local]: every item after the regular expression is a key=value parameter; the line is ignored";
+        const TYPE: &str =
+            "[Map Local]: data-type is file, text, tiny-gif or base64; the line is ignored";
+        const FILE: &str =
+            "[Map Local]: data-type=file takes a path or a URL in data; the line is ignored";
+        const URL: &str = "[Map Local]: data is not a URL rurge can download; the line is ignored";
+        const BASE64: &str = "[Map Local]: data is not valid base64; the line is ignored";
+        const HEADER: &str = "[Map Local]: header is `name:value|name:value` or base64 of header lines, with valid names and values; the line is ignored";
+        const STATUS: &str =
+            "[Map Local]: status-code is a whole number from 200 to 999; the line is ignored";
+
+        // the first item is the URL expression, always, and the rest are
+        // parameters: a word that is not one is not read as a value
+        for (line, message) in [
+            ("^a data", PARAMETER),
+            ("^a data-type=text mystery", PARAMETER),
+        ] {
+            let (rules, diags) = read_map_local(line);
+            assert!(rules.is_empty(), "{line}");
+            assert_eq!(said(&diags), [("W0012", message)], "{line}");
+        }
+
+        let (rules, diags) = read_map_local("( data-type=text");
+        assert!(rules.is_empty());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "W0012");
+        assert!(diags[0].message.starts_with(REGEX), "{}", diags[0].message);
+
+        for (line, message) in [
+            ("^a data-type=xml", TYPE),
+            ("^a data-type=file", FILE),
+            (r#"^a data="""#, FILE),
+            ("data-type=text", FILE),
+            (r#"^a data="https://[x/""#, URL),
+            ("^a data-type=base64 data=@@@", BASE64),
+            ("^a data-type=text status-code=199", STATUS),
+            ("^a data-type=text status-code=1000", STATUS),
+            ("^a data-type=text status-code=x", STATUS),
+            (r#"^a data-type=text header="a b:c""#, HEADER),
+            ("^a data-type=text header=@@@", HEADER),
+            (r#"^a data-type=text header="a:b|c""#, HEADER),
+        ] {
+            let (rules, diags) = read_map_local(line);
+            assert!(rules.is_empty(), "{line}");
+            assert_eq!(said(&diags), [("W0012", message)], "{line}");
+        }
+
+        // a header value that is not text a header may carry, base64 encoded
+        let encoded = base64::engine::general_purpose::STANDARD.encode("a: b\u{1}c");
+        let (rules, diags) = read_map_local(&format!(r#"^a data-type=text header="{encoded}""#));
+        assert!(rules.is_empty(), "{encoded}");
+        assert_eq!(said(&diags), [("W0012", HEADER)], "{encoded}");
+    }
+
+    /// A parameter `[Map Local]` does not know is `W0001`, and the line is
+    /// kept; the key is named only when it is written the way a parameter name
+    /// is, so that nothing of the line is repeated (phase 4 M3 design 10.2).
+    #[test]
+    fn map_local_unknown_keys_get_w0001() {
+        let (rules, diags) = read_map_local("^a data-type=text mystery=1");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            said(&diags),
+            [("W0001", "[Map Local]: unknown parameter `mystery` ignored")]
+        );
+
+        let (rules, diags) = read_map_local("^a data-type=text Weird.Key=1");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            said(&diags),
+            [("W0001", "[Map Local]: unknown parameter ignored")]
+        );
+    }
+
+    /// A parameter written twice takes the later value, and its key is read
+    /// without regard to case (phase 4 M3 design 10.2).
+    #[test]
+    fn a_key_written_twice_takes_the_later() {
+        let (rules, diags) = read_map_local("^a data-type=text data=a data=b");
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(rules[0].data, MapData::Text("b".to_string()));
+
+        let (rules, diags) = read_map_local("^a DATA-TYPE=base64 data-type=text data=x");
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(rules[0].data, MapData::Text("x".to_string()));
+    }
+
+    /// `Content-Length` and `Transfer-Encoding` in a `[Map Local]` `header`
+    /// are dropped, the rest of the line is kept, and one `W0041` says so
+    /// (phase 4 M3 design 10.2, the phase 4 / M3b plan's P7).
+    #[test]
+    fn framing_headers_in_map_local_are_dropped_with_w0041() {
+        let (rules, diags) = read_map_local(
+            r#"^a data-type=text header="Content-Length:5|X-A:1|transfer-encoding:chunked""#,
+        );
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].headers, [("X-A".to_string(), "1".to_string())]);
+        assert_eq!(diags.len(), 1, "{:?}", said(&diags));
+        let d = &diags[0];
+        assert_eq!(d.code, "W0041");
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(
+            d.message,
+            "[Map Local]: Content-Length and Transfer-Encoding in header are not used; the rest of the line is kept"
+        );
+        assert_eq!(
+            d.hint,
+            Some(
+                "rurge frames the answer by the length of its data: remove the two names from header"
+            )
+        );
+    }
+
+    /// A path in text rurge downloaded is refused with `W0033` and the line is
+    /// dropped; a URL in the same text is what to write instead (phase 4 M3
+    /// design 10.2, the phase 4 / M3b plan's P6).
+    #[test]
+    fn a_map_local_path_from_downloaded_text_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (origin, message, hint) in [
+            (
+                Origin::Remote(Arc::from(Path::new("1.conf"))),
+                "a downloaded file cannot name a local file for Map Local; the line is ignored",
+                "write the line in the local profile to map to a local file",
+            ),
+            (
+                Origin::Managed(Arc::from(Path::new("1.conf"))),
+                "the downloaded copy of a managed profile cannot name a local file for Map Local; the line is ignored",
+                "give `data` a URL instead",
+            ),
+        ] {
+            let (rules, diags) = read_map_local_from("^a data=x.json", dir.path(), origin.clone());
+            assert!(rules.is_empty(), "{origin:?}");
+            assert_eq!(diags.len(), 1, "{origin:?}");
+            let d = &diags[0];
+            assert_eq!(d.code, "W0033", "{origin:?}");
+            assert_eq!(d.message, format!("[Map Local]: {message}"), "{origin:?}");
+            assert_eq!(d.hint, Some(hint), "{origin:?}");
+
+            let (rules, diags) =
+                read_map_local_from(r#"^a data="https://a.test/x""#, dir.path(), origin.clone());
+            assert!(diags.is_empty(), "{origin:?}: {:?}", said(&diags));
+            assert_eq!(
+                rules[0].data,
+                MapData::Url(url::Url::parse("https://a.test/x").unwrap()),
+                "{origin:?}"
+            );
+        }
+    }
+
+    /// A path written in a local include joins the directory of the main
+    /// profile, not that of the file the line stands in (phase 4 M3 design
+    /// 10.1).
+    #[test]
+    fn relative_paths_join_the_main_profile_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::Include(Arc::from(Path::new("other/part.conf")));
+        let (rules, diags) = read_map_local_from("^a data=x.json", dir.path(), origin);
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(rules[0].data, MapData::File(dir.path().join("x.json")));
+    }
+
+    /// A `Debug` of a `[Map Local]` rule shows neither the text nor the bytes
+    /// it answers with, nor a header value, nor the query of a URL (phase 4 M3
+    /// design 8.5 and 14).
+    #[test]
+    fn the_debug_of_map_local_shows_no_data_or_value() {
+        let bytes = base64::engine::general_purpose::STANDARD.encode("s3cr3t-b");
+        let text = format!(
+            "^a data-type=text data=\"s3cr3t-t\"\n\
+^a data-type=base64 data={bytes}\n\
+^a data=y header=\"X-Token: s3cr3t-h\"\n\
+^a data=\"https://a.test/p?tok=q1\""
+        );
+        let (rules, diags) = read_map_local(&text);
+        assert!(diags.is_empty(), "{:?}", said(&diags));
+        assert_eq!(rules.len(), 4);
+        let shown = format!("{rules:?}");
+        for part in ["s3cr3t-t", "s3cr3t-b", "s3cr3t-h", "tok", "q1"] {
+            assert!(!shown.contains(part), "{part}: {shown}");
+        }
+        assert!(shown.contains("X-Token"), "{shown}");
+        assert!(shown.contains("https://a.test/…"), "{shown}");
     }
 }

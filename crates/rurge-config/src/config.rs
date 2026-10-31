@@ -247,9 +247,9 @@ pub struct Config {
     pub ssid_settings: Vec<SsidSetting>,
     /// `[IP Rewrite]`: the lines that can be read, in the order written.
     pub ip_rewrite: IpRewrite,
-    /// `[URL Rewrite]`, `[Header Rewrite]` and `[Body Rewrite]`: the lines
-    /// that can be read, in the order written (phase 4 M3 design 6.1, 7.1 and
-    /// 9.1). `[Map Local]` follows in M3b.
+    /// `[URL Rewrite]`, `[Header Rewrite]`, `[Body Rewrite]` and `[Map
+    /// Local]`: the lines that can be read, in the order written (phase 4 M3
+    /// design 6.1, 7.1, 9.1 and 10.1).
     pub rewrite: RewriteConfig,
     pub deferred: DeferredSections,
     /// The `#!MANAGED-CONFIG` line of the text in effect: none when it is a
@@ -954,6 +954,14 @@ pub fn from_profile(
                 .section("Body Rewrite")
                 .into_iter()
                 .flat_map(Section::active_entries),
+            &mut diags,
+        ),
+        map_local: rewrite::parse_map_local(
+            profile
+                .section("Map Local")
+                .into_iter()
+                .flat_map(Section::active_entries),
+            base_dir,
             &mut diags,
         ),
     };
@@ -2803,6 +2811,40 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
             assert!(l.config.unknown_sections.is_empty(), "{section}");
             assert!(l.config.deferred.get("Body Rewrite").is_none(), "{section}");
             assert_eq!(l.config.rewrite.body.len(), 1, "{section}");
+        }
+    }
+
+    /// `[Map Local]` is a section rurge reads (phase 4 M3 design 10.1): its
+    /// active lines are typed into `Config::rewrite`, a relative path joined
+    /// to the directory the profile is in, and the section is no longer one
+    /// waiting for a later version.
+    #[test]
+    fn map_local_is_read_and_no_longer_deferred() {
+        for section in ["Map Local", "map local"] {
+            let l = load_text(&format!(
+                "[{section}]\n^http://a\\.test/file data=\"data/x.json\"\n[Rule]\nFINAL,DIRECT\n"
+            ));
+            assert!(
+                !l.diagnostics.has_errors(),
+                "{section}: {:?}",
+                l.diagnostics.iter().collect::<Vec<_>>()
+            );
+            let c = codes_of(&l);
+            for unwanted in [
+                codes::W_DEFERRED_SECTION,
+                codes::W_UNKNOWN_SECTION,
+                codes::W_INVALID_VALUE,
+            ] {
+                assert!(!c.contains(&unwanted), "{section}: {c:?}");
+            }
+            assert!(l.config.unknown_sections.is_empty(), "{section}");
+            assert!(l.config.deferred.get("Map Local").is_none(), "{section}");
+            assert_eq!(l.config.rewrite.map_local.len(), 1, "{section}");
+            assert_eq!(
+                l.config.rewrite.map_local[0].data,
+                rewrite::MapData::File(Path::new("/profiles").join("data/x.json")),
+                "{section}"
+            );
         }
     }
 
@@ -5697,6 +5739,9 @@ C = external, exec=/bin/c, local-port=1082, addresses=10.0.0.1\n\
     const SET_IN_DOWNLOADED_HINT: &str = "write the line in the local profile to use a local set";
     const SET_IN_COPY: &str = "the downloaded copy of a managed profile cannot name a local file as a set; the line is ignored";
     const SET_IN_COPY_HINT: &str = "name the set by a URL instead";
+    const MAP_LOCAL_IN_DOWNLOADED: &str = "[Map Local]: a downloaded file cannot name a local file for Map Local; the line is ignored";
+    const MAP_LOCAL_IN_DOWNLOADED_HINT: &str =
+        "write the line in the local profile to map to a local file";
     const INCLUDE_IN_COPY: &str =
         "the downloaded copy of a managed profile cannot include a local file; the line is ignored";
     const INCLUDE_IN_COPY_HINT: &str = "to include a local file, load a profile without `#!MANAGED-CONFIG` that takes the downloaded parts in by `#!include`";
@@ -5757,6 +5802,48 @@ C = external, exec=/bin/c, local-port=1082, addresses=10.0.0.1\n\
             Some(hours(5)),
             &fake,
         )
+    }
+
+    /// A downloaded text cannot name a local file as `[Map Local]` data: the
+    /// line is refused with `W0033` and no path from it is kept; a URL in the
+    /// same text is what to write instead (phase 4 M3 design 10.2).
+    #[test]
+    fn map_local_paths_in_a_remote_include_are_refused() {
+        let link = "https://example.com/map.conf";
+        let remote = format!(
+            "[Map Local]\n^http://a\\.test/file data={PATH_MARK}.json\n\
+^http://a\\.test/url data=\"https://example.com/data.json\"\n"
+        );
+        let fake = Arc::new(Fake::new().text(link, &remote));
+        let dir = tempfile::tempdir().unwrap();
+        let l = load_with_remote(
+            dir.path(),
+            &format!("[Map Local]\n#!include {link}\n[Rule]\nFINAL,DIRECT\n"),
+            &fake,
+        );
+        assert_eq!(
+            refusals(&l),
+            refused(
+                "1.conf",
+                &[2],
+                MAP_LOCAL_IN_DOWNLOADED,
+                MAP_LOCAL_IN_DOWNLOADED_HINT
+            )
+        );
+        // nothing else is said, and the load has no error
+        assert_eq!(
+            l.diagnostics.len(),
+            1,
+            "{:?}",
+            l.diagnostics.clone().into_vec()
+        );
+        let rules = &l.config.rewrite.map_local;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].data,
+            rewrite::MapData::Url(Url::parse("https://example.com/data.json").unwrap())
+        );
+        assert_no_path_is_shown(&l);
     }
 
     /// A downloaded text cannot name a local file as a set: a `[Rule]` line

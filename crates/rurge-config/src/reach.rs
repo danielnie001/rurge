@@ -64,6 +64,22 @@ impl Reach {
         }
     }
 
+    /// What is said when text of this reach names a local file as `[Map
+    /// Local]` data, if it may not; the line is ignored.
+    pub(crate) fn map_local_refusal(self) -> Option<Refusal> {
+        match self {
+            Reach::Anywhere => None,
+            Reach::ManagedCopy => Some(Refusal {
+                message: "the downloaded copy of a managed profile cannot name a local file for Map Local; the line is ignored",
+                hint: "give `data` a URL instead",
+            }),
+            Reach::Nowhere => Some(Refusal {
+                message: "a downloaded file cannot name a local file for Map Local; the line is ignored",
+                hint: "write the line in the local profile to map to a local file",
+            }),
+        }
+    }
+
     /// What is said when the group a text of this reach defines names a local
     /// file as its `policy-path`, if it may not. The message follows the
     /// group's name.
@@ -104,6 +120,28 @@ mod tests {
             Some(Refusal {
                 message: "a downloaded file cannot include a local file; the line is ignored",
                 hint: "include the local file from the local profile instead",
+            })
+        );
+    }
+
+    /// Only the user's own text names a local file as `[Map Local]` data: the
+    /// copy of a managed profile and any other downloaded text do not, and say
+    /// so in words of their own.
+    #[test]
+    fn only_the_users_own_text_names_a_local_file_for_map_local() {
+        assert_eq!(Reach::Anywhere.map_local_refusal(), None);
+        assert_eq!(
+            Reach::ManagedCopy.map_local_refusal(),
+            Some(Refusal {
+                message: "the downloaded copy of a managed profile cannot name a local file for Map Local; the line is ignored",
+                hint: "give `data` a URL instead",
+            })
+        );
+        assert_eq!(
+            Reach::Nowhere.map_local_refusal(),
+            Some(Refusal {
+                message: "a downloaded file cannot name a local file for Map Local; the line is ignored",
+                hint: "write the line in the local profile to map to a local file",
             })
         );
     }

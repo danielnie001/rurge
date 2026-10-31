@@ -422,6 +422,7 @@ fn read_rules(lines: &str) -> (RewriteConfig, Vec<rurge_config::Diagnostic>) {
             &mut diags,
         ),
         body: Vec::new(),
+        map_local: Vec::new(),
     };
     (cfg, diags.into_vec())
 }

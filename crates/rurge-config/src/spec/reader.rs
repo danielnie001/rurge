@@ -45,7 +45,7 @@ pub(crate) fn written_as_name(definition: &str, key: &str) -> bool {
 
 /// Whether `text` is written the way a parameter name is: ASCII lower-case
 /// letters, digits, `-` and `_`, at most 32 of them.
-fn is_plain_name(text: &str) -> bool {
+pub(crate) fn is_plain_name(text: &str) -> bool {
     (1..=32).contains(&text.len())
         && text
             .bytes()

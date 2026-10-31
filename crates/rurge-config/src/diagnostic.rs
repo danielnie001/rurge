@@ -281,9 +281,9 @@ pub mod codes {
     pub const W_API_TLS_NO_CA: &str = "W0040";
     /// A `[Header Rewrite]` line names `Content-Length` or `Transfer-Encoding`.
     /// The line is kept, and every request whose framing it changes fails
-    /// (phase 4 M3 design 13). From phase 4 M3b the two names in a
-    /// `[Map Local]` `header` are not used and the same code says so; the two
-    /// places mean different things, so each carries a hint of its own.
+    /// (phase 4 M3 design 13). The two names in a `[Map Local]` `header` are
+    /// not used and the same code says so; the two places mean different
+    /// things, so each carries a hint of its own.
     pub const W_REWRITE_FRAMING: &str = "W0041";
     /// A `[Body Rewrite]` line in the jq form: this build has no jq, so the
     /// line is ignored (phase 4 M3 design 13; M3c waits for the owner's

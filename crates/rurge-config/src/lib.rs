@@ -59,7 +59,8 @@ pub use reach::Reach;
 pub use remote::{Remote, RemoteRef, RemoteRole, RemoteSource};
 pub use requirement::Environment;
 pub use rewrite::{
-    BodyRewrite, Direction, HeaderAction, HeaderRewrite, RewriteConfig, UrlMode, UrlRewrite,
+    BodyRewrite, Direction, HeaderAction, HeaderRewrite, MapData, MapLocal, RewriteConfig, UrlMode,
+    UrlRewrite,
 };
 pub use rule::{
     HostnameType, InternalSet, ParseCtx, Pattern, PolicyRef, PortExpr, ProcessPattern,

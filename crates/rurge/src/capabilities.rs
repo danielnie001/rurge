@@ -19,8 +19,8 @@ use std::collections::HashSet;
 
 /// Reported as `CORE_VERSION` to requirement expressions (see FR-CFG-08).
 /// The manual ties 22 to the `smart` group, which rurge has. It ties 20 to
-/// Body Rewrite and inline Map Local, which rurge parses without effect
-/// (`W0016`): a profile that asks for 20 gets the same here either way.
+/// Body Rewrite and inline Map Local, which rurge has from phase 4 M3b (the
+/// jq form of Body Rewrite aside, `W0042`).
 pub const CORE_VERSION: u64 = 22;
 
 const INACTIVE_RULE_TYPES: [&str; 5] = [

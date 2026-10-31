@@ -4,7 +4,6 @@ use crate::text::{Entry, Profile};
 use crate::value::starts_with_ci;
 
 const DEFERRED: &[&str] = &[
-    "Map Local",
     "Script",
     "Panel",
     "Port Forwarding",
@@ -68,8 +67,8 @@ mod tests {
         assert!(!is_deferred("header rewrite"));
         // typed since phase 4 M3b
         assert!(!is_deferred("Body Rewrite"));
-        // still deferred: phase 4 M3b types them
-        assert!(is_deferred("Map Local"));
+        assert!(!is_deferred("Map Local"));
+        // still deferred
         assert!(is_deferred("Tailscale home"));
         assert!(is_deferred("Tailscale "));
         assert!(!is_deferred("Tailscale"));

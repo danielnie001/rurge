@@ -965,6 +965,12 @@ ERROR  消息 body rewrite task failed: {错误}
 | 26 | 1 | 修正轮 1（评审意见，都只是注释与测试的写法，不改行为）：① `dialect.rs` 的 `BodyPattern` 文档注释把 `^` 与 `$` 的 CRLF 读法说成设计第 5.4 节的意思（不在 `\r\n` 中间匹配）；② `diagnostic.rs` 的 `codes::hint` 名单里 `W0042` 一条挪到 `W0039` 之后（文字不改）；③ `W_JQ_REWRITE_UNAVAILABLE` 的文档注释点名 `phase 4 design Q4`；④ `rewrite.rs` 的两条黄金用例的规则行改成原始字符串（带 `"` 的 jq 行用 `r#"…"#`），文字仍与 `manual-excerpts.md` 逐字相同；⑤ `BodyRewrite.pairs` 的注释改成一句通顺的。跑了 `cargo fmt --all --check`（exit=0，`gate-task-1-fix1-fmt.log`）、`cargo clippy --all-targets -- -D warnings`（exit=0，`gate-task-1-fix1-clippy.log`）与 `cargo test -j 8 --workspace --lib -- dialect:: body_rewrite jq_lines`（19 passed、0 failed，exit=0，`gate-task-1-fix1-test.log`）；按派工不跑全量门禁 | 本提交 |
 | 27 | 1 | 修正轮 2：`dialect.rs` 里 `BodyPattern` 文档注释的那一段整段换成派工给的五句（`^` 与 `$` 把 `\r` 与 `\n` 都当行尾、但不在一对 CRLF 的中间匹配，`.` 两个都不配），依据是 `regex-automata-0.4.18/src/util/look.rs:955-975` 的 `is_start_crlf` / `is_end_crlf`；另一处没动。跑了 `cargo fmt --all --check`（exit=0，`gate-task-1-fix2-fmt.log`）、`cargo clippy --all-targets -- -D warnings`（exit=0，`gate-task-1-fix2-clippy.log`）与 `cargo test -j 8 --workspace --lib -- dialect::`（15 passed、0 failed，exit=0，`gate-task-1-fix2-test.log`）；按派工不跑全量门禁 | 本提交 |
 
+| 28 | 2 | 与计划对不上的：`spec::reader::is_plain_name` 今天是私有的，而任务 2 要从 `rewrite.rs` 用它；照任务 0 报告的建议改成 `pub(crate)`（只改可见性，不改语义）。 | 本提交 |
+| 29 | 2 | 执行者的裁定：`split_words` 一个字也没有的行直接跳过、不给诊断——只有空行会这样，而文本层已经把空行丢掉，P7 的 `[Map Local]` 消息里没有“这一行不是……”的形状那一句。 | 本提交 |
+| 30 | 2 | 执行者的裁定：`header=""` 得到没有头、也没有诊断：它没有 `:`，按 Base64 解，空的 Base64 解出来就是空的。 | 本提交 |
+| 31 | 2 | 执行者的裁定：`status-code=+200` 这种带 `+` 的写法照 Rust 的整数解析接受——P5 只说“读成 `u16`、在 200 ～ 999”，没写符号。 | 本提交 |
+| 32 | 2 | 执行者的裁定：`header` 里名字是 `Content-Length` / `Transfer-Encoding` 的对先跟别的对一样校验名字与值、再丢掉；值本身不合法时给头那一句（`W0012`、这一行跳过），不是 `W0041`。 | 本提交 |
+
 ## 延后事项
 
 | # | 事项 | 去向 |
