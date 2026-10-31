@@ -283,3 +283,494 @@ async fn counts_survive_a_reload() {
     assert_eq!(origin.requests()[1].header("x-a"), Some("1"));
     assert_eq!(h.engine.http_counts().rewrite.header, 2);
 }
+
+/// A listener a profile can name as an HTTP proxy and that nothing is to dial:
+/// the cases here whose rewrite answers the request by itself put every rule
+/// that would reach an upstream on this one, and fail when it was reached
+/// (`the phase 4 / M3a plan's P19`).
+struct Guard {
+    listener: std::net::TcpListener,
+    port: u16,
+}
+
+impl Guard {
+    fn new() -> Guard {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a guard port");
+        listener
+            .set_nonblocking(true)
+            .expect("a guard that does not block");
+        let port = listener.local_addr().expect("a guard address").port();
+        Guard { listener, port }
+    }
+
+    /// The policy line a profile names to send a request here.
+    fn policy(&self, name: &str) -> String {
+        format!("{name} = http, 127.0.0.1, {}", self.port)
+    }
+
+    /// How many connections reached the guard: none, for a request the case
+    /// says never reaches an upstream.
+    fn connections(&self) -> usize {
+        let mut seen = 0;
+        loop {
+            match self.listener.accept() {
+                Ok(_) => seen += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return seen,
+                // a connection that was reset after it was taken still reached
+                // the guard
+                Err(_) => return seen + 1,
+            }
+        }
+    }
+}
+
+/// One request written whole — its head and its body in one write
+/// (`CLAUDE.md`) — and the answer read to the end of the connection.
+async fn exchange(proxy: SocketAddr, request: &str) -> String {
+    let mut s = TcpStream::connect(proxy).await.unwrap();
+    s.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut buf)).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// A loopback origin that answers every request with one fixed body and keeps
+/// each request's head: the manual's header example needs the request line
+/// *with its query string*, which `TestServer` does not record (it keeps
+/// `uri().path()`). `the phase 4 / M3a plan's execution record row 64`.
+struct RecordingOrigin {
+    addr: SocketAddr,
+    heads: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingOrigin {
+    async fn spawn(body: &'static str) -> RecordingOrigin {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let heads: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let kept = heads.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let kept = kept.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte))
+                            .await
+                        {
+                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+                            Ok(Ok(_)) => head.push(byte[0]),
+                        }
+                    }
+                    kept.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&head).into_owned());
+                    let answer = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        RecordingOrigin { addr, heads }
+    }
+
+    /// The head of every request it was asked, in order.
+    fn heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
+    }
+}
+
+/// The manual's `[URL Rewrite]` page, its first example, word for word
+/// (`http/url-rewrite.html`; `the phase 4 / M3a plan's P19`): the request
+/// carries the test origin's port, which the manual's line leaves to the text
+/// after the match, and the two names are pinned to the loopback by `[Host]`.
+///
+/// The origin is a hand-written one because what this case has to show is the
+/// request line *with its query string*, and `TestServer` records the path
+/// alone (`rurge-net`'s `RecordingOrigin` stands beside it; `the phase 4 / M3a
+/// plan's execution record row 64`).
+#[tokio::test]
+async fn the_manual_url_rewrite_header_example() {
+    let origin = RecordingOrigin::spawn("rewritten").await;
+    let port = origin.addr.port();
+    let general = format!("force-http-engine-hosts = www.google.cn:{port}");
+    let h = harness_with(
+        Profile {
+            general: &general,
+            hosts: "www.google.cn = 127.0.0.1\nwww.google.com = 127.0.0.1",
+            rules: "DOMAIN,www.google.cn,DIRECT",
+            sections: "[URL Rewrite]\n^http://www\\.google\\.cn http://www.google.com header",
+            ..Profile::default()
+        },
+        EngineShared {
+            sniff_wait: Duration::from_millis(300),
+            ..shared_on(NetworkFacts::default())
+        },
+    )
+    .await;
+    let url = format!("http://www.google.cn:{port}/s?q=1");
+    let host = format!("www.google.cn:{port}");
+
+    // through the HTTP listener, whose request line is absolute
+    let answer = plain_get(h.http(), &url, &host).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert!(answer.ends_with("rewritten"), "{answer}");
+
+    // through SOCKS5, on a sniffed connection: the request line names a path
+    let mut tunnel = connect_via_socks5(h.socks(), "www.google.cn", port).await;
+    let answer = get(&mut tunnel, &host, "/s?q=1").await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert!(answer.ends_with("rewritten"), "{answer}");
+
+    let heads = origin.heads();
+    assert_eq!(heads.len(), 2, "{heads:?}");
+    for head in &heads {
+        assert!(
+            head.starts_with("GET /s?q=1 HTTP/1.1"),
+            "the path and its query reached the origin: {head}"
+        );
+        assert!(
+            head.contains(&format!("\r\nhost: www.google.com:{port}\r\n"))
+                || head.contains(&format!("\r\nHost: www.google.com:{port}\r\n")),
+            "the new authority names the origin: {head}"
+        );
+    }
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    let note = format!(
+        "URL Rewrite: header by ^http://www\\.google\\.cn -> http://www.google.com:{port}/s"
+    );
+    for record in &records {
+        assert_eq!(record.url.as_deref(), Some(url.as_str()), "{record:?}");
+        assert_eq!(record.notes, [note.as_str()], "{record:?}");
+        assert_eq!(
+            record.rule.as_deref(),
+            Some("DOMAIN,www.google.cn,DIRECT"),
+            "{record:?}"
+        );
+        assert_eq!(record.policy, ["DIRECT"], "{record:?}");
+    }
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!((counts.url, counts.header), (2, 0), "{counts:?}");
+}
+
+/// The manual's `302` and `307` examples (`http/url-rewrite.html`), one engine
+/// each: the answer is the status, the `Location` and an empty body, and the
+/// policy the rule chose — a guard here — is never dialled.
+#[tokio::test]
+async fn the_manual_url_rewrite_302_and_307_examples() {
+    for (mode, status) in [("302", "302"), ("307", "307")] {
+        let guard = Guard::new();
+        let proxies = guard.policy("guard");
+        let sections = format!("[URL Rewrite]\n^http://yachen\\.com https://yach.me {mode}");
+        let h = harness_with(
+            Profile {
+                proxies: &proxies,
+                hosts: "yachen.com = 127.0.0.1\nyach.me = 127.0.0.1",
+                rules: "DOMAIN,yachen.com,guard",
+                sections: &sections,
+                ..Profile::default()
+            },
+            shared_on(NetworkFacts::default()),
+        )
+        .await;
+
+        let answer = plain_get(h.http(), "http://yachen.com/", "yachen.com").await;
+        assert!(
+            answer.starts_with(&format!("HTTP/1.1 {status}")),
+            "{answer}"
+        );
+        assert_eq!(
+            header_value(&answer, "location").as_deref(),
+            Some("https://yach.me/"),
+            "{answer}"
+        );
+        assert_eq!(
+            header_value(&answer, "content-length").as_deref(),
+            Some("0"),
+            "{answer}"
+        );
+        assert_eq!(
+            guard.connections(),
+            0,
+            "the {mode} rule answers the request without an upstream"
+        );
+        let records = the_records(&h, 1).await;
+        assert_eq!(
+            records[0].status_code,
+            Some(status.parse().unwrap()),
+            "{records:?}"
+        );
+        assert_eq!(
+            records[0].notes,
+            [format!("URL Rewrite: {status} by ^http://yachen\\.com")],
+            "{records:?}"
+        );
+        assert_eq!(records[0].policy, ["guard"], "{records:?}");
+        assert_eq!(records[0].url.as_deref(), Some("http://yachen.com/"));
+        let counts = h.engine.http_counts().rewrite;
+        assert_eq!((counts.url, counts.skipped), (1, 0), "{counts:?}");
+    }
+}
+
+/// The manual's `reject` example (`http/url-rewrite.html`): with the error
+/// page on the client gets its 403; with it off the connection is closed and
+/// nothing is read. Either way the policy the rule chose is never dialled.
+#[tokio::test]
+async fn the_manual_url_rewrite_reject_example() {
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    for pages in [true, false] {
+        let general = if pages {
+            "show-error-page-for-reject = true"
+        } else {
+            "show-error-page-for-reject = false"
+        };
+        let h = harness_with(
+            Profile {
+                general,
+                proxies: &proxies,
+                hosts: "ad.com = 127.0.0.1",
+                rules: "DOMAIN,ad.com,guard",
+                sections: "[URL Rewrite]\n^http://ad\\.com/ad\\.png _ reject",
+                ..Profile::default()
+            },
+            shared_on(NetworkFacts::default()),
+        )
+        .await;
+
+        let answer = plain_get(h.http(), "http://ad.com/ad.png", "ad.com").await;
+        if pages {
+            assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+            assert!(
+                answer.contains("The request was rejected by a URL Rewrite rule."),
+                "{answer}"
+            );
+        } else {
+            assert!(
+                answer.is_empty(),
+                "a rejection with no page closes the connection: {answer:?}"
+            );
+        }
+        assert_eq!(
+            guard.connections(),
+            0,
+            "the reject answers the request without an upstream"
+        );
+        let records = the_records(&h, 1).await;
+        assert_eq!(
+            records[0].status,
+            RecordStatus::Rejected("REJECT".into()),
+            "{records:?}"
+        );
+        assert_eq!(
+            records[0].status_code,
+            if pages { Some(403) } else { None },
+            "{records:?}"
+        );
+        assert_eq!(
+            records[0].notes,
+            ["URL Rewrite: reject by ^http://ad\\.com/ad\\.png".to_string()],
+            "{records:?}"
+        );
+        let counts = h.engine.http_counts().rewrite;
+        assert_eq!((counts.url, counts.skipped), (1, 0), "{counts:?}");
+    }
+}
+
+/// The manual's "Matching details" (`http/url-rewrite.html`): the request line
+/// names the guard and the `Host` field names `ad.com`, and the URL rebuilt
+/// from that field is what the rule matches. The guard is where the dial would
+/// have gone, so its silence is the evidence that nothing was dialled.
+#[tokio::test]
+async fn the_manual_matching_details_example() {
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let h = harness_with(
+        Profile {
+            general: "show-error-page-for-reject = true",
+            proxies: &proxies,
+            hosts: "ad.com = 127.0.0.1",
+            rules: "IP-CIDR,127.0.0.1/32,guard",
+            sections: "[URL Rewrite]\n^http://ad\\.com/ad\\.png _ reject",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+
+    let url = format!("http://127.0.0.1:{}/ad.png", guard.port);
+    let answer = plain_get(h.http(), &url, "ad.com").await;
+    assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+    assert_eq!(
+        guard.connections(),
+        0,
+        "the URL rebuilt from Host matched, so the guard was not dialled"
+    );
+    let records = the_records(&h, 1).await;
+    assert_eq!(records[0].url.as_deref(), Some(url.as_str()));
+    assert_eq!(
+        records[0].notes,
+        ["URL Rewrite: reject by ^http://ad\\.com/ad\\.png".to_string()],
+        "{records:?}"
+    );
+    assert_eq!(records[0].policy, ["guard"], "{records:?}");
+}
+
+/// An engine for the manual's header-rewrite examples: `example.com` pinned to
+/// the loopback, and the `[Header Rewrite]` lines of one example.
+async fn example_engine(section: &str) -> (Harness, TestServer) {
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    let h = harness_with(
+        Profile {
+            hosts: "example.com = 127.0.0.1",
+            rules: "DOMAIN,example.com,DIRECT",
+            sections: section,
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    (h, origin)
+}
+
+/// A `GET` in absolute form through the listener, its own fields beside `Host`,
+/// and the answer as the client reads it. `example.com` carries the origin's
+/// port, which the manual's `^http://example.com` still matches as a prefix.
+async fn example_get(h: &Harness, port: u16, fields: &[(&str, &str)]) -> String {
+    let fields: String = fields
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    exchange(
+        h.http(),
+        &format!(
+            "GET http://example.com:{port}/a HTTP/1.1\r\nHost: example.com:{port}\r\n\
+             {fields}Connection: close\r\n\r\n"
+        ),
+    )
+    .await
+}
+
+/// The manual's `[Header Rewrite]` page, its "Example" (`header-rewrite.html`),
+/// word for word: four lines on one engine — the two `Cookie` fields gone, a
+/// `DNT` added, the `User-Agent` replaced, and the answer's `Date` rewritten.
+#[tokio::test]
+async fn the_manual_header_rewrite_examples() {
+    let (h, origin) = example_engine(
+        "[Header Rewrite]\n\
+         http-request ^http://example.com header-add DNT 1\n\
+         http-request ^http://example.com header-del Cookie\n\
+         http-request ^http://example.com header-replace User-Agent Unknown\n\
+         http-response ^http://example.com header-replace-regex Date 2022 2023",
+    )
+    .await;
+    // hyper's server adds no `Date` of its own when the route names one
+    origin.set_header("/a", "date", "Sat, 01 Jan 2022 00:00:00 GMT");
+    let port = origin_addr(&origin).port();
+    let request = format!(
+        "GET http://example.com:{port}/a HTTP/1.1\r\nHost: example.com:{port}\r\n\
+         Cookie: a=1\r\nCookie: b=2\r\nUser-Agent: test/1\r\nConnection: close\r\n\r\n"
+    );
+    let answer = exchange(h.http(), &request).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    let seen = origin.requests();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let dnt: Vec<&str> = seen[0]
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("dnt"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(dnt, ["1"], "exactly one DNT: 1, as the page's After shows");
+    assert_eq!(seen[0].header("cookie"), None, "{seen:?}");
+    assert_eq!(seen[0].header("user-agent"), Some("Unknown"), "{seen:?}");
+    assert_eq!(
+        header_value(&answer, "date").as_deref(),
+        Some("Sat, 01 Jan 2023 00:00:00 GMT"),
+        "{answer}"
+    );
+
+    // the direction left out: `header-add` alone
+    let (h, origin) =
+        example_engine("[Header Rewrite]\n^http://example.com header-add DNT 1").await;
+    let port = origin_addr(&origin).port();
+    let answer = example_get(&h, port, &[]).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert_eq!(
+        origin.requests()[0].header("dnt"),
+        Some("1"),
+        "a line with no direction is a request rule"
+    );
+
+    // `header-del` before `header-add`: the client's `DNT: 0` is gone, and
+    // exactly one `DNT: 1` takes its place
+    let (h, origin) = example_engine(
+        "[Header Rewrite]\n\
+         ^http://example.com header-del DNT\n\
+         ^http://example.com header-add DNT 1",
+    )
+    .await;
+    let port = origin_addr(&origin).port();
+    let answer = example_get(&h, port, &[("DNT", "0")]).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    let seen = origin.requests();
+    let dnt: Vec<&str> = seen[0]
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("dnt"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(dnt, ["1"], "{dnt:?}");
+}
+
+/// The manual's `header-replace-regex` example (`header-rewrite.html`): the
+/// `Safari` of the page's "Before" `User-Agent` becomes the "After" one.
+#[tokio::test]
+async fn the_manual_header_rewrite_regex_example() {
+    let (h, origin) = example_engine(
+        "[Header Rewrite]\n\
+         http-request ^http://example.com header-replace-regex User-Agent Safari Chrome",
+    )
+    .await;
+    let before = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_4) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.1 Safari/603.1.30";
+    let after = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_4) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.1 Chrome/603.1.30";
+    let port = origin_addr(&origin).port();
+    let answer = example_get(&h, port, &[("User-Agent", before)]).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert_eq!(origin.requests()[0].header("user-agent"), Some(after));
+}
+
+/// The manual's "Limitations" (`header-rewrite.html`): a line that changes a
+/// message's framing fails the request, and the origin is never asked. The
+/// line is kept at load time with `W0041`, which this case does not count.
+#[tokio::test]
+async fn the_manual_header_rewrite_framing_limit() {
+    let (h, origin) = example_engine(
+        "[Header Rewrite]\nhttp-request ^http://example.com header-del Content-Length",
+    )
+    .await;
+    let port = origin_addr(&origin).port();
+    let body = "body";
+    let request = format!(
+        "POST http://example.com:{port}/a HTTP/1.1\r\nHost: example.com:{port}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let answer = exchange(h.http(), &request).await;
+    assert!(answer.starts_with("HTTP/1.1 502"), "{answer}");
+    assert!(
+        origin.requests().is_empty(),
+        "a request whose framing changed is not sent"
+    );
+    let records = the_records(&h, 1).await;
+    assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(h.engine.http_counts().rewrite.failed, 1);
+}
