@@ -1316,9 +1316,7 @@ impl<U: Upstreams> Requests<U> {
                 }
             }
         };
-        let resp = Response::from_parts(parts, body);
-        handle.set_status(resp.status().as_u16());
-        let (parts, body) = resp.into_parts();
+        handle.set_status(parts.status.as_u16());
         let outing = Outing {
             // a shared HTTP/2 connection is found under its key, not put back
             // there; an HTTP/1.1 connection keeps the key unless a send on
@@ -2959,12 +2957,14 @@ const LOCAL_BLOCK: usize = 64 * 1024;
 /// does, and a file that became shorter or stalls ends the answer with an
 /// error.
 struct LocalFile {
-    /// The file and how much of it is left to open it from, `None` once it was
-    /// let go — by `complete`, `fail`, `stop` or the watchdog. One read at a
-    /// time, and never across any of those.
+    /// The file, read no further than the length it had when it was opened,
+    /// `None` once it was let go — by `complete`, `fail`, `stop` or the
+    /// watchdog. One read at a time, and never across any of those.
     file: Arc<Mutex<Option<tokio::io::Take<tokio::fs::File>>>>,
-    /// The path as the line wrote it, which is what a record names, never a
-    /// byte of the file.
+    /// The path the file was opened at, which is what a record names, never
+    /// a byte of the file: a relative one in the line was joined to the main
+    /// profile's directory when the profile was read (`phase 4 M3 design
+    /// 10.1`).
     path: PathBuf,
     /// How many bytes of the file the answer still owes the client.
     left: u64,
@@ -4069,9 +4069,13 @@ mod tests {
         /// (`phase 4 M3 design 9.3`).
         async fn response_chunked(&mut self) -> (String, Vec<u8>) {
             let head = self.response_head().await;
-            let body = read_chunked(&mut self.buf, &mut self.stream)
-                .await
-                .expect("a chunked body before the connection closed");
+            let body = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_chunked(&mut self.buf, &mut self.stream),
+            )
+            .await
+            .expect("a chunked body within 10 s")
+            .expect("a chunked body before the connection closed");
             (head, body)
         }
 
@@ -4083,9 +4087,13 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("transfer-encoding: chunked")
             {
-                read_chunked(&mut self.buf, &mut self.stream)
-                    .await
-                    .expect("a chunked body before the connection closed")
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    read_chunked(&mut self.buf, &mut self.stream),
+                )
+                .await
+                .expect("a chunked body within 10 s")
+                .expect("a chunked body before the connection closed")
             } else {
                 let len = content_length(&head);
                 self.take(len).await
@@ -7660,10 +7668,10 @@ mod tests {
         (Arc::new(rules), counters)
     }
 
-    /// What a case expects `/v1/rurge/http` to say it counted: the two numbers
-    /// of URL and header rewrites. `body` and `map_local` are zero here, and a
-    /// case that asserts either writes the count it expects over this one with
-    /// a struct update (`the phase 4 / M3b plan's P18`).
+    /// What a case expects `/v1/rurge/http` to say it counted: the URL and
+    /// header rewrites, the skipped and the failed. `body` and `map_local` are
+    /// zero here, and a case that asserts either writes the count it expects
+    /// over this one with a struct update (`the phase 4 / M3b plan's P18`).
     fn counted(url: u64, header: u64, skipped: u64, failed: u64) -> RewriteCounts {
         RewriteCounts {
             url,
@@ -8743,6 +8751,37 @@ mod tests {
                 }
             );
         }
+
+        // the data of a 204 is not read at all: a file that is not there
+        // answers 204 all the same, and that is no failure
+        let (rules, counters) = map_local_rules(
+            "[Map Local]\n\
+             ^http://m\\.test/ data-type=file data=\"missing.json\" status-code=204",
+            dir.path(),
+        );
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /s HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 204"), "{head}");
+        assert_eq!(header_value(&head, "content-length"), None, "{head}");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Map Local: file by ^http://m\\.test/"]
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                map_local: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+        assert_eq!(guarded.accepted.load(Ordering::Relaxed), 0);
     }
 
     /// A file that is not there answers 502 (or closes when the generation
