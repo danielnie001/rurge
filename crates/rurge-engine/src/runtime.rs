@@ -60,11 +60,11 @@ pub struct Runtime {
     /// when `[MITM]` names no CA, when it cannot be used, or when TLS cannot
     /// be set up. Only the entries and the hand-over read it.
     pub(crate) mitm: Option<Arc<Mitm>>,
-    /// What this generation rewrites with (`phase 4 M3 design 8.4`): `None`
-    /// when neither section has a usable line, when the roots of the origin
-    /// side cannot be read, or when the TLS configurations cannot be built.
-    /// The switch of the engine and the policy a request took are asked
-    /// elsewhere (`M3-D27`).
+    /// What this generation rewrites with (`phase 4 M3 design 8.2, 8.4`):
+    /// `None` when neither section has a usable line, when the roots of the
+    /// origin side cannot be read, or when the TLS configurations cannot be
+    /// built. The switch of the engine and the policy a request took are
+    /// asked elsewhere (`M3-D27`).
     pub(crate) rewrite: Option<Arc<Rewrite>>,
 }
 
@@ -287,7 +287,7 @@ async fn build_mitm(config: &Config, shared: &EngineShared) -> Option<Arc<Mitm>>
     }
 }
 
-/// This generation's rewrites (`phase 4 M3 design 8.4`, the phase 4 / M3a
+/// This generation's rewrites (`phase 4 M3 design 8.2`, the phase 4 / M3a
 /// plan's P17).
 ///
 /// Neither section with a usable line means `None`, and the roots of the
@@ -297,7 +297,7 @@ async fn build_mitm(config: &Config, shared: &EngineShared) -> Option<Arc<Mitm>>
 ///
 /// A failure — the roots cannot be read, or the TLS configurations cannot be
 /// built — turns the rewrites of this generation off, not the engine: the
-/// next generation builds its own (`phase 4 M3 design 8.4`), and what says so
+/// next generation builds its own (`phase 4 M3 design 8.2`), and what says so
 /// is the log line the failure leaves.
 async fn build_rewrite(config: &Config, shared: &EngineShared) -> Option<Arc<Rewrite>> {
     if config.rewrite.is_empty() {

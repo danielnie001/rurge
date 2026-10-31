@@ -149,8 +149,8 @@ impl Upstreams for ConnUpstreams {
                         egress: rt.factory.egress_route(),
                     };
                     // The switch of the engine and the policy the rules chose
-                    // (`phase 4 M3 design 8.4`, `M3-D27`): a request routed to
-                    // a REJECT keeps no rewrite at all, and one routed while
+                    // (`phase 4 M3 design 8.4, 11`, `M3-D27`): a request routed
+                    // to a REJECT keeps no rewrite at all, and one routed while
                     // the switch is off gets none either.
                     let rewrite =
                         if self.engine.rewrite_on() && first.terminal != TerminalKind::Reject {

@@ -1,7 +1,7 @@
-//! The rewrites one generation carries (`phase 4 M3 design 8.4`, 12; the phase
-//! 4 / M3a plan's task 6): the `rewrite` switch of one engine, a request whose
-//! policy is one of REJECT's, the gateway a `302` carries, and the counts that
-//! outlive a reload.
+//! The rewrites one generation carries (`phase 4 M3 design 8.4, 11, 12`; the
+//! phase 4 / M3a plan's task 6): the `rewrite` switch of one engine, a request
+//! whose policy is one of REJECT's, the gateway a `302` carries, and the counts
+//! that outlive a reload.
 //!
 //! Nothing here goes beyond the loopback: every origin and guard is a loopback
 //! server, and every name a rule names is pinned to `127.0.0.1` by `[Host]`.
@@ -47,7 +47,7 @@ fn header_value(head: &str, name: &str) -> Option<String> {
     })
 }
 
-/// The `rewrite` switch (`phase 4 M3 design 8.4`): with it off neither a
+/// The `rewrite` switch (`phase 4 M3 design 11`): with it off neither a
 /// header rule nor a URL rule of this generation acts, and neither leaves a
 /// note or a count; with it on again, both do.
 #[tokio::test]

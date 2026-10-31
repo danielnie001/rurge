@@ -200,7 +200,7 @@ pub struct Engine {
     /// Unlike the mode it is not part of a generation: it takes effect for the
     /// next session and does not end the decrypted connections that are open.
     mitm_on: AtomicBool,
-    /// Whether this generation's rewrites act (`phase 4 M3 design 8.4`): on
+    /// Whether this generation's rewrites act (`phase 4 M3 design 11`): on
     /// unless `state.json` says otherwise. As `mitm_on`, it is not part of a
     /// generation: it is read when a request is routed, so it takes effect for
     /// the next request and does not end the requests that are open.
@@ -761,7 +761,7 @@ impl Engine {
     }
 
     /// Whether this generation's `[URL Rewrite]` and `[Header Rewrite]` act
-    /// (`phase 4 M3 design 8.4`). On unless `state.json` said otherwise at
+    /// (`phase 4 M3 design 11`). On unless `state.json` said otherwise at
     /// start.
     pub fn rewrite_on(&self) -> bool {
         self.rewrite_on.load(Ordering::Relaxed)

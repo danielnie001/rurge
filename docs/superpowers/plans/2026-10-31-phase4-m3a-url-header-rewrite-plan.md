@@ -898,6 +898,8 @@ I0005 的消息
 | 58 | 6 | 用例里给网络经 `EngineShared::network.store(…)`，不手建 `NetworkCell`（与 P19 的写法同一件事，执行者的裁定） | 本提交 |
 | 59 | 6 | 门禁（任务 6 提交 a）：`df -h /d` 有 108 GiB 可用；`cargo fmt --all --check` exit=0（`gate-task-6a-fmt.log`）、`cargo clippy --all-targets -- -D warnings` exit=0（`gate-task-6a-clippy.log`）；全量测试第一次运行 exit=101，`udp_tls_family` 以 `STATUS_HEAP_CORRUPTION` 退出（本机已知的注入 DLL），那次日志里 91 / 5095 / 0 / 13，该二进制单独重跑三次全过（`rerun-task-6a-udp-tls-family.log`）；第二次全量运行 exit=0，92 / 5102 / 0 / 13（`gate-task-6a-test-2.log`），与基线 91 / 5098 / 0 / 13 加本提交的 4 条、1 个新测试二进制对得上 | 本提交 |
 | 60 | 6 | 门禁（任务 6 提交 b）：`df -h /d` 有 108 GiB 可用；`cargo fmt --all --check` exit=0（`gate-task-6b-fmt.log`）、`cargo clippy --all-targets -- -D warnings` exit=0（`gate-task-6b-clippy.log`）、全量测试 exit=0，92 / 5104 / 0 / 13（`gate-task-6b-test.log`），与派工单的期望一致 | 本提交 |
+| 61 | 6 | 注释里八处出处的订正（订正派工单第 2 节那一处出处，协调者写错）：开关改引设计第 11 节——`engine.rs` 的 `rewrite_on` 字段与 `rewrite_on()`、`tests/rewrite.rs` 的模块文档注释（并引 8.4、11、12）与 `the_rewrite_switch_turns_every_rewrite_off`；「建不成只关这一代」改引第 8.2 节——`Runtime.rewrite`（并引 8.2、8.4）与 `build_rewrite` 的两处；`http.rs` 的 `route` 并引 8.4 与 11（REJECT 在 8.4、开关在 11），`M3-D27` 照留。只改出处里的节号，不动代码与断言（协调者的裁定） | 本提交 |
+| 62 | 6 | 修正轮 1 的三样（不跑全量是协调者的决定，这一轮只改注释）：`cargo fmt --all --check` exit=0（`gate-task-6-fix-1-fmt.log`）、`cargo clippy --all-targets -- -D warnings` exit=0（`gate-task-6-fix-1-clippy.log`）、`cargo test -j 8 --workspace --test rewrite` exit=0，4 passed（`gate-task-6-fix-1-rewrite.log`） | 本提交 |
 
 ## 延后事项
 
