@@ -615,3 +615,21 @@ M3 的文档任务把下面各条写进兼容性清单（`docs/surge-compatibili
 ## 22. 计划与执行期的订正
 
 写计划与执行时对本文正文的改动记在这里，一条一段：改了正文哪一处、以哪一处为准。正文不逐处改，读正文之前先读这一节。
+
+写 M3a 计划时（`docs/superpowers/plans/2026-10-31-phase4-m3a-url-header-rewrite-plan.md`，对着 `58ec98f` 核对）：
+
+1. 第 2 节 M3a 的任务表是任务 0 ～ 7；计划拆成任务 0 ～ 8：本文的任务 4 拆成计划的任务 4（每个请求的对上游 TLS 与池的键 `(K, OriginKey)`，行为不变）与任务 5（引擎里的各步），本文的任务 5 ～ 7 依次是计划的任务 6 ～ 8。脱敏的那一条用例在计划的任务 1、随 `split_words` 一起：第 2 节把它写在任务 2，以第 4.3 节"加 `split_words` 的提交在说明里写这一段理由，并加一条脱敏的用例钉住"为准（计划 P1）。
+
+2. 第 3 节的 `Word` 多一个字段 `quoted: bool`（这一项整个在引号里）。第 4.1 节没有说空的引号：`""` 留成一项、文字是空串——逗号分隔的列表丢掉它们（`split_fields`），第 7.1 节的 `header-add X ""` 要它。`Word` 与 `Template` 的 `Debug` 不显示文字（`Word(***)`、`Template(***)`）。以计划 P2、P4 为准。
+
+3. 第 3 节的 `UrlRewrite` 多一个字段 `gateway: bool`：第 6.1 节"替换里写着 `{{{GATEWAY_ADDRESS}}}` 时加载时就记下"记在这里。M3a 的 `RewriteConfig` 只有 `url` 与 `header` 两个字段，`body` 与 `map_local` 由 M3b 加（计划 P6）。
+
+4. 第 7.2 节 `header-replace`"全部同名的行换成这个值"：计划定为换成**一行**，留在原来第一行的位置（`HeaderMap` 的 `OccupiedEntry::insert`）；登记（计划 P9、P21）。
+
+5. 第 6.2 节"之后的 `header` 规则一概跳过"与第 8.5 节"每个被跳过的改写一条"：第一条 `header` 生效之后的 `header` 规则不求、不留备注、不计入 `skipped`——手册说只有第一条生效，它们不是被跳过的改写（计划 P9、P11）。
+
+6. 第 6.3 节合法的新 URL 另加两条：`https` / `wss` 的主机要能当 TLS 的名字（`ServerName`），否则不合法——不加这一条，就要到拨号之后才失败；`#` 之后的部分去掉（第 6.3 节只说用户名口令不用）。以计划 P10 为准；前一条登记。
+
+7. 第 6.5 节 `reject`"同 `REJECT` 策略对引擎里一个请求的答复"：状态码、标题与关掉连接的办法同 REJECT，错误页的说明改成 `The request was rejected by a URL Rewrite rule.`——REJECT 那一页的 "…by the REJECT policy." 在这里不实（计划 P12）；登记。
+
+8. 第 16 节第 3 条"另加一条按地址的规则作第二道防线"与"要连上游的（`header` 模式）在替换里加上测试源站的端口"：规则照手册原文逐字写，测试源站的端口写在请求里（式子照样命中，替换之后端口留着），不改手册的规则；不连上游的例子照手册的 URL 发，规则选测试自己持有的守卫监听器。第二道防线是共用夹具的 `dns-server`——回环上的 `MockDns`；夹具在规则之后自带 `FINAL,DIRECT`，用例不另写 `FINAL`（计划 P19）。
