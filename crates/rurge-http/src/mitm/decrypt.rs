@@ -50,6 +50,7 @@ pub enum Decision {
 /// client's SNI, or the target when there is none), and how long the
 /// handshake may take — as long as the client's own handshake was given
 /// (`phase 4 M2 design 9.2`, the same 30 seconds as `8.2`).
+#[derive(Clone)]
 pub struct OriginTls {
     pub config: Arc<ClientConfig>,
     /// The same trust and the same name, offering `http/1.1` only: an upgrade

@@ -33,6 +33,7 @@ use rurge_inbound::{Close, FailKind, SessionHandle, SessionOutcome};
 use rurge_net::BoxFuture;
 use rurge_net::connector::BoxedStream;
 use rurge_proto::RejectKind;
+use rustls::pki_types::ServerName;
 use std::error::Error as StdError;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -214,11 +215,53 @@ impl Reusable for Pooled {
     }
 }
 
+/// What one upstream connection of a request's key says about the origin side
+/// (`phase 4 M3 design 8.3`, `the phase 4 / M3a plan's P14`): whether the
+/// dialled stream carries TLS, and the name it was verified against. The pool
+/// and the shared HTTP/2 connections are keyed by `(U::Key, OriginKey)`, so
+/// that a plain connection is never lent to a request that needs TLS, nor a
+/// connection to one name to a request for another: a rewrite can change the
+/// scheme and the name of what it dials (`phase 4 M3 design 8.3`).
+///
+/// The key holds the name and no configuration: every TLS connection of one
+/// client connection is dialled with one configuration — the decrypted
+/// connection's, or the generation's `Rewrite` — and `U::Key` tells the
+/// generations apart (`M3-D31`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OriginKey {
+    /// No TLS between the dialled stream and hyper.
+    Plain,
+    /// TLS, verified against this name.
+    Tls(ServerName<'static>),
+}
+
+impl OriginKey {
+    /// The key of a request's upstream: `origin` is what `Conn::origin` holds
+    /// for a connection the engine decrypted, and what a `https` target a
+    /// rewrite chose needs (`phase 4 M3 design 8.3`).
+    pub(crate) fn of(origin: Option<&OriginTls>) -> OriginKey {
+        match origin {
+            None => OriginKey::Plain,
+            Some(tls) => OriginKey::Tls(tls.name.clone()),
+        }
+    }
+}
+
+/// What the pool and the shared HTTP/2 connections of one client connection
+/// keep their upstream connections under (`the phase 4 / M3a plan's P14`): the
+/// key `dial` gave and the origin side the request reached. Both are needed:
+/// a rewrite can change the scheme of what is dialled as well as the target,
+/// and a connection is only ever lent to a request that dials the same.
+type UpstreamKey<U> = (<U as Upstreams>::Key, OriginKey);
+
 /// What one client connection carries between its requests.
 struct Shared<U: Upstreams> {
     conn: Conn,
     upstreams: U,
-    pool: Mutex<Pool<U::Key, Pooled>>,
+    /// The upstream connections this client connection keeps between its
+    /// requests, keyed by what `dial` chose and by the origin side a request
+    /// reached (`phase 4 M3 design 8.3`, `the phase 4 / M3a plan's P14`).
+    pool: Mutex<Pool<UpstreamKey<U>, Pooled>>,
     /// How many requests reached `route` (`P10`): a connection that reaches no
     /// route gets a record of its own instead (`design 10.2`).
     routed: AtomicU64,
@@ -231,7 +274,7 @@ struct Shared<U: Upstreams> {
     /// its requests, one per key at most (`phase 4 M2 design 10.2`, `the phase
     /// 4 / M2b plan's P10`). They are never put back: a request under the key
     /// finds the one that is still open.
-    h2: Mutex<Vec<SharedH2<U::Key>>>,
+    h2: Mutex<Vec<SharedH2<UpstreamKey<U>>>>,
 }
 
 /// One shared HTTP/2 upstream connection of a client connection (`phase 4 M2
@@ -248,7 +291,10 @@ impl<U: Upstreams> Shared<U> {
     /// (`the phase 4 / M2b plan's P10`): its sender is cloned, so the request
     /// holds its own stream and not the connection. Items whose connection
     /// went away (a GOAWAY, the origin closing it) are dropped on the way.
-    fn borrow_h2(&self, key: &U::Key) -> Option<(http2::SendRequest<ReqBody>, Option<SocketAddr>)> {
+    fn borrow_h2(
+        &self,
+        key: &UpstreamKey<U>,
+    ) -> Option<(http2::SendRequest<ReqBody>, Option<SocketAddr>)> {
         let mut h2 = self.h2.lock().expect("h2");
         h2.retain(|shared| !shared.sender.is_closed());
         let shared = h2.iter().find(|shared| &shared.key == key)?;
@@ -261,7 +307,7 @@ impl<U: Upstreams> Shared<U> {
     /// connection of its own is never pooled and never lent.
     fn share(
         &self,
-        key: &mut Option<U::Key>,
+        key: &mut Option<UpstreamKey<U>>,
         sender: http2::SendRequest<ReqBody>,
         peer: Option<SocketAddr>,
     ) {
@@ -436,7 +482,13 @@ impl<U: Upstreams> Requests<U> {
         // idle in the pool under this key, then a fresh dial in this task
         // (design 8.4, 8.5). The key leaves the request only if a shared
         // HTTP/2 connection takes it over.
-        let mut key = Some(key);
+        //
+        // The key is the connection's own origin side as well as what `dial`
+        // chose: a request whose upstream is under TLS and one whose upstream
+        // is plain are not lent each other's connection, nor are two names'
+        // (`phase 4 M3 design 8.3`, `the phase 4 / M3a plan's P14`).
+        let origin = self.shared.conn.origin.clone();
+        let mut key = Some((key, OriginKey::of(origin.as_ref())));
         let mut route = Some(route);
         let borrowed_h2 = if needs_h1 {
             None
@@ -492,6 +544,7 @@ impl<U: Upstreams> Requests<U> {
                             pages,
                             route.take().expect("the dial is not used yet"),
                             &mut key,
+                            origin.as_ref(),
                             needs_h1,
                         )
                         .await
@@ -605,6 +658,7 @@ impl<U: Upstreams> Requests<U> {
                             form: &form,
                             progress: &progress,
                             key: &mut key,
+                            origin: origin.as_ref(),
                             h1_only: needs_h1,
                             body: &request_meter,
                         },
@@ -655,6 +709,7 @@ impl<U: Upstreams> Requests<U> {
                             form: &form,
                             progress: &progress,
                             key: &mut key,
+                            origin: origin.as_ref(),
                             h1_only: needs_h1,
                             body: &request_meter,
                         },
@@ -935,17 +990,20 @@ impl<U: Upstreams> Requests<U> {
 
     /// Dials the route and starts its hyper client on the tracker
     /// (`phase 4 M1 design 8.4`): the first send and a send after the request
-    /// was not written both come through here. A decrypted connection puts the
-    /// TLS to the origin over the dialled stream first (`phase 4 M2 design
-    /// 9.2`), offering `h2` unless `h1_only`, which an upgrade or a tunnel asks
-    /// for (`phase 4 M2 design 10.4`, `the phase 4 / M2b plan's P12`); what the
-    /// origin chose in ALPN says which client starts. The dial is not raced
-    /// against the request's token; what it brings back is dropped when the
-    /// token fired meanwhile (`P1`).
+    /// was not written both come through here. `origin` is what the request's
+    /// upstream is on the origin side (`the phase 4 / M3a plan's P14`): what
+    /// `Conn::origin` holds unless a rewrite changed the target. A decrypted
+    /// connection puts the TLS to the origin over the dialled stream first
+    /// (`phase 4 M2 design 9.2`), offering `h2` unless `h1_only`, which an
+    /// upgrade or a tunnel asks for (`phase 4 M2 design 10.4`, `the phase 4 /
+    /// M2b plan's P12`); what the origin chose in ALPN says which client
+    /// starts. The dial is not raced against the request's token; what it
+    /// brings back is dropped when the token fired meanwhile (`P1`).
     async fn connect(
         &self,
         handle: &Arc<SessionHandle>,
         route: U::Route,
+        origin: Option<&OriginTls>,
         h1_only: bool,
     ) -> Result<
         (
@@ -970,7 +1028,7 @@ impl<U: Upstreams> Requests<U> {
         // (`phase 4 M2 design 9.2`, P14). The handshake is not raced against
         // the token: it has `OriginTls::wait` of its own, as the dial has.
         let metered = Metered::new(upstream.stream, meter.clone());
-        let sender = match &self.shared.conn.origin {
+        let sender = match origin {
             // plain HTTP/2 (h2c) is not something rurge speaks: a plain
             // connection is HTTP/1.1 only (`the phase 4 / M2b plan's P9`)
             None => Sender::H1(self.start_h1(metered).await?),
@@ -1072,15 +1130,18 @@ impl<U: Upstreams> Requests<U> {
 
     /// A new connection for a request sent again, with the failures of the
     /// dial already answered for the client (`phase 4 M1 design 8.6`, `P4`).
-    /// `h1_only` is what the request needs of it (`the phase 4 / M2b plan's
-    /// P12`); an HTTP/2 connection it brings is shared under `key` before
-    /// anything is sent on it (`the phase 4 / M2b plan's P10`).
+    /// `origin` is what the request's upstream is on the origin side
+    /// (`the phase 4 / M3a plan's P14`); `h1_only` is what the request needs
+    /// of the connection (`the phase 4 / M2b plan's P12`). An HTTP/2
+    /// connection it brings is shared under `key` before anything is sent on
+    /// it (`the phase 4 / M2b plan's P10`).
     async fn redial(
         &self,
         guard: &Guard,
         pages: Pages,
         route: U::Route,
-        key: &mut Option<U::Key>,
+        key: &mut Option<UpstreamKey<U>>,
+        origin: Option<&OriginTls>,
         h1_only: bool,
     ) -> Result<
         (
@@ -1091,7 +1152,7 @@ impl<U: Upstreams> Requests<U> {
         ),
         Result<Response<ResponseBody>, Close>,
     > {
-        match self.connect(guard.handle(), route, h1_only).await {
+        match self.connect(guard.handle(), route, origin, h1_only).await {
             Ok((sender, meter, forward, peer)) => {
                 // at once, not when the answer comes: a concurrent request
                 // under the same key has to find it while this one is still
@@ -1133,7 +1194,7 @@ impl<U: Upstreams> Requests<U> {
         pages: Pages,
         route: U::Route,
         mut req: Request<ReqBody>,
-        resend: Resend<'_, U::Key>,
+        resend: Resend<'_, UpstreamKey<U>>,
     ) -> Result<
         (
             Sent,
@@ -1148,11 +1209,12 @@ impl<U: Upstreams> Requests<U> {
             form,
             progress,
             key,
+            origin,
             h1_only,
             body,
         } = resend;
         let (mut sender, meter, forward, peer) =
-            match self.redial(guard, pages, route, key, h1_only).await {
+            match self.redial(guard, pages, route, key, origin, h1_only).await {
                 Ok(parts) => parts,
                 Err(answer) => return Err(answer),
             };
@@ -1384,8 +1446,12 @@ struct Resend<'a, K> {
     form: &'a Form,
     progress: &'a Arc<Progress>,
     /// The key, until a connection that carries this request takes it over
-    /// (`the phase 4 / M2b plan's P10`).
+    /// (`the phase 4 / M2b plan's P10`). What `dial` chose and the origin side
+    /// the request reached (`the phase 4 / M3a plan's P14`).
     key: &'a mut Option<K>,
+    /// What the request's upstream is on the origin side (`the phase 4 / M3a
+    /// plan's P14`): the new connection is dialled with it, as the first was.
+    origin: Option<&'a OriginTls>,
     /// An upgrade or a tunnel needs an upstream that speaks HTTP/1.1
     /// (`phase 4 M2 design 10.4`, `the phase 4 / M2b plan's P12`).
     h1_only: bool,
@@ -1616,7 +1682,9 @@ fn rename<B>(req: &mut Request<B>, authority: &http::uri::Authority, name: &str)
 struct Outing<K> {
     /// The key of a pooled HTTP/1.1 connection; `None` for a shared HTTP/2
     /// one, and for an HTTP/1.1 connection whose key a send on HTTP/2 took
-    /// over (`the phase 4 / M2b plan's P10`).
+    /// over (`the phase 4 / M2b plan's P10`). What `dial` chose and the origin
+    /// side the request reached: the pool keeps the two together
+    /// (`the phase 4 / M3a plan's P14`).
     key: Option<K>,
     /// HTTP/1.1's connection or HTTP/2's shared one (`phase 4 M2 design 10.2`):
     /// only the first goes back to the pool (`the phase 4 / M2b plan's P10`).
@@ -1901,7 +1969,7 @@ struct Tail<U: Upstreams> {
     /// or the watchdog (`phase 4 M2 design 10.5`, `the phase 4 / M2b plan's
     /// P14`). The lock is held for one poll at a time and never across
     /// `complete`, `fail` or `stop`, which take from it themselves.
-    up: Arc<Mutex<Option<UpstreamBody<U::Key>>>>,
+    up: Arc<Mutex<Option<UpstreamBody<UpstreamKey<U>>>>>,
     idle: Duration,
     deadline: Pin<Box<Sleep>>,
     /// The request's token: `kill` and a stop end the exchange here, because
@@ -1933,7 +2001,7 @@ impl<U: Upstreams> Tail<U> {
         inner: Incoming,
         guard: Guard,
         shared: Arc<Shared<U>>,
-        outing: Outing<U::Key>,
+        outing: Outing<UpstreamKey<U>>,
         body: Meter,
     ) -> Tail<U> {
         let idle = shared.conn.idle;
@@ -1976,7 +2044,7 @@ impl<U: Upstreams> Tail<U> {
 
     /// Takes the upstream out of the slot, letting nothing go while the lock
     /// is held (`the phase 4 / M2b plan's P14`).
-    fn take_upstream(&self) -> Option<UpstreamBody<U::Key>> {
+    fn take_upstream(&self) -> Option<UpstreamBody<UpstreamKey<U>>> {
         self.up.lock().expect("upstream body").take()
     }
 
@@ -6234,5 +6302,40 @@ mod tests {
         drop(sender);
         conn.abort();
         served_within(rig.served, Duration::from_secs(5)).await;
+    }
+
+    /// The key of the pool and of the shared HTTP/2 connections says whether
+    /// the upstream is plain or under TLS, and which name the TLS went to
+    /// (`phase 4 M3 design 8.3`, `the phase 4 / M3a plan's P14`): a rewrite
+    /// can change the scheme and the name, so a key without them would lend a
+    /// plain connection where TLS is needed and one name's for another.
+    ///
+    /// The configuration is not in the key: every TLS connection of one
+    /// client connection is dialled with one configuration, and `K` tells the
+    /// generations apart (`phase 4 M3 design 8.3`, `M3-D31`).
+    #[test]
+    fn origin_keys_tell_plain_from_tls_and_names_apart() {
+        let name = |text: &str| ServerName::try_from(text.to_string()).expect("a server name");
+        // `insecure`, so that an empty root store is enough: webpki wants an
+        // anchor otherwise
+        let tls = |text: &str, alpn: &[&[u8]]| {
+            let config = origin_client_config(Arc::new(RootCertStore::empty()), true, alpn)
+                .expect("a client configuration");
+            OriginTls {
+                h1: Arc::clone(&config),
+                config,
+                name: name(text),
+                wait: Duration::from_secs(5),
+            }
+        };
+        assert_eq!(OriginKey::of(None), OriginKey::Plain);
+        let a = tls("a.test", &[b"h2", b"http/1.1"]);
+        let b = tls("b.test", &[b"h2", b"http/1.1"]);
+        assert_eq!(OriginKey::of(Some(&a)), OriginKey::Tls(name("a.test")));
+        assert_ne!(OriginKey::of(Some(&a)), OriginKey::of(Some(&b)));
+        assert_ne!(OriginKey::of(Some(&a)), OriginKey::Plain);
+        // the same name, dialled with another configuration: still one key
+        let other = tls("a.test", &[b"http/1.1"]);
+        assert_eq!(OriginKey::of(Some(&a)), OriginKey::of(Some(&other)));
     }
 }
