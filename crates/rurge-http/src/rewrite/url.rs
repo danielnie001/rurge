@@ -163,8 +163,10 @@ impl NewUrl {
 /// Whether the authority writes a port. `Authority::port` cannot tell a
 /// written `:65536` from no port at all (`http` 1.5.0), so the text decides: an
 /// address in brackets ends at its `]`, anything else at its last `:`, and a
-/// `:` after that followed by digits is a written port. The `user:password@`
-/// prefix is not part of it.
+/// `:` after that with anything after it is a written port — an empty one is
+/// none. Whether what follows reads as a port is `port_u16`'s business, so
+/// `a.test:abc` writes one that does not read and its URL is not valid. The
+/// `user:password@` prefix is not part of it.
 fn writes_a_port(authority: &http::uri::Authority) -> bool {
     let text = authority.as_str().rsplit('@').next().unwrap_or_default();
     let after_host = match text.rfind(']') {
