@@ -39,12 +39,12 @@ pub fn translate(source: &str) -> Result<String, String> {
             i += 2;
             match next {
                 'h' => push_member(&mut out, BLANKS, depth > 0),
-                'H' if depth > 0 => return Err(refused(next)),
+                'H' if depth > 0 => return Err(refused_in_class(next)),
                 'H' => push_member(&mut out, &format!("^{BLANKS}"), false),
                 'v' => push_member(&mut out, LINE_BREAKS, depth > 0),
-                'V' if depth > 0 => return Err(refused(next)),
+                'V' if depth > 0 => return Err(refused_in_class(next)),
                 'V' => push_member(&mut out, &format!("^{LINE_BREAKS}"), false),
-                'R' if depth > 0 => return Err(refused(next)),
+                'R' if depth > 0 => return Err(refused_in_class(next)),
                 'R' => {
                     out.push_str("(?:\\r\\n|[");
                     out.push_str(LINE_BREAKS);
@@ -107,7 +107,7 @@ fn push_member(out: &mut String, body: &str, in_class: bool) {
     }
 }
 
-fn refused(letter: char) -> String {
+fn refused_in_class(letter: char) -> String {
     format!("`\\{letter}` cannot be used inside a character class")
 }
 
