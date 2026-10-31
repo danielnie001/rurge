@@ -109,7 +109,7 @@ impl NewUrl {
         };
         let bare = path.split('?').next().unwrap_or("/");
         // what retargeting a request needs, made here so that it cannot fail
-        // there (`the phase 4 / M3a plan's execution record row 31`)
+        // there (`the phase 4 / M3a plan's execution record row 28`)
         let absolute = match scheme.as_str() {
             "ws" => format!("http://{host_authority}{path}"),
             "wss" => format!("https://{host_authority}{path}"),
@@ -163,14 +163,25 @@ impl NewUrl {
 /// Whether the authority writes a port. `Authority::port` cannot tell a
 /// written `:65536` from no port at all (`http` 1.5.0), so the text decides: an
 /// address in brackets ends at its `]`, anything else at its last `:`, and a
-/// `:` after that is a written port. The `user:password@` prefix is not part
-/// of it.
+/// `:` after that followed by digits is a written port. The `user:password@`
+/// prefix is not part of it.
 fn writes_a_port(authority: &http::uri::Authority) -> bool {
     let text = authority.as_str().rsplit('@').next().unwrap_or_default();
-    match text.rfind(']') {
-        Some(end) => text[end + 1..].starts_with(':'),
-        None => text.contains(':'),
-    }
+    let after_host = match text.rfind(']') {
+        // an address in brackets ends at its `]`
+        Some(end) => &text[end + 1..],
+        // anything else ends at its last `:`, if it has one
+        None => match text.rfind(':') {
+            Some(at) => &text[at..],
+            None => "",
+        },
+    };
+    // an empty port is no port: RFC 3986 §3.2.3 lets `port` be empty and a
+    // normalizer drops it, and the WHATWG URL Standard's port state sets
+    // nothing for one
+    after_host
+        .strip_prefix(':')
+        .is_some_and(|port| !port.is_empty())
 }
 
 /// The URLs a rule is tried against, in the manual's order (`phase 4 M3 design
@@ -215,7 +226,7 @@ pub(crate) fn candidates(
 /// follows the new authority unless the client speaks HTTP/2 and named none.
 pub(crate) fn retarget_request<B>(req: &mut Request<B>, new: &NewUrl, h2_client: bool) {
     // the two forms were read when the URL was, so neither decided here can
-    // fail (`the phase 4 / M3a plan's execution record row 31`)
+    // fail (`the phase 4 / M3a plan's execution record row 28`)
     let absolute = req.uri().scheme().is_some();
     *req.uri_mut() = if absolute {
         new.parts.absolute.clone()
@@ -425,6 +436,17 @@ mod tests {
         let url = parsed("http://a.test:80/");
         assert_eq!(url.url(), "http://a.test/");
 
+        // an empty port is no port: RFC 3986 lets `port` be empty and a
+        // normalizer drops it, and the WHATWG URL Standard sets nothing for
+        // one
+        let url = parsed("http://a.test:/");
+        assert_eq!(url.url(), "http://a.test/");
+        assert_eq!(url.target().port, 80);
+
+        // only a TLS host has to be one a certificate is verified against
+        let url = parsed("http://a..b/");
+        assert_eq!(url.url(), "http://a..b/");
+
         for text in [
             "ftp://a.test/",
             "http:///x",
@@ -433,6 +455,9 @@ mod tests {
             "/relative",
             "a.test",
             "",
+            // `Authority` takes `a..b`, but a server name may not hold an empty
+            // label (rustls-pki-types 1.15.1)
+            "https://a..b/",
         ] {
             assert!(NewUrl::parse(text).is_none(), "{text}");
         }
@@ -543,8 +568,7 @@ mod tests {
         assert_eq!(req.uri().to_string(), "https://b.test/s");
     }
 
-    /// The candidates of `url`, as the engine builds them for a plain
-    /// connection to `target`.
+    /// `url` as the only candidate: a case about the rules alone.
     fn one(url: &str) -> Vec<String> {
         vec![url.to_string()]
     }

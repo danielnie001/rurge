@@ -271,11 +271,12 @@ impl Rewrite {
     }
 }
 
-/// `text` with every non-overlapping match of `pattern` replaced by/// `template`'s expansion, from left to right (`phase 4 M3 design 5.5`).
+/// `text` with every non-overlapping match of `pattern` replaced by
+/// `template`'s expansion, from left to right (`phase 4 M3 design 5.5`).
 ///
 /// `Err` when the expression hits its backtracking limit: fancy-regex's own
 /// `replace_all` would panic there, which is why this is written out
-/// (`the phase 4 / M3a plan's P3`).
+/// (`the phase 4 / M3a plan's execution record row 6`).
 pub(super) fn replace_all(
     pattern: &rurge_config::rule::Pattern,
     template: &rurge_config::dialect::Template,
@@ -425,7 +426,7 @@ fn read_rules(lines: &str) -> (RewriteConfig, Vec<rurge_config::Diagnostic>) {
 }
 
 /// A trust store holding one CA made in memory: the side of a case that checks
-/// certificates never reads a system store (`phase 4 M3 design 17`).
+/// certificates never reads a system store (`phase 4 M3 design 16`).
 #[cfg(test)]
 pub(crate) fn test_roots() -> Arc<RootCertStore> {
     let ca =
