@@ -470,7 +470,7 @@ Header Rewrite skipped: the rewritten Host is not a valid HTTP/2 authority
 
 `build_rewrite`（`crates/rurge-engine/src/runtime.rs`）在每一代建一次；两个节都空时不读根、交 `None`。建不成只关这一代、不关进程，除了一行日志没有别的痕迹（设计第 8.2 节）：
 
-- 根读不出来（`shared.roots` 是 `None` 而系统的信任库读不出）——DEBUG：`the roots of the origin side cannot be read; rewrites are off for this generation`；
+- 读根的阻塞任务没有交回（`shared.roots` 是 `None`，`spawn_blocking(union_root_store)` 交回的是 `Err`：那个任务 panic 了，或者运行时正在关）——DEBUG：`the roots of the origin side cannot be read; rewrites are off for this generation`。系统的信任库读不出**不是**这一行：`union_root_store`（`crates/rurge-net/src/tls.rs`）照样并上 webpki-roots，另写一行 WARN `no native root certificates loaded; the union is webpki-roots alone`，这一代的重写照常建；
 - `Rewrite::build` 失败（例如空的根，rustls 报 `NoRootAnchors`）——WARN：`rewrites are off: cannot set up TLS: {e}`。
 
 ### 没有覆盖的
