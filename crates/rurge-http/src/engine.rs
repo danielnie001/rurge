@@ -514,14 +514,17 @@ impl<U: Upstreams> Requests<U> {
         {
             rewrite = None;
         }
-        // The URL the request's rules see (`phase 4 M3 design 6.2`).
-        let url = handle.session().url.clone();
+        // The URL the request's rules see, and what they leave of it
+        // (`phase 4 M3 design 6.2`): the record keeps the URL the request came
+        // with, the rules of the answer compare the one it went to.
+        let mut url = handle.session().url.clone();
         // What the request's upstream is on the origin side (`phase 4 M3 design
         // 8.2`): what the connection came with unless a rewrite changed the
         // target.
         let mut origin = self.shared.conn.origin.clone();
         let mut retargeted = false;
         let mut host_change = HostChange::Same;
+        let mut headers_changed = false;
         // 3. the request's headers (`phase 4 M3 design 7`, `the phase 4 / M3a
         // plan's P15`): before the URL rules, so that each sees what the ones
         // before it left, and before the hop-by-hop headers go.
@@ -530,6 +533,7 @@ impl<U: Upstreams> Requests<U> {
             let out = rules.headers(Direction::Request, text, req.headers_mut(), &mut notes);
             note_rewrites(&handle, rules, notes);
             if out.changed {
+                headers_changed = true;
                 rules.counters().header();
             }
             if out.framing {
@@ -575,6 +579,7 @@ impl<U: Upstreams> Requests<U> {
                             .upstreams
                             .retarget(route, key, new.target(), forwardable);
                     retargeted = true;
+                    url = Some(new.url().to_string());
                     // a decrypted connection's TLS is its own, under the new
                     // name; any other request's is the generation's
                     origin = match new.server_name() {
@@ -948,6 +953,40 @@ impl<U: Upstreams> Requests<U> {
             );
         }
         if (upgrade && switching) || (tunnel && resp.status().is_success()) {
+            // The head of a 101 is rewritten before the tunnel opens
+            // (`phase 4 M3 design 7.2`, `the phase 4 / M3a plan's P15`): the
+            // hop-by-hop headers go with what an upgrade needs kept, which is
+            // what `promote` does again below, and doing it twice is doing it
+            // once.
+            if let (Some(rules), Some(text)) = (rewrite.as_deref(), url.as_deref())
+                && rules.has_response_rules()
+            {
+                headers::strip(
+                    resp.headers_mut(),
+                    Keep {
+                        upgrade: true,
+                        proxy_authorization: false,
+                    },
+                );
+                let mut notes = Vec::new();
+                let out = rules.headers(Direction::Response, text, resp.headers_mut(), &mut notes);
+                note_rewrites(&handle, rules, notes);
+                if out.changed && !headers_changed {
+                    rules.counters().header();
+                }
+                if out.framing {
+                    // a 101 has no body, but a rule that changes its framing
+                    // fails the request all the same (`phase 4 M3 design 7.3`)
+                    rules.counters().failed();
+                    return self.failed(
+                        &guard,
+                        pages,
+                        "Header Rewrite changed Content-Length or Transfer-Encoding".to_string(),
+                        "A Header Rewrite rule changed Content-Length or Transfer-Encoding, so the request was not sent."
+                            .to_string(),
+                    );
+                }
+            }
             let upstream_upgrade = hyper::upgrade::on(&mut resp);
             let client_upgrade = client_upgrade.expect("an upgrade was asked for");
             return Ok(self.promote(guard, resp, client_upgrade, upstream_upgrade, meter, tunnel));
@@ -960,8 +999,32 @@ impl<U: Upstreams> Requests<U> {
         if resp.version() == http::Version::HTTP_2 && !self.shared.conn.h2 {
             *resp.version_mut() = http::Version::HTTP_11;
         }
-        handle.set_status(resp.status().as_u16());
         headers::strip(resp.headers_mut(), Keep::NONE);
+        // The answer's headers, after the hop-by-hop ones went and before the
+        // status the record keeps (`phase 4 M3 design 7.2`, `the phase 4 /
+        // M3a plan's P15`): a rule that changes how the answer is framed fails
+        // it, and no `Tail` is made for a lost answer.
+        if let (Some(rules), Some(text)) = (rewrite.as_deref(), url.as_deref())
+            && rules.has_response_rules()
+        {
+            let mut notes = Vec::new();
+            let out = rules.headers(Direction::Response, text, resp.headers_mut(), &mut notes);
+            note_rewrites(&handle, rules, notes);
+            if out.changed && !headers_changed {
+                rules.counters().header();
+            }
+            if out.framing {
+                rules.counters().failed();
+                return self.failed(
+                    &guard,
+                    pages,
+                    "Header Rewrite changed Content-Length or Transfer-Encoding".to_string(),
+                    "A Header Rewrite rule changed Content-Length or Transfer-Encoding, so the request was not sent."
+                        .to_string(),
+                );
+            }
+        }
+        handle.set_status(resp.status().as_u16());
         let (parts, body) = resp.into_parts();
         let outing = Outing {
             // a shared HTTP/2 connection is found under its key, not put back
@@ -7364,5 +7427,96 @@ mod tests {
             "{notes:?}"
         );
         assert_eq!(counters.snapshot(), counted(0, 0, 1, 0));
+    }
+
+    /// The head of a 101 is rewritten before the tunnel opens (`phase 4 M3
+    /// design 7.2`, `the phase 4 / M3a plan's P15`), and the exchange that
+    /// follows it is left alone.
+    #[tokio::test]
+    async fn the_101_head_is_rewritten() {
+        let answer = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nhello websocket";
+        let (addr, _, _, _heads) = upgrading_origin(answer).await;
+        let (rules, counters) = rewrite_of(
+            "[Header Rewrite]\nhttp-response ^http://target\\.test header-add X-W 1",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send(
+                "GET /ws HTTP/1.1\r\nHost: target.test\r\n\
+                 Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert_eq!(
+            header_value(&head, "x-w").as_deref(),
+            Some("1"),
+            "the 101's head was not rewritten: {head}"
+        );
+        // what follows the head is the tunnel, as it was
+        assert_eq!(rig.client.take(15).await, b"hello websocket");
+        rig.client.send("ping").await.unwrap();
+        assert_eq!(rig.client.take(4).await, b"ping");
+        rig.client.stream.shutdown().await.unwrap();
+        while rig.client.fill().await {}
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(101));
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(counters.snapshot(), counted(0, 1, 0, 0));
+    }
+
+    /// A rewrite that changes how the answer is framed fails it, and the
+    /// upstream connection is not put back (`phase 4 M3 design 7.3`, `the
+    /// phase 4 / M3a plan's P15`): the request after it dials anew.
+    #[tokio::test]
+    async fn a_response_whose_framing_changes_fails() {
+        let origin = TestServer::spawn().await;
+        origin.set("/a", "one");
+        origin.set("/b", "two");
+        let (rules, counters) = rewrite_of(
+            "[Header Rewrite]\nhttp-response ^http://target\\.test/a header-del Content-Length",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /a HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        let page = String::from_utf8_lossy(&body);
+        assert!(
+            page.contains(
+                "A Header Rewrite rule changed Content-Length or Transfer-Encoding, so the request was not sent."
+            ),
+            "{page}"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(502));
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(
+                "Header Rewrite changed Content-Length or Transfer-Encoding".to_string()
+            ))
+        );
+        // the answer of the failed request is dropped, so its connection is
+        // not one the next request is lent
+        rig.client
+            .send("GET /b HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"two");
+        assert_eq!(
+            rig.fake.dials(),
+            2,
+            "the connection of the failed answer was handed back"
+        );
+        assert_eq!(counters.snapshot(), counted(0, 1, 0, 1));
     }
 }

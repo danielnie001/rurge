@@ -21,10 +21,6 @@ pub mod headers;
 pub mod mitm;
 pub mod pool;
 pub mod prefix;
-// the engine calls these from phase 4 / M3a task 5 on: until then the module's
-// own entry points have no caller, and a request's notes, its counts and the
-// two ways it is rewritten are all worked out here only
-#[allow(dead_code)]
 pub mod rewrite;
 pub mod sniff;
 pub mod tls;
