@@ -633,3 +633,13 @@ M3 的文档任务把下面各条写进兼容性清单（`docs/surge-compatibili
 7. 第 6.5 节 `reject`"同 `REJECT` 策略对引擎里一个请求的答复"：状态码、标题与关掉连接的办法同 REJECT，错误页的说明改成 `The request was rejected by a URL Rewrite rule.`——REJECT 那一页的 "…by the REJECT policy." 在这里不实（计划 P12）；登记。
 
 8. 第 16 节第 3 条"另加一条按地址的规则作第二道防线"与"要连上游的（`header` 模式）在替换里加上测试源站的端口"：规则照手册原文逐字写，测试源站的端口写在请求里（式子照样命中，替换之后端口留着），不改手册的规则；不连上游的例子照手册的 URL 发，规则选测试自己持有的守卫监听器。第二道防线是共用夹具的 `dns-server`——回环上的 `MockDns`；夹具在规则之后自带 `FINAL,DIRECT`，用例不另写 `FINAL`（计划 P19）。
+
+**执行 M3a 时**：由 M3a 的任务 8 补上（`docs/superpowers/plans/2026-10-31-phase4-m3a-url-header-rewrite-plan.md` 的「执行期修正记录」）。
+
+9. 第 6.3 节"写了端口时在 1 ～ 65535"：执行时定空着的端口算没写、用缺省端口（`http://a.test:/`、`wss://[::1]:/`），不是不合法。依据是 RFC 3986 第 3.2.3 节（`port = *DIGIT`，`URI producers and normalizers should omit the port component and its ':' delimiter if port is empty`）与 WHATWG URL Standard 的 port state；照字面读，"写了端口"也可以读成包括空的那一种。以修正记录第 37 行为准。
+
+10. 第 6.3 节"合法的新 URL"只列了 scheme、主机不空与端口：执行时多一条——URL 的三样（绝对形式的 `Uri`、源站形式的 `Uri`、`Host` 的值）造不成一样就不合法。例子是 `http://[fe80::1%25eth0]/`：`http::Uri` 读得成，主机却读不成地址，`origin_authority` 写出的东西读不回。以修正记录第 28 行为准。
+
+11. 第 7.2 节"结果不能当头的值时那一行的值不变、留备注"读来是一行一条：执行时定一条 `header-replace-regex` 规则至多一条 `Skipped`（同名的几行都失败时留最后失败的那一行的），`skipped` 只数一次。以修正记录第 35 行为准。
+
+12. 第 7.4 节"删掉了全部 `Host` 时放回原来的各行、留备注"与第 12 节"`header` 是头被 Header Rewrite 改过的请求"：执行时 `header-del Host` 那一条规则照 P9 留 `Done`、`changed` 为真、`header` 加一，之后 `Host` 放回、再留 `Skipped(Host cannot be removed)`——请求的头最终没有变，却数了一次 `header`，第 12 节的定义对这一种不成立。以修正记录第 36 行为准。

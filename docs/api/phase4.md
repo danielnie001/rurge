@@ -362,3 +362,121 @@ API 的监听器外面套一层 TLS：每条连接按客户端的 SNI 签叶证�
 - **没有把 CA 装进任何信任库**：`generate` 只打印步骤；测试的客户端一律是 rustls 的、根只有测试自己的 CA，全部证据在回环上。
 - **`0600` 那一段只有 CI 会编译**（这台 Windows 开发机上编译不到）；Windows 上不设权限是登记的取舍。
 - 没有手工验收，也没有经真浏览器试过；**M2c 的提交都在本地，CI 没有见过**。
+
+## M3a　URL Rewrite 与 Header Rewrite
+
+`[URL Rewrite]` 与 `[Header Rewrite]` 生效了：每个请求在选定策略之后依次过请求一侧的 Header Rewrite 与 URL Rewrite（`302` / `307` / `reject` 在这里答复，`header` 换掉拨号的目标而不重选策略），应答过应答一侧的 Header Rewrite；改过的 `Host` 在发出之前写回；换了目标的请求带着自己的对上游 TLS（设计第 6 ～ 8 节，计划 P15 ～ P18）。两个节不再是 `W0016` 的名单（`[Replica]` 认得并忽略、给 `I0005`；写明 `Content-Length` 或 `Transfer-Encoding` 的行保留、给 `W0041`），`rewrite` 开关与计数也做了（设计第 11、12 节）。`[Body Rewrite]` 与 `[Map Local]` 随 M3b，照旧列在 `W0016` 里。
+
+**这一节写的是本地提交的行为：M3a 的提交在本地，M1a、M1b、M2a、M2b 与 M2c 的也一样，CI 都没有见过。**
+
+### `/v1/features/rewrite`
+
+`GET` 给 `{"enabled":bool}`。`POST {"enabled":bool}` 给 `{}`，并把开关写进 `state.json`（`version` 是 2，`features.rewrite` 是布尔）；切换立即对**下一个请求**生效，已经走到选路的请求照它开始时的样子走完，开着的连接不因此断掉（设计第 11 节）。
+
+缺省是**开**（没设过时；总设计 P4-D19、M3-D24）。启动时 `state.json` 里记着的值由 `Engine::restore_switches` 装回开关，不写盘。
+
+`POST` 之后有一行 INFO（`crates/rurge-api/src/routes/features.rs`），原文与字段照代码：
+
+```
+enabled=false rewrite switched via http-api
+```
+
+即消息 `rewrite switched via http-api`，字段 `enabled`（`true` / `false`）。
+
+关着时四个节一概不生效：`[URL Rewrite]`、`[Header Rewrite]`、`[Body Rewrite]` 与 `[Map Local]`（后两个到 M3b 才有效果）；计数一个也不动，备注一条也不留。开关在 `ConnUpstreams::route` 里读（`crates/rurge-engine/src/http.rs`），所以每个请求各读一次。
+
+用例 `the_rewrite_switch_is_read_switched_and_kept`（缺省开、切换、`state.json` 的 `version` 2 与 `features.rewrite`）、`a_daemon_restores_the_rewrite_switch_from_state_json`（`crates/rurge/tests/cli.rs`：起守护进程之后读得到文件里记着的值）、`the_rewrite_switch_turns_every_rewrite_off`（关着时 `header` 规则与 `302` 规则都不生效，请求照原样到源站）。
+
+### `GET /v1/rurge/http` 的 `rewrite`
+
+应答在 `mitm` 之后多一个对象，键的次序固定（设计第 12 节，计划 P18）：
+
+```json
+{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0},"requests":0,"mitm":{"decrypted":0,"untrusted":0,"failed":0,"noRequest":0},"rewrite":{"url":0,"header":0,"body":0,"mapLocal":0,"skipped":0,"failed":0}}
+```
+
+正文的字节恰好是这一串，用例 `rurge_http_counts_start_at_zero`（`crates/rurge-api/tests/api.rs`）写着它。六个数：
+
+- `url`：有 URL Rewrite 规则起了作用的请求（`header`、`302`、`307`、`reject` 四种模式都算，一个请求至多一次）；
+- `header`：头被 Header Rewrite 改过的请求（两个方向，一个请求至多一次）；
+- `body`：正文被 Body Rewrite 改过的请求（到 M3b 之前一直是 0）；
+- `mapLocal`：由 Map Local 答复的请求（到 M3b 之前一直是 0）；
+- `skipped`：留了备注而跳过的改写，每一个计一次；
+- `failed`：因为重写而失败的请求（框架头变了，两侧都算）。
+
+自进程启动起累计，**重载不清零**：计数器是 `rurge-http` 的 `RewriteCounters`，一个引擎一份，放在 `EngineShared.rewrite` 里（不在 `Runtime` 里），`Rewrite::build` 每一代拿到同一个。用例 `counts_survive_a_reload`、`notes_and_counts_reach_the_api_shape`（`crates/rurge-engine/tests/rewrite.rs`）。
+
+`body` 与 `mapLocal` 两个键 M3a 就定下了、恒为 0，为的是 M3b 加它们时不改形状（M3-D25）。
+
+### 请求记录的备注
+
+每一个起作用的与每一个跳过的改写各留一条备注，走 `/v1/requests/*` 的 `notes`（设计第 8.5 节，M3-D18）。**备注里从不带头的值、正文、查询串与网关的地址**：`{式子}` 是规则的原文（`Pattern::source` 照写的，不是编译之前改写过的），`header` 那一句里的 URL 只有 scheme、主机、端口与路径，没有查询串。措辞照代码逐字：
+
+**起作用的（`Done`）**
+
+```
+URL Rewrite: header by {式子} -> http://{主机}:{端口}{路径}
+URL Rewrite: 302 by {式子}
+URL Rewrite: 307 by {式子}
+URL Rewrite: reject by {式子}
+Header Rewrite: {request|response} {header-add|header-del|header-replace|header-replace-regex} {名字} by {式子}
+```
+
+`header` 那一句里的 URL 是新 URL 的 `note()`：缺省的端口不写、IPv6 带方括号、路径至少是 `/`，查询串去掉。
+
+**跳过的（`Skipped`，每一条 `skipped` 加一）**
+
+```
+URL Rewrite skipped: {式子}: the rewritten URL is not a valid http, https, ws or wss URL
+URL Rewrite skipped: {式子}: the rewritten Location cannot be a header value
+URL Rewrite skipped: {式子}: there is no IPv4 gateway
+URL Rewrite skipped: {式子}: the regular expression hit its backtracking limit
+Header Rewrite skipped: {式子}: the regular expression hit its backtracking limit
+Header Rewrite skipped: {式子}: header-replace-regex made a value a header cannot carry
+Header Rewrite skipped: Host cannot be removed
+Header Rewrite skipped: the rewritten Host is not a valid HTTP/2 authority
+```
+
+三处特别的：
+
+- **`header-del Host`（或任何让 `Host` 一行也不剩的规则）**留两条：那一条规则自己的 `Done`（`Header Rewrite: request header-del Host by {式子}`），与之后放回 `Host` 时的 `Header Rewrite skipped: Host cannot be removed`。请求的头最终没有变，`header` 却数了一次——设计第 12 节"头被 Header Rewrite 改过的请求"那一句对这一种不成立（设计第 22 节第 12 条，修正记录第 36 行）。
+- **一条 `header-replace-regex` 规则至多一条 `Skipped`**：同名的几行都失败时留最后失败的那一行的备注，`skipped` 也只数一次（设计第 22 节第 11 条，修正记录第 35 行）。
+- **HTTP/2 上游上写不回的 `Host`**：改了 `Host` 而值当不了 `:authority`（例如 `a/b`）时留 `Header Rewrite skipped: the rewritten Host is not a valid HTTP/2 authority`，一个请求至多一条，借来的连接被拒、在第二条连接上重发也一样；这时请求以连接的目标为 authority（修正记录第 44、52 行）。用例 `a_host_that_is_no_authority_is_noted_once_across_a_resend`。同一个 `Host` 用绝对形式交给转发的 HTTP 代理时也不写回（设计第 7.4 节，M3-D30）。
+
+用例 `no_header_value_reaches_the_notes_or_the_log`（`crates/rurge-engine/tests/rewrite.rs`：替换 `Authorization`、URL 带查询串时备注与会话日志里都没有它们）、`notes_never_carry_values_or_queries`（`crates/rurge-http/src/rewrite/mod.rs`）。
+
+### 失败与答复
+
+**框架头被改（两侧都失败）**：请求一侧的规则改了 `Content-Length` 或 `Transfer-Encoding` 时请求不拨号、不发往上游；应答一侧的则丢掉上游的应答，那条上游连接不回池。两侧都答 502 的错误页（`show-error-page` 关着时关掉连接，HTTP/2 上是重置这个流），页上的两句话不同，照 `crates/rurge-http/src/engine.rs` 逐字：
+
+- 请求一侧：`A Header Rewrite rule changed Content-Length or Transfer-Encoding, so the request was not sent.`
+- 应答一侧：`A Header Rewrite rule changed Content-Length or Transfer-Encoding of the response, so the response was not passed on.`
+
+记录里的失败原因两侧都是 `Header Rewrite changed Content-Length or Transfer-Encoding`，备注都是 `Header Rewrite failed: {式子}: Content-Length or Transfer-Encoding changed`，`failed` 各加一；头确实被改过，`header` 也各加一（设计第 12 节；用例 `a_request_whose_framing_changes_fails_before_the_dial`、`a_response_whose_framing_changes_fails`、`the_manual_header_rewrite_framing_limit`）。
+
+**`302` / `307`**：答一个只有 `Location` 与 `Content-Length: 0` 的应答（hyper 自己加的头，例如 `date`，不归 rurge 管），连接照常保持；记录的状态码是 302 或 307，`url` 加一（设计第 6.4 节，M3-D10）。`Location` 不能当头的值时这条规则放弃、留备注、接着求下一条。
+
+**`reject`**：同 `REJECT` 一族对一个请求的答复，只是错误页的说明是 `The request was rejected by a URL Rewrite rule.`：`show-error-page-for-reject` 为真时答 403、标题 `Request rejected`；为假时关掉连接（HTTP/2 上重置这个流）。记录是"被拒"（设计第 6.5 节、第 22 节第 7 条，M3-D27 的拒绝仍由拨号那一侧做）。
+
+### 不过重写的请求
+
+三处（设计第 8.4 节）：
+
+- **嗅探到的连接上客户端发来的 `CONNECT` 与绝对形式的请求**：客户端在对它自己的代理说话，这两种照原样转给连接的目标，一条规则也不求、不计数（M3-D29；用例 `an_absolute_form_request_on_a_sniffed_connection_is_not_rewritten`、`connect_and_absolute_form_on_a_sniffed_connection_are_not_rewritten`）。
+- **选定 REJECT 一族的请求**：`ConnUpstreams::route` 看第一条尝试的终点，是 REJECT 就不给这一代的重写——照 M1b 在拨号时被拒绝，不过任何重写、计数不动（M3-D27；用例 `a_rejected_request_is_not_rewritten`）。
+- **`rewrite` 开关关着**：见上面 `/v1/features/rewrite`。
+
+### 建不成一代的重写
+
+`build_rewrite`（`crates/rurge-engine/src/runtime.rs`）在每一代建一次；两个节都空时不读根、交 `None`。建不成只关这一代、不关进程，除了一行日志没有别的痕迹（设计第 8.2 节）：
+
+- 根读不出来（`shared.roots` 是 `None` 而系统的信任库读不出）——DEBUG：`the roots of the origin side cannot be read; rewrites are off for this generation`；
+- `Rewrite::build` 失败（例如空的根，rustls 报 `NoRootAnchors`）——WARN：`rewrites are off: cannot set up TLS: {e}`。
+
+### 没有覆盖的
+
+- `[Body Rewrite]` 与 `[Map Local]`（M3b）：两节照旧在 `W0016` 里，`rewrite` 的 `body` 与 `mapLocal` 恒为 0。
+- jq、`br`、`zstd` 与 `regex` 一侧的 Body Rewrite（M3c，等总设计 Q4）。
+- 没有手工验收：`docs/acceptance/phase4-manual.md` 一项也没有做过，M3a 没有往里加条目（M3b 收尾时加）。
+- 没有观察过 Surge 在下面这些地方的实际行为，照设计写：换目标的请求仍走选定的策略、新的主机不进 fake 地址池；`header` 模式的 `{{{GATEWAY_ADDRESS}}}` 是普通的字；`wss` 也算合法。
+- 全部证据是回环上的用例：没有经真浏览器、没有对真实的站点试过。**M3a 的提交都在本地，CI 没有见过。**

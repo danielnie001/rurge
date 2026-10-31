@@ -197,6 +197,10 @@ cargo test -j 8 --workspace --lib -- tls::   # 阶段 4 / M2c，API 的 TLS 监�
 cargo test -j 8 --workspace --test api -- tls   # 阶段 4 / M2c，`rurge-api` 的两条（2 条）：API 经 TLS 服务时拿到的是 MITM CA 签的证书；`serve_tls` 没有 CA 时照样绑上、什么也不答
 cargo test -j 8 --workspace --test cli -- run::mitm   # 阶段 4 / M2c，`http-api-tls` 的两条端到端（2 条）：`status` 与 `stop` 经 HTTPS 够得到 API（`--remote` 仍是明文、连不上）、没有 CA 时 API 不起而 rurge 照常跑
 cargo test -j 8 --workspace --bins -- an_https_endpoint_needs_a_usable_ca   # 阶段 4 / M2c，命令行的 `Endpoint`（1 条）：`http-api-tls` 把 Profile 里那张 CA 的证书放进 `Endpoint`，CA 用不了时在任何请求之前就报错；`what_a_reload_says_about_the_api` 钉住重载时关于 API 的每一句（`cargo test -j 8 --workspace --bins -- what_a_reload_says_about_the_api`）
+cargo test -j 8 --workspace --lib -- dialect   # 阶段 4 / M3a，`rurge-config` 的 `dialect`（7 条）：九种 ICU 写法在类外的改写与别的照抄、类里的成员与三种拒绝、改写之后的式子意思与 ICU 一致、`Template` 照 NSRegularExpression 展开、`Word` 与 `Template` 的 `Debug` 不显示文字
+cargo test -j 8 --workspace --lib -- rewrite   # 阶段 4 / M3a：这个过滤词一共选中 58 条（一台机器上的一次运行，`-- --list` 数）——`rurge-config` 14 条（`rewrite::tests::` 7 条：两个节的读法与每一种诊断、`header-replace` 换成一行、框架头的 `W0041`、值的两种写法、`Debug`；`dialect::tests::translate_rewrites_the_icu_escapes`、`redact::tests::rewrite_lines_are_shown_as_written`、`config::tests::rewrite_sections_are_read_and_no_longer_deferred` 各 1 条；`[IP Rewrite]` 的 4 条）、`rurge-http` 21 条（`rewrite::tests::` 4 条、`rewrite::url::tests::` 9 条、`rewrite::header::tests::` 6 条，另加 `engine::tests::` 里名字带 `rewrite` 的 2 条）、`rurge-policy` 1 条、`rurge-rules` 1 条、`rurge-tun` 21 条（阶段 3 / M5 的 `tests::rewrite::`，与 M3a 无关）
+cargo test -j 8 --workspace --lib -- headers_are_rewritten not_rewritten head_is_rewritten redirect_is_answered rewrite_reject header_mode_sends retargeted changed_host_is_written_back deleting_ request_whose_framing response_whose_framing plain_connection_uses_the_rewrite pool_keeps_plain backtracking_rule origin_keys host_that_is_no_authority   # 阶段 4 / M3a，`rurge-http` 的引擎里 M3a 加的 18 条：它们没有共同的词，这 14 个过滤词正好选中这 18 条（一条不多、一条不少）。M3a 之后 `--lib -- engine::tests::` 一共选中 151 条（`rurge-http` 79、`rurge-engine` 9、`rurge-rules` 63）
+cargo test -j 8 --workspace --test rewrite   # 阶段 4 / M3a，经引擎的端到端（23 条）：手册的两页黄金用例（`header`、`302`、`307`、`reject`、"Matching details"、Header Rewrite 页的四种动作与省略方向、`header-del` 与 `header-add` 连用、改框架头而失败）、开关、被拒的请求不重写、`302` 带网关、计数跨重载，以及解密的 `https://` 请求、解密的 HTTP/2 请求改写到明文、`http://` 改写成 `https://`、明文与 TLS 不共用连接、经转发的代理、`Host` 的写回与删除、嗅探到的连接上的绝对形式、`Proxy-Authorization`、回溯超限、头的值与查询串不进备注与日志、六个计数
 # 阶段 3 / M5 重跑的基准读数（一台机器上的一次运行、**不是 CI**；release，`TUN_BENCH_FAR=memory`；命令仍是上面 B1 / B2 / b3 那三条）：B1 八个量出来的行都过 0.7 Gbit/s 的线（最低的一行 4.065，是线的 5.8 倍），四个计数都是 0，中位数上行 8.03、下行 4.84 Gbit/s（两个 MTU 混在一起，只作量级）；同设置（MTU 1500、`tx_max` 256 KiB）的 5.717 / 5.172 是上一次的 79.7% 与 94.7%。B2 门槛读数（峰值减去全部测试一侧的项）403,671,140 字节（403.7 MB / 385.0 MiB），在线 429,000,000 字节以内、余量 25.3 MB；保守读数（只减去准的应用端套接字缓冲）445,333,604 字节（445.3 MB），超线 16.3 MB——这个读数照旧归项目所有者，这里只记数。b3 中位数 0.9 微秒、p99 2.9 微秒，最大 4542.2 微秒（4.5 ms，落在第 28,673 个查询上，是线的 22.7 倍，两处都是池的 `HashMap` 的翻倍处，读代码与算术得出）。细节与上一次不同的原因见计划「执行期修正记录」第 61 ～ 63 行
 cargo insta test -p rurge-config --review       # 语料库快照有变化时审阅
 cargo clippy --all-targets -- -D warnings       # 零警告（CI 设 RUSTUP_TOOLCHAIN=1.89.0，与本机的 MSRV 工具链一致；更新的 clippy 会多出 lint）
@@ -460,3 +464,29 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 七、**诊断看流**：`rurge check` 把诊断写在**标准输出**（有位置的带 `<文件>:<行>`，有 `hint` 的下面另起一行 `  hint: …`，按位置排序、没有位置的排在最前），`rurge run` 写在**标准错误**（不带位置，同样排过序），日志行在**标准输出**（M2c 记录第 44 行）。抓 WARN 的用例读标准输出——`crates/rurge/tests/cli.rs` 的 `output_until_it_is_running` 就把标准错误丢掉了。
 
 八、**带等待的 M2c 用例提交前各自单独循环跑二十次以上**（全过才算数）：任务 5 的五条握手用例一圈、`--test api` 的两条一圈、任务 5 修正轮 1 的五条又一圈、`--test cli` 的 `run::mitm` 两条一圈（各 20 次）。日志与命令行在工作区（git 忽略）：`task-5-loop-tls.log`、`task-5-loop-api.log`、`task-5-fix-1-loop-tls.log`、`task-6-loop-mitm.log`。
+
+### 阶段 4 / M3a 起：URL Rewrite 与 Header Rewrite
+
+阶段 4 / M3a 起另有几条（计划 `docs/superpowers/plans/2026-10-31-phase4-m3a-url-header-rewrite-plan.md`，下面写“M3a 记录第 N 行”指它末尾的「执行期修正记录」；M1a、M1b、M2a、M2b、M2c 与 M3a 的提交都在本地，CI 都没有见过）：
+
+一、**手册的黄金用例照手册的原文逐字写规则**（P19）：`crates/rurge-engine/tests/rewrite.rs` 里手册的那七条（任务 7 的第一批）照 `http/url-rewrite.html` 与 `http/header-rewrite.html` 的例子行一字不改；要连上游的那些把**测试源站的端口写在请求里**（`http://www.google.cn:{源站端口}/`），式子 `^http://www\.google\.cn` 照样命中、替换之后端口留着。与手册的出入写在用例的注释里，不改手册的规则（设计第 16 节第 3 条、第 22 节第 8 条；M3a 记录第 64 行）。
+
+二、**用例里出现的每个名字各一行 `[Host]` 钉到 `127.0.0.1`**：换目标之后的新主机、`Location` 里的、规则里写着而这一次请求不会去的都算（M3a 记录第 64、66 行）。第二道防线是共用夹具的 `dns-server`（回环上的 `MockDns`），夹具在规则之后自带 `FINAL,DIRECT`，用例不另写 `FINAL`（P19）。
+
+三、**不该拨号的请求，把策略指向 `Guard`**（P19）：`tests/rewrite.rs` 的 `Guard` 是测试自己持有的回环监听器（非阻塞的 `accept()`，`connections()` 数到过几条），Profile 把它写成 HTTP 代理策略；用例结束前断言 `connections() == 0`。**请求本来就指向测试自己的源站时不必另起守卫**：源站的 `connections() == 0` 是同一件事（M3a 记录第 57 行）。
+
+四、**网关的地址只经 `EngineShared.network` 给**：`302` 的 `Location` 与网关只是文字、从不被拨，用例里的网关用 `127.0.0.2`；给网络经 `EngineShared::network.store(…)`，不手建 `NetworkCell`（M3a 记录第 58 行）。
+
+五、**建引擎的用例经 `harness_with` / `harness_trusting` 给 `TlsFixture` 的根，不用 `harness(p)`**（P19，M3a 记录第 20、32、56 行）：`harness(p)` 的 `roots` 是 `None`，`build_rewrite` 会去读系统的信任库；给空的根同样不行——那是 rustls 的 `NoRootAnchors`，这一代就没有重写，用例会在重写没生效的情况下绿。只建 `Rewrite` 的单元用例用 `crate::mitm::testing::generated` 或 `engine.rs` 测试模块里的 `roots_of`。
+
+六、**URL Rewrite 的替换只换配上的那一段、尾巴照接**（设计第 5.5 节，M3a 记录第 45 行）：写规则与期望的 URL 时照这个算——`^http://target\.test/a https://localhost:{端口}/secure` 配 `http://target.test/a` 得 `https://localhost:{端口}/secure`；而 `^http://target\.test https://localhost:{端口}/` 配同一个请求得 `https://localhost:{端口}//a`（没配上的 `/a` 接在后面），源站答 404。
+
+七、**换到 `https` 而目标不讲 TLS 时，握手要等 `REWRITE_HANDSHAKE` 的 30 秒**（M3a 记录第 46 行）：用例不这样换；非要换的话用 accept 之后立刻关的源站（`closing_origin()`），否则读应答的时限先到。
+
+八、**`TestServer` 记下的 `RecordedRequest.path` 是 `uri().path()`、不带查询串**（M3a 记录第 64 行）：要断言查询串到了源站，用 `tests/rewrite.rs` 的 `RecordingOrigin`（它把每个请求的头整个记下）。
+
+九、**解密的端到端用例的源站不在 443 上**：把它的端口写进 `[MITM]` 的 `hostname`（`origin.test:{端口}`），不用假的 SOCKS5 把端口凑到 443——换目标之后的拨号走选定的策略，假的 SOCKS5 连的是它自己写死的目标，到不了新的主机（M3a 记录第 65 行；`tests/mitm.rs` 的 `a_written_port_makes_its_port_sniffable` 是同一做法）。
+
+十、**手写的上游代理收到 `CONNECT` 记下之后立刻关连接**（`tests/rewrite.rs` 的 `RecordingProxy`）：否则对它的 TLS 握手要等 `REWRITE_HANDSHAKE` 的 30 秒。
+
+十一、**带等待的 M3a 用例提交前各自单独循环跑二十次以上**（全过才算数）：任务 5 的 14 条一圈、应答一侧的 2 条一圈、修正轮 1 的 2 条一圈；任务 6 的 `tests/rewrite.rs` 4 条、`--test api` 的 1 条与 `--test cli` 的 1 条各一圈；任务 7 的两批（7 条与 12 条）各一圈。日志与命令行在工作区（git 忽略）：`task-5-loop-a.log`、`task-5-loop-b.log`、`task-5-fix-1-loop.log`、`loop-task-6a.log`、`loop-task-6b-api.log`、`loop-task-6b-cli.log`、`loop-task-7a.log`、`loop-task-7b.log`。
