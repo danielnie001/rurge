@@ -15,11 +15,13 @@
 
 mod body;
 mod header;
+mod map_local;
 mod url;
 
 use crate::mitm::OriginTls;
 use body::{BodyRule, body_rule};
 use bytes::Bytes;
+use map_local::{MapRule, map_rule};
 use rurge_config::HostName;
 use rurge_config::mitm::MitmConfig;
 use rurge_config::rewrite::RewriteConfig;
@@ -151,6 +153,7 @@ pub struct Rewrite {
     url: Vec<UrlRule>,
     header: Vec<HeaderRule>,
     body: Vec<BodyRule>,
+    map_local: Vec<MapRule>,
     config: Arc<ClientConfig>,
     h1: Arc<ClientConfig>,
     counters: Arc<RewriteCounters>,
@@ -226,7 +229,7 @@ impl Rewrite {
         mitm: &MitmConfig,
         roots: Arc<RootCertStore>,
         counters: Arc<RewriteCounters>,
-        _url_data: &dyn Fn(&str) -> UrlData,
+        url_data: &dyn Fn(&str) -> UrlData,
     ) -> Result<Option<Rewrite>, BuildError> {
         if cfg.is_empty() {
             return Ok(None);
@@ -250,6 +253,11 @@ impl Rewrite {
             url: cfg.url.iter().map(url_rule).collect(),
             header: cfg.header.iter().filter_map(header_rule).collect(),
             body: cfg.body.iter().map(body_rule).collect(),
+            map_local: cfg
+                .map_local
+                .iter()
+                .map(|rule| map_rule(rule, url_data))
+                .collect(),
             config,
             h1,
             counters,
@@ -534,6 +542,17 @@ mod tests {
         )
         .expect("no rules read cleanly");
         assert!(rewritten.is_none());
+
+        // one `[Map Local]` line is a generation, even with no other section
+        let rewritten = Rewrite::build(
+            &config_of("[Map Local]\n^http://a\\.test/ data-type=text data=hi"),
+            &MitmConfig::default(),
+            test_roots(),
+            Arc::new(RewriteCounters::default()),
+            &no_url_data,
+        )
+        .expect("the line reads cleanly");
+        assert!(rewritten.is_some());
     }
 
     #[test]
