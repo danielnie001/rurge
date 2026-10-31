@@ -653,4 +653,4 @@ M2 的文档任务把下面各条写进兼容性清单（`docs/surge-compatibili
 
 **执行 M3b 时**：由 M3b 的任务 9 补上（理由在阶段 4 / M3b 计划 `docs/superpowers/plans/2026-10-31-phase4-m3b-body-rewrite-map-local-plan.md`「执行期修正记录」第 20 行）。
 
-30. 第 10.3 节末条"trailers 照 M1b（声明过才转）"——同上，比实际宽：`Trailer` 是逐跳的头，引擎在 M1b 就把它去掉了，hyper 1.11.1 的 HTTP/1.1 编码器只写 `Trailer` 里声明过的那些，所以到 HTTP/1.1 客户端的 trailer 一个也不转；两端都讲 HTTP/2 时照转（M3 设计第 22 节第 20 条）。
+30. 第 10.3 节末条"trailers 照 M1b（声明过才转）"——同上，比实际宽：`Trailer` 是逐跳的头，引擎在 M1b 就把它去掉了，hyper 1.11.1 的 HTTP/1.1 编码器只写 `Trailer` 里声明过的那些，所以到 HTTP/1.1 客户端的 trailer 一个也不转；两端都讲 HTTP/2 时照转（M3b 计划「执行期修正记录」第 20 行）。

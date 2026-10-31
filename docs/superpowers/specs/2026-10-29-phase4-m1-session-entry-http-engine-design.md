@@ -560,4 +560,4 @@ M1b 执行时又改了下面几处。以这里为准，理由在 M1b 计划（`d
 
 M3b 执行时又订正了一处。以这里为准，理由在阶段 4 / M3b 计划（`docs/superpowers/plans/2026-10-31-phase4-m3b-body-rewrite-map-local-plan.md`）「执行期修正记录」第 20 行；上面各条照旧有效。
 
-11. **第 13 节第 6 条“trailers 只在声明过时转发”比实际宽**（M3 设计第 22 节第 20 条那一条修正的同一件事）：到 HTTP/1.1 客户端的 trailer 一个也不转——引擎把 `Trailer` 当逐跳的头去掉（第 8.7 节），而 hyper 1.11.1 的 HTTP/1.1 编码器只写 `Trailer` 里声明过的那些，头里没有它就一条也不写；两端都讲 HTTP/2 时照转（`crates/rurge-http/src/engine.rs` 的 `an_unchanged_response_keeps_its_bytes_and_trailers`，经一条配上而没有改动的规则）。
+11. **第 13 节第 6 条“trailers 只在声明过时转发”比实际宽**（M3b 计划「执行期修正记录」第 20 行那一条修正的同一件事）：到 HTTP/1.1 客户端的 trailer 一个也不转——引擎把 `Trailer` 当逐跳的头去掉（第 8.7 节），而 hyper 1.11.1 的 HTTP/1.1 编码器只写 `Trailer` 里声明过的那些，头里没有它就一条也不写；两端都讲 HTTP/2 时照转（`crates/rurge-http/src/engine.rs` 的 `an_unchanged_response_keeps_its_bytes_and_trailers`，经一条配上而没有改动的规则）。
