@@ -1716,7 +1716,7 @@ struct Resend<'a, K> {
     host: Option<&'a HeaderValue>,
     /// Whether the note a `Host` that cannot be an HTTP/2 authority needs was
     /// left already, so that one request leaves one
-    /// (`the phase 4 / M3a plan's execution record row 43`).
+    /// (`the phase 4 / M3a plan's execution record row 44`).
     noted: &'a mut bool,
     /// The generation's rules, for the count a note leaves
     /// (`the phase 4 / M3a plan's P11`).
