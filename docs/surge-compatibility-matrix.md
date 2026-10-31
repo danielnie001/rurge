@@ -625,7 +625,7 @@
 | --- | --- | --- | --- | --- |
 | 语法 `<url regex> key=value ...`；需启用 Rewrite 功能；HTTPS 需 MITM | | ✅ | 4 | **阶段 4 / M3b 起**：照写的次序比当前的 URL，**第一条命中的答复**；`rewrite` 开关关着时一概不生效（同另外两个节）；相对路径一律相对主 Profile 的目录（本地 include 来的行也一样）；读不了的项 `W0012` 并跳过，不认识的键 `W0001` 而行保留；`header` 里的 `Content-Length` 与 `Transfer-Encoding` 不用，另给一条 `W0041` |
 | `data-type`：`file`（默认）`text` `tiny-gif` `base64` | | ✅ | 4 | **阶段 4 / M3b 起**：只认这四个（不分大小写），别的 `W0012`；缺省 `file` |
-| `data`：文件路径（相对配置目录 / 绝对路径 / URL 下载缓存）、文本、Base64 | | 🟡 | 4 | **阶段 4 / M3b 起**：以 `http://` 或 `https://` 开头的是 URL，经资源管理器下载与缓存（更新间隔缺省一天、大小上限缺省 64 MiB，没下载到时答 502）；**URL 的数据写在下载到的文本（远程 include、托管 Profile 的副本）里时整行拒绝、给 `W0033`**（同 `[Rule]` 的集合与 `[Host]` 的脚本，下载到的文本不因为被 include 而多出权力），标 🟡；`base64` 先按标准字母表解、不成再按没有填充的；没有 `data` 时 `text` 与 `base64` 都是空的正文 |
+| `data`：文件路径（相对配置目录 / 绝对路径 / URL 下载缓存）、文本、Base64 | | 🟡 | 4 | **阶段 4 / M3b 起**：以 `http://` 或 `https://` 开头的是 URL，经资源管理器下载与缓存（更新间隔缺省一天、大小上限缺省 64 MiB，没下载到时答 502）；**URL 的数据写在下载到的文本（远程 include、托管 Profile 的副本）里时整行拒绝、给 `W0033`**（同 `[Rule]` 的 `RULE-SET` / `DOMAIN-SET`：下载到的文本不因为被 include 而多出权力，`set_refusal` 与 `map_local_refusal` 是一对），标 🟡；`base64` 先按标准字母表解、不成再按没有填充的；没有 `data` 时 `text` 与 `base64` 都是空的正文 |
 | `data-type=text data=""` 返回空响应 | | ✅ | 4 | **阶段 4 / M3b 起**：空正文照样答复（`Content-Length: 0`），`Content-Type` 是 `text/plain` |
 | `header`：`a:b\|c:d`；无 `:` 时视为 Base64 编码的多行头 | | ✅ | 4 | **阶段 4 / M3b 起**：两种写法都收；逐跳的头丢掉；名字或值不合法的 `W0012` |
 | `status-code`：200–999，默认 200 | | ✅ | 4 | **阶段 4 / M3b 起**：200 ～ 999 之外 `W0012`；204 与 304 不读数据、没有正文 |
