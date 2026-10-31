@@ -415,7 +415,7 @@ enabled=false rewrite switched via http-api
 **起作用的（`Done`）**
 
 ```
-URL Rewrite: header by {式子} -> http://{主机}:{端口}{路径}
+URL Rewrite: header by {式子} -> {scheme}://{authority}{路径}
 URL Rewrite: 302 by {式子}
 URL Rewrite: 307 by {式子}
 URL Rewrite: reject by {式子}
