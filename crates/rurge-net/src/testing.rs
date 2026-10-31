@@ -1,6 +1,7 @@
 //! What tests share: an in-process HTTP(S) server (programmable routes, ETag /
 //! 304, delays and request recording), a resource cache with a copy already in
-//! it, and a capture of the log. Never used by production code.
+//! it, a capture of the log, and loopback ports that nothing listens on. Never
+//! used by production code.
 
 use crate::resource::{CacheDir, Meta};
 use bytes::Bytes;
@@ -433,6 +434,46 @@ fn tls_acceptor() -> TlsAcceptor {
         .expect("server config");
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     TlsAcceptor::from(Arc::new(config))
+}
+
+/// A loopback port that `binds` could bind just now, and that no socket
+/// another test opens can come by. A port the system handed out and the
+/// test then gave back can be handed out again to anyone, a moment later;
+/// this one lies in a range the system does not hand out by itself — the
+/// dynamic ports of Windows (by default), Linux and macOS are all above it —
+/// and is tried just before it is returned. One walk for every caller: no
+/// two of them are given the same port.
+fn unassigned_port(binds: impl Fn(u16) -> bool) -> u16 {
+    const PORTS: std::ops::Range<u64> = 20_000..30_000;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // this process starts somewhere else in the range than the one before it
+    let start = u64::from(std::process::id()).wrapping_mul(7919);
+    for _ in 0..100 {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = PORTS.start + start.wrapping_add(n) % (PORTS.end - PORTS.start);
+        let port = u16::try_from(port).expect("a port");
+        if binds(port) {
+            return port;
+        }
+    }
+    panic!("no port of {PORTS:?} is free");
+}
+
+/// A loopback UDP port with nothing on it: a datagram to it is answered
+/// with an ICMP "port unreachable".
+pub fn closed_udp_port() -> u16 {
+    unassigned_port(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok())
+}
+
+/// A loopback TCP port with nothing on it: a connection to it is refused —
+/// at once on Linux and macOS, after about two seconds on Windows (measured
+/// on the development machine: 2.03 to 2.05 s), which whoever connects to it
+/// allows for. The socket that tried the port is closed before the number is
+/// handed out, so that nothing is left on it: a socket left bound and not
+/// listening refuses on Linux and Windows, and leaves the connection waiting
+/// on macOS.
+pub fn closed_tcp_port() -> u16 {
+    unassigned_port(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
 }
 
 #[cfg(test)]

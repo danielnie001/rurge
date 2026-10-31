@@ -1071,9 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn refused_connection_is_an_error() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = crate::testing::closed_tcp_port();
         let c = DirectConnector::new(Arc::new(SystemResolve));
         let err = c
             .connect(
@@ -2197,12 +2195,8 @@ mod tests {
     #[tokio::test]
     async fn a_closed_port_does_not_stop_a_direct_carrier() {
         let echo = udp_echo().await;
-        // the socket goes with the statement: nobody listens on its port
-        let closed = UdpSocket::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        // nobody listens on it, and no socket another test opens is handed it
+        let closed = SocketAddr::from(([127, 0, 0, 1], crate::testing::closed_udp_port()));
         let c = DirectConnector::new(Arc::new(SystemResolve));
         let carrier = c.open_udp(&ConnectOpts::default()).await.unwrap();
         let to = |addr: SocketAddr| Target::new(HostName::Ip(addr.ip()), addr.port());
