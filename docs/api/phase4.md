@@ -553,9 +553,9 @@ Map Local failed: {式子}: the data is not available yet
 Map Local 的规则命中了、数据却给不出来时，答 502 的错误页（`show-error-page` 关着时什么也不答、关掉连接；HTTP/2 上是重置这个流），会话以失败结束，`failed` 加一，这一条 `Failed` 备注的 `{原因}` 与记录是同一件事的两种说法：
 
 - **文件打不开、读不到元数据或不是普通文件**（例如是个目录）：记录是 `Map Local: cannot read {路径}`（`{路径}` 是 `Path::display`），备注的原因写 `the file cannot be read`，错误页的说明是 `The file a Map Local rule names cannot be read.`
-- **URL 的数据还没下载好**：记录是 `Map Local: the data from {来源} is not available yet`，备注的原因写 `the data is not available yet`，错误页的说明是 `The data a Map Local rule names has not been downloaded yet.` `{来源}` 是 `rurge_config::remote::origin` 的结果（`scheme://host[:port]`），登录信息与会话之后的路径都不出现。
+- **URL 的数据还没下载好**：记录是 `Map Local: the data from {来源} is not available yet`，备注的原因写 `the data is not available yet`，错误页的说明是 `The data a Map Local rule names has not been downloaded yet.` `{来源}` 是 `rurge_config::remote::origin` 的结果（`scheme://host[:port]/…`，末尾的 `/…` 是照写的省略号，例如 `https://d.test/…`），不出现的是用户名、密码、路径与查询串。
 
-**读到一半出错**不是 502：答复已经开始，文件在那之后读不了、变短了或停住了。记录是 `Map Local: reading {路径} failed: {错误}`、`Map Local: {路径} became shorter while it was read` 或 `Map Local: reading {路径} stalled`（`{错误}` 是那次读的错误），会话以失败结束，客户端收到的正文以错误终止；`map_local` 已经数过这个请求，`failed` **不再**加，也不另留备注（计划 P15、P16，设计第 22 节第 21 条）。
+**读到一半出错**不是 502：答复已经开始，文件在那之后读不了、变短了或停住了。记录是 `Map Local: reading {路径} failed: {错误}`、`Map Local: {路径} became shorter while it was read` 或 `Map Local: reading {路径} stalled`（`{错误}` 是那次读的错误），会话以失败结束，客户端收到的正文以错误终止；`mapLocal` 已经数过这个请求，`failed` **不再**加，也不另留备注（计划 P15、P16，设计第 22 节第 21 条）。
 
 ### 那一行 WARN 与一行 DEBUG
 
@@ -572,8 +572,8 @@ Map Local 的规则命中了、数据却给不出来时，答 502 的错误页�
 
 - 列表里那一项的 `path`（标签）是 `map local data {键的前 8 位} ({来源})`，`{来源}` 只到 `rurge_config::remote::origin`（`crates/rurge-engine/src/runtime.rs` 的 `build_rewrite`，修正记录第 67 行）。URL 是凭据，不进日志、不进标签的其余部分。
 - 同一个 URL 写在几行里只有一项：第一次登记定下种类与标签（用例 `the_same_map_local_url_is_one_resource`）。
-- 它挂在这一代的资源管理器上，所以 `rewrite` 开关关着时照样下载（`build_rewrite` 的文档注释，设计第 10.3 节）；不联网的一代（资源管理器是 offline 的）从不下载，它的 URL 一律答 `Map Local: the data from {来源} is not available yet`。
-- 更新间隔是 `None`（不自动刷新），大小上限照资源管理器的缺省（64 MiB）。
+- 它挂在这一代的资源管理器上，所以 `rewrite` 开关关着时照样下载（`build_rewrite` 的文档注释，设计第 10.3 节）；不联网的一代（资源管理器是 offline 的）从不下载——数据目录里有这个 URL 早先下载的副本时照那份副本答（用例 `offline_mode_uses_the_cache_only`），没有副本时才答 `Map Local: the data from {来源} is not available yet`。
+- 登记时的更新间隔是 `None`，即资源管理器缺省的 86 400 秒（一天）：在线的一代照这个间隔在后台再下载它，与别的外部资源一样；大小上限照资源管理器的缺省（64 MiB）。
 
 用例 `map_local_urls_are_listed_as_data`、`map_local_url_data_that_never_came_answers_502`、`the_same_map_local_url_is_one_resource`（都在 `crates/rurge-engine/tests/rewrite.rs`）。
 
@@ -611,7 +611,7 @@ Map Local 的规则命中了、数据却给不出来时，答 502 的错误页�
 
 ### 没有覆盖的
 
-- **jq、`br`、`zstd`**：jq 的 Body Rewrite 只有 `W0042`（这一行跳过），`br` 与 `zstd` 的应答不改写（留 `the content-encoding … is not supported` 一类备注）；对上游收窄 `Accept-Encoding`、fancy-regex 的升级都归项目所有者（设计第 21 节 Q4、M3c）。
+- **jq、`br`、`zstd`**：jq 的 Body Rewrite 只有 `W0042`（这一行跳过），`br` 与 `zstd` 的应答不改写（备注是 `content-encoding br is not supported` 或 `content-encoding zstd is not supported`）；对上游收窄 `Accept-Encoding`、fancy-regex 的升级都归项目所有者（设计第 21 节 Q4、M3c）。
 - **不把改写过的正文压回去**：改过的应答是明文，`Content-Encoding` 去掉了（设计第 9.6 节）。
 - **没有手工验收**：`docs/acceptance/phase4-manual.md` 的 M3 一节一项也没有做过（M3b 任务 8 加的）；**M3b 的提交都在本地，CI 没有见过**。
 - **全部证据是回环上的用例**：源站是测试自己的 HTTP / TLS 服务器，客户端是测试自己写的；没有经真浏览器、没有对真实的站点试过。
