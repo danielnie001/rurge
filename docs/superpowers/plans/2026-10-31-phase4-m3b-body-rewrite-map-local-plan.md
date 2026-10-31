@@ -963,6 +963,7 @@ ERROR  消息 body rewrite task failed: {错误}
 | 24 | 1 | 与计划对不上的：第 7 条用例的第二半在 `"ab"` 重复 **20** 次上就分开了（`with_backtrack_limit(.., 1_000_000)` 得 `None`、`BodyPattern::new` 得 `Some`），不需要再调重复次数，照计划写的 20 次跑 | 本提交 |
 | 25 | 1 | 执行者的裁定：`parse_body` 里一对的式子（`BodyPattern::new`）编不了时与 URL 式子编不了同样处理——这一行整行跳过、只给一条 `W0012`，后面成对的项不再读（P3 只写了诊断都带这一行的 `span`）；每一行都先看项数、再编式子，所以 `http-response ^a b` 一类的形状错只给形状那一条 | 本提交 |
 | 26 | 1 | 修正轮 1（评审意见，都只是注释与测试的写法，不改行为）：① `dialect.rs` 的 `BodyPattern` 文档注释把 `^` 与 `$` 的 CRLF 读法说成设计第 5.4 节的意思（不在 `\r\n` 中间匹配）；② `diagnostic.rs` 的 `codes::hint` 名单里 `W0042` 一条挪到 `W0039` 之后（文字不改）；③ `W_JQ_REWRITE_UNAVAILABLE` 的文档注释点名 `phase 4 design Q4`；④ `rewrite.rs` 的两条黄金用例的规则行改成原始字符串（带 `"` 的 jq 行用 `r#"…"#`），文字仍与 `manual-excerpts.md` 逐字相同；⑤ `BodyRewrite.pairs` 的注释改成一句通顺的。跑了 `cargo fmt --all --check`（exit=0，`gate-task-1-fix1-fmt.log`）、`cargo clippy --all-targets -- -D warnings`（exit=0，`gate-task-1-fix1-clippy.log`）与 `cargo test -j 8 --workspace --lib -- dialect:: body_rewrite jq_lines`（19 passed、0 failed，exit=0，`gate-task-1-fix1-test.log`）；按派工不跑全量门禁 | 本提交 |
+| 27 | 1 | 修正轮 2：`dialect.rs` 里 `BodyPattern` 文档注释的那一段整段换成派工给的五句（`^` 与 `$` 把 `\r` 与 `\n` 都当行尾、但不在一对 CRLF 的中间匹配，`.` 两个都不配），依据是 `regex-automata-0.4.18/src/util/look.rs:955-975` 的 `is_start_crlf` / `is_end_crlf`；另一处没动。跑了 `cargo fmt --all --check`（exit=0，`gate-task-1-fix2-fmt.log`）、`cargo clippy --all-targets -- -D warnings`（exit=0，`gate-task-1-fix2-clippy.log`）与 `cargo test -j 8 --workspace --lib -- dialect::`（15 passed、0 failed，exit=0，`gate-task-1-fix2-test.log`）；按派工不跑全量门禁 | 本提交 |
 
 ## 延后事项
 
