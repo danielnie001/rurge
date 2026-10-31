@@ -643,3 +643,23 @@ M3 的文档任务把下面各条写进兼容性清单（`docs/surge-compatibili
 11. 第 7.2 节"结果不能当头的值时那一行的值不变、留备注"读来是一行一条：执行时定一条 `header-replace-regex` 规则至多一条 `Skipped`（同名的几行都失败时留最后失败的那一行的），`skipped` 只数一次。以修正记录第 35 行为准。
 
 12. 第 7.4 节"删掉了全部 `Host` 时放回原来的各行、留备注"与第 12 节"`header` 是头被 Header Rewrite 改过的请求"：执行时 `header-del Host` 那一条规则照 P9 留 `Done`、`changed` 为真、`header` 加一，之后 `Host` 放回、再留 `Skipped(Host cannot be removed)`——请求的头最终没有变，却数了一次 `header`，第 12 节的定义对这一种不成立。以修正记录第 36 行为准。
+
+写 M3b 计划时（`docs/superpowers/plans/2026-10-31-phase4-m3b-body-rewrite-map-local-plan.md`，对着 `ba6646a` 核对）：
+
+13. 第 2 节 M3b 的大纲拆成计划的任务 0 ～ 9：大纲里"正文的缓冲、上限与解压""Body Rewrite 在引擎里的两个方向""Map Local 的四种数据与 `ResourceKind::MapLocal`"分成任务 3（正文的读入、何时缓冲与解压）、任务 4（改写的求值与 Map Local 的规则）、任务 5（引擎里的三步）与任务 6（Map Local 的 URL 与资源管理器）；"手工清单加 M3 的几项"与"M3 收尾的文档"分成任务 8、9（计划 P1）。
+
+14. 第 3 节的 `BodyPattern` 是公开的枚举 `Plain(regex::Regex)` / `Fancy(fancy_regex::Regex)`：计划改成结构体 `{ pub source: String, … }`，编译好的那一种是私有的，替换（`replace_all`，逐个取匹配、照 `Template` 展开）也在 `rurge-config` 里——`rurge-http` 不依赖 `regex`（第 3 节只给它加 `flate2`），用不了编译好的式子。以计划 P2 为准。
+
+15. 第 3 节的 `MapData::Url(String)` 改成 `Url(url::Url)`：加载时就读成 URL，读不成的 `W0012`；`MapData` 与 `MapLocal` 的 `Debug` 不显示文本、Base64 与头的值，URL 只显示到 `rurge_config::remote::origin`（计划 P5）。
+
+16. 第 3 节的表与第 10.3 节"控制面的名字 `map-local`"改成 **`data`**：手册 HTTP API 的 `GET /v1/external_resources` 列的种类是 "ruleset, domainset, script, policy-group and data"，`docs/api/phase1.md` 与兼容性清单已经把 `data` 对到 Map Local；`map-local` 是 Surge 的 API 不给的名字（计划 P19）。
+
+17. 第 13 节 `W0042` 的消息多 `[Body Rewrite]: ` 的前缀，同这个节别的诊断："[Body Rewrite]: jq body rewrite is not available in this build of rurge; the line is ignored"（计划 P7）。
+
+18. 第 9.2 节讲 HTTP/2 的客户端没有 `content-length` 而有正文的请求"同 chunked"：不缓冲、原样转发、WARN 的限频同 chunked，备注的原因是它自己的 `the request body has no length`，不说成 chunked（计划 P10）。
+
+19. 第 10.3 节"`tiny-gif`：`responses::tiny_gif()` 那一张 GIF 的字节"：`tiny_gif()` 交回的是一个应答，字节是 `rurge_inbound::responses::TINY_GIF`（计划 P15）。
+
+20. 第 3 节 `Rewrite::build` 的签名多一个参数 `url_data: &dyn Fn(&str) -> UrlData`（`UrlData` 是 `Arc<dyn Fn() -> Option<Bytes> + Send + Sync>`）：引擎把 Map Local 的每个 URL 挂进这一代的资源管理器，交回读当时那一份数据的闭包；`rurge-http` 不必认识资源管理器怎样登记一类资源（计划 P19）。
+
+21. 第 10.3 节"读到一半出错……同上游正文出错"与第 12 节 `failed` 的"Map Local 的数据读不到"：`failed` 只数答复之前就读不到的（文件打不开、不是普通文件、URL 还没有数据，都是 502 或关闭）；读到一半出错或文件读到一半变短的不计入 `failed`——这个请求已经由 Map Local 答复、计入 `mapLocal`，坏的是正文的递送，同上游正文出错不算重写的失败。记录分别是 `Map Local: reading <路径> failed: <错误>` 与 `Map Local: <路径> became shorter while it was read`（计划 P15、P16）。
