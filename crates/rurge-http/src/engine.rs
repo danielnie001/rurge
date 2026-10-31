@@ -16,8 +16,8 @@ use super::headers::{self, Keep};
 use super::mitm::OriginTls;
 use super::pool::{Meter, Metered, Pool, Reusable};
 use super::rewrite::{
-    HostChange, MapRule, MapSource, ReadAhead, Rewrite, UrlOutcome, candidates, redirect,
-    retarget_request, write_back_host,
+    Ahead, Buffer, HostChange, MapRule, MapSource, REQUEST, ReadAhead, Rewrite, UrlOutcome,
+    candidates, read_ahead, redirect, request_buffer, retarget_request, write_back_host,
 };
 use super::version::{Form, fit};
 use bytes::Bytes;
@@ -646,6 +646,157 @@ impl<U: Upstreams> Requests<U> {
         // tunnel (design 8.9)
         let tunnel = sniffed && req.method() == http::Method::CONNECT;
         let needs_h1 = upgrade || tunnel;
+        // 6. the request's body (`phase 4 M3 design 9.5`, the phase 4 / M3b
+        // plan's P14): only when a rule of this direction matches the URL, and
+        // only for a body that can be read whole. A body that cannot be —
+        // chunked, expected with `100-continue`, of no length over HTTP/2 — is
+        // forwarded as it came, with a note and one WARN an hour for every
+        // rule that matched it (`phase 4 M3 design 9.2`, `14`).
+        let request_body_rules = match (rewrite.as_deref(), url.as_deref()) {
+            (Some(rules), Some(text)) if !needs_h1 => {
+                let mut notes = Vec::new();
+                let matched = rules.body_rules(Direction::Request, text, &mut notes);
+                note_rewrites(&handle, rules, notes);
+                (!matched.is_empty()).then(|| {
+                    (
+                        Arc::clone(rewrite.as_ref().expect("the rules are in hand")),
+                        matched,
+                    )
+                })
+            }
+            _ => None,
+        };
+        let mut req = match request_body_rules {
+            None => req.map(ReadAhead::through),
+            Some((generation, matched)) => {
+                let rules: &Rewrite = &generation;
+                match request_buffer(&req, self.shared.conn.h2) {
+                    Buffer::Skip(reason) => {
+                        let host = handle.session().dst_host.to_string();
+                        let now = Instant::now();
+                        let mut notes = Vec::new();
+                        for &i in &matched {
+                            let rule = rules.body_rule(i);
+                            notes.push(crate::rewrite::Note::Skipped(format!(
+                                "Body Rewrite skipped: {}: {reason}",
+                                rule.source()
+                            )));
+                            if rule.should_warn(now) {
+                                tracing::warn!(
+                                    pattern = rule.source(),
+                                    "request body not rewritten: {reason}"
+                                );
+                            }
+                            tracing::debug!(
+                                host = host.as_str(),
+                                pattern = rule.source(),
+                                "request body not rewritten: {reason}"
+                            );
+                        }
+                        note_rewrites(&handle, rules, notes);
+                        req.map(ReadAhead::through)
+                    }
+                    Buffer::Yes => {
+                        let (mut parts, body) = req.into_parts();
+                        let ahead = read_ahead(
+                            body,
+                            REQUEST.bytes,
+                            self.shared.conn.idle,
+                            handle.token(),
+                            None,
+                        )
+                        .await;
+                        let body = match ahead {
+                            Ahead::Whole { data, trailers } => {
+                                let encodings: Vec<HeaderValue> = parts
+                                    .headers
+                                    .get_all(header::CONTENT_ENCODING)
+                                    .iter()
+                                    .cloned()
+                                    .collect();
+                                // the body is decoded and rewritten off the
+                                // runtime's threads (`M3-D21`), and a stop or a
+                                // kill ends the request while it runs
+                                let job = {
+                                    let generation = Arc::clone(&generation);
+                                    let matched = matched.clone();
+                                    let data = data.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let mut notes = Vec::new();
+                                        let changed = generation.rewrite_body(
+                                            &matched, &encodings, &data, REQUEST, &mut notes,
+                                        );
+                                        (changed, notes)
+                                    })
+                                };
+                                let outcome = tokio::select! {
+                                    biased;
+                                    _ = handle.token().cancelled() => return Err(Close),
+                                    outcome = job => outcome,
+                                };
+                                let changed = match outcome {
+                                    Ok((changed, notes)) => {
+                                        note_rewrites(&handle, rules, notes);
+                                        changed
+                                    }
+                                    Err(e) => {
+                                        // a panic in the blocking task is no
+                                        // reason to fail the request: the body
+                                        // goes out as it came
+                                        tracing::error!("body rewrite task failed: {e}");
+                                        None
+                                    }
+                                };
+                                match changed {
+                                    Some(bytes) => {
+                                        // a rewritten body is framed by its new
+                                        // length, and its trailers go (`phase 4
+                                        // M3 design 9.6`, P13)
+                                        parts.headers.remove(header::CONTENT_ENCODING);
+                                        parts.headers.remove(header::TRANSFER_ENCODING);
+                                        parts.headers.insert(
+                                            header::CONTENT_LENGTH,
+                                            HeaderValue::from(bytes.len()),
+                                        );
+                                        rules.counters().body();
+                                        ReadAhead::whole(bytes, None)
+                                    }
+                                    None => ReadAhead::whole(data, trailers),
+                                }
+                            }
+                            Ahead::Over { .. } => {
+                                let source = rules.body_rule(matched[0]).source();
+                                let mut notes = Vec::new();
+                                notes.push(crate::rewrite::Note::Failed(format!(
+                                    "Body Rewrite failed: {source}: the request body is over {}",
+                                    REQUEST.text
+                                )));
+                                note_rewrites(&handle, rules, notes);
+                                rules.counters().failed();
+                                handle.finish(SessionOutcome::Failed(
+                                    "Body Rewrite: the request body is over 32 MiB".to_string(),
+                                ));
+                                return Err(Close);
+                            }
+                            Ahead::Stalled => {
+                                handle.finish(SessionOutcome::Failed(
+                                    "request body stalled".to_string(),
+                                ));
+                                return Err(Close);
+                            }
+                            Ahead::Failed(e) => {
+                                handle.finish(SessionOutcome::Failed(format!(
+                                    "request body failed: {e}"
+                                )));
+                                return Err(Close);
+                            }
+                            Ahead::Cancelled => return Err(Close),
+                        };
+                        Request::from_parts(parts, body)
+                    }
+                }
+            }
+        };
         // 5. an upstream connection (`phase 4 M2 design 10.2`, `the phase 4 /
         // M2b plan's P10`): one shared under this key if what carries this
         // request may speak HTTP/2 and such a connection is open, then one
@@ -8667,6 +8818,250 @@ mod tests {
                 map_local: 1,
                 ..counted(0, 0, 0, 0)
             }
+        );
+    }
+
+    /// A request's body is rewritten before anything is dialled, and the
+    /// origin gets the new bytes and their length (`phase 4 M3 design 9.5`,
+    /// the phase 4 / M3b plan's P13, P14).
+    #[tokio::test]
+    async fn a_request_body_is_rewritten_before_the_dial() {
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-request ^http://b\\.test/ value abc",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send(
+                "POST /x HTTP/1.1\r\nHost: b.test\r\nContent-Length: 17\r\n\r\n\
+                 key=value&value=1",
+            )
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one request reached the origin");
+        assert_eq!(seen[0].body, b"key=abc&abc=1");
+        assert_eq!(
+            header_value(&seen[0].head, "content-length").as_deref(),
+            Some("13"),
+            "{}",
+            seen[0].head
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Body Rewrite: request by ^http://b\\.test/"]
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                body: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+    }
+
+    /// A body pattern of `^$` gives a request that had no body one (`phase 4
+    /// M3 design 9.5`; the manual's own example is a `GET`).
+    #[tokio::test]
+    async fn an_empty_get_can_get_a_body() {
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-request ^http://b\\.test/ ^$ generated",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /g HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen[0].body, b"generated");
+        assert_eq!(
+            header_value(&seen[0].head, "content-length").as_deref(),
+            Some("9"),
+            "{}",
+            seen[0].head
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Body Rewrite: request by ^http://b\\.test/"]
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                body: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+    }
+
+    /// A request whose own length is over the limit is closed before it is
+    /// dialled and not a byte of it is read (`phase 4 M3 design 9.3`, the
+    /// phase 4 / M3b plan's P14).
+    #[tokio::test]
+    async fn a_request_whose_length_is_over_the_limit_closes_before_the_dial() {
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-request ^http://b\\.test/ x y",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        // the length alone says it is over: the bytes are never sent
+        rig.client
+            .send(
+                "POST /big HTTP/1.1\r\nHost: b.test\r\n\
+                 Content-Length: 33554433\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rig.client.until_eof().await, "");
+        assert_eq!(rig.fake.dials(), 0, "nothing is dialled");
+        assert!(
+            records.lock().unwrap().is_empty(),
+            "nothing reached the origin"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(
+                "Body Rewrite: the request body is over 32 MiB".to_string()
+            ))
+        );
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Body Rewrite failed: ^http://b\\.test/: the request body is over 32 MiB"]
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                failed: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+    }
+
+    /// A chunked body and one expected with `100-continue` are forwarded as
+    /// they came, and every rule that matched says why it did nothing
+    /// (`phase 4 M3 design 9.2`, the phase 4 / M3b plan's P10, P18).
+    #[tokio::test]
+    async fn chunked_and_expect_requests_are_not_buffered() {
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-request ^http://b\\.test/ value abc",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send(
+                "POST /c HTTP/1.1\r\nHost: b.test\r\nTransfer-Encoding: chunked\r\n\r\n\
+                 5\r\nvalue\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let (head, _) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        rig.client
+            .send(
+                "POST /e HTTP/1.1\r\nHost: b.test\r\nContent-Length: 5\r\n\
+                 Expect: 100-continue\r\n\r\nvalue",
+            )
+            .await
+            .unwrap();
+        // hyper's server writes the interim 100 when the body is read
+        let head = rig.client.response_head().await;
+        let head = if head.starts_with("HTTP/1.1 100") {
+            rig.client.response_head().await
+        } else {
+            head
+        };
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].body, b"value");
+        assert_eq!(seen[1].body, b"value");
+        let first = rig.fake.finished(0).await;
+        assert_eq!(
+            rewrite_notes(&first),
+            ["Body Rewrite skipped: ^http://b\\.test/: the request body is chunked"]
+        );
+        let second = rig.fake.finished(1).await;
+        assert_eq!(
+            rewrite_notes(&second),
+            ["Body Rewrite skipped: ^http://b\\.test/: the request expects 100-continue"]
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 2, 0));
+    }
+
+    /// A request body that stops part way is not waited for longer than the
+    /// idle timeout (`phase 4 M3 design 9.3`, the phase 4 / M3b plan's P14).
+    #[tokio::test]
+    async fn a_request_body_that_stalls_while_buffered_closes() {
+        let (addr, records) = recording_origin().await;
+        let (rules, _counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-request ^http://b\\.test/ x y",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = rig_timed(
+            Entry::Sniffed,
+            addr,
+            Duration::from_millis(200),
+            Duration::from_secs(5),
+        )
+        .await;
+        rig.fake.rewrite(rules);
+        // ten bytes promised, five sent, and then nothing
+        rig.client
+            .send("POST /slow HTTP/1.1\r\nHost: b.test\r\nContent-Length: 10\r\n\r\nxxxxx")
+            .await
+            .unwrap();
+        assert_eq!(rig.client.until_eof().await, "");
+        assert_eq!(rig.fake.dials(), 0, "nothing is dialled");
+        assert!(records.lock().unwrap().is_empty());
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("request body stalled".to_string()))
+        );
+    }
+
+    /// A request killed while its body is buffered stops at once (`phase 4 M3
+    /// design 9.3`, the phase 4 / M3b plan's P14).
+    #[tokio::test]
+    async fn a_killed_request_stops_buffering() {
+        let (addr, records) = recording_origin().await;
+        let (rules, _counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-request ^http://b\\.test/ x y",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("POST /k HTTP/1.1\r\nHost: b.test\r\nContent-Length: 10\r\n\r\nxxxxx")
+            .await
+            .unwrap();
+        let handle = rig.fake.handle(0).await;
+        handle.kill();
+        assert_eq!(rig.client.until_eof().await, "");
+        assert_eq!(rig.fake.dials(), 0, "nothing is dialled");
+        assert!(records.lock().unwrap().is_empty());
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("killed".to_string()))
         );
     }
 }
