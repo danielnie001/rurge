@@ -1564,14 +1564,14 @@ fn form_of<B>(
 
 /// The port a request's URL leaves out when the connection's target names
 /// none: 80 over plain HTTP, 443 over TLS (`phase 4 M2 design 9.1`).
-fn default_port(scheme: &str) -> u16 {
+pub(crate) fn default_port(scheme: &str) -> u16 {
     if scheme == "https" { 443 } else { 80 }
 }
 
 /// A target as a URL can carry it: the port unless it is `default_port`, and
 /// an IPv6 address in brackets (`HostName`'s own display has none,
 /// `types.rs`).
-fn origin_authority(host: &HostName, port: u16, default_port: u16) -> String {
+pub(crate) fn origin_authority(host: &HostName, port: u16, default_port: u16) -> String {
     let host = match host {
         HostName::Domain(d) => d.clone(),
         HostName::Ip(IpAddr::V6(v6)) => format!("[{v6}]"),

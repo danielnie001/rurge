@@ -322,7 +322,7 @@ pub(crate) fn classify(error: &io::Error) -> HandshakeFailure {
 
 /// The name the origin side is verified against (`phase 4 M2 design 9.2`):
 /// the client's SNI, or the target when there is none; an address is one.
-fn server_name(name: &HostName) -> Result<ServerName<'static>, HandshakeFailure> {
+pub(crate) fn server_name(name: &HostName) -> Result<ServerName<'static>, HandshakeFailure> {
     match name {
         HostName::Domain(text) => {
             ServerName::try_from(text.clone()).map_err(|_| HandshakeFailure::Failed {

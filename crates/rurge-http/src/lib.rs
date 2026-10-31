@@ -7,7 +7,9 @@
 //! them (`engine`).
 //!
 //! M2 brings `mitm`: the certificate authority of `[MITM]`, which is read,
-//! checked and reported on when a profile is loaded.
+//! checked and reported on when a profile is loaded. M3a brings `rewrite`:
+//! `[URL Rewrite]` and `[Header Rewrite]` evaluated for one request, and the
+//! counts the API reports.
 //!
 //! The engine stays outside this crate: which policy a request takes, how
 //! its outbound connection is made and how an upgraded exchange is relayed
@@ -19,6 +21,7 @@ pub mod headers;
 pub mod mitm;
 pub mod pool;
 pub mod prefix;
+pub mod rewrite;
 pub mod sniff;
 pub mod tls;
 
@@ -32,5 +35,6 @@ pub use engine::{
 pub use headers::{Keep, host_port, strip};
 pub use pool::{Meter, Metered, Pool, Reusable};
 pub use prefix::Prefixed;
+pub use rewrite::{Rewrite, RewriteCounters, RewriteCounts};
 pub use sniff::{Judged, MAX_PREFIX, SNIFF_WAIT, Sniffed, judge, sniff};
 pub use tls::ClientHello;
