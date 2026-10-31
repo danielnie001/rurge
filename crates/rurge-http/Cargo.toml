@@ -36,6 +36,7 @@ flate2.workspace = true
 [dev-dependencies]
 rurge-net = { workspace = true, features = ["testing"] }
 rurge-proto = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

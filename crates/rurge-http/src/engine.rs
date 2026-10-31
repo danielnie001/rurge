@@ -16,12 +16,12 @@ use super::headers::{self, Keep};
 use super::mitm::OriginTls;
 use super::pool::{Meter, Metered, Pool, Reusable};
 use super::rewrite::{
-    HostChange, ReadAhead, Rewrite, UrlOutcome, candidates, redirect, retarget_request,
-    write_back_host,
+    HostChange, MapRule, MapSource, ReadAhead, Rewrite, UrlOutcome, candidates, redirect,
+    retarget_request, write_back_host,
 };
 use super::version::{Form, fit};
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri, header};
+use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use http_body_util::BodyExt;
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
@@ -42,12 +42,13 @@ use rustls::pki_types::ServerName;
 use std::error::Error as StdError;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Sleep;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
@@ -622,6 +623,20 @@ impl<U: Upstreams> Requests<U> {
                 UrlOutcome::Go(None) => {}
             }
         }
+        // 5. `[Map Local]` (`phase 4 M3 design 10.2`, the phase 4 / M3b plan's
+        // P14): a rule that matches answers the request itself, and nothing is
+        // dialled. A request that upgrades is asked too — only its headers are
+        // looked at — and gets a plain answer.
+        if let (Some(rules), Some(text)) = (rewrite.as_deref(), url.as_deref()) {
+            let mut notes = Vec::new();
+            let matched = rules.map_local(text, &mut notes);
+            note_rewrites(&handle, rules, notes);
+            if let Some(rule) = matched {
+                return self
+                    .map_local(guard, pages, rules, rule, req.method())
+                    .await;
+            }
+        }
 
         // Only an upgrade keeps `Upgrade` and `Connection: upgrade`; every
         // other request drops them (design 8.7, 8.9). Read after the rewrite:
@@ -1047,6 +1062,139 @@ impl<U: Upstreams> Requests<U> {
             request_meter,
         );
         Ok(Response::from_parts(parts, tail.boxed()))
+    }
+
+    /// Answers a request a `[Map Local]` rule matched, without dialling
+    /// anything (`phase 4 M3 design 10.2`, the phase 4 / M3b plan's P15): the
+    /// status and headers the line wrote, and the data it names — a file read
+    /// as it goes, the bytes of a URL, or the bytes the line wrote itself.
+    async fn map_local(
+        &self,
+        guard: Guard,
+        pages: Pages,
+        rules: &Rewrite,
+        rule: &MapRule,
+        method: &Method,
+    ) -> Result<Response<ResponseBody>, Close> {
+        let status = rule.status();
+        let mut headers = rule.headers().clone();
+        // a 204 and a 304 have no body: their data is not read at all, and
+        // neither of them carries a length (`M3-D19`)
+        let bodyless = status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
+        let head = *method == Method::HEAD;
+        let mut file = None;
+        let mut data = None;
+        if !bodyless {
+            match rule.data() {
+                MapSource::File(path) => {
+                    let Some((opened, size)) = open_local_file(path.as_path()).await else {
+                        return self.map_local_failed(
+                            guard,
+                            pages,
+                            rules,
+                            rule,
+                            format!("Map Local: cannot read {}", path.display()),
+                            "the file cannot be read",
+                            LOCAL_FILE_MISSING,
+                        );
+                    };
+                    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(size));
+                    if !head {
+                        file = Some((opened, size, path.clone()));
+                    }
+                }
+                MapSource::Url {
+                    data: source,
+                    origin,
+                } => match source() {
+                    Some(bytes) => {
+                        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+                        if !head {
+                            data = Some(bytes);
+                        }
+                    }
+                    None => {
+                        return self.map_local_failed(
+                            guard,
+                            pages,
+                            rules,
+                            rule,
+                            format!("Map Local: the data from {origin} is not available yet"),
+                            "the data is not available yet",
+                            LOCAL_DATA_MISSING,
+                        );
+                    }
+                },
+                MapSource::Bytes(bytes) => {
+                    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+                    if !head {
+                        data = Some(bytes.clone());
+                    }
+                }
+            }
+        }
+        // the request was answered: a note names the line and the kind of its
+        // data, never a byte of it (`phase 4 M3 design 8.5`)
+        note_rewrites(
+            guard.handle(),
+            rules,
+            vec![crate::rewrite::Note::Done(format!(
+                "Map Local: {} by {}",
+                rule.kind(),
+                rule.source()
+            ))],
+        );
+        rules.counters().map_local();
+        guard.handle().set_status(status.as_u16());
+        let body: ResponseBody = match (file, data) {
+            (Some((opened, size, path)), _) => {
+                // the file's answer ends when it was read to its end, and it
+                // ends the request itself (P16)
+                let idle = self.shared.conn.idle;
+                LocalFile::new(opened, path, size, guard, &self.shared.conn, idle).boxed()
+            }
+            (None, data) => {
+                guard.handle().finish(SessionOutcome::Completed);
+                drop(guard);
+                match data {
+                    Some(bytes) => responses::full(bytes),
+                    None => responses::empty(),
+                }
+            }
+        };
+        let mut response = Response::builder()
+            .status(status)
+            .body(body)
+            .expect("a response of rurge's own");
+        *response.headers_mut() = headers;
+        Ok(response)
+    }
+
+    /// Answers a request a `[Map Local]` rule matched but could not answer
+    /// (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P15): a 502, or the
+    /// connection closed when the generation says no page. The request counts
+    /// as failed and not as answered.
+    #[allow(clippy::too_many_arguments)]
+    fn map_local_failed(
+        &self,
+        guard: Guard,
+        pages: Pages,
+        rules: &Rewrite,
+        rule: &MapRule,
+        record: String,
+        reason: &str,
+        page: &str,
+    ) -> Result<Response<ResponseBody>, Close> {
+        rules.counters().failed();
+        note_rewrites(
+            guard.handle(),
+            rules,
+            vec![crate::rewrite::Note::Failed(format!(
+                "Map Local failed: {}: {reason}",
+                rule.source()
+            ))],
+        );
+        self.failed(&guard, pages, record, page.to_string())
     }
 
     /// The session of one request, before a handle is made of it: what the
@@ -2527,6 +2675,259 @@ impl<U: Upstreams> Drop for Tail<U> {
     }
 }
 
+/// How much of a `[Map Local]` file one read takes: a block of its own, copied
+/// into a `Bytes` before the lock goes (`phase 4 M3 design 10.3`, the phase 4 /
+/// M3b plan's P16).
+const LOCAL_BLOCK: usize = 64 * 1024;
+
+/// The body of a `[Map Local]` answer that reads a file as the client takes it
+/// (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P16): the file is opened
+/// per request, a block at a time goes out, the request ends when the file
+/// does, and a file that became shorter or stalls ends the answer with an
+/// error.
+struct LocalFile {
+    /// The file and how much of it is left to open it from, `None` once it was
+    /// let go — by `complete`, `fail`, `stop` or the watchdog. One read at a
+    /// time, and never across any of those.
+    file: Arc<Mutex<Option<tokio::io::Take<tokio::fs::File>>>>,
+    /// The path as the line wrote it, which is what a record names, never a
+    /// byte of the file.
+    path: PathBuf,
+    /// How many bytes of the file the answer still owes the client.
+    left: u64,
+    idle: Duration,
+    deadline: Pin<Box<Sleep>>,
+    /// The request's token: `kill` and a stop end the answer here.
+    cancelled: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    /// How far the answer got, for the watchdog that watches the client
+    /// (`design 8.10`).
+    progress: Arc<Progress>,
+    /// Fired when the answer is over (or the body is dropped).
+    watchdog: CancellationToken,
+    guard: Guard,
+    /// The file was read to its end: `is_end_stream` says this and nothing
+    /// else.
+    reached_end: bool,
+    /// Nothing more will be handed on: the answer ended, or its one error went.
+    done: bool,
+}
+
+/// One read of a `[Map Local]` file, taken out of the lock before anything
+/// else is done with it.
+enum LocalRead {
+    Data(Bytes),
+    /// The file ended before the length it was opened with.
+    Short,
+    Failed(std::io::Error),
+    Pending,
+    /// The watchdog let the file go.
+    Gone,
+}
+
+impl LocalFile {
+    fn new(
+        file: tokio::io::Take<tokio::fs::File>,
+        path: PathBuf,
+        size: u64,
+        guard: Guard,
+        conn: &Conn,
+        idle: Duration,
+    ) -> LocalFile {
+        let cancelled = Box::pin(guard.handle().token().clone().cancelled_owned());
+        let progress = Progress::new();
+        let watchdog = CancellationToken::new();
+        let slot = Arc::new(Mutex::new(Some(file)));
+        let mut body = LocalFile {
+            file: Arc::clone(&slot),
+            path,
+            left: size,
+            idle,
+            deadline: Box::pin(tokio::time::sleep(idle)),
+            cancelled,
+            progress: progress.clone(),
+            watchdog: watchdog.clone(),
+            guard,
+            reached_end: false,
+            done: false,
+        };
+        if size == 0 {
+            // nothing to read: the request ends here, as `Tail` ends a
+            // response that came with no body at all
+            body.complete();
+        } else {
+            watch_the_client(
+                conn,
+                body.guard.handle(),
+                body.guard.left,
+                progress,
+                idle,
+                slot,
+                watchdog,
+            );
+        }
+        body
+    }
+
+    /// The answer was read to its end: the request is complete, and there is
+    /// no connection to put back.
+    fn complete(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        self.reached_end = true;
+        self.watchdog.cancel();
+        self.file.lock().expect("local file").take();
+        self.guard.handle().finish(SessionOutcome::Completed);
+    }
+
+    /// A file that ended too early or could not be read: the request fails,
+    /// and the client's body ends with an error.
+    fn fail(&mut self, message: String) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        self.watchdog.cancel();
+        self.file.lock().expect("local file").take();
+        self.guard.handle().finish(SessionOutcome::Failed(message));
+    }
+
+    /// The request's token fired: the guard says how it ends.
+    fn stop(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        self.watchdog.cancel();
+        self.file.lock().expect("local file").take();
+        self.guard.retire();
+    }
+}
+
+impl Drop for LocalFile {
+    /// The body went away without a word (hyper dropped it): the watchdog has
+    /// nothing left to watch, and the file goes with it.
+    fn drop(&mut self) {
+        self.watchdog.cancel();
+        let file = self.file.lock().expect("local file").take();
+        drop(file);
+    }
+}
+
+impl Body for LocalFile {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(None);
+        }
+        // one read, under the lock, and its result taken out of it: the
+        // watchdog takes from the same slot
+        let read = {
+            let mut held = this.file.lock().expect("local file");
+            match held.as_mut() {
+                None => LocalRead::Gone,
+                Some(file) => {
+                    let want = this.left.min(LOCAL_BLOCK as u64) as usize;
+                    if want == 0 {
+                        LocalRead::Short
+                    } else {
+                        let mut block = [0u8; LOCAL_BLOCK];
+                        let mut buf = tokio::io::ReadBuf::new(&mut block[..want]);
+                        match Pin::new(file).poll_read(cx, &mut buf) {
+                            Poll::Ready(Ok(())) if buf.filled().is_empty() => LocalRead::Short,
+                            Poll::Ready(Ok(())) => {
+                                LocalRead::Data(Bytes::copy_from_slice(buf.filled()))
+                            }
+                            Poll::Ready(Err(e)) => LocalRead::Failed(e),
+                            Poll::Pending => LocalRead::Pending,
+                        }
+                    }
+                }
+            }
+        };
+        match read {
+            LocalRead::Data(data) => {
+                this.deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.idle);
+                this.progress.moved();
+                this.left -= data.len() as u64;
+                if this.left == 0 {
+                    this.complete();
+                }
+                Poll::Ready(Some(Ok(Frame::data(data))))
+            }
+            LocalRead::Short => {
+                let message = format!(
+                    "Map Local: {} became shorter while it was read",
+                    this.path.display()
+                );
+                this.fail(message.clone());
+                Poll::Ready(Some(Err(Box::new(UpstreamBodyFailed(message)))))
+            }
+            LocalRead::Failed(e) => {
+                let message = format!("Map Local: reading {} failed: {e}", this.path.display());
+                this.fail(message.clone());
+                Poll::Ready(Some(Err(Box::new(UpstreamBodyFailed(message)))))
+            }
+            LocalRead::Gone => {
+                // the watchdog let the file go, and hyper resets the client's
+                // stream with this one error (`the phase 4 / M2b plan's P14`)
+                this.done = true;
+                let error: BoxError = if this.guard.handle().token().is_cancelled() {
+                    Box::new(Close)
+                } else {
+                    Box::new(Stalled("client stopped reading"))
+                };
+                Poll::Ready(Some(Err(error)))
+            }
+            LocalRead::Pending => {
+                this.progress.waiting();
+                if this.cancelled.as_mut().poll(cx).is_ready() {
+                    this.stop();
+                    return Poll::Ready(Some(Err(Box::new(Close))));
+                }
+                if this.deadline.as_mut().poll(cx).is_ready() {
+                    let message = format!("Map Local: reading {} stalled", this.path.display());
+                    this.fail(message);
+                    return Poll::Ready(Some(Err(Box::new(Stalled("local file stalled")))));
+                }
+                Poll::Pending
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.reached_end
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.left)
+    }
+}
+
+/// The file a `[Map Local]` line names, opened for this request, and how long
+/// it is (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P15): opening a
+/// directory differs between the three platforms, and none of their answers is
+/// a file to read.
+async fn open_local_file(
+    path: &std::path::Path,
+) -> Option<(tokio::io::Take<tokio::fs::File>, u64)> {
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let metadata = file.metadata().await.ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some((file.take(metadata.len()), metadata.len()))
+}
+
 /// One poll of an upstream body, taken out of the slot before anything else is
 /// done with it (`the phase 4 / M2b plan's P14`): the frame and whether it was
 /// the last one, the error, the end, `Pending`, or a slot the watchdog emptied.
@@ -2857,6 +3258,14 @@ const CONNECT_NOT_SUPPORTED: &str = "CONNECT over HTTP/2 is not supported";
 /// The record keeps `Header Rewrite changed Content-Length or
 /// Transfer-Encoding` on both sides.
 const RESPONSE_FRAMING_LOST: &str = "A Header Rewrite rule changed Content-Length or Transfer-Encoding of the response, so the response was not passed on.";
+
+/// What the page of a `[Map Local]` answer whose file cannot be read says
+/// (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P18).
+const LOCAL_FILE_MISSING: &str = "The file a Map Local rule names cannot be read.";
+
+/// What the page of a `[Map Local]` answer whose URL has no data yet says
+/// (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P18).
+const LOCAL_DATA_MISSING: &str = "The data a Map Local rule names has not been downloaded yet.";
 
 /// Serves `client` as HTTP/1.1 (`phase 4 M1 design 8.1`): until the connection
 /// ends or `requests`' connection token fires, and then until the connection
@@ -3364,6 +3773,13 @@ mod tests {
         async fn until_eof(&mut self) -> String {
             while self.fill().await {}
             String::from_utf8_lossy(&self.buf).to_string()
+        }
+
+        /// Everything the engine says until it closes the connection, as the
+        /// bytes they are: a body cut short is not text.
+        async fn until_close(&mut self) -> Vec<u8> {
+            while self.fill().await {}
+            std::mem::take(&mut self.buf)
         }
     }
 
@@ -4176,6 +4592,28 @@ mod tests {
         })
         .await
         .expect("the condition held within 5 s");
+    }
+
+    /// A listener a `[Map Local]` answer must never reach: it counts the
+    /// connections it accepted, and a case that answers nothing dials it
+    /// (`the phase 4 / M3b plan's P14`).
+    struct Guarded {
+        addr: SocketAddr,
+        accepted: Arc<AtomicUsize>,
+    }
+
+    async fn guarded_origin() -> Guarded {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+            }
+        });
+        Guarded { addr, accepted }
     }
 
     async fn holding_origin(answer: &'static [u8]) -> Holding {
@@ -6749,21 +7187,39 @@ mod tests {
         lines: &str,
         roots: Arc<RootCertStore>,
     ) -> (Arc<Rewrite>, Arc<crate::rewrite::RewriteCounters>) {
+        rewrite_from(
+            &crate::rewrite::config_of(lines),
+            roots,
+            &crate::rewrite::no_url_data,
+        )
+    }
+
+    /// As `rewrite_of`, from rules already read — a `[Map Local]` line whose
+    /// file is relative to `base_dir` needs `crate::rewrite::config_in` — and
+    /// with the data a `[Map Local]` URL holds, which no resource manager
+    /// hands in here (`the phase 4 / M3b plan's P19`).
+    fn rewrite_from(
+        cfg: &rurge_config::rewrite::RewriteConfig,
+        roots: Arc<RootCertStore>,
+        url_data: &dyn Fn(&str) -> crate::rewrite::UrlData,
+    ) -> (Arc<Rewrite>, Arc<crate::rewrite::RewriteCounters>) {
         let counters = Arc::new(crate::rewrite::RewriteCounters::default());
         let rules = Rewrite::build(
-            &crate::rewrite::config_of(lines),
+            cfg,
             &MitmConfig::default(),
             roots,
             Arc::clone(&counters),
-            &crate::rewrite::no_url_data,
+            url_data,
         )
         .expect("a generation")
         .expect("the lines make rules");
         (Arc::new(rules), counters)
     }
 
-    /// What a case expects `/v1/rurge/http` to say it counted: `body` and
-    /// `map_local` stay at zero until M3b (`the phase 4 / M3a plan's P11`).
+    /// What a case expects `/v1/rurge/http` to say it counted: the two numbers
+    /// of URL and header rewrites. `body` and `map_local` are zero here, and a
+    /// case that asserts either writes the count it expects over this one with
+    /// a struct update (`the phase 4 / M3b plan's P18`).
     fn counted(url: u64, header: u64, skipped: u64, failed: u64) -> RewriteCounts {
         RewriteCounts {
             url,
@@ -6780,7 +7236,12 @@ mod tests {
         handle
             .notes()
             .into_iter()
-            .filter(|note| note.starts_with("URL Rewrite") || note.starts_with("Header Rewrite"))
+            .filter(|note| {
+                note.starts_with("URL Rewrite")
+                    || note.starts_with("Header Rewrite")
+                    || note.starts_with("Body Rewrite")
+                    || note.starts_with("Map Local")
+            })
             .collect()
     }
 
@@ -7621,5 +8082,591 @@ mod tests {
             "a request the rule does not reach leaves none"
         );
         assert_eq!(counters.snapshot(), counted(0, 1, 1, 0));
+    }
+
+    /// A generation of `lines` whose relative `[Map Local]` files are under
+    /// `dir` (`the phase 4 / M3b plan's P5`), trusted by a CA made in memory.
+    fn map_local_rules(
+        lines: &str,
+        dir: &std::path::Path,
+    ) -> (Arc<Rewrite>, Arc<crate::rewrite::RewriteCounters>) {
+        rewrite_from(
+            &crate::rewrite::config_in(lines, dir),
+            roots_of("rurge test rewrite CA"),
+            &crate::rewrite::no_url_data,
+        )
+    }
+
+    /// A `[Map Local]` rule answers the request itself (`phase 4 M3 design
+    /// 10.2`, the phase 4 / M3b plan's P15): its status, its headers with a
+    /// `Content-Type` and the length of its data, and its data — and nothing is
+    /// dialled.
+    #[tokio::test]
+    async fn map_local_answers_without_a_dial() {
+        let dir = tempfile::tempdir().unwrap();
+        let guarded = guarded_origin().await;
+        let (rules, counters) = map_local_rules(
+            "[Map Local]\n\
+             ^http://m\\.test/ data-type=text data=\"{}\" status-code=500 header=\"X-A:1\"",
+            dir.path(),
+        );
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /x HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 500"), "{head}");
+        assert_eq!(header_value(&head, "x-a").as_deref(), Some("1"), "{head}");
+        assert_eq!(
+            header_value(&head, "content-type").as_deref(),
+            Some("text/plain"),
+            "{head}"
+        );
+        assert_eq!(
+            header_value(&head, "content-length").as_deref(),
+            Some("2"),
+            "{head}"
+        );
+        assert_eq!(body, b"{}");
+        assert_eq!(rig.fake.dials(), 0, "a Map Local answer is not dialled");
+        assert_eq!(
+            guarded.accepted.load(Ordering::Relaxed),
+            0,
+            "nothing reached the origin"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(500));
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert!(
+            handle.connect_time().is_none(),
+            "Map Local has no remote address"
+        );
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Map Local: text by ^http://m\\.test/"]
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                map_local: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+    }
+
+    /// A file is read as the client takes it: the length is the file's, the
+    /// type its name's, the bytes its own, and the request ends when it was
+    /// read to its end (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's
+    /// P16).
+    #[tokio::test]
+    async fn map_local_streams_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0..204_800u32).map(|i| b'a' + (i % 26) as u8).collect();
+        std::fs::write(dir.path().join("big.json"), &content).unwrap();
+        let guarded = guarded_origin().await;
+        let (rules, counters) = map_local_rules(
+            "[Map Local]\n^http://m\\.test/big data-type=file data=\"big.json\"",
+            dir.path(),
+        );
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /big HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(
+            header_value(&head, "content-length").as_deref(),
+            Some("204800"),
+            "{head}"
+        );
+        assert_eq!(
+            header_value(&head, "content-type").as_deref(),
+            Some("application/json"),
+            "{head}"
+        );
+        // 200 KiB take more than one block, and the client has read the head
+        // alone: the file is not read to its end yet
+        let handle = rig.fake.handle(0).await;
+        assert!(!handle.is_finished(), "the record ends with the body");
+        assert_eq!(rig.client.take(204_800).await, content);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                map_local: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+        assert_eq!(guarded.accepted.load(Ordering::Relaxed), 0);
+    }
+
+    /// A `HEAD` a `[Map Local]` rule answers gets the length of the data and
+    /// no body (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P15).
+    #[tokio::test]
+    async fn map_local_answers_head_with_the_length_and_no_body() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ten.txt"), b"0123456789").unwrap();
+        let guarded = guarded_origin().await;
+        let (rules, counters) = map_local_rules(
+            "[Map Local]\n^http://m\\.test/ten data-type=file data=\"ten.txt\"",
+            dir.path(),
+        );
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("HEAD /ten HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(
+            header_value(&head, "content-length").as_deref(),
+            Some("10"),
+            "{head}"
+        );
+        // nothing of the file follows: the next answer's head starts where
+        // this one ended
+        rig.client
+            .send("GET /ten HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let next = rig.client.response_head().await;
+        assert!(
+            next.starts_with("HTTP/1.1 200"),
+            "a body came after the HEAD: {next}"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.method().as_deref(), Some("HEAD"));
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                map_local: 2,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+    }
+
+    /// A 204 and a 304 have no body and no length, and their data is not read
+    /// at all (`M3-D19`, the phase 4 / M3b plan's P15).
+    #[tokio::test]
+    async fn map_local_204_and_304_send_no_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let guarded = guarded_origin().await;
+        for code in ["204", "304"] {
+            let (rules, counters) = map_local_rules(
+                &format!(
+                    "[Map Local]\n^http://m\\.test/ data-type=text data=abc status-code={code}"
+                ),
+                dir.path(),
+            );
+            let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+            rig.fake.rewrite(rules);
+            rig.client
+                .send("GET /s HTTP/1.1\r\nHost: m.test\r\n\r\n")
+                .await
+                .unwrap();
+            let head = rig.client.response_head().await;
+            assert!(head.starts_with(&format!("HTTP/1.1 {code}")), "{head}");
+            assert_eq!(
+                header_value(&head, "content-length"),
+                None,
+                "{code}: {head}"
+            );
+            // nothing follows the head: the next answer's head starts where
+            // this one ended
+            rig.client
+                .send("GET /t HTTP/1.1\r\nHost: m.test\r\n\r\n")
+                .await
+                .unwrap();
+            let next = rig.client.response_head().await;
+            assert!(
+                next.starts_with(&format!("HTTP/1.1 {code}")),
+                "{code}: a body came after the head: {next}"
+            );
+            let handle = rig.fake.finished(0).await;
+            assert_eq!(handle.status(), Some(code.parse().unwrap()));
+            assert_eq!(
+                counters.snapshot(),
+                RewriteCounts {
+                    map_local: 2,
+                    ..counted(0, 0, 0, 0)
+                }
+            );
+        }
+    }
+
+    /// A file that is not there answers 502 (or closes when the generation
+    /// says no page), is recorded, and counts as failed rather than answered
+    /// (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P15, P18).
+    #[tokio::test]
+    async fn a_missing_file_answers_502() {
+        let dir = tempfile::tempdir().unwrap();
+        let guarded = guarded_origin().await;
+        let lines = "[Map Local]\n^http://m\\.test/m data-type=file data=\"missing.json\"";
+        let record = format!(
+            "Map Local: cannot read {}",
+            dir.path().join("missing.json").display()
+        );
+
+        let (rules, counters) = map_local_rules(lines, dir.path());
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /m HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        let page = String::from_utf8_lossy(&body);
+        assert!(page.contains("Connection failed"), "{page}");
+        assert!(
+            page.contains("The file a Map Local rule names cannot be read."),
+            "{page}"
+        );
+        assert_eq!(rig.fake.dials(), 0);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), Some(502));
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(record.clone()))
+        );
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Map Local failed: ^http://m\\.test/m: the file cannot be read"]
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                failed: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+        assert_eq!(guarded.accepted.load(Ordering::Relaxed), 0);
+
+        // no error page: the connection goes and nothing is said
+        let (rules, counters) = map_local_rules(lines, dir.path());
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.go_pages(Pages {
+            error: false,
+            reject: true,
+        });
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /m HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(rig.client.until_eof().await, "");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.status(), None, "no answer, no status");
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Failed(record)));
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                failed: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+        assert_eq!(guarded.accepted.load(Ordering::Relaxed), 0);
+    }
+
+    /// A directory is no file to answer with, on any of the three platforms
+    /// (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P15).
+    #[tokio::test]
+    async fn a_file_that_is_a_directory_answers_502() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("folder")).unwrap();
+        let guarded = guarded_origin().await;
+        let (rules, counters) = map_local_rules(
+            "[Map Local]\n^http://m\\.test/m data-type=file data=\"folder\"",
+            dir.path(),
+        );
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /m HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Connection failed"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rig.fake.dials(), 0);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(format!(
+                "Map Local: cannot read {}",
+                dir.path().join("folder").display()
+            )))
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                failed: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+    }
+
+    /// A file that becomes shorter between the head and the end of the answer
+    /// ends it with an error, is recorded, and still counts as answered
+    /// (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P15, P16).
+    #[tokio::test]
+    async fn a_file_that_becomes_shorter_ends_the_answer_with_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("eight.bin");
+        std::fs::write(&path, vec![b'x'; 8 << 20]).unwrap();
+        let guarded = guarded_origin().await;
+        let (rules, counters) = map_local_rules(
+            "[Map Local]\n^http://m\\.test/eight data-type=file data=\"eight.bin\"",
+            dir.path(),
+        );
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /eight HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(
+            header_value(&head, "content-length").as_deref(),
+            Some("8388608"),
+            "{head}"
+        );
+        // the client has taken nothing yet, so the file is only part way read
+        let shorter = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        shorter.set_len(0).await.unwrap();
+        drop(shorter);
+        let body = rig.client.until_close().await;
+        assert!(
+            body.len() < 8 << 20,
+            "the answer was cut short: {} bytes",
+            body.len()
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(format!(
+                "Map Local: {} became shorter while it was read",
+                path.display()
+            )))
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                map_local: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+    }
+
+    /// A URL whose data has not been downloaded answers 502, and the record
+    /// names where the data was to come from, not the path it would be read at
+    /// (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P18, P19).
+    #[tokio::test]
+    async fn url_data_that_is_not_there_answers_502() {
+        let dir = tempfile::tempdir().unwrap();
+        let guarded = guarded_origin().await;
+        let (rules, counters) = rewrite_from(
+            &crate::rewrite::config_in(
+                "[Map Local]\n\
+                 ^http://m\\.test/d data-type=file data=\"https://d.test/data.json\"",
+                dir.path(),
+            ),
+            roots_of("rurge test rewrite CA"),
+            &crate::rewrite::no_url_data,
+        );
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /d HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert!(
+            String::from_utf8_lossy(&body)
+                .contains("The data a Map Local rule names has not been downloaded yet."),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(rig.fake.dials(), 0);
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed(
+                "Map Local: the data from https://d.test/… is not available yet".to_string()
+            ))
+        );
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Map Local failed: ^http://m\\.test/d: the data is not available yet"]
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                failed: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+    }
+
+    /// A URL's data answers with its bytes, and its type comes from the last
+    /// part of the URL's path (`phase 4 M3 design 10.3`, the phase 4 / M3b
+    /// plan's P15, P17, P19).
+    #[tokio::test]
+    async fn url_data_answers_from_what_the_engine_gives() {
+        let dir = tempfile::tempdir().unwrap();
+        let guarded = guarded_origin().await;
+        let data = |_url: &str| -> crate::rewrite::UrlData {
+            Arc::new(|| Some(Bytes::from_static(b"abc")))
+        };
+        let (rules, counters) = rewrite_from(
+            &crate::rewrite::config_in(
+                "[Map Local]\n\
+                 ^http://m\\.test/d data-type=file data=\"https://d.test/data.json\"",
+                dir.path(),
+            ),
+            roots_of("rurge test rewrite CA"),
+            &data,
+        );
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /d HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(
+            header_value(&head, "content-type").as_deref(),
+            Some("application/json"),
+            "{head}"
+        );
+        assert_eq!(body, b"abc");
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                map_local: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+        assert_eq!(guarded.accepted.load(Ordering::Relaxed), 0);
+    }
+
+    /// A client that reads nothing of a `[Map Local]` file: the watchdog lets
+    /// the answer go after the idle timeout, as it does for an upstream body
+    /// (`design 8.10`, 8.11; the phase 4 / M3b plan's P16).
+    #[tokio::test]
+    async fn a_local_file_nobody_reads_is_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.bin"), vec![b'x'; 8 << 20]).unwrap();
+        let guarded = guarded_origin().await;
+        let (rules, counters) = map_local_rules(
+            "[Map Local]\n^http://m\\.test/big data-type=file data=\"big.bin\"",
+            dir.path(),
+        );
+        let mut rig = rig_timed(
+            Entry::Sniffed,
+            guarded.addr,
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+        )
+        .await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /big HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        // the head arrives, and the client reads nothing more of the file. A
+        // Map Local answer has no upstream connection to count its bytes on,
+        // so the head is what says the answer began.
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(
+            header_value(&head, "content-length").as_deref(),
+            Some("8388608"),
+            "{head}"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("client stopped reading".into()))
+        );
+        assert_eq!(handle.status(), Some(200));
+        let served = rig.served().await;
+        assert_eq!(served.routed, 1);
+        assert_eq!(
+            served.error, None,
+            "the engine dropped the connection itself"
+        );
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                map_local: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
+    }
+
+    /// A request killed while its `[Map Local]` file is still being read ends
+    /// as killed and takes the connection with it (`design 8.10`, 8.11; the
+    /// phase 4 / M3b plan's P16).
+    #[tokio::test]
+    async fn kill_ends_a_local_file_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.bin"), vec![b'x'; 8 << 20]).unwrap();
+        let guarded = guarded_origin().await;
+        let (rules, counters) = map_local_rules(
+            "[Map Local]\n^http://m\\.test/big data-type=file data=\"big.bin\"",
+            dir.path(),
+        );
+        let mut rig = rig_timed(
+            Entry::Sniffed,
+            guarded.addr,
+            // long enough that the idle deadline is not the one that ends it
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /big HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let handle = rig.fake.handle(0).await;
+        handle.kill();
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Failed("killed".into()))
+        );
+        let served = rig.served().await;
+        assert_eq!(served.routed, 1);
+        assert_eq!(
+            counters.snapshot(),
+            RewriteCounts {
+                map_local: 1,
+                ..counted(0, 0, 0, 0)
+            }
+        );
     }
 }
