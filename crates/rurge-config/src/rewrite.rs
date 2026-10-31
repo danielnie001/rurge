@@ -111,8 +111,8 @@ pub struct BodyRewrite {
 }
 
 /// What a `[Map Local]` line answers with (manual: Features › Map Local,
-/// phase 4 M3 design 10.2). `data-type` picks it, and a `file` line names
-/// either a local file or a URL whose data rurge downloads.
+/// phase 4 M3 design 10.1 and 10.3). `data-type` picks it, and a `file` line
+/// names either a local file or a URL whose data rurge downloads.
 #[derive(Clone, PartialEq, Eq)]
 pub enum MapData {
     File(PathBuf),
@@ -537,7 +537,7 @@ pub fn parse_map_local<'a>(
 
 /// One `[Map Local]` line, or nothing when it cannot be read; whatever is not
 /// kept is said with `W0012`, `W0001`, `W0033` or `W0041` (phase 4 M3 design
-/// 10.2, the phase 4 / M3b plan's P5).
+/// 10.1, the phase 4 / M3b plan's P5).
 fn read_map_local(entry: &Entry, base_dir: &Path, diags: &mut Diagnostics) -> Option<MapLocal> {
     let words = split_words(&entry.raw);
     // the first item is the expression for the URL, whether or not it looks
@@ -1444,7 +1444,7 @@ HTTP-REQUEST-JQ ^a .
 
     /// `data-type` is optional and `file` by default; a `file` line may name a
     /// URL instead, an absolute path stays as written, and each of the other
-    /// three types fills its data in its own way (phase 4 M3 design 10.2).
+    /// three types fills its data in its own way (phase 4 M3 design 10.1).
     #[test]
     fn map_local_data_types_and_defaults() {
         let dir = tempfile::tempdir().unwrap();
@@ -1500,7 +1500,7 @@ HTTP-REQUEST-JQ ^a .
 
     /// A `header` value is `name:value|name:value`, or the base64 of
     /// newline-separated header lines when it holds no `:` (manual: Features ›
-    /// Map Local, phase 4 M3 design 10.2).
+    /// Map Local, phase 4 M3 design 10.1).
     #[test]
     fn map_local_reads_both_header_forms() {
         let (rules, diags) = read_map_local(r#"^a data=x header="a: b | c:d|""#);
@@ -1534,7 +1534,7 @@ HTTP-REQUEST-JQ ^a .
     }
 
     /// Every way a `[Map Local]` line can be wrong gives `W0012` with the
-    /// message of its own, and the line is not kept (phase 4 M3 design 10.2,
+    /// message of its own, and the line is not kept (phase 4 M3 design 10.1,
     /// the phase 4 / M3b plan's P5 and P7).
     #[test]
     fn map_local_refuses() {
@@ -1595,7 +1595,7 @@ HTTP-REQUEST-JQ ^a .
 
     /// A parameter `[Map Local]` does not know is `W0001`, and the line is
     /// kept; the key is named only when it is written the way a parameter name
-    /// is, so that nothing of the line is repeated (phase 4 M3 design 10.2).
+    /// is, so that nothing of the line is repeated (phase 4 M3 design 10.1).
     #[test]
     fn map_local_unknown_keys_get_w0001() {
         let (rules, diags) = read_map_local("^a data-type=text mystery=1");
@@ -1614,7 +1614,7 @@ HTTP-REQUEST-JQ ^a .
     }
 
     /// A parameter written twice takes the later value, and its key is read
-    /// without regard to case (phase 4 M3 design 10.2).
+    /// without regard to case (phase 4 M3 design 10.1).
     #[test]
     fn a_key_written_twice_takes_the_later() {
         let (rules, diags) = read_map_local("^a data-type=text data=a data=b");
@@ -1628,7 +1628,7 @@ HTTP-REQUEST-JQ ^a .
 
     /// `Content-Length` and `Transfer-Encoding` in a `[Map Local]` `header`
     /// are dropped, the rest of the line is kept, and one `W0041` says so
-    /// (phase 4 M3 design 10.2, the phase 4 / M3b plan's P7).
+    /// (phase 4 M3 design 10.1, the phase 4 / M3b plan's P7).
     #[test]
     fn framing_headers_in_map_local_are_dropped_with_w0041() {
         let (rules, diags) = read_map_local(
@@ -1654,7 +1654,7 @@ HTTP-REQUEST-JQ ^a .
 
     /// A path in text rurge downloaded is refused with `W0033` and the line is
     /// dropped; a URL in the same text is what to write instead (phase 4 M3
-    /// design 10.2, the phase 4 / M3b plan's P6).
+    /// design 10.1, the phase 4 / M3b plan's P6).
     #[test]
     fn a_map_local_path_from_downloaded_text_is_refused() {
         let dir = tempfile::tempdir().unwrap();

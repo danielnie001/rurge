@@ -5806,7 +5806,7 @@ C = external, exec=/bin/c, local-port=1082, addresses=10.0.0.1\n\
 
     /// A downloaded text cannot name a local file as `[Map Local]` data: the
     /// line is refused with `W0033` and no path from it is kept; a URL in the
-    /// same text is what to write instead (phase 4 M3 design 10.2).
+    /// same text is what to write instead (phase 4 M3 design 10.1).
     #[test]
     fn map_local_paths_in_a_remote_include_are_refused() {
         let link = "https://example.com/map.conf";
