@@ -174,8 +174,14 @@ pub struct Pattern {
 }
 
 impl Pattern {
+    /// Compiles `source` after `dialect::translate` has rewritten the ICU
+    /// spellings that fancy-regex reads otherwise (phase 4 M3 design 5.2).
+    /// `URL-REGEX` rules, `policy-regex-filter` and `policy-priority` share
+    /// it with the rewrite sections, so all of them read those spellings as
+    /// ICU does; `source` keeps what the profile wrote.
     pub fn new(source: &str) -> Result<Pattern, String> {
-        fancy_regex::Regex::new(source)
+        let translated = crate::dialect::translate(source)?;
+        fancy_regex::Regex::new(&translated)
             .map(|regex| Pattern {
                 source: source.to_string(),
                 regex,
@@ -1346,6 +1352,21 @@ mod tests {
             matches!(&and.kind, RuleKind::And(subs) if matches!(&subs[0].kind, RuleKind::UserAgent(g) if g.source() == "a)b,c")),
             "{and}"
         );
+    }
+
+    /// A `URL-REGEX` rule reads the ICU escapes as ICU reads them, while its
+    /// source stays as it was written (phase 4 M3 design 5.2, the phase 4 /
+    /// M3a plan's P5).
+    #[test]
+    fn url_regex_rules_read_icu_escapes() {
+        let rule = parse(r"URL-REGEX,^http://x\.test/a\hb,DIRECT").unwrap();
+        let p = match &rule.kind {
+            RuleKind::UrlRegex(p) => p,
+            _ => panic!("{rule}"),
+        };
+        assert_eq!(p.source, r"^http://x\.test/a\hb", "{rule}");
+        assert!(p.regex.is_match("http://x.test/a b").unwrap(), "{rule}");
+        assert!(!p.regex.is_match("http://x.test/a1b").unwrap(), "{rule}");
     }
 
     /// The twelve `PROTOCOL` keywords (manual, Protocol and Network Rules)

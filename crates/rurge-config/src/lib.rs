@@ -8,6 +8,7 @@
 pub mod config;
 pub mod deferred;
 pub mod diagnostic;
+pub mod dialect;
 pub mod general;
 pub mod glob;
 pub mod host;
@@ -39,6 +40,7 @@ pub use config::{
 };
 pub use deferred::DeferredSections;
 pub use diagnostic::{Diagnostic, Diagnostics, ParseError, Severity, codes};
+pub use dialect::Template;
 pub use general::{
     BlockQuicGlobal, ControllerAccess, DnsServer, EncryptedDns, EncryptedDnsScheme, General,
     HijackTarget, Ipv6Vif, Listener, LogLevel, UdpFallback, UdpTest, UnknownKey,
