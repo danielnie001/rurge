@@ -4499,4 +4499,22 @@ P = https, h, 443, bob, aHVudGVyMg==, tfo=true\n";
             let _ = redact_definition(&text);
         }
     }
+
+    /// The lines of `[URL Rewrite]` and `[Header Rewrite]` are shown as
+    /// written: redaction reads every line alike and hides nothing here
+    /// (phase 4 M3 design 4.3; `docs/api/phase1.md`, the lines kept as they
+    /// stand). The new word split keeps that, and this pins it down leaves
+    /// the question of hiding these values to the project owner.
+    #[test]
+    fn rewrite_lines_are_shown_as_written() {
+        let input = concat!(
+            "[URL Rewrite]\n",
+            "^http://a\\.test/(.*) \"http://b.test/$1\" header\n",
+            "'^http://c\\.test' _ reject\n",
+            "[Header Rewrite]\n",
+            "http-request ^http://a\\.test header-add X-Trace \"v1 v2\"\n",
+            "http-response '^http://a\\.test' header-replace-regex Set-Cookie 'n=\\d+' \"n=0\"",
+        );
+        assert_eq!(redact_profile(input), input);
+    }
 }

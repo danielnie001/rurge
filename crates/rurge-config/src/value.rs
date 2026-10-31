@@ -179,6 +179,104 @@ pub fn split_list(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// One word of a line cut at the blanks outside quotes (design 4.1, the
+/// phase 4 / M3a plan's P2).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Word {
+    /// The word with the quotes taken off when the whole of it is in them.
+    pub text: String,
+    /// Where the word starts in the line, byte offset, quotes included.
+    pub start: usize,
+    /// Where it ends in the line: one past its last byte.
+    pub end: usize,
+    /// The parameter the word is: its key, and its value with its quotes taken
+    /// off once. `None` for a value, and for a word wholly in quotes.
+    pub param: Option<(String, String)>,
+    /// Whether the whole word is in quotes.
+    pub quoted: bool,
+}
+
+/// A word can be a header value: nothing of it is shown.
+impl std::fmt::Debug for Word {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Word(***)")
+    }
+}
+
+/// The words of a line, cut at the spaces and tabs outside quotes (design
+/// 4.1, the phase 4 / M3a plan's P2). A quote opens where a word starts or
+/// right after the word's first `=`; a quote without a partner runs to the
+/// end of the line; anywhere else a quote is a character. A blank line has no
+/// words.
+pub fn split_words(text: &str) -> Vec<Word> {
+    let bytes = text.as_bytes();
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = bytes.len();
+        let mut eq = None;
+        let mut at_value_start = true;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if matches!(c, b' ' | b'\t') {
+                end = i;
+                break;
+            }
+            if at_value_start && matches!(c, b'"' | b'\'') {
+                match partner(&text[i..], c as char) {
+                    Some(at) => {
+                        i += at + 1;
+                        at_value_start = false;
+                        continue;
+                    }
+                    None => {
+                        end = bytes.len();
+                        break;
+                    }
+                }
+            }
+            at_value_start = false;
+            if c == b'=' && eq.is_none() {
+                eq = Some(i);
+                at_value_start = true;
+            }
+            i += 1;
+        }
+        let raw = &text[start..end];
+        let (shown, quoted) = match wholly_quoted(raw) {
+            Some(inner) => (inner, true),
+            None => (raw.to_string(), false),
+        };
+        let param = match eq {
+            Some(at) if !quoted => {
+                let key = raw[..at - start].trim();
+                if key.is_empty() {
+                    None
+                } else {
+                    let value = raw[at - start + 1..].trim();
+                    let value = wholly_quoted(value).unwrap_or_else(|| value.to_string());
+                    Some((key.to_string(), value))
+                }
+            }
+            _ => None,
+        };
+        words.push(Word {
+            text: shown,
+            start,
+            end,
+            param,
+            quoted,
+        });
+        i = end;
+    }
+    words
+}
+
 /// `item`, one item of a list, as a value or a parameter; `eq` is where its
 /// first `=` that starts a value outside any group stands, if it has one.
 fn read_field(item: &str, eq: Option<usize>) -> Option<Field> {
@@ -708,5 +806,105 @@ mod tests {
         let (params, positional) = ParamMap::from_fields(&split_fields("alice, \"pa=ss\""));
         assert!(params.is_empty());
         assert_eq!(positional, ["alice", "pa=ss"]);
+    }
+
+    /// Blanks outside quotes cut a line into words, and the offsets keep the
+    /// words where they stand (the phase 4 / M3a plan's P2).
+    #[test]
+    fn split_words_cuts_at_blanks_outside_quotes() {
+        let words = split_words("a  b\tc");
+        let got: Vec<(&str, usize, usize, bool)> = words
+            .iter()
+            .map(|w| (w.text.as_str(), w.start, w.end, w.quoted))
+            .collect();
+        assert_eq!(
+            got,
+            [("a", 0, 1, false), ("b", 3, 4, false), ("c", 5, 6, false)]
+        );
+        assert!(words.iter().all(|w| w.param.is_none()));
+        assert!(split_words("").is_empty());
+        assert!(split_words("   ").is_empty());
+    }
+
+    /// Both quotes hold a blank: inside them the line does not cut (design
+    /// 4.1).
+    #[test]
+    fn split_words_reads_both_quotes() {
+        let words = split_words(r#""a b" 'c d' e"#);
+        let got: Vec<(&str, usize, usize, bool)> = words
+            .iter()
+            .map(|w| (w.text.as_str(), w.start, w.end, w.quoted))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a b", 0, 5, true),
+                ("c d", 6, 11, true),
+                ("e", 12, 13, false),
+            ]
+        );
+        assert!(words.iter().all(|w| w.param.is_none()));
+    }
+
+    /// Inside `"` a backslash takes the next character with it, inside `'`
+    /// nothing escapes (line-splitting design LS-D4, design 4.1).
+    #[test]
+    fn split_words_unescapes_only_inside_double_quotes() {
+        let words = split_words(r#""a\"b\\c\d" 'x\y'"#);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, r#"a"b\c\d"#);
+        assert_eq!(words[1].text, r"x\y");
+    }
+
+    /// A value in quotes right after the word's first `=` is the word's
+    /// parameter, while the word itself is still the text as written (design
+    /// 4.1, the phase 4 / M3a plan's P2).
+    #[test]
+    fn split_words_reads_a_quoted_value_after_the_first_equals() {
+        let words = split_words(r#"data="a b" k=v x"#);
+        assert_eq!(words.len(), 3);
+        assert_eq!(words[0].text, r#"data="a b""#);
+        assert_eq!(
+            words[0].param,
+            Some(("data".to_string(), "a b".to_string()))
+        );
+        assert!(!words[0].quoted);
+        assert_eq!(words[1].param, Some(("k".to_string(), "v".to_string())));
+        assert_eq!(words[1].text, "k=v");
+        assert!(words[2].param.is_none());
+        assert_eq!(words[2].text, "x");
+    }
+
+    /// A quote with no partner runs to the end of the line, and the word is
+    /// the text as written, the quote included (design 4.1).
+    #[test]
+    fn an_unpaired_quote_runs_to_the_end() {
+        let text = r#"a "b c"#;
+        let words = split_words(text);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[1].text, r#""b c"#);
+        assert_eq!(words[1].end, text.len());
+        assert!(!words[1].quoted);
+    }
+
+    /// A quote anywhere but the start of a word or right after its first `=`
+    /// is an ordinary character (design 4.1).
+    #[test]
+    fn a_quote_inside_a_word_is_a_character() {
+        let words = split_words(r#"a"b c"d"#);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, r#"a"b"#);
+        assert_eq!(words[1].text, r#"c"d"#);
+        assert!(words.iter().all(|w| !w.quoted));
+    }
+
+    /// An empty quoted word is a word: `header-add X ""` needs one (design
+    /// 4.1, the phase 4 / M3a plan's P2).
+    #[test]
+    fn an_empty_quoted_word_is_kept() {
+        let words = split_words(r#"x """#);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[1].text, "");
+        assert!(words[1].quoted);
     }
 }
