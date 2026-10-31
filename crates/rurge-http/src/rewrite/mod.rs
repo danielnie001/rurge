@@ -248,8 +248,7 @@ impl Rewrite {
         gateway: &dyn Fn() -> Option<Ipv4Addr>,
         notes: &mut Vec<Note>,
     ) -> UrlOutcome {
-        let _ = (candidates, gateway, notes);
-        UrlOutcome::Go(None)
+        url::evaluate(self, candidates, gateway, notes)
     }
 
     /// Evaluates the header rules of one direction against a URL and a header
@@ -266,11 +265,32 @@ impl Rewrite {
     }
 }
 
-/// The name a rewritten request verifies its origin against, from the
-/// `[MITM]` name rule (`phase 4 M3 design 8.2`).
-fn tls_name(host: &HostName) -> Option<ServerName<'static>> {
-    let _ = host;
-    None
+/// `text` with every non-overlapping match of `pattern` replaced by/// `template`'s expansion, from left to right (`phase 4 M3 design 5.5`).
+///
+/// `Err` when the expression hits its backtracking limit: fancy-regex's own
+/// `replace_all` would panic there, which is why this is written out
+/// (`the phase 4 / M3a plan's P3`).
+pub(super) fn replace_all(
+    pattern: &rurge_config::rule::Pattern,
+    template: &rurge_config::dialect::Template,
+    text: &str,
+) -> Result<String, ()> {
+    let groups = pattern.regex.captures_len() - 1;
+    let mut out = String::with_capacity(text.len());
+    let mut end = 0;
+    for captures in pattern.regex.captures_iter(text) {
+        let captures = captures.map_err(|_| ())?;
+        let whole = captures.get(0).expect("every match is group zero");
+        out.push_str(&text[end..whole.start()]);
+        template.expand(
+            &|group| captures.get(group).map(|found| found.as_str()),
+            groups,
+            &mut out,
+        );
+        end = whole.end();
+    }
+    out.push_str(&text[end..]);
+    Ok(out)
 }
 
 /// One `[URL Rewrite]` line, ready to evaluate. Nothing in it can fail: the
