@@ -265,8 +265,9 @@ pub const BODY_BACKTRACK_LIMIT: usize = 100_000_000;
 /// A `[Body Rewrite]` expression (`phase 4 M3 design 5.4`).
 ///
 /// Two engines compile it. `regex` reads the start and end of a line the way
-/// the manual wants: `\r` and `\n` both end a line, neither is matched in the
-/// middle of one, and `.` matches neither. fancy-regex reads the lookarounds
+/// the manual wants: `^` and `$` both end a line at `\r` and at `\n`, neither
+/// matches between the `\r` and the `\n` of a CRLF pair, and `.` matches
+/// neither. fancy-regex reads the lookarounds
 /// and back references `regex` refuses, but its multi-line mode knows only
 /// `\n`, so a pattern that lands there counts the `\r` of a CRLF line into the
 /// line — a difference rurge registers (phase 4 M3 design 5.4).

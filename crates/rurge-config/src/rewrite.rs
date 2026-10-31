@@ -91,8 +91,8 @@ pub struct BodyRewrite {
     pub direction: Direction,
     /// The expression for the URL the line takes effect on.
     pub pattern: Pattern,
-    /// The body pattern and the replacement of each consecutive replacement,
-    /// in order.
+    /// Each pair is a body pattern and the replacement it writes; the pairs
+    /// apply in the order written, one after the other.
     pub pairs: Vec<(BodyPattern, Template)>,
     pub span: Span,
 }
@@ -860,12 +860,9 @@ http-response ^http://example.com header-replace-regex Date 2022 2023
     /// 9.1).
     #[test]
     fn body_rewrite_reads_the_manual_examples() {
-        let text = "\
-http-request ^http(s)?://example\\.com value abc
-\
-http-response ^http(s)?://example\\.com documents Surge
-\
-http-response ^https?://example\\.com/ regex1 replacement1 regex2 replacement2
+        let text = r"http-request ^http(s)?://example\.com value abc
+http-response ^http(s)?://example\.com documents Surge
+http-response ^https?://example\.com/ regex1 replacement1 regex2 replacement2
 ";
         let (rules, diags) = read_body(text);
         assert!(diags.is_empty(), "{:?}", said(&diags));
@@ -977,11 +974,9 @@ http-response ^https?://example\\.com/ regex1 replacement1 regex2 replacement2
     /// whatever it writes after the direction (phase 4 M3 design 13).
     #[test]
     fn jq_lines_are_ignored_with_w0042() {
-        let text = "\
-http-response-jq ^http://httpbingo.org/anything '.headers |= with_entries(select(.key | test(\"^X-\") | not))'
-\
+        let text = r#"http-response-jq ^http://httpbingo.org/anything '.headers |= with_entries(select(.key | test("^X-") | not))'
 HTTP-REQUEST-JQ ^a .
-";
+"#;
         let (rules, diags) = read_body(text);
         assert!(rules.is_empty());
         assert_eq!(diags.len(), 2, "{:?}", said(&diags));

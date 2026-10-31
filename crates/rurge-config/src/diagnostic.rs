@@ -287,7 +287,7 @@ pub mod codes {
     pub const W_REWRITE_FRAMING: &str = "W0041";
     /// A `[Body Rewrite]` line in the jq form: this build has no jq, so the
     /// line is ignored (phase 4 M3 design 13; M3c waits for the owner's
-    /// answer on new dependencies).
+    /// answer to phase 4 design Q4).
     pub const W_JQ_REWRITE_UNAVAILABLE: &str = "W0042";
     pub const I_LEGACY_MIGRATED: &str = "I0001";
     pub const I_LINE_DISABLED: &str = "I0002";
@@ -344,10 +344,10 @@ pub mod codes {
     /// - `W0031`: the cipher of an imported line is not the reader's to
     ///   change, and the message of the profile's own line says to use an AEAD
     ///   cipher.
-    /// - `W0042`: the message already says the line has no effect, and nothing
-    ///   in the profile but removing the line changes that.
     /// - `W0039`: no one sentence fits every problem it reports — each of
     ///   them says its own remedy in the message.
+    /// - `W0042`: the message already says the line has no effect, and nothing
+    ///   in the profile but removing the line changes that.
     /// - `I0001`, `I0002`, `I0003`, `I0004`, `I0005`: they inform.
     pub fn hint(code: &str) -> Option<&'static str> {
         Some(match code {
