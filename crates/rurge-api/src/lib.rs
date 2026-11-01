@@ -104,6 +104,17 @@ pub(crate) fn router(key: String, ctx: ApiContext) -> Router {
         .route("/v1/requests/kill", post(routes::requests::kill))
         .route("/v1/traffic", get(routes::traffic::traffic))
         .route("/v1/rurge/http", get(routes::rurge_http::http))
+        .route("/v1/rurge/capture", get(routes::capture::status))
+        .route("/v1/rurge/capture/sessions", get(routes::capture::sessions))
+        .route(
+            "/v1/rurge/capture/sessions/{name}",
+            get(routes::capture::session),
+        )
+        .route(
+            "/v1/rurge/capture/entries/{id}",
+            get(routes::capture::entry),
+        )
+        .route("/v1/rurge/capture/clear", post(routes::capture::clear))
         .route("/v1/mitm/ca", get(routes::mitm::ca))
         .route("/v1/dns", get(routes::dns::dns))
         .route("/v1/dns/flush", post(routes::dns::flush))

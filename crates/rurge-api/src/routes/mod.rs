@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod dns;
 pub mod features;
 pub mod geoip;

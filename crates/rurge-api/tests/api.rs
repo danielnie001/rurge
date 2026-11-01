@@ -3,7 +3,8 @@
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::Request;
+use hyper::header::{self, HeaderValue};
+use hyper::{HeaderMap, Method, Request, StatusCode, Version};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use rurge_api::{ApiContext, BAN_FAILURES, ServerFuture, serve, serve_tls};
@@ -3485,4 +3486,613 @@ async fn requests_carry_the_method_the_url_and_the_status_code() {
         text.contains("\"method\":\"GET\",\"url\":\"http://ads.test/\",\"statusCode\":null"),
         "{text}"
     );
+}
+
+/// An entry the tests store themselves: no request of theirs goes through the
+/// engine, so the store is filled with `put`, which only the tests of other
+/// crates have (the phase 4 / M4a plan's P2). Every field is set to something
+/// a test can recognise; a test changes the ones it is about.
+fn capture_entry(id: u64, session: &str) -> rurge_engine::capture::Entry {
+    use rurge_engine::capture::{Body, Entry, Head, Outcome, ResponseHead, Timings};
+    let mut request_headers = HeaderMap::new();
+    request_headers.insert(header::HOST, HeaderValue::from_static("a.test"));
+    request_headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    Entry {
+        id,
+        session: Arc::from(session),
+        started: UNIX_EPOCH + Duration::from_millis(1_761_984_000_000),
+        request: Head {
+            method: Method::GET,
+            url: "http://a.test/one?x=1".to_string(),
+            version: Version::HTTP_11,
+            headers: request_headers,
+        },
+        request_body: Body::empty(),
+        response: Some(ResponseHead {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers: response_headers,
+        }),
+        response_body: Body {
+            data: Bytes::from_static(b"hi"),
+            size: 2,
+            truncated: None,
+        },
+        timings: Timings {
+            connect: Some(Duration::from_millis(3)),
+            dns: None,
+            wait: Some(Duration::from_millis(20)),
+            receive: Some(Duration::from_millis(12)),
+            total: Duration::from_millis(35),
+            reused: false,
+        },
+        remote: Some(SocketAddr::from(([127, 0, 0, 1], 8080))),
+        outcome: Outcome::Completed,
+        error: None,
+        rule: Some("DOMAIN,a.test,DIRECT".to_string()),
+        policy: vec!["DIRECT".to_string()],
+        notes: Vec::new(),
+    }
+}
+
+/// What the store holds, as `GET /v1/rurge/capture` gives it (`phase 4 M4
+/// design 7.1`): the two limits it was made with, what it uses, and the four
+/// counts.
+#[tokio::test]
+async fn the_capture_status_says_the_limits_and_the_counts() {
+    let api = api().await;
+    assert_eq!(
+        get(&api, "/v1/rurge/capture").await,
+        (
+            200,
+            json!({
+                "limits": { "total": 104857600, "body": 5242880 },
+                "used": 0,
+                "entries": 0,
+                "stored": 0,
+                "evicted": 0,
+                "dropped": 0,
+                "truncated": 0,
+            })
+        )
+    );
+    assert!(api.engine.capture().put(capture_entry(1, "a")));
+    assert!(api.engine.capture().put(capture_entry(2, "a")));
+    let (status, body) = get(&api, "/v1/rurge/capture").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["entries"], 2, "{body}");
+    assert_eq!(body["stored"], 2, "{body}");
+    let used = api.engine.capture().status().used;
+    assert_ne!(used, 0);
+    assert_eq!(body["used"].as_u64(), Some(used), "{body}");
+}
+
+/// The sessions that have entries, by name, with how many and how much they
+/// cost (`phase 4 M4 design 7.2`).
+#[tokio::test]
+async fn capture_sessions_are_listed_by_name() {
+    let api = api().await;
+    assert!(api.engine.capture().put(capture_entry(1, "b")));
+    assert!(api.engine.capture().put(capture_entry(2, "a")));
+    assert!(api.engine.capture().put(capture_entry(3, "a")));
+    let (status, body) = get(&api, "/v1/rurge/capture/sessions").await;
+    assert_eq!(status, 200, "{body}");
+    let listed = body.as_array().expect("an array");
+    assert_eq!(listed.len(), 2, "{body}");
+    assert_eq!(listed[0]["name"], "a", "{body}");
+    assert_eq!(listed[1]["name"], "b", "{body}");
+    assert_eq!(listed[0]["entries"], 2, "{body}");
+    assert_eq!(listed[1]["entries"], 1, "{body}");
+    // the two entries of `a` are the same as the one of `b`, so they cost
+    // twice as much
+    let one = listed[1]["bytes"].as_u64().expect("bytes");
+    assert_ne!(one, 0, "{body}");
+    assert_eq!(listed[0]["bytes"].as_u64(), Some(one * 2), "{body}");
+}
+
+/// The entries of a session, from the newest to the oldest, as the summary
+/// line of `phase 4 M4 design 7.3` has them; `limit` as
+/// `/v1/requests/recent` takes it.
+#[tokio::test]
+async fn a_capture_session_lists_its_entries_newest_first() {
+    use rurge_engine::capture::{Body, Outcome, Truncated};
+    let api = api().await;
+    assert!(api.engine.capture().put(capture_entry(1, "a")));
+    assert!(api.engine.capture().put(capture_entry(2, "a")));
+    // the newest one was refused without an answer, and its request body was
+    // larger than what the store kept of it
+    let mut newest = capture_entry(3, "a");
+    newest.request_body = Body {
+        data: Bytes::from_static(b"abc"),
+        size: 900,
+        truncated: Some(Truncated::Limit),
+    };
+    newest.response = None;
+    newest.response_body = Body::empty();
+    newest.outcome = Outcome::Failed;
+    assert!(api.engine.capture().put(newest));
+
+    let (status, body) = get(&api, "/v1/rurge/capture/sessions/a").await;
+    assert_eq!(status, 200, "{body}");
+    let listed = body.as_array().expect("an array");
+    assert_eq!(listed.len(), 3, "{body}");
+    assert_eq!(
+        listed.iter().map(|e| e["id"].clone()).collect::<Vec<_>>(),
+        vec![json!(3), json!(2), json!(1)],
+        "{body}"
+    );
+    assert_eq!(
+        listed[0],
+        json!({
+            "id": 3,
+            "startedMs": 1761984000000u64,
+            "method": "GET",
+            "url": "http://a.test/one?x=1",
+            "status": null,
+            "outcome": "failed",
+            "requestBodySize": 900,
+            "responseBodySize": 0,
+            "truncated": true,
+            "totalMs": 35,
+        }),
+        "{body}"
+    );
+    assert_eq!(listed[1]["status"], 200, "{body}");
+    assert_eq!(listed[1]["outcome"], "completed", "{body}");
+    assert_eq!(listed[1]["requestBodySize"], 0, "{body}");
+    assert_eq!(listed[1]["responseBodySize"], 2, "{body}");
+    assert_eq!(listed[1]["truncated"], false, "{body}");
+
+    let (status, body) = get(&api, "/v1/rurge/capture/sessions/a?limit=1").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body[0]["id"], 3, "{body}");
+
+    assert_eq!(
+        get(&api, "/v1/rurge/capture/sessions/a?limit=0").await,
+        (400, json!({ "error": "limit must be at least 1" }))
+    );
+    assert_eq!(
+        get(&api, "/v1/rurge/capture/sessions/nope").await,
+        (404, json!({ "error": "unknown capture session `nope`" }))
+    );
+}
+
+/// An id that is not a number is a bad request, and one that no entry has is
+/// not found (`phase 4 M4 design 7.5`).
+#[tokio::test]
+async fn entry_ids_are_numbers_of_entries_that_are_there() {
+    let api = api().await;
+    assert!(api.engine.capture().put(capture_entry(7, "a")));
+    assert_eq!(
+        get(&api, "/v1/rurge/capture/entries/abc").await,
+        (400, json!({ "error": "entry id must be a number" }))
+    );
+    assert_eq!(
+        get(&api, "/v1/rurge/capture/entries/99").await,
+        (404, json!({ "error": "unknown capture entry 99" }))
+    );
+    assert_eq!(get(&api, "/v1/rurge/capture/entries/7").await.0, 200);
+}
+
+/// One entry as `phase 4 M4 design 7.5` gives it: every key, the four
+/// credential headers masked, a header value that is no text, and a body the
+/// store kept a part of. The second entry is a refusal that answered nothing.
+#[tokio::test]
+async fn an_entry_is_shown_whole_with_four_headers_masked() {
+    use rurge_engine::capture::{Body, Outcome, Truncated};
+    use rurge_proto::RejectKind;
+
+    /// What the answer says the value of every `name` header is.
+    fn values_of(headers: &Value, name: &str) -> Vec<String> {
+        headers
+            .as_array()
+            .expect("an array of headers")
+            .iter()
+            .filter(|h| h["name"] == name)
+            .map(|h| h["value"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    let api = api().await;
+    let mut entry = capture_entry(42, "default");
+    entry.request.headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+    );
+    entry.request.headers.insert(
+        header::PROXY_AUTHORIZATION,
+        HeaderValue::from_static("Basic cHJveHk6cGFzcw=="),
+    );
+    entry
+        .request
+        .headers
+        .append(header::COOKIE, HeaderValue::from_static("sid=1"));
+    entry
+        .request
+        .headers
+        .append(header::COOKIE, HeaderValue::from_static("sid=2"));
+    entry
+        .request
+        .headers
+        .insert("x-other", HeaderValue::from_static("v"));
+    entry.request.headers.insert(
+        "x-bytes",
+        HeaderValue::from_bytes(b"a\xffb").expect("a header value may hold 0xff"),
+    );
+    let response = entry.response.as_mut().expect("a response");
+    response.headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_static("sid=3; Path=/"),
+    );
+    entry.response_body = Body {
+        data: Bytes::from_static(b"abcde"),
+        size: 1234,
+        truncated: Some(Truncated::Limit),
+    };
+    let request_names: Vec<String> = entry
+        .request
+        .headers
+        .iter()
+        .map(|(name, _)| name.as_str().to_string())
+        .collect();
+    let response_names: Vec<String> = entry
+        .response
+        .as_ref()
+        .expect("a response")
+        .headers
+        .iter()
+        .map(|(name, _)| name.as_str().to_string())
+        .collect();
+    assert!(api.engine.capture().put(entry));
+
+    let mut refused = capture_entry(43, "default");
+    refused.response = None;
+    refused.outcome = Outcome::Rejected(RejectKind::Drop);
+    refused.error = Some("dropped by the rules".to_string());
+    assert!(api.engine.capture().put(refused));
+
+    let (status, body) = get(&api, "/v1/rurge/capture/entries/42").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], 42, "{body}");
+    assert_eq!(body["session"], "default", "{body}");
+    assert_eq!(body["startedMs"], 1761984000000u64, "{body}");
+    assert_eq!(body["request"]["method"], "GET", "{body}");
+    assert_eq!(body["request"]["url"], "http://a.test/one?x=1", "{body}");
+    assert_eq!(body["request"]["version"], "HTTP/1.1", "{body}");
+    assert_eq!(
+        body["request"]["body"],
+        json!({ "size": 0, "stored": 0, "truncated": null, "base64": "" }),
+        "{body}"
+    );
+    assert_eq!(
+        body["response"]["body"],
+        json!({ "size": 1234, "stored": 5, "truncated": "limit", "base64": "YWJjZGU=" }),
+        "{body}"
+    );
+    assert_eq!(body["response"]["status"], 200, "{body}");
+    assert_eq!(body["response"]["version"], "HTTP/1.1", "{body}");
+
+    // the headers come in the order the map keeps them in, as name and value
+    let request = body["request"]["headers"].as_array().expect("an array");
+    assert_eq!(
+        request
+            .iter()
+            .map(|h| h["name"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        request_names,
+        "{body}"
+    );
+    let response_headers = body["response"]["headers"].as_array().expect("an array");
+    assert_eq!(
+        response_headers
+            .iter()
+            .map(|h| h["name"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        response_names,
+        "{body}"
+    );
+    let headers = &body["request"]["headers"];
+    assert_eq!(values_of(headers, "authorization"), ["***"], "{body}");
+    assert_eq!(values_of(headers, "proxy-authorization"), ["***"], "{body}");
+    assert_eq!(values_of(headers, "cookie"), ["***", "***"], "{body}");
+    assert_eq!(
+        values_of(&body["response"]["headers"], "set-cookie"),
+        ["***"],
+        "{body}"
+    );
+    assert_eq!(values_of(headers, "x-other"), ["v"], "{body}");
+    assert_eq!(values_of(headers, "host"), ["a.test"], "{body}");
+    assert_eq!(
+        values_of(headers, "x-bytes"),
+        ["a\u{fffd}b"],
+        "a value that is no text is shown with the replacement character: {body}"
+    );
+
+    assert_eq!(
+        body["timings"],
+        json!({
+            "connectMs": 3,
+            "dnsMs": null,
+            "waitMs": 20,
+            "receiveMs": 12,
+            "totalMs": 35,
+            "reused": false,
+        }),
+        "{body}"
+    );
+    assert_eq!(body["remoteAddr"], "127.0.0.1:8080", "{body}");
+    assert_eq!(body["outcome"], "completed", "{body}");
+    assert_eq!(body["rejectKind"], Value::Null, "{body}");
+    assert_eq!(body["error"], Value::Null, "{body}");
+    assert_eq!(body["rule"], "DOMAIN,a.test,DIRECT", "{body}");
+    assert_eq!(body["policy"], json!(["DIRECT"]), "{body}");
+    assert_eq!(body["notes"], json!([]), "{body}");
+    assert!(
+        body["request"]["body"].get("decoded").is_none()
+            && body["response"]["body"].get("decoded").is_none(),
+        "without `decode` a body has no `decoded`: {body}"
+    );
+
+    let (status, refused) = get(&api, "/v1/rurge/capture/entries/43").await;
+    assert_eq!(status, 200, "{refused}");
+    assert_eq!(refused["response"], Value::Null, "{refused}");
+    assert_eq!(refused["outcome"], "rejected", "{refused}");
+    assert_eq!(refused["rejectKind"], "REJECT-DROP", "{refused}");
+    assert_eq!(refused["error"], "dropped by the rules", "{refused}");
+}
+
+/// `?decode=true` undoes the `content-encoding` of both bodies, and says why
+/// it cannot for the ones it leaves as they are (`phase 4 M4 design 7.5`).
+#[tokio::test]
+async fn decode_undoes_gzip_and_says_why_it_cannot() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use rurge_engine::capture::{Body, Truncated};
+    use std::io::Write;
+
+    fn gzipped(data: &[u8]) -> Bytes {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).expect("in memory");
+        Bytes::from(encoder.finish().expect("in memory"))
+    }
+
+    /// An entry whose response is `data` behind `encoding`, if any.
+    fn with_response_body(
+        id: u64,
+        encoding: Option<&'static str>,
+        data: Bytes,
+    ) -> rurge_engine::capture::Entry {
+        let mut entry = capture_entry(id, "a");
+        if let Some(name) = encoding {
+            entry
+                .response
+                .as_mut()
+                .expect("a response")
+                .headers
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static(name));
+        }
+        entry.response_body = Body {
+            size: data.len() as u64,
+            data,
+            truncated: None,
+        };
+        entry
+    }
+
+    let api = api().await;
+    let plain = b"hello hello hello".to_vec();
+    let gz = gzipped(&plain);
+    assert!(
+        api.engine
+            .capture()
+            .put(with_response_body(1, Some("gzip"), gz.clone()))
+    );
+    assert!(api.engine.capture().put(with_response_body(
+        2,
+        Some("br"),
+        Bytes::from_static(b"compressed stuff")
+    )));
+    let mut truncated =
+        with_response_body(3, Some("gzip"), Bytes::copy_from_slice(&gz[..gz.len() / 2]));
+    truncated.response_body.truncated = Some(Truncated::Limit);
+    assert!(api.engine.capture().put(truncated));
+    assert!(api.engine.capture().put(with_response_body(
+        4,
+        None,
+        Bytes::from_static(b"plain bytes")
+    )));
+
+    let (status, body) = get(&api, "/v1/rurge/capture/entries/1?decode=true").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["response"]["body"],
+        json!({
+            "size": gz.len(),
+            "stored": gz.len(),
+            "truncated": null,
+            "base64": STANDARD.encode(&plain),
+            "decoded": true,
+            "notDecoded": null,
+        }),
+        "{body}"
+    );
+    assert_eq!(
+        body["request"]["body"],
+        json!({
+            "size": 0,
+            "stored": 0,
+            "truncated": null,
+            "base64": "",
+            "decoded": false,
+            "notDecoded": null,
+        }),
+        "a request body with no encoding is not decoded: {body}"
+    );
+
+    let (status, body) = get(&api, "/v1/rurge/capture/entries/2?decode=true").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["response"]["body"]["decoded"], false, "{body}");
+    assert_eq!(
+        body["response"]["body"]["notDecoded"], "content-encoding br is not supported",
+        "{body}"
+    );
+    assert_eq!(
+        body["response"]["body"]["base64"],
+        STANDARD.encode(b"compressed stuff"),
+        "{body}"
+    );
+
+    let (status, body) = get(&api, "/v1/rurge/capture/entries/3?decode=true").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["response"]["body"]["decoded"], false, "{body}");
+    assert_eq!(
+        body["response"]["body"]["notDecoded"], "the body was truncated",
+        "{body}"
+    );
+
+    let (status, body) = get(&api, "/v1/rurge/capture/entries/4?decode=true").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["response"]["body"],
+        json!({
+            "size": 11,
+            "stored": 11,
+            "truncated": null,
+            "base64": STANDARD.encode(b"plain bytes"),
+            "decoded": false,
+            "notDecoded": null,
+        }),
+        "{body}"
+    );
+
+    // `decode=false` is the same as none
+    let (status, plain_answer) = get(&api, "/v1/rurge/capture/entries/1").await;
+    assert_eq!(status, 200, "{plain_answer}");
+    let (status, body) = get(&api, "/v1/rurge/capture/entries/1?decode=false").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["response"]["body"], plain_answer["response"]["body"],
+        "{body}"
+    );
+    assert_eq!(
+        body["response"]["body"]["base64"],
+        STANDARD.encode(&gz),
+        "{body}"
+    );
+    assert!(body["response"]["body"].get("decoded").is_none(), "{body}");
+
+    assert_eq!(
+        get(&api, "/v1/rurge/capture/entries/1?decode=yes").await,
+        (400, json!({ "error": "decode must be true or false" }))
+    );
+}
+
+/// `POST /v1/rurge/capture/clear` takes one session or all of them, and the
+/// four counts stay (`phase 4 M4 design 7.6`).
+#[tokio::test]
+async fn clearing_takes_one_session_or_all() {
+    /// The body the endpoint takes nothing from, fixed.
+    const BAD_BODY: &str =
+        "the body must be a JSON object; \"session\", when given, must be a string";
+
+    let api = api().await;
+    let fill = || {
+        let store = api.engine.capture();
+        assert!(store.put(capture_entry(1, "a")));
+        assert!(store.put(capture_entry(2, "a")));
+        assert!(store.put(capture_entry(3, "b")));
+    };
+
+    // no body at all is every session
+    fill();
+    let (status, _, bytes) =
+        call_text(api.addr, "POST", "/v1/rurge/capture/clear", Some(KEY), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).expect("a JSON answer"),
+        json!({ "cleared": 3 })
+    );
+    assert!(api.engine.capture().sessions().is_empty());
+    assert_eq!(
+        api.engine.capture().status().stored,
+        3,
+        "clearing does not reset the counts"
+    );
+
+    fill();
+    assert_eq!(
+        post(&api, "/v1/rurge/capture/clear", json!({})).await,
+        (200, json!({ "cleared": 3 }))
+    );
+    assert_eq!(api.engine.capture().status().entries, 0);
+
+    fill();
+    assert_eq!(
+        post(&api, "/v1/rurge/capture/clear", json!({ "session": "a" })).await,
+        (200, json!({ "cleared": 2 }))
+    );
+    assert_eq!(
+        api.engine
+            .capture()
+            .sessions()
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect::<Vec<_>>(),
+        ["b"]
+    );
+    assert_eq!(
+        post(
+            &api,
+            "/v1/rurge/capture/clear",
+            json!({ "session": "nope" })
+        )
+        .await,
+        (200, json!({ "cleared": 0 })),
+        "a session no entry has clears nothing, and is no 404"
+    );
+
+    for body in [json!({ "session": 5 }), json!([])] {
+        let (status, answer) = post(&api, "/v1/rurge/capture/clear", body).await;
+        assert_eq!((status, answer), (400, json!({ "error": BAD_BODY })));
+    }
+    let (status, _, bytes) = call_text(
+        api.addr,
+        "POST",
+        "/v1/rurge/capture/clear",
+        Some(KEY),
+        Some("x".to_string()),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).expect("a JSON answer"),
+        json!({ "error": BAD_BODY })
+    );
+    assert_eq!(
+        api.engine.capture().status().stored,
+        9,
+        "nothing cleared the counts"
+    );
+}
+
+/// A session name with a space, a slash or characters outside ASCII reaches
+/// its session through the path, percent-encoded (`phase 4 M4 design 7.3`).
+#[tokio::test]
+async fn odd_session_names_are_reached_through_the_path() {
+    let api = api().await;
+    assert!(api.engine.capture().put(capture_entry(1, "a b/c")));
+    assert!(api.engine.capture().put(capture_entry(2, "调试")));
+
+    let (status, body) = get(&api, "/v1/rurge/capture/sessions/a%20b%2Fc").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body[0]["id"], 1, "{body}");
+
+    let (status, body) = get(&api, "/v1/rurge/capture/sessions/%E8%B0%83%E8%AF%95").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body[0]["id"], 2, "{body}");
 }

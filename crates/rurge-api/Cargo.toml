@@ -11,6 +11,7 @@ repository.workspace = true
 rurge-config.workspace = true
 rurge-engine.workspace = true
 axum.workspace = true
+base64.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,7 +27,8 @@ rurge-proto = { workspace = true, features = ["testing"] }
 rurge-net = { workspace = true, features = ["testing"] }
 rurge-rules.workspace = true
 rurge-policy.workspace = true
-rurge-http.workspace = true
+rurge-http = { workspace = true, features = ["testing"] }
+flate2.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
