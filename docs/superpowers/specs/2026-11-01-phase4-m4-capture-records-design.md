@@ -595,3 +595,21 @@ pub enum Routed<R, K> {
 7. 第 4.3 节第 1 条"再加固定的 512 字节（条目本身、队列的一格、几个 `String` 与 `Vec` 的头；第 4.5 节量过之后可以改这个数）" → 7168。第 4.5 节量过（调试构建、一台机器上的一次运行，不是 CI；量法照第 6 条）：512 时装满比基线多出的与总量之比是 1.5207，照计划 P15 的式子改成 7168 之后是 1.0266；修正轮 1 让存进去的条目复制自己的头之后重跑一次是 1.0843，不再改。括号里说的组成也不准了：多出的大半是两张 `HeaderMap` 超出每行 32 字节的那部分，只对量的那种形状（每侧 14 行头、4 KiB 正文）成立，头的行数多得多的条目实际的占用仍比账多（`crates/rurge-http/src/capture/mod.rs` 里 `ENTRY_OVERHEAD` 的注释）。缺省的上限不因此改。以修正记录第 76 行为准（重跑的数见第 81 行）。
 
 8. 第 5.2 节第 2 条"出站模式是直连或全局代理、或会话属于 `external` 程序时，`choose_policy_with` 不求规则就定了策略" → 全局代理只在全局策略设了而且认得时不求规则；全局策略没设或不认得时，`choose_policy_with` 告警一次（`outbound mode is proxy but the global policy is unset or unknown; routing by rules`）、照规则走，命中的那一行的 `always-capture` 照读。这是 M4a 之前就有的行为，不是执行期改的，正文少了这个限定；`docs/api/phase4.md` 的「M4a　抓包」一节照代码写了。以修正记录第 88 行 ③ 为准（改文档的是第 89 行）。
+
+写 M4b 计划时（`docs/superpowers/plans/2026-11-02-phase4-m4b-records-plan.md`，对着 `33efe98` 核对）：
+
+9. 第 2 节 M4b 的大纲 → 计划的任务 0 ～ 8、9a、9b：三个新字段分成任务 1（句柄、记录与 API）与任务 2（引擎里数两个正文）；UDP 的远端（任务 5）排在复用、共用的 TCP 载体（任务 6）与 QUIC 一族、WireGuard（任务 7）之前——任务 7 要用任务 5 的 `Datagram::far_end`，记录读 `Trail` 时不再分 TCP 与 UDP 也随 UDP 一起改；`Trail` 的在途查找与 `trail::current()`（任务 4）在它们之前；文档收尾分成 9a（手工清单、`docs/api/phase4.md`、`docs/testing.md`）与 9b（其余）。以计划 P1 为准。
+
+10. 第 10.2 节的表"嗅探判为既不是 HTTP 也不是 TLS"一行只管 `Sniffed::Other`：客户端在嗅探时关掉的（`Sniffed::Closed`）没有表示任何协议，不写备注（`force-http-engine-hosts` 命中时照旧进引擎）；嗅探等到时限的，`force-http-engine-hosts` 命中也照旧拨号，照写"sniffing timed out"。以计划 P6 ④ 为准。
+
+11. 第 10.2 节第 1 条"暂停、fake 地址背后没有名字、被预匹配拒绝的会话本来就被拒绝或失败、各有自己的说明，也不写" → 前两种在 `sniffable_session` 里排在两张名单之前，照"最先成立的那一条"（M4-D31）本来就不写；预匹配排在名单之后，所以只有名单没有命中、最先成立的是预匹配的不写，命中 `always-raw-tcp-*` 而又被预匹配的规则拒绝的照写那一句。原因在拨号建句柄时写，之后被任何规则拒绝的都带着它（登记）。以计划 P6 ⑤ 为准。
+
+12. 第 10.2 节第 2 条留给计划核定的次序（V14）定为：名单 → 开关 → CA → 来源 → 名字 → ALPN。`Mitm::decides` 的次序随之改成名单 → 来源 → 名字 → ALPN，交回五种（`Decrypt`、`NotListed`、`SourceBlocked`、`NoCertificate`、`AlpnMismatch`）；只有标签变了，解不解密与今天相同。以计划 P6 ①、③ 为准。
+
+13. 第 10.3 节只说了客户端的 UDP 流 → rurge 自己的 UDP 会话（DoQ、DoH3 的载体）同样照新口径：`wrap_internal_udp` 用载体的 `far_end()` 写或清会话的 `Trail`，直连的是服务端的地址，经 socks5 的是中继。以计划 P8 ④ 为准。
+
+14. 第 10.3 节的表 QUIC 一族那一行"直连的是这条 QUIC 连接此刻的远端（quinn 的 `remote_address()`；端口跳跃时是此刻的那个端口）" → 不用 quinn 的 `remote_address()`：跳端口时它是第一个端口，经承载时是替身 `192.0.2.1:443`。改由 `Path` 记下自己的远端（`rurge_net::quic::FarEnd`：直连是那个地址，跳端口的是此刻的端口，经承载的是承载的远端），连接带着它，`Session` 每次借出时写进会话的 `Trail`。以计划 P10 为准。
+
+15. 第 10.1 节没有说 `HEAD`：hyper 1.11.1 的 HTTP/1.1 服务端不写 HEAD 应答的正文，HTTP/2 服务端照样发出去。所以 rurge 自己的页答 HEAD 时，HTTP/1.1 上 `responseBodyBytes` 是 0，HTTP/2 上是页的长度（照实数，不改 hyper 的行为；登记）；上游与 Map Local 对 HEAD 的应答本来没有正文，两种版本都是 0。以计划 P5 ③ 为准。
+
+16. 第 10.3 节的表 snell 一行"重拨之后写新的对端" → 重拨在会话的 `Trail` 下跑（`Retry` 握着它），重拨里的查找也算进这条会话的 `dnsMs`（登记：那是这条会话花的时间）。以计划 P9 ② 为准。
