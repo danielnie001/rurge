@@ -3,6 +3,9 @@
 
 mod auth;
 mod error;
+// the handler of the phase 4 / M4a plan's task 6 (b) uses it
+#[allow(dead_code)]
+mod har;
 mod linger;
 mod routes;
 mod tls;

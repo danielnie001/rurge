@@ -260,7 +260,7 @@ fn response_json(head: &ResponseHead, body: &Body, decode: bool, body_limit: u64
 /// a value: the bytes of a value that are no UTF-8 are shown as U+FFFD, and
 /// the values of the four credential headers are `***`, never read out (the
 /// store keeps them as they came).
-fn headers_json(headers: &HeaderMap) -> Value {
+pub(crate) fn headers_json(headers: &HeaderMap) -> Value {
     Value::Array(
         headers
             .iter()
@@ -311,7 +311,7 @@ fn body_json(body: &Body, decoded: Option<Result<Option<Bytes>, NotDecoded>>) ->
 }
 
 /// How a request ended (`phase 4 M4 design 7.3`).
-fn outcome_name(outcome: Outcome) -> &'static str {
+pub(crate) fn outcome_name(outcome: Outcome) -> &'static str {
     match outcome {
         Outcome::Completed => "completed",
         Outcome::Upgraded => "upgraded",
@@ -321,7 +321,7 @@ fn outcome_name(outcome: Outcome) -> &'static str {
 }
 
 /// The REJECT flavour of a refused request, `null` for the others.
-fn reject_kind(outcome: Outcome) -> Option<&'static str> {
+pub(crate) fn reject_kind(outcome: Outcome) -> Option<&'static str> {
     match outcome {
         Outcome::Rejected(kind) => Some(kind.name()),
         _ => None,
