@@ -3895,6 +3895,283 @@ mod run {
         }
     }
 
+    /// `spawn_command`, for a daemon whose first lines matter: every line up to
+    /// the one `api on http://` begins is handed back, with the port of that
+    /// line. `spawn_command` cannot do this: it reads while it waits for the
+    /// two `listening on` lines and drops what came before them, and the
+    /// warning about a lowered body size is written before the API starts.
+    fn lines_until_the_api(mut cmd: Command) -> (Daemon, Vec<String>, u16) {
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let lines = forward_lines(child.stdout.take().unwrap());
+        // Owned before anything can panic, as in `spawn_command_with`.
+        let daemon = Daemon {
+            child,
+            http: 0,
+            socks: 0,
+            lines,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut read = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = match daemon.lines.recv_timeout(remaining) {
+                Ok(line) => line,
+                Err(e) => {
+                    panic!("rurge run did not reach its API within 20 s: {e:?}; read: {read:?}")
+                }
+            };
+            if let Some(rest) = line.strip_prefix("api on http://") {
+                let port = rest
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .expect("api port");
+                return (daemon, read, port);
+            }
+            read.push(line);
+        }
+    }
+
+    /// The limits the store keeps are what `--capture-size` and
+    /// `--capture-body-size`, or the two variables of those names, say;
+    /// without either they are the defaults.
+    #[test]
+    fn the_capture_limits_come_from_the_options_or_the_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let given = serde_json::json!({ "total": 2097152, "body": 3072 });
+        let defaults = serde_json::json!({ "total": 104857600, "body": 5242880 });
+        for (i, how) in ["the options", "the variables", "neither"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut cmd = rurge_run(&conf, &dir.path().join(format!("data{i}")));
+            cmd.env_remove("RURGE_CAPTURE_SIZE");
+            cmd.env_remove("RURGE_CAPTURE_BODY_SIZE");
+            let expected = match how {
+                "the options" => {
+                    cmd.args(["--capture-size", "2m", "--capture-body-size", "3k"]);
+                    given.clone()
+                }
+                "the variables" => {
+                    cmd.env("RURGE_CAPTURE_SIZE", "2M");
+                    cmd.env("RURGE_CAPTURE_BODY_SIZE", "3K");
+                    given.clone()
+                }
+                _ => defaults.clone(),
+            };
+            let daemon = spawn_command(cmd);
+            let api = api_port(&daemon);
+            let (status, body) = api_call(api, "GET", "/v1/rurge/capture", "k", None);
+            assert_eq!(status, 200, "{how}: {body}");
+            let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(read["limits"], expected, "{how}: {body}");
+        }
+    }
+
+    /// A body size over the total is lowered to it, and the start says so
+    /// once, before the API is up; a body size nobody gave is lowered to the
+    /// total without a word.
+    #[test]
+    fn a_body_size_over_the_capture_size_is_lowered_with_a_warning() {
+        let warned = "the capture body size (2048 bytes) is larger than the capture size; lowered to 1024 bytes";
+        let lowered = serde_json::json!({ "total": 1024, "body": 1024 });
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let mut cmd = rurge_run(&conf, &dir.path().join("data0"));
+        cmd.env_remove("RURGE_CAPTURE_SIZE");
+        cmd.env_remove("RURGE_CAPTURE_BODY_SIZE");
+        cmd.args(["--capture-size", "1k", "--capture-body-size", "2k"]);
+        let (daemon, before, api) = lines_until_the_api(cmd);
+        let said: Vec<&String> = before.iter().filter(|line| line.contains(warned)).collect();
+        assert_eq!(said.len(), 1, "before the API: {before:?}");
+        let (status, body) = api_call(api, "GET", "/v1/rurge/capture", "k", None);
+        assert_eq!(status, 200, "{body}");
+        let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(read["limits"], lowered, "{body}");
+        drop(daemon);
+        let mut cmd = rurge_run(&conf, &dir.path().join("data1"));
+        cmd.env_remove("RURGE_CAPTURE_SIZE");
+        cmd.env_remove("RURGE_CAPTURE_BODY_SIZE");
+        cmd.args(["--capture-size", "1k"]);
+        let (_daemon, before, api) = lines_until_the_api(cmd);
+        assert!(
+            before
+                .iter()
+                .all(|line| !line.contains("capture body size")),
+            "nothing to warn about: {before:?}"
+        );
+        let (status, body) = api_call(api, "GET", "/v1/rurge/capture", "k", None);
+        assert_eq!(status, 200, "{body}");
+        let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(read["limits"], lowered, "{body}");
+    }
+
+    /// A size the option cannot read is the usage error clap makes of it, and
+    /// the text says which way it could not be read.
+    #[test]
+    fn bad_capture_sizes_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        for (option, written, why) in [
+            (
+                "--capture-size",
+                "12x",
+                "invalid size `12x`: expected a number of bytes, optionally followed by k, m or g",
+            ),
+            (
+                "--capture-body-size",
+                "17179869184g",
+                "size `17179869184g` is too large",
+            ),
+        ] {
+            let mut child = rurge_run(&conf, &data)
+                .arg(option)
+                .arg(written)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let status = loop {
+                if let Ok(Some(status)) = child.try_wait() {
+                    break status;
+                }
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("rurge run took `{written}` and went on running");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut stderr)
+                .unwrap();
+            assert_eq!(status.code(), Some(2), "{written}: {stderr}");
+            assert!(stderr.contains(why), "{written}: {stderr}");
+        }
+    }
+
+    /// The text an answer that came in `Transfer-Encoding: chunked` carries.
+    /// The HAR document is a stream, so hyper frames it that way; `api_call`
+    /// hands back what came after the head as it is.
+    fn dechunked(body: &str) -> String {
+        let mut out = String::new();
+        let mut rest = body;
+        while let Some((size, tail)) = rest.split_once("\r\n") {
+            let size = match usize::from_str_radix(size.trim(), 16) {
+                Ok(size) => size,
+                Err(_) => break,
+            };
+            if size == 0 {
+                break;
+            }
+            if tail.len() < size {
+                out.push_str(tail);
+                break;
+            }
+            out.push_str(&tail[..size]);
+            rest = tail[size..].trim_start_matches("\r\n");
+        }
+        out
+    }
+
+    /// A capture switched on over the API takes in what goes through the HTTP
+    /// listener, and the session it lands in is exported as HAR 1.2.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capture_switched_on_over_the_api_is_exported_as_har() {
+        let target = TestServer::spawn().await;
+        target.set("/hello", "hi from target");
+        let port = target.url("/").port().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let conf = write_conf(dir.path(), API_GENERAL);
+        let data = dir.path().join("data");
+        let daemon = tokio::task::spawn_blocking(move || {
+            let mut cmd = rurge_run(&conf, &data);
+            cmd.env_remove("RURGE_CAPTURE_SIZE");
+            cmd.env_remove("RURGE_CAPTURE_BODY_SIZE");
+            cmd.args(["--capture-size", "1m"]);
+            spawn_command(cmd)
+        })
+        .await
+        .unwrap();
+        let api = api_port(&daemon);
+        let switched = tokio::task::spawn_blocking(move || {
+            api_call(
+                api,
+                "POST",
+                "/v1/features/capture",
+                "k",
+                Some(r#"{"enabled":true}"#),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(switched.0, 200, "{}", switched.1);
+        let http_port = daemon.http;
+        let asked = tokio::task::spawn_blocking(move || {
+            http_get(http_port, &format!("http://127.0.0.1:{port}/hello"))
+        })
+        .await
+        .unwrap();
+        assert!(asked.starts_with("HTTP/1.1 200"), "{asked}");
+        // The entry is stored when the request's HTTP part ends, which is
+        // after the answer has been written to the client.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (status, body) = api_call(api, "GET", "/v1/rurge/capture/sessions", "k", None);
+            assert_eq!(status, 200, "{body}");
+            let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let known = read
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == "default" && s["entries"].as_u64() == Some(1));
+            if known {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no `default` entry within 5 s: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (status, har) = api_call(
+            api,
+            "GET",
+            "/v1/rurge/capture/sessions/default/har",
+            "k",
+            None,
+        );
+        assert_eq!(status, 200, "{har}");
+        let har: serde_json::Value = serde_json::from_str(&dechunked(&har)).unwrap();
+        assert_eq!(har["log"]["version"], "1.2", "{har}");
+        let entries = har["log"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{har}");
+        let entry = &entries[0];
+        assert!(
+            entry["request"]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/hello"),
+            "{har}"
+        );
+        assert_eq!(entry["response"]["status"], 200, "{har}");
+        assert_eq!(
+            entry["response"]["content"]["text"], "hi from target",
+            "{har}"
+        );
+    }
+
     /// The data directory and the log file are named by the environment as
     /// well as by the command line: with nothing but `RURGE_DATA_DIR` and
     /// `RURGE_LOG_FILE` set, `state.json` is made in the one and the startup

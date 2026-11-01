@@ -19,6 +19,7 @@ use rurge_config::general::LogLevel;
 use rurge_config::general::{Listener, parse_http_listen, parse_socks5_listen};
 use rurge_config::rule::PolicyRef;
 use rurge_config::session::ListenerKind;
+use rurge_engine::capture::{CaptureStore, DEFAULT_BODY, DEFAULT_TOTAL, Limits};
 use rurge_engine::control::{Control, EnhancedStatus, LogLevel as ApiLogLevel, Mode, ReloadReport};
 use rurge_engine::profile::{Boot, BootLimits, ProfileSources, boot_need, disk_remote};
 use rurge_engine::shared::OwnResolve;
@@ -80,6 +81,23 @@ pub struct RunArgs {
     /// Keep this many finished requests in the in-memory log (default 1000)
     #[arg(long, env = "RURGE_REQUEST_LOG_SIZE", value_name = "N")]
     pub request_log_size: Option<usize>,
+    /// Keep at most this much of the captured requests in memory: bytes, or a
+    /// number with k, m or g (default 100m)
+    #[arg(
+        long,
+        env = "RURGE_CAPTURE_SIZE",
+        value_name = "SIZE",
+        value_parser = parse_size
+    )]
+    pub capture_size: Option<u64>,
+    /// Keep at most this much of each captured body (default 5m)
+    #[arg(
+        long,
+        env = "RURGE_CAPTURE_BODY_SIZE",
+        value_name = "SIZE",
+        value_parser = parse_size
+    )]
+    pub capture_body_size: Option<u64>,
     /// Reload the profile when it or its included files change on disk
     #[arg(long, env = "RURGE_WATCH", value_parser = switch())]
     pub watch: bool,
@@ -133,6 +151,45 @@ pub(crate) fn parse_log_level(s: &str) -> Result<LevelFilter, String> {
             ));
         }
     })
+}
+
+/// Reads a capture size (`phase 4 M4 design 4.2`): a number of bytes,
+/// optionally followed by `k`, `m` or `g` for 1024, 1024² and 1024³ (the
+/// phase 4 / M4a plan's P13).
+pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
+    let (digits, multiplier) = match s.as_bytes().last() {
+        Some(b'k') | Some(b'K') => (&s[..s.len() - 1], 1 << 10),
+        Some(b'm') | Some(b'M') => (&s[..s.len() - 1], 1 << 20),
+        Some(b'g') | Some(b'G') => (&s[..s.len() - 1], 1 << 30),
+        _ => (s, 1),
+    };
+    let too_large = || format!("size `{s}` is too large");
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "invalid size `{s}`: expected a number of bytes, optionally followed by k, m or g"
+        ));
+    }
+    // The digits alone can be over `u64` as well as the product.
+    let bytes: u64 = digits.parse().map_err(|_| too_large())?;
+    bytes.checked_mul(multiplier).ok_or_else(too_large)
+}
+
+/// The limits a `rurge run` keeps, and the warning to log when the body size
+/// it was given is over the total and so lowered to it (the phase 4 / M4a
+/// plan's P13).
+pub(crate) fn capture_limits(size: Option<u64>, body: Option<u64>) -> (Limits, Option<String>) {
+    let total = size.unwrap_or(DEFAULT_TOTAL);
+    let limits = Limits::new(total, body.unwrap_or(DEFAULT_BODY));
+    // A body size nobody gave is the default, and the default lowered to a
+    // small total is what the total asks for, not something to warn about.
+    let lowered = match body {
+        Some(b) if b > total => Some(format!(
+            "the capture body size ({b} bytes) is larger than the capture size; lowered to {} bytes",
+            limits.body
+        )),
+        _ => None,
+    };
+    (limits, lowered)
 }
 
 /// Surge `loglevel` → tracing level (phase 1 design §12).
@@ -1756,6 +1813,13 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         if look_up_processes {
             shared.owners = Some(Arc::new(PlatformOwners::new()));
         }
+        // The store the captured requests go: the one limit of the run, made
+        // once here so that every generation sees the same one.
+        let (limits, lowered) = capture_limits(args.capture_size, args.capture_body_size);
+        if let Some(w) = lowered {
+            tracing::warn!("{w}");
+        }
+        shared.capture = CaptureStore::new(limits);
         // The sources of the profile that are downloaded, which this run
         // follows. What a wait before the log downloaded is on the disk, and
         // that is all they need to know of it. Every reload, and the API's
@@ -2304,6 +2368,81 @@ mod tests {
         assert_eq!(parse_log_level("error").unwrap(), LevelFilter::ERROR);
         assert!(parse_log_level("loud").is_err());
         assert_eq!(mode_name(&OutboundMode::Rule), "rule");
+    }
+
+    /// A capture size is bytes, with `k`, `m` or `g` for the binary multiples
+    /// and nothing else: no sign, no space, no fraction and no other suffix
+    /// (the phase 4 / M4a plan's P13).
+    #[test]
+    fn sizes_are_bytes_with_an_optional_binary_suffix() {
+        let bytes = [
+            ("0", 0),
+            ("1", 1),
+            ("1k", 1024),
+            ("1K", 1024),
+            ("2m", 2 * 1024 * 1024),
+            ("3G", 3 * 1024 * 1024 * 1024),
+            ("100M", 100 * 1024 * 1024),
+            ("18446744073709551615", u64::MAX),
+        ];
+        for (written, expected) in bytes {
+            assert_eq!(parse_size(written).unwrap(), expected, "{written}");
+        }
+        let invalid = [
+            "", "k", "1.5m", "-1", "+1", "1kb", " 1", "1 k", "0x10", "1t",
+        ];
+        for written in invalid {
+            assert_eq!(
+                parse_size(written).unwrap_err(),
+                format!(
+                    "invalid size `{written}`: expected a number of bytes, optionally followed by k, m or g"
+                ),
+                "{written}"
+            );
+        }
+        let too_large = ["18446744073709551616", "17179869184g"];
+        for written in too_large {
+            assert_eq!(
+                parse_size(written).unwrap_err(),
+                format!("size `{written}` is too large"),
+                "{written}"
+            );
+        }
+    }
+
+    /// A body limit over the total is lowered to it, in the store and in one
+    /// warning at the start (the phase 4 / M4a plan's P13).
+    #[test]
+    fn the_body_size_is_lowered_to_the_capture_size() {
+        assert_eq!(
+            capture_limits(Some(1024), Some(2048)),
+            (
+                Limits::new(1024, 1024),
+                Some(
+                    "the capture body size (2048 bytes) is larger than the capture size; lowered to 1024 bytes"
+                        .to_string()
+                )
+            )
+        );
+        assert_eq!(
+            capture_limits(Some(1024), None),
+            (Limits::new(1024, 1024), None)
+        );
+        assert_eq!(capture_limits(None, None), (Limits::default(), None));
+        assert_eq!(
+            capture_limits(None, Some(200 * 1024 * 1024)),
+            (
+                Limits::new(DEFAULT_TOTAL, DEFAULT_TOTAL),
+                Some(
+                    "the capture body size (209715200 bytes) is larger than the capture size; lowered to 104857600 bytes"
+                        .to_string()
+                )
+            )
+        );
+        assert_eq!(
+            capture_limits(Some(10), Some(10)),
+            (Limits::new(10, 10), None)
+        );
     }
 
     /// `POST /v1/log/level` sets, for each of its six names, the level the
