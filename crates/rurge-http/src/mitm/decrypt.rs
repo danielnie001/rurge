@@ -36,12 +36,21 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
 
 /// What the engine does with a sniffed TLS session (`phase 4 M2 design 7.1`):
-/// decrypt it, pass it through, or pass it through because the client offers
-/// no protocol rurge decrypts.
+/// decrypt it, or pass it through saying which condition passed it — the one
+/// the engine writes on the session's record (`phase 4 M4 design 10.2`, the
+/// phase 4 / M4b plan's P6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     Decrypt,
-    Pass,
+    /// The list does not take this target.
+    NotListed,
+    /// `[MITM] client-source-address` refuses this source.
+    SourceBlocked,
+    /// rustls will not take the name as a server name, so no leaf can be
+    /// issued for it.
+    NoCertificate,
+    /// The client offers an ALPN and none of what it offers is a protocol
+    /// rurge decrypts.
     AlpnMismatch,
 }
 
@@ -157,7 +166,13 @@ impl Mitm {
     }
 
     /// Whether this connection is decrypted (`phase 4 M2 design 7.1`), in the
-    /// order of the design: the source, the list, the name, the ALPN.
+    /// order of the design: the list, the source, the name, the ALPN.
+    ///
+    /// The list comes before the source because the answer says why a session
+    /// is passed through (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's
+    /// P6): a session the list does not take is not passed for its source,
+    /// which it would be said to be if the source were asked first. Only a
+    /// session that all four conditions take is decrypted, as before.
     pub fn decides(
         &self,
         source: IpAddr,
@@ -166,9 +181,6 @@ impl Mitm {
         port: u16,
         alpn: &[Vec<u8>],
     ) -> Decision {
-        if self.blocked(source) {
-            return Decision::Pass;
-        }
         // with an SNI only the SNI is compared; a bare entry covers every
         // port for an SNI (`phase 4 M2 design 7.3`)
         let listed = match sni {
@@ -176,7 +188,10 @@ impl Mitm {
             None => self.effective.matches(target, port),
         };
         if listed != Some(true) {
-            return Decision::Pass;
+            return Decision::NotListed;
+        }
+        if self.blocked(source) {
+            return Decision::SourceBlocked;
         }
         // the name the certificate is issued for: one rustls will not take
         // cannot be signed for, so the connection is passed through
@@ -185,7 +200,7 @@ impl Mitm {
             .as_domain()
             .is_some_and(|d| ServerName::try_from(d.to_string()).is_err())
         {
-            return Decision::Pass;
+            return Decision::NoCertificate;
         }
         // a client that offers no ALPN is decrypted; a client offering one is
         // decrypted only if rurge serves it — `h2` counts when this
@@ -528,20 +543,31 @@ mod tests {
         tokio::join!(accept, connect)
     }
 
-    /// The source is asked first, then the list, then whether the name can be
-    /// signed for, and the ALPN last (`phase 4 M2 design 7.1`).
+    /// The list is asked first, then the source, then whether the name can be
+    /// signed for, and the ALPN last (`phase 4 M2 design 7.1`): the list
+    /// comes first because a session it does not take must not be said to be
+    /// passed for its source (`phase 4 M4 design 10.2`, the phase 4 / M4b
+    /// plan's P6).
     #[test]
-    fn decides_in_the_design_order() {
+    fn decides_lists_first_then_source_name_and_alpn() {
         let local = IpAddr::from(Ipv4Addr::LOCALHOST);
 
-        // a listed host from a source that is not allowed
+        // the list comes before the source: a listed host from a source that
+        // is not allowed says so, and a host the list does not take says that
+        // instead of blaming the source
         let mut blocked = cfg("ok.test");
         blocked.client_source_address = Some(SourceList::parse("10.0.0.0/8").0);
         let rig = rig_of(blocked);
         let ok = HostName::parse("ok.test");
         assert_eq!(
             rig.mitm.decides(local, Some(&ok), &ok, 443, &[]),
-            Decision::Pass
+            Decision::SourceBlocked
+        );
+        let unlisted = HostName::parse("other.test");
+        assert_eq!(
+            rig.mitm
+                .decides(local, Some(&unlisted), &unlisted, 443, &[]),
+            Decision::NotListed
         );
 
         // the first entry of the list that matches decides
@@ -549,7 +575,7 @@ mod tests {
         let bad = HostName::parse("bad.test");
         assert_eq!(
             rig.mitm.decides(local, Some(&bad), &bad, 443, &[]),
-            Decision::Pass
+            Decision::NotListed
         );
         assert_eq!(
             rig.mitm.decides(local, Some(&ok), &ok, 443, &[]),
@@ -563,7 +589,7 @@ mod tests {
         );
         assert_eq!(
             rig.mitm.decides(local, None, &ok, 8443, &[]),
-            Decision::Pass
+            Decision::NotListed
         );
         assert_eq!(
             rig.mitm.decides(local, None, &ok, 443, &[]),
@@ -583,7 +609,7 @@ mod tests {
         let rig = rig_of(cfg(&odd.to_string()));
         assert_eq!(
             rig.mitm.decides(local, Some(&odd), &odd, 443, &[]),
-            Decision::Pass
+            Decision::NoCertificate
         );
 
         // a client that offers no ALPN, or http/1.1, is decrypted
@@ -613,7 +639,7 @@ mod tests {
         assert_eq!(
             rig.mitm
                 .decides(local, Some(&other), &other, 443, &[b"h2".to_vec()]),
-            Decision::Pass,
+            Decision::NotListed,
             "not listed"
         );
         let mut blocked = cfg("ok.test");
@@ -622,7 +648,7 @@ mod tests {
         assert_eq!(
             rig.mitm
                 .decides(local, Some(&ok), &ok, 443, &[b"h2".to_vec()]),
-            Decision::Pass,
+            Decision::SourceBlocked,
             "source not allowed"
         );
         let odd = HostName::parse(&format!("{}.test", "a".repeat(64)));
@@ -630,7 +656,7 @@ mod tests {
         assert_eq!(
             rig.mitm
                 .decides(local, Some(&odd), &odd, 443, &[b"h2".to_vec()]),
-            Decision::Pass,
+            Decision::NoCertificate,
             "no server name"
         );
     }

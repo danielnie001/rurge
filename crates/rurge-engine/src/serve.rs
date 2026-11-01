@@ -9,10 +9,11 @@
 
 use crate::FAKE_ADDRESS_NOT_KNOWN;
 use crate::control::Mode;
-use crate::engine::{Engine, HANDSHAKE_TIMEOUT, policy_known};
+use crate::engine::{Engine, HANDSHAKE_TIMEOUT, PassedBy, policy_known};
 use crate::fake_address::Turned;
 use crate::mitm::Hint;
 use rurge_config::HostName;
+use rurge_config::general::General;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{ListenerKind, SessionInfo, Transport};
 use rurge_dns::fakeip::{Lease, in_space};
@@ -28,6 +29,54 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+// Why a session was passed through, or not decrypted, as its record says it
+// (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's P6): one session writes
+// at most one of these, when its handle is made.
+
+/// `always-raw-tcp-hosts` takes it, so it is never sniffed.
+const RAW_HOSTS: &str = "Passed through: always-raw-tcp-hosts";
+/// `always-raw-tcp-keywords` takes its name, so it is never sniffed.
+const RAW_KEYWORDS: &str = "Passed through: always-raw-tcp-keywords";
+/// The sniff found neither HTTP nor TLS and the settings do not force it into
+/// the engine.
+const NEITHER: &str = "Passed through: neither HTTP nor TLS";
+/// The client sent nothing the sniff could judge before the wait ran out.
+const TIMED_OUT: &str = "Passed through: sniffing timed out";
+/// The generation's `mitm` switch is off.
+const MITM_OFF: &str = "Not decrypted: MITM is off";
+/// The generation has no usable CA to sign a leaf with.
+const NO_CA: &str = "Not decrypted: no usable CA";
+/// The client offers an ALPN and none of it is a protocol rurge decrypts.
+const NO_PROTOCOL: &str = "Not decrypted: the client offers no protocol rurge decrypts";
+/// `[MITM] client-source-address` refuses the client.
+const SOURCE: &str = "Not decrypted: the client is not in client-source-address";
+/// rustls will not take the name as a server name, so no leaf can be issued
+/// for it.
+const NO_CERTIFICATE: &str = "Not decrypted: no certificate can be made for this name";
+
+/// Which of the two lists takes this session, if either, as the note its
+/// record carries (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's P6).
+///
+/// The hosts are asked before the keywords, as `sniffable_session` asks them,
+/// and neither list is asked about a port: a session is passed through whole.
+pub(crate) fn raw_listed(general: &General, host: &HostName, port: u16) -> Option<&'static str> {
+    // design 4.1 (4), which the general design puts before everything else
+    if general.always_raw_tcp_hosts.matches(host, port) == Some(true) {
+        return Some(RAW_HOSTS);
+    }
+    // design 4.1 (4) and 4.2: an IP literal is not a hostname, so no keyword
+    // is looked for in one; the name is lowercase already
+    if let HostName::Domain(name) = host
+        && general
+            .always_raw_tcp_keywords
+            .iter()
+            .any(|k| !k.is_empty() && name.contains(&k.to_ascii_lowercase()))
+    {
+        return Some(RAW_KEYWORDS);
+    }
+    None
+}
 
 /// How the sniffs of an engine ended (design 7.5), as `GET /v1/rurge/http`
 /// reads them once they are a `SniffedCounts`.
@@ -155,18 +204,10 @@ impl Engine {
         let runtime = self.runtime();
         let general = &runtime.config.general;
         let (host, port) = (&probed.dst_host, probed.dst_port);
-        // design 4.1 (4), which the general design puts before everything else
-        if general.always_raw_tcp_hosts.matches(host, port) == Some(true) {
-            return false;
-        }
-        // design 4.1 (4) and 4.2: an IP literal is not a hostname, so no
-        // keyword is looked for in one; the name is lowercase already
-        if let HostName::Domain(name) = host
-            && general
-                .always_raw_tcp_keywords
-                .iter()
-                .any(|k| !k.is_empty() && name.contains(&k.to_ascii_lowercase()))
-        {
+        // design 4.1 (4), which the general design puts before everything
+        // else, and 4.2: either list takes the session whole — and the record
+        // says which one took it (`phase 4 M4 design 10.2`)
+        if raw_listed(general, host, port).is_some() {
             return false;
         }
         // design 4.1 (5): the two ports of the design, and whatever
@@ -268,10 +309,17 @@ impl Engine {
         )
     }
 
-    /// What a sniffed TLS session is decrypted with (`phase 4 M2 design 7.1`,
-    /// in the order of the phase 4 / M2a plan's P18): the switch, the
-    /// session's name, and this generation's CA, list and ALPN. `None` passes
-    /// the session through as `M1` does.
+    /// What a sniffed TLS session is decrypted with (`phase 4 M2 design 7.1`),
+    /// or the condition that passed it through (`phase 4 M4 design 10.2`): the
+    /// list, the switch, this generation's CA, the source, the name and the
+    /// ALPN, in that order. `Err(None)` is a session passed through with
+    /// nothing the record says about it.
+    ///
+    /// The list is asked before the switch so that a session it does not take
+    /// is not said to be passed for the switch, the CA, the source, the name
+    /// or the ALPN the design's order puts after it (`phase 4 M4 design 10.2`,
+    /// the phase 4 / M4b plan's P6). Whether a session is decrypted is what it
+    /// was: every condition must hold.
     ///
     /// The two lines of DEBUG say why a session the list covers was not
     /// decrypted: a generation without a usable CA, and a client that offers
@@ -281,11 +329,8 @@ impl Engine {
         &self,
         session: &SessionInfo,
         hello: &ClientHello,
-    ) -> Option<(Arc<Mitm>, HostName)> {
-        if !self.mitm_on() {
-            return None;
-        }
-        let target = self.named_target(session)?;
+    ) -> Result<(Arc<Mitm>, HostName), Option<&'static str>> {
+        let target = self.named_target(session).ok_or(None)?;
         let sni = hello
             .sni
             .as_deref()
@@ -294,25 +339,29 @@ impl Engine {
         // the SNI, or the target when there is none (`phase 4 M2 design 7.3`)
         let name = sni.clone().unwrap_or_else(|| target.clone());
         let runtime = self.runtime();
+        let listed = match &sni {
+            Some(sni) => runtime
+                .config
+                .mitm
+                .effective
+                .matches_sni(sni, session.dst_port),
+            None => runtime
+                .config
+                .mitm
+                .effective
+                .matches(&target, session.dst_port),
+        };
+        if listed != Some(true) {
+            return Err(None);
+        }
+        if !self.mitm_on() {
+            return Err(Some(MITM_OFF));
+        }
         let Some(mitm) = runtime.mitm.clone() else {
-            let listed = match &sni {
-                Some(sni) => runtime
-                    .config
-                    .mitm
-                    .effective
-                    .matches_sni(sni, session.dst_port),
-                None => runtime
-                    .config
-                    .mitm
-                    .effective
-                    .matches(&target, session.dst_port),
-            };
-            if listed == Some(true) {
-                tracing::debug!(
-                    "{name} is listed for MITM but this generation has no usable CA; passing it through"
-                );
-            }
-            return None;
+            tracing::debug!(
+                "{name} is listed for MITM but this generation has no usable CA; passing it through"
+            );
+            return Err(Some(NO_CA));
         };
         match mitm.decides(
             source_of(session.listener, session.src),
@@ -321,7 +370,12 @@ impl Engine {
             session.dst_port,
             &hello.alpn,
         ) {
-            rurge_http::mitm::Decision::Decrypt => Some((mitm, name)),
+            rurge_http::mitm::Decision::Decrypt => Ok((mitm, name)),
+            // the list is asked above: a session it does not take is the
+            // session `decides` tells apart from the other three
+            rurge_http::mitm::Decision::NotListed => Err(None),
+            rurge_http::mitm::Decision::SourceBlocked => Err(Some(SOURCE)),
+            rurge_http::mitm::Decision::NoCertificate => Err(Some(NO_CERTIFICATE)),
             rurge_http::mitm::Decision::AlpnMismatch => {
                 let alpn: Vec<String> = hello
                     .alpn
@@ -332,9 +386,8 @@ impl Engine {
                     "{name} is listed for MITM but the client offers no protocol rurge decrypts ({}); passing it through",
                     alpn.join(", ")
                 );
-                None
+                Err(Some(NO_PROTOCOL))
             }
-            rurge_http::mitm::Decision::Pass => None,
         }
     }
 
@@ -713,6 +766,10 @@ impl Engine {
         let forced = self.forces_http_engine(&session);
         let mut session = session;
         let mut into_engine = false;
+        // why this session is passed through, when the sniff or the decision
+        // said (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's P6 ④):
+        // written on the record when the handle is made
+        let mut passed = None;
         match sniffed {
             Sniffed::Tls(hello) => {
                 // the ClientHello's SNI is lowercase already, or absent when it
@@ -723,9 +780,12 @@ impl Engine {
                 // the generation and the switch of this moment (`phase 4 M2
                 // design 7.1`); a session that is not decrypted carries on as
                 // `M1` passes it through
-                if let Some((mitm, name)) = self.decrypting(&session, &hello) {
-                    self.serve_mitm(session, client, mitm, name, opts).await;
-                    return;
+                match self.decrypting(&session, &hello) {
+                    Ok((mitm, name)) => {
+                        self.serve_mitm(session, client, mitm, name, opts).await;
+                        return;
+                    }
+                    Err(note) => passed = note,
                 }
             }
             Sniffed::Http => {
@@ -734,8 +794,16 @@ impl Engine {
             }
             // design 7.1: forwarded as it is, with no protocol on the record;
             // the settings may still keep it in the engine (design 6.4)
-            Sniffed::Other | Sniffed::Closed => into_engine = forced,
-            Sniffed::Timeout => {}
+            Sniffed::Other => {
+                into_engine = forced;
+                if !forced {
+                    passed = Some(NEITHER);
+                }
+            }
+            // a client that closed its side showed no protocol at all, so
+            // there is nothing to say about it (the phase 4 / M4b plan's P6)
+            Sniffed::Closed => into_engine = forced,
+            Sniffed::Timeout => passed = Some(TIMED_OUT),
             // the client is gone: nothing to dial for, nothing to record
             Sniffed::Failed => return,
         }
@@ -744,7 +812,7 @@ impl Engine {
             return;
         }
         let client: BoxedStream = Box::new(client);
-        match self.dial(session).await {
+        match self.dial_noted(session, PassedBy::Sniff(passed)).await {
             Ok(dialed) => {
                 let token = dialed.handle.token().clone();
                 let mut relay = self.relay(client, dialed.stream, dialed.handle);

@@ -7,6 +7,7 @@ use crate::fake_address::Turned;
 use crate::observe::{RequestLog, TrafficStats};
 use crate::owner::{EXTERNAL, LOOKUPS, NOT_IN_TIME, SLOW, SlotProcess, query_for};
 use crate::runtime::Runtime;
+use crate::serve::raw_listed;
 use crate::shared::EngineShared;
 use crate::state::{Features, StateStore};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -2009,37 +2010,88 @@ impl Engine {
             Err(refused) => refused_dial(handle, refused),
         }
     }
+
+    /// `Dialer::dial` and the dial of a sniffed session: the handle is made
+    /// here, and the note the record carries is written on it before anything
+    /// is dialed (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's P6 ⑤).
+    pub(crate) async fn dial_noted(
+        &self,
+        mut session: SessionInfo,
+        passed: PassedBy,
+    ) -> Result<Dialed, DialError> {
+        // loaded once, together: the name is picked, approved and
+        // resolved against the same generation
+        let (rt, registry) = self.snapshot();
+        // a fake address that came in at a proxy port is the name behind
+        // it before anything else sees the session (phase 3 M3 design 13)
+        let turned = self.turn_back(&mut session);
+        let process = self.look_up_owner(&session);
+        let handle = self.new_handle_with(session, process);
+        match turned {
+            Turned::Unchanged => {}
+            // the address stays the name's as long as the session lasts
+            Turned::Name(lease) => handle.on_finish(move |_, _| drop(lease)),
+            // nothing was dialed, so there is nothing to say about it
+            Turned::Unknown => return fail(handle, FailKind::Other, FAKE_ADDRESS_NOT_KNOWN),
+        }
+        // the reason the session is passed through, if there is one: what the
+        // sniff decided for a session it saw, and the two lists for one no
+        // one sniffed (`phase 4 M4 design 10.2`). A session the lists took is
+        // noted here too when pre-matching refused it: the lists are asked
+        // before the probe (`the phase 4 / M4b plan's P6`).
+        let note = match passed {
+            PassedBy::Sniff(note) => note,
+            PassedBy::Lists if self.judged_at_the_entry(handle.session()) => raw_listed(
+                &rt.config.general,
+                &handle.session().dst_host,
+                handle.session().dst_port,
+            ),
+            PassedBy::Lists => None,
+        };
+        if let Some(note) = note {
+            handle.add_note(note);
+        }
+        // A client's TCP session to a host whose QUIC the engine blocked
+        // is that client falling back (phase 3 M5 design 6.3): the table
+        // of `block-quic=adaptive` hears of it. The engine's own sessions
+        // come through `dial_internal` instead, so they cannot pass for a
+        // client's.
+        self.quic_adaptive
+            .on_tcp(&handle.session().dst_host.to_string(), Instant::now());
+        let trail = handle.trail().clone();
+        trail
+            .follow(self.connect_session(rt, registry, handle))
+            .await
+    }
+
+    /// The first two steps of `sniffable_session`: a TCP session of a client's
+    /// entry, in an engine that is not paused. These are the sessions the two
+    /// lists judge at all (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's
+    /// P6 ⑤).
+    fn judged_at_the_entry(&self, session: &SessionInfo) -> bool {
+        session.transport == Transport::Tcp
+            && matches!(
+                session.listener,
+                ListenerKind::Http | ListenerKind::Socks5 | ListenerKind::Tun
+            )
+            && !self.is_suspended()
+    }
+}
+
+/// How a session came to be passed through, or that no one sniffed it
+/// (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's P6 ⑤): what
+/// `dial_noted` writes on the record when it makes the handle.
+pub(crate) enum PassedBy {
+    /// A session no one sniffed: the two lists are asked at the dial, in the
+    /// order `sniffable_session` asks them.
+    Lists,
+    /// A sniffed session: the reason the sniff or the decision left, if any.
+    Sniff(Option<&'static str>),
 }
 
 impl Dialer for Engine {
-    fn dial<'a>(&'a self, mut session: SessionInfo) -> BoxFuture<'a, Result<Dialed, DialError>> {
-        Box::pin(async move {
-            // loaded once, together: the name is picked, approved and
-            // resolved against the same generation
-            let (rt, registry) = self.snapshot();
-            // a fake address that came in at a proxy port is the name behind
-            // it before anything else sees the session (phase 3 M3 design 13)
-            let turned = self.turn_back(&mut session);
-            let process = self.look_up_owner(&session);
-            let handle = self.new_handle_with(session, process);
-            match turned {
-                Turned::Unchanged => {}
-                // the address stays the name's as long as the session lasts
-                Turned::Name(lease) => handle.on_finish(move |_, _| drop(lease)),
-                Turned::Unknown => return fail(handle, FailKind::Other, FAKE_ADDRESS_NOT_KNOWN),
-            }
-            // A client's TCP session to a host whose QUIC the engine blocked
-            // is that client falling back (phase 3 M5 design 6.3): the table
-            // of `block-quic=adaptive` hears of it. The engine's own sessions
-            // come through `dial_internal` instead, so they cannot pass for a
-            // client's.
-            self.quic_adaptive
-                .on_tcp(&handle.session().dst_host.to_string(), Instant::now());
-            let trail = handle.trail().clone();
-            trail
-                .follow(self.connect_session(rt, registry, handle))
-                .await
-        })
+    fn dial<'a>(&'a self, session: SessionInfo) -> BoxFuture<'a, Result<Dialed, DialError>> {
+        Box::pin(self.dial_noted(session, PassedBy::Lists))
     }
 
     fn relay<'a>(
