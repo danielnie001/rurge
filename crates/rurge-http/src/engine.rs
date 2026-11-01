@@ -21,6 +21,7 @@ use super::rewrite::{
     retarget_request, write_back_host,
 };
 use super::version::{Form, fit};
+use crate::capture::{Capture, RequestTap};
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use http_body_util::BodyExt;
@@ -130,10 +131,19 @@ pub enum Routed<R, K> {
         /// `None` when the switch is off, this generation has no rules, or the
         /// policy the rules chose is one of REJECT's (`phase 4 M3 design 8.4`).
         rewrite: Option<Arc<Rewrite>>,
+        /// Where the request is captured, `None` when it is not captured
+        /// (`phase 4 M4 design 4.6`).
+        capture: Option<Capture>,
     },
     /// A refusal, unanswered: the HTTP engine answers it and finishes the
     /// handle (`P4`).
-    Refused { refusal: Refusal, pages: Pages },
+    Refused {
+        refusal: Refusal,
+        pages: Pages,
+        /// Where the refusal is captured, `None` when it is not captured
+        /// (`phase 4 M4 design 5.3`).
+        capture: Option<Capture>,
+    },
 }
 
 /// What answers a refusal or a failure: the generation the request was routed
@@ -483,7 +493,11 @@ impl<U: Upstreams> Requests<U> {
             return Err(Close);
         }
         let (mut route, mut key, pages, rewrite) = match routed {
-            Routed::Refused { refusal, pages } => {
+            Routed::Refused {
+                refusal,
+                pages,
+                capture: _,
+            } => {
                 return self.answer(&guard, refusal, pages).await;
             }
             Routed::Go {
@@ -491,6 +505,7 @@ impl<U: Upstreams> Requests<U> {
                 key,
                 pages,
                 rewrite,
+                capture: _,
             } => (route, key, pages, rewrite),
         };
         if prepared.unknown {
@@ -969,7 +984,14 @@ impl<U: Upstreams> Requests<U> {
         let (parts, request_body) = req.into_parts();
         let req = Request::from_parts(
             parts,
-            Idle::new(request_body, idle, progress.clone(), request_meter.clone()).boxed(),
+            Idle::new(
+                request_body,
+                idle,
+                progress.clone(),
+                request_meter.clone(),
+                None,
+            )
+            .boxed(),
         );
         // Only an HTTP/2 connection counts by the request: an HTTP/1.1 one is
         // lent to it and counts on the connection (`P11`).
@@ -2615,16 +2637,26 @@ struct Idle<B> {
     /// Counts the bytes of this request's body as its own, on a shared HTTP/2
     /// connection (`phase 4 M2 design 10.2`, `the phase 4 / M2b plan's P11`).
     body: Meter,
+    /// Takes the request's body as it goes by, when the request is captured
+    /// (`phase 4 M4 design 6.1`).
+    tap: Option<RequestTap>,
 }
 
 impl<B> Idle<B> {
-    fn new(inner: B, idle: Duration, progress: Arc<Progress>, body: Meter) -> Idle<B> {
+    fn new(
+        inner: B,
+        idle: Duration,
+        progress: Arc<Progress>,
+        body: Meter,
+        tap: Option<RequestTap>,
+    ) -> Idle<B> {
         Idle {
             inner,
             idle,
             deadline: None,
             progress,
             body,
+            tap,
         }
     }
 }
@@ -2659,6 +2691,12 @@ where
                 // of it (`the phase 4 / M2b plan's P11`)
                 if let Some(data) = frame.data_ref() {
                     this.body.count_up(data.len() as u64);
+                    // the same data, kept as the captured request's body; the
+                    // trailers after it are not its body (`phase 4 M4 design
+                    // 6.1`)
+                    if let Some(tap) = &this.tap {
+                        tap.chunk(data);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -3743,6 +3781,8 @@ mod tests {
         /// The headers `dial` says an upstream HTTP proxy takes the request
         /// with: `Some` is a forward, `None` is no proxy.
         forward: Mutex<Option<Vec<(String, String)>>>,
+        /// Where `route` says the request is captured: `None` for nowhere.
+        capture: Mutex<Option<Capture>>,
     }
 
     /// The engine side of `Upstreams`, scripted by the path of each request’s
@@ -3772,6 +3812,7 @@ mod tests {
                     reject: true,
                 }),
                 forward: Mutex::new(None),
+                capture: Mutex::new(None),
             }))
         }
 
@@ -3896,14 +3937,20 @@ mod tests {
             Box::pin(async move {
                 let pages = *self.0.go_pages.lock().unwrap();
                 let rewrite = self.0.rewrite.lock().unwrap().clone();
+                let capture = self.0.capture.lock().unwrap().clone();
                 match step {
                     Step::Go(key) => Routed::Go {
                         route: key,
                         key,
                         pages,
                         rewrite,
+                        capture,
                     },
-                    Step::Refused { refusal, pages } => Routed::Refused { refusal, pages },
+                    Step::Refused { refusal, pages } => Routed::Refused {
+                        refusal,
+                        pages,
+                        capture,
+                    },
                 }
             })
         }

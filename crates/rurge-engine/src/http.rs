@@ -163,6 +163,8 @@ impl Upstreams for ConnUpstreams {
                         key,
                         pages,
                         rewrite,
+                        // the phase 4 / M4a plan's task 4 gives the real one
+                        capture: None,
                     }
                 }
                 Err(refused) => {
@@ -170,6 +172,8 @@ impl Upstreams for ConnUpstreams {
                     Routed::Refused {
                         refusal: refused.into(),
                         pages,
+                        // the phase 4 / M4a plan's task 4 gives the real one
+                        capture: None,
                     }
                 }
             }
