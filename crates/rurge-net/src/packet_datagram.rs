@@ -33,6 +33,10 @@ const QUEUE: usize = 256;
 
 struct PacketDatagram {
     to: Target,
+    /// Where the carrier's datagrams leave rurge, as the carrier told when
+    /// this datagram was made: the relay a SOCKS5 association rides, or the
+    /// server of a carrier that sends its own (`phase 4 M4 design 10.3`).
+    far_end: Option<SocketAddr>,
     outgoing: mpsc::Sender<Vec<u8>>,
     incoming: Mutex<mpsc::Receiver<Vec<u8>>>,
     failed: Arc<Mutex<Failed>>,
@@ -75,6 +79,7 @@ fn as_the_end(e: io::Error) -> io::Error {
 /// `socket` as a datagram to `to`, which it has resolved (`PacketSocket::resolve`).
 pub fn packet_datagram(socket: BoxedPacketSocket, to: Target) -> BoxedDatagram {
     let socket: Arc<dyn PacketSocket> = Arc::from(socket);
+    let far_end = socket.far_end(&to);
     let (outgoing, mut queued) = mpsc::channel::<Vec<u8>>(QUEUE);
     let (arrived, incoming) = mpsc::channel::<Vec<u8>>(QUEUE);
     let failed = Arc::new(Mutex::new(Failed::default()));
@@ -126,6 +131,7 @@ pub fn packet_datagram(socket: BoxedPacketSocket, to: Target) -> BoxedDatagram {
     });
     Box::new(PacketDatagram {
         to,
+        far_end,
         outgoing,
         incoming: Mutex::new(incoming),
         failed,
@@ -186,6 +192,10 @@ impl Datagram for PacketDatagram {
             HostName::Domain(_) => None,
         }
     }
+
+    fn far_end(&self) -> Option<SocketAddr> {
+        self.far_end
+    }
 }
 
 impl Drop for PacketDatagram {
@@ -217,6 +227,8 @@ mod tests {
         /// What it ends with once the script is over; without, it ends
         /// with nothing to say.
         ending: Mutex<Option<io::Error>>,
+        /// What it answers as the far end of its datagrams.
+        far_end: Option<SocketAddr>,
     }
 
     impl PacketSocket for Scripted {
@@ -245,6 +257,10 @@ mod tests {
                 }
             })
         }
+
+        fn far_end(&self, _to: &Target) -> Option<SocketAddr> {
+            self.far_end
+        }
     }
 
     type Script = (mpsc::Sender<(Target, Vec<u8>)>, Log);
@@ -263,6 +279,16 @@ mod tests {
         failures: Vec<io::Error>,
         ending: Option<io::Error>,
     ) -> (BoxedPacketSocket, Script) {
+        scripted_from(failures, ending, None)
+    }
+
+    /// `scripted_with`, the carrier answering `far_end` as where its
+    /// datagrams leave rurge.
+    fn scripted_from(
+        failures: Vec<io::Error>,
+        ending: Option<io::Error>,
+        far_end: Option<SocketAddr>,
+    ) -> (BoxedPacketSocket, Script) {
         let (tx, rx) = mpsc::channel(16);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let socket = Scripted {
@@ -270,6 +296,7 @@ mod tests {
             sent: sent.clone(),
             failing: Mutex::new(failures.into()),
             ending: Mutex::new(ending),
+            far_end,
         };
         (Box::new(socket), (tx, sent))
     }
@@ -532,5 +559,21 @@ mod tests {
         assert_eq!(*sent.lock().unwrap(), [(peer.clone(), b"out".to_vec())]);
         arrive.send((peer, b"back".to_vec())).await.unwrap();
         assert_eq!(recv(&datagram).await.unwrap(), b"back");
+    }
+
+    /// The datagram's far end is the carrier's, not the target it stands
+    /// for (`phase 4 M4 design 10.3`): a carrier that rides a proxy sends to
+    /// its target through the proxy's far end.
+    #[tokio::test]
+    async fn a_packet_datagram_far_end_is_its_carriers() {
+        let relay: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        let target = at("192.0.2.7", 443);
+        let (socket, _) = scripted_from(Vec::new(), None, Some(relay));
+        let datagram = packet_datagram(socket, target.clone());
+        assert_eq!(datagram.far_end(), Some(relay));
+        assert_eq!(datagram.peer_addr(), Some("192.0.2.7:443".parse().unwrap()));
+        let (socket, _) = scripted_from(Vec::new(), None, None);
+        let datagram = packet_datagram(socket, target);
+        assert_eq!(datagram.far_end(), None);
     }
 }

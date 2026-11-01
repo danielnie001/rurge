@@ -43,6 +43,16 @@ pub trait Datagram: Send + Sync {
     fn peer_addr(&self) -> Option<SocketAddr> {
         None
     }
+    /// The far end of the hop the carrier's datagrams leave rurge by
+    /// (`phase 4 M4 design 10.3`): the address one that sends its own
+    /// datagrams sends them to, the far end of the socket one that rides
+    /// another socket rides. Not the same thing as `peer_addr`: a
+    /// `PacketDatagram`'s `peer_addr` is the target it stands for
+    /// (WireGuard's `land` matches it against the endpoint). `None` when the
+    /// carrier cannot tell.
+    fn far_end(&self) -> Option<SocketAddr> {
+        None
+    }
     /// The IP TOS (IPv6 traffic class) byte of the datagrams sent from now
     /// on; `0` goes back to what the carrier started with. A carrier that
     /// cannot mark its datagrams ignores it.
@@ -72,6 +82,16 @@ pub trait PacketSocket: Send + Sync {
     /// when a datagram does not fit, and a carrier that strips a header
     /// (SOCKS5) receives the header too.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>>;
+    /// The far end of the hop a datagram for `to` leaves rurge by
+    /// (`phase 4 M4 design 10.3`): the address one that sends its own
+    /// datagrams sends them to, the far end of the socket one that rides
+    /// another socket rides. Not the same thing as the target: a carrier
+    /// that rides another socket reaches `to` through that socket's far end.
+    /// `None` when the carrier cannot tell.
+    fn far_end(&self, to: &Target) -> Option<SocketAddr> {
+        let _ = to;
+        None
+    }
 }
 
 pub type BoxedPacketSocket = Box<dyn PacketSocket>;
@@ -942,6 +962,13 @@ impl PacketSocket for DirectPacket {
             Poll::Pending
         }))
     }
+
+    fn far_end(&self, to: &Target) -> Option<SocketAddr> {
+        match &to.host {
+            HostName::Ip(ip) => Some(SocketAddr::new(*ip, to.port)),
+            HostName::Domain(_) => None,
+        }
+    }
 }
 
 /// The socket has a local port: something bound it already.
@@ -984,6 +1011,10 @@ impl Datagram for DirectDatagram {
 
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.socket.peer_addr().ok()
+    }
+
+    fn far_end(&self) -> Option<SocketAddr> {
+        self.peer_addr()
     }
 
     fn set_tos(&self, tos: u8) -> io::Result<()> {
@@ -1745,6 +1776,39 @@ mod tests {
             send(&datagram, b"ping").await;
             assert_eq!(recv(&datagram).await, b"ping");
         }
+    }
+
+    /// DIRECT's datagram leaves by the socket it connected (`phase 4 M4
+    /// design 10.3`): its far end is its peer.
+    #[tokio::test]
+    async fn a_direct_datagram_far_end_is_its_peer() {
+        let echo = udp_echo().await;
+        let c = DirectConnector::new(Arc::new(Fixed(vec![ip("127.0.0.1")])));
+        let datagram = c
+            .connect_udp(
+                &Target::new(HostName::Ip(echo.ip()), echo.port()),
+                &ConnectOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(datagram.far_end(), Some(echo));
+        assert_eq!(datagram.far_end(), datagram.peer_addr());
+    }
+
+    /// DIRECT's association sends each datagram itself: one for an address
+    /// leaves by it, and one for a name is looked up in `send_to`, so the
+    /// carrier cannot tell yet (`phase 4 M4 design 10.3`).
+    #[tokio::test]
+    async fn a_direct_packet_far_end_is_the_address_it_sends_to() {
+        let c = DirectConnector::new(Arc::new(Fixed(vec![ip("127.0.0.1")])));
+        let packet = c.open_packet().unwrap();
+        let by_address = Target::new(HostName::Ip("127.0.0.1".parse().unwrap()), 5353);
+        assert_eq!(
+            packet.far_end(&by_address),
+            Some("127.0.0.1:5353".parse().unwrap())
+        );
+        let by_name = Target::new(HostName::parse("echo.test"), 5353);
+        assert_eq!(packet.far_end(&by_name), None);
     }
 
     /// The policy's socket options go on a UDP socket too; `set_tos(0)`
