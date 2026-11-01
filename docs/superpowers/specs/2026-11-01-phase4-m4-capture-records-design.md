@@ -589,3 +589,9 @@ pub enum Routed<R, K> {
 5. 第 12 节第 3 条"`rurge-engine` 的 `tests/http.rs` 与 `tests/mitm.rs`" → 新文件 `crates/rurge-engine/tests/capture.rs`，要的夹具从 `tests/rewrite.rs` 照抄。以计划 P14 为准。
 
 6. 第 4.5 节"各自单独以 release 运行" → 调试构建、`rurge-http` 的库内用例（`crates/rurge-http/src/capture/memory.rs`）：`--release` 要把整个工作区另编一份（这台开发机的 D: 盘被 `target/` 写满过）；条目、`HeaderMap`、`Bytes` 在两种构建里分配的大小相同，量的是装满与基线两次运行的差；库内的用例走真实的按块记账（`Pending`）。以计划 P15 为准。
+
+**执行 M4a 时**：由 M4a 的任务 9b 补上（`docs/superpowers/plans/2026-11-01-phase4-m4a-capture-plan.md` 的「执行期修正记录」）。
+
+7. 第 4.3 节第 1 条"再加固定的 512 字节（条目本身、队列的一格、几个 `String` 与 `Vec` 的头；第 4.5 节量过之后可以改这个数）" → 7168。第 4.5 节量过（调试构建、一台机器上的一次运行，不是 CI；量法照第 6 条）：512 时装满比基线多出的与总量之比是 1.5207，照计划 P15 的式子改成 7168 之后是 1.0266；修正轮 1 让存进去的条目复制自己的头之后重跑一次是 1.0843，不再改。括号里说的组成也不准了：多出的大半是两张 `HeaderMap` 超出每行 32 字节的那部分，只对量的那种形状（每侧 14 行头、4 KiB 正文）成立，头的行数多得多的条目实际的占用仍比账多（`crates/rurge-http/src/capture/mod.rs` 里 `ENTRY_OVERHEAD` 的注释）。缺省的上限不因此改。以修正记录第 76 行为准（重跑的数见第 81 行）。
+
+8. 第 5.2 节第 2 条"出站模式是直连或全局代理、或会话属于 `external` 程序时，`choose_policy_with` 不求规则就定了策略" → 全局代理只在全局策略设了而且认得时不求规则；全局策略没设或不认得时，`choose_policy_with` 告警一次（`outbound mode is proxy but the global policy is unset or unknown; routing by rules`）、照规则走，命中的那一行的 `always-capture` 照读。这是 M4a 之前就有的行为，不是执行期改的，正文少了这个限定；`docs/api/phase4.md` 的「M4a　抓包」一节照代码写了。以修正记录第 88 行 ③ 为准（改文档的是第 89 行）。
