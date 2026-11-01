@@ -2777,3 +2777,343 @@ async fn api_tls_is_the_last_ca_a_generation_had() {
         "nothing to sign the API's certificates with"
     );
 }
+
+// ---- why a TLS session was not decrypted (plan task 3)
+
+/// What a record says about why its session was not decrypted: only the notes
+/// of the phase 4 / M4b plan's P6, in the order they were written.
+fn reasons(record: &rurge_engine::RequestRecord) -> Vec<&str> {
+    record
+        .notes
+        .iter()
+        .map(String::as_str)
+        .filter(|note| note.starts_with("Passed through:") || note.starts_with("Not decrypted:"))
+        .collect()
+}
+
+/// Asserts that `record`'s reason is exactly `note`, and nothing else that
+/// says why the session was passed through (`None`: no reason at all).
+fn assert_reason(record: &rurge_engine::RequestRecord, note: Option<&str>) {
+    let wanted: Vec<&str> = note.into_iter().collect();
+    assert_eq!(reasons(record), wanted, "{record:?}");
+}
+
+/// The switch is asked after the list and before anything else: a listed
+/// session is noted as passed for it, and a session no list takes says nothing
+/// at all (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's P6).
+#[tokio::test]
+async fn a_listed_session_with_mitm_off_is_noted() {
+    let origin = TlsFixture::new(&["listed.test", "other.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let ca = mitm.ca_p12_base64("pw");
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "listed.test = 127.0.0.1\nother.test = 127.0.0.1",
+            rules: "DOMAIN,listed.test,A\nDOMAIN,other.test,A",
+            sections: &mitm_section("listed.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+    h.engine.set_mitm(false).await;
+
+    let cases = [
+        ("listed.test", Some("Not decrypted: MITM is off")),
+        ("other.test", None),
+    ];
+    let mut seen = 0;
+    for (name, note) in cases {
+        let tunnel = connect_via_socks5(h.socks(), name, 443).await;
+        let mut tls = handshake(tunnel, client_config(origin.roots(), &[], true), name)
+            .await
+            .expect("the session is passed through to the origin");
+        let response = get(&mut tls, name, "/a").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        drop(tls);
+
+        seen += 1;
+        let record = the_records(&h, seen).await.remove(seen - 1);
+        assert_eq!(record.dst, format!("{name}:443"), "{record:?}");
+        assert_reason(&record, note);
+    }
+}
+
+/// A generation without a usable CA cannot sign a leaf for a listed name, so
+/// it is passed through and its record says so (`phase 4 M4 design 10.2`).
+#[tokio::test]
+async fn a_listed_session_without_a_usable_ca_is_noted() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    // the CA is the right one, its passphrase is not: `W0039` says so at load
+    // and this generation has no `Mitm`
+    let section = format!(
+        "[MITM]\nhostname = origin.test\nca-p12 = {}\nca-passphrase = wrong-pw",
+        mitm.ca_p12_base64("pw")
+    );
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &section,
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(
+        tunnel,
+        client_config(origin.roots(), &[], true),
+        "origin.test",
+    )
+    .await
+    .expect("the session is passed through to the origin");
+    let response = get(&mut tls, "origin.test", "/a").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    drop(tls);
+
+    let record = the_records(&h, 1).await.remove(0);
+    assert_reason(&record, Some("Not decrypted: no usable CA"));
+}
+
+/// A source `[MITM] client-source-address` refuses is passed through with that
+/// as its reason, and a name the list does not take is not said to be refused
+/// for its source: the list is asked first (`phase 4 M4 design 10.2`).
+#[tokio::test]
+async fn a_listed_session_from_a_source_not_allowed_is_noted() {
+    let origin = TlsFixture::new(&["listed.test", "other.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let ca = mitm.ca_p12_base64("pw");
+    // the client comes from the loopback, which is not in the list
+    let section = format!(
+        "[MITM]\nhostname = listed.test\nclient-source-address = 10.0.0.0/8\nca-p12 = {ca}\nca-passphrase = pw"
+    );
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "listed.test = 127.0.0.1\nother.test = 127.0.0.1",
+            rules: "DOMAIN,listed.test,A\nDOMAIN,other.test,A",
+            sections: &section,
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+    assert!(
+        h.engine.mitm_ca_der().is_some(),
+        "the CA is usable; the source is what passes these through"
+    );
+
+    let cases = [
+        (
+            "listed.test",
+            Some("Not decrypted: the client is not in client-source-address"),
+        ),
+        ("other.test", None),
+    ];
+    let mut seen = 0;
+    for (name, note) in cases {
+        let tunnel = connect_via_socks5(h.socks(), name, 443).await;
+        let mut tls = handshake(tunnel, client_config(origin.roots(), &[], true), name)
+            .await
+            .expect("the session is passed through to the origin");
+        let response = get(&mut tls, name, "/a").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        drop(tls);
+
+        seen += 1;
+        let record = the_records(&h, seen).await.remove(seen - 1);
+        assert_eq!(record.dst, format!("{name}:443"), "{record:?}");
+        assert_reason(&record, note);
+    }
+}
+
+/// A client whose ALPN rurge does not serve is passed through with that as its
+/// reason (`phase 4 M4 design 10.2`, `phase 4 M2 design 7.4`).
+#[tokio::test]
+async fn a_listed_session_whose_alpn_rurge_does_not_decrypt_is_noted() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let Err(error) = handshake(
+        tunnel,
+        client_config(mitm_roots, &[&b"spdy/3"[..]], true),
+        "origin.test",
+    )
+    .await
+    else {
+        panic!("the client is passed through and sees the origin's certificate");
+    };
+    // the origin serves neither protocol, so the client is told so; what it is
+    // told is its business, the record's note is the engine's
+    let _ = error;
+
+    let record = the_records(&h, 1).await.remove(0);
+    assert_reason(
+        &record,
+        Some("Not decrypted: the client offers no protocol rurge decrypts"),
+    );
+}
+
+/// Builds a minimal TLS ClientHello record carrying one SNI host_name — the
+/// same bytes as `crates/rurge-engine/src/sniff.rs`'s test helper, which
+/// `tests/` cannot reach. rustls will not send a name it takes no server name
+/// for, so the hello of that case is written by hand.
+fn hand_written_hello(host: &str) -> Vec<u8> {
+    let sni = host.as_bytes();
+    // server_name extension body: list_len(2) + type(1) + name_len(2) + name
+    let mut server_name = Vec::new();
+    server_name.extend_from_slice(&((sni.len() + 3) as u16).to_be_bytes());
+    server_name.push(0); // host_name
+    server_name.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+    server_name.extend_from_slice(sni);
+    // extension: type 0x0000 + len + body
+    let mut ext = Vec::new();
+    ext.extend_from_slice(&0u16.to_be_bytes());
+    ext.extend_from_slice(&(server_name.len() as u16).to_be_bytes());
+    ext.extend_from_slice(&server_name);
+    // handshake body
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]); // client_version TLS1.2
+    body.extend_from_slice(&[0u8; 32]); // random
+    body.push(0); // session_id len
+    body.extend_from_slice(&2u16.to_be_bytes()); // cipher suites len
+    body.extend_from_slice(&[0x13, 0x01]);
+    body.push(1); // compression len
+    body.push(0);
+    body.extend_from_slice(&(ext.len() as u16).to_be_bytes()); // extensions len
+    body.extend_from_slice(&ext);
+    // handshake header: type 0x01 + 3-byte len
+    let mut hs = vec![0x01];
+    let bl = body.len();
+    hs.extend_from_slice(&[(bl >> 16) as u8, (bl >> 8) as u8, bl as u8]);
+    hs.extend_from_slice(&body);
+    // TLS record: type 0x16, version, len
+    let mut rec = vec![0x16, 0x03, 0x01];
+    rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+    rec.extend_from_slice(&hs);
+    rec
+}
+
+/// A listed name rustls takes no server name for cannot be signed for: the
+/// session is passed through with that as its reason (`phase 4 M4 design
+/// 10.2`).
+#[tokio::test]
+async fn a_listed_name_no_certificate_can_be_made_for_is_noted() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(echo),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let ca = mitm.ca_p12_base64("pw");
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "other.test = 127.0.0.1",
+            rules: "DOMAIN,other.test,A",
+            sections: &mitm_section("*.test", &ca),
+            ..Profile::default()
+        },
+        mitm.roots(),
+    )
+    .await;
+
+    let mut s = connect_via_socks5(h.socks(), "other.test", 443).await;
+    s.write_all(&hand_written_hello(&format!("{}.test", "a".repeat(64))))
+        .await
+        .unwrap();
+    // the client goes and the echo's answer has nobody to reach: the record
+    // ends, and only what it says about the passing is asked
+    drop(s);
+
+    let record = the_records(&h, 1).await.remove(0);
+    assert_reason(
+        &record,
+        Some("Not decrypted: no certificate can be made for this name"),
+    );
+}
+
+/// A session that is decrypted carries no reason at all: none of the notes
+/// about a passing is written for it (`phase 4 M4 design 10.2`).
+#[tokio::test]
+async fn a_decrypted_session_has_no_reason() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let upstream = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin_addr(&server)),
+        ..Socks5Script::default()
+    })
+    .await;
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let h = harness_mitm(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", upstream.addr().port()),
+            hosts: "origin.test = 127.0.0.1",
+            rules: "DOMAIN,origin.test,A",
+            sections: &mitm_section("origin.test", &ca),
+            ..Profile::default()
+        },
+        origin.roots(),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", 443).await;
+    let mut tls = handshake(tunnel, client_config(mitm_roots, &[], true), "origin.test")
+        .await
+        .expect("the client trusts the MITM CA");
+    let response = get(&mut tls, "origin.test", "/a").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    drop(tls);
+
+    let record = the_records(&h, 1).await.remove(0);
+    assert_eq!(record.protocol, Some(ProtocolKind::Https), "{record:?}");
+    assert_reason(&record, None);
+}

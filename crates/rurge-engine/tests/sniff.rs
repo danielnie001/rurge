@@ -1047,3 +1047,365 @@ async fn a_dropped_tun_session_ends_when_the_app_closes() {
         "the hold answers nothing at all: {rest:?}"
     );
 }
+
+// ---- why a session was passed through, or not decrypted (plan task 3)
+
+/// What a record says about why its session never reached the engine: only the
+/// notes of the phase 4 / M4b plan's P6, in the order they were written.
+fn reasons(record: &rurge_engine::RequestRecord) -> Vec<&str> {
+    record
+        .notes
+        .iter()
+        .map(String::as_str)
+        .filter(|note| note.starts_with("Passed through:") || note.starts_with("Not decrypted:"))
+        .collect()
+}
+
+/// Asserts that `record`'s reason is exactly `note`, and nothing else that
+/// says why the session was passed through (`None`: no reason at all).
+fn assert_reason(record: &rurge_engine::RequestRecord, note: Option<&str>) {
+    let wanted: Vec<&str> = note.into_iter().collect();
+    assert_eq!(reasons(record), wanted, "{record:?}");
+}
+
+/// The two lists of `[General]` are written on the record of the sessions they
+/// keep out of the engine, and the hosts come before the keywords
+/// (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's P6): at the two proxy
+/// entries, whose answer comes before anything is read.
+#[tokio::test]
+async fn always_raw_tcp_hosts_and_keywords_are_noted() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(echo),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            general: "always-raw-tcp-hosts = raw.test, both-rawkey.test\n\
+always-raw-tcp-keywords = rawkey",
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            hosts: "raw.test = 127.0.0.1\na-rawkey.test = 127.0.0.1\nboth-rawkey.test = 127.0.0.1",
+            rules: "DOMAIN,raw.test,A\nDOMAIN,a-rawkey.test,A\nDOMAIN,both-rawkey.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    const HOSTS: &str = "Passed through: always-raw-tcp-hosts";
+    const KEYWORDS: &str = "Passed through: always-raw-tcp-keywords";
+    // `a-rawkey.test` is taken by the keyword alone, `both-rawkey.test` by both
+    // and the hosts say so, and `raw.test` by the hosts alone: an entry with
+    // no `*` matches itself and nothing under it
+    let cases = [
+        ("raw.test", HOSTS),
+        ("a-rawkey.test", KEYWORDS),
+        ("both-rawkey.test", HOSTS),
+    ];
+    let mut seen = 0;
+    for (name, note) in cases {
+        for entry in [Http, Socks5] {
+            let mut tunnel = match entry {
+                Http => connect_via_http(h.http(), &format!("{name}:443")).await,
+                _ => connect_via_socks5(h.socks(), name, 443).await,
+            };
+            echo_through(&mut tunnel, b"ping").await;
+            drop(tunnel);
+
+            seen += 1;
+            let record = the_records(&h, seen).await.remove(seen - 1);
+            assert_eq!(record.dst, format!("{name}:443"), "{record:?}");
+            assert_reason(&record, Some(note));
+        }
+    }
+}
+
+/// The lists are asked before the port, and a session no one sniffs is judged
+/// at its dial: a listed name on a port that is never sniffed still says so,
+/// and a name no list takes says nothing (`phase 4 M4 design 10.2`).
+#[tokio::test]
+async fn a_listed_raw_host_on_a_port_that_is_never_sniffed_is_noted_still() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(echo),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            general: "always-raw-tcp-hosts = raw.test",
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            hosts: "raw.test = 127.0.0.1\nother.test = 127.0.0.1",
+            rules: "DOMAIN,raw.test,A\nDOMAIN,other.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    // 8443 is neither of the two ports of the design, nor one the settings
+    // add, so neither session is sniffed at all
+    let mut tunnel = connect_via_socks5(h.socks(), "raw.test", 8443).await;
+    echo_through(&mut tunnel, b"ping").await;
+    drop(tunnel);
+    let record = the_records(&h, 1).await.remove(0);
+    assert_eq!(record.dst, "raw.test:8443", "{record:?}");
+    assert_reason(&record, Some("Passed through: always-raw-tcp-hosts"));
+
+    let mut tunnel = connect_via_socks5(h.socks(), "other.test", 8443).await;
+    echo_through(&mut tunnel, b"ping").await;
+    drop(tunnel);
+    let record = the_records(&h, 2).await.remove(1);
+    assert_eq!(record.dst, "other.test:8443", "{record:?}");
+    assert_reason(&record, None);
+}
+
+/// A session the lists took keeps its note even when the rules refuse it: the
+/// note is written when the handle is made, before the rules are asked
+/// (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's P6 ⑤).
+#[tokio::test]
+async fn a_listed_raw_host_that_the_rules_reject_keeps_its_note() {
+    let h = harness_with(
+        Profile {
+            general: "always-raw-tcp-hosts = raw.test",
+            hosts: "raw.test = 127.0.0.1",
+            rules: "DOMAIN,raw.test,REJECT",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, _s) = socks5_connect(h.socks(), "raw.test", 443).await;
+    assert_eq!(reply[1], 0x02, "not allowed by ruleset: {reply:?}");
+
+    let record = the_records(&h, 1).await.remove(0);
+    assert_eq!(
+        record.status,
+        RecordStatus::Rejected("REJECT".into()),
+        "{record:?}"
+    );
+    assert_reason(&record, Some("Passed through: always-raw-tcp-hosts"));
+}
+
+/// A session that showed neither HTTP nor TLS is noted as such, unless the
+/// settings keep it in the engine whatever it shows (`phase 4 M4 design
+/// 10.2`, design 6.4).
+#[tokio::test]
+async fn neither_http_nor_tls_is_noted() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let script = || Socks5Script {
+        connect_to: Some(echo),
+        ..Socks5Script::default()
+    };
+    let a = FakeSocks5::spawn(script()).await;
+    let proxies = format!("A = socks5, 127.0.0.1, {}", a.addr().port());
+    let hosts = "neither.test = 127.0.0.1\nforced.test = 127.0.0.1";
+    let rules = "DOMAIN,neither.test,A\nDOMAIN,forced.test,A";
+
+    // the greeting of a server-first protocol is neither
+    let h = harness_with(
+        Profile {
+            proxies: &proxies,
+            hosts,
+            rules,
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+    let mut s = connect_via_socks5(h.socks(), "neither.test", 443).await;
+    echo_through(&mut s, b"SSH-2.0-test\r\n\r\n").await;
+    drop(s);
+    let record = the_records(&h, 1).await.remove(0);
+    assert_eq!(record.protocol, None, "nothing was judged: {record:?}");
+    assert_reason(&record, Some("Passed through: neither HTTP nor TLS"));
+
+    // the same bytes, to a name the settings force into the engine: it stays
+    // there, and its record says nothing about the sniff
+    let h = harness_with(
+        Profile {
+            general: "force-http-engine-hosts = forced.test:443",
+            proxies: &proxies,
+            hosts,
+            rules,
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+    let (reply, mut s) = socks5_connect(h.socks(), "forced.test", 443).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    s.write_all(b"SSH-2.0-test\r\n\r\n").await.unwrap();
+    let mut back = [0u8; 1024];
+    let got = tokio::time::timeout(Duration::from_secs(5), s.read(&mut back))
+        .await
+        .expect("the engine answers within the bound")
+        .unwrap();
+    let answer = String::from_utf8_lossy(&back[..got]).into_owned();
+    assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+    drop(s);
+    let record = the_records(&h, 1).await.remove(0);
+    assert_reason(&record, None);
+}
+
+/// A client that says nothing for the whole wait is passed through after it,
+/// and the record says so (design 6.3, `phase 4 M4 design 10.2`).
+#[tokio::test]
+async fn a_sniff_that_waits_out_its_time_is_noted() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(echo),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            hosts: "quiet.test = 127.0.0.1",
+            rules: "DOMAIN,quiet.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, s) = socks5_connect(h.socks(), "quiet.test", 443).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    // nothing is sent: the 300 ms wait runs out and the session is dialed. The
+    // fixed wait is the margin over it, and what it waits for is the dial that
+    // follows the wait — not for nothing to happen
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    drop(s);
+
+    let record = the_records(&h, 1).await.remove(0);
+    assert_eq!(record.protocol, None, "nothing was shown: {record:?}");
+    assert_reason(&record, Some("Passed through: sniffing timed out"));
+}
+
+/// A client that closes its side during the wait showed no protocol at all,
+/// so the record gives no reason for its passing (the phase 4 / M4b plan's
+/// P6 ④).
+#[tokio::test]
+async fn a_client_that_closes_during_the_wait_has_no_note() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(echo),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            hosts: "target.test = 127.0.0.1",
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut s) = socks5_connect(h.socks(), "target.test", 443).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    s.write_all(b"GE").await.unwrap();
+    s.shutdown().await.unwrap();
+    let mut back = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut back))
+        .await
+        .expect("the echo comes back within the bound")
+        .unwrap();
+    assert_eq!(&back, b"GE");
+    drop(s);
+
+    let record = the_records(&h, 1).await.remove(0);
+    assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+    assert_reason(&record, None);
+}
+
+/// A paused engine refuses its sessions before it answers them, and before the
+/// lists are asked: no list is noted for a session nothing was sniffed for
+/// (the phase 4 / M4b plan's P6 ⑤).
+#[tokio::test]
+async fn a_paused_engine_writes_no_reason() {
+    let a = FakeSocks5::spawn(Socks5Script::default()).await;
+    let h = harness_with(
+        Profile {
+            general: "always-raw-tcp-hosts = target.test",
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    h.engine.suspend(Some("strict".into()));
+    let (reply, _s) = socks5_connect(h.socks(), "target.test", 443).await;
+    assert_eq!(reply[1], 0x05, "today's refusal, not a tunnel: {reply:?}");
+
+    let record = the_records(&h, 1).await.remove(0);
+    assert_eq!(record.status, RecordStatus::Failed, "{record:?}");
+    assert_reason(&record, None);
+}
+
+/// Pre-matching is asked before the answer, and the lists are asked before it:
+/// a session it refuses is noted only when a list took it, which is the one
+/// order in which both can speak (`the phase 4 / M4b plan's P6 ⑤`).
+#[tokio::test]
+async fn pre_matching_writes_no_reason_unless_a_list_came_first() {
+    let h = harness_with(
+        Profile {
+            general: "always-raw-tcp-hosts = listed-ads.test",
+            hosts: "ads.test = 127.0.0.1\nlisted-ads.test = 127.0.0.1",
+            rules: "DOMAIN,ads.test,REJECT,pre-matching\nDOMAIN,listed-ads.test,REJECT,pre-matching",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, _s) = socks5_connect(h.socks(), "ads.test", 443).await;
+    assert_eq!(reply[1], 0x02, "not allowed by ruleset: {reply:?}");
+    let record = the_records(&h, 1).await.remove(0);
+    assert!(
+        matches!(record.status, RecordStatus::Rejected(_)),
+        "{record:?}"
+    );
+    assert_reason(&record, None);
+
+    let (reply, _s) = socks5_connect(h.socks(), "listed-ads.test", 443).await;
+    assert_eq!(reply[1], 0x02, "not allowed by ruleset: {reply:?}");
+    let record = the_records(&h, 2).await.remove(1);
+    assert!(
+        matches!(record.status, RecordStatus::Rejected(_)),
+        "{record:?}"
+    );
+    assert_reason(&record, Some("Passed through: always-raw-tcp-hosts"));
+}
+
+/// A TLS session no `[MITM]` takes is passed through as `M1` passes it, and
+/// its record says nothing about it: no list, no switch and no CA were asked
+/// of a generation that has none (`phase 4 M4 design 10.2`).
+#[tokio::test]
+async fn an_unlisted_tls_session_has_no_note() {
+    let fixture = TlsFixture::new(&["sni.test"]);
+    let (_a, _b, proxies) = two_policies(fixture.spawn_echo(false).await).await;
+    let h = harness_with(
+        Profile {
+            proxies: &proxies,
+            hosts: "target.test = 127.0.0.1",
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "target.test", 443).await;
+    ping_over(tunnel).await;
+
+    let record = the_records(&h, 1).await.remove(0);
+    assert_eq!(record.protocol, Some(ProtocolKind::Https), "{record:?}");
+    assert_reason(&record, None);
+}
