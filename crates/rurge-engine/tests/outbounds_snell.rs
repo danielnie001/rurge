@@ -474,11 +474,9 @@ async fn snell_v1_and_v2_carry_no_udp() {
 #[tokio::test]
 async fn udp_keeps_to_the_policys_port_whatever_udp_port_says() {
     let fake = FakeSnell::spawn(SnellScript::new("s3same")).await;
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // nobody listens on it over TCP, which is what a `udp-port` that was
+    // followed would be dialed with: snell carries UDP on a TCP connection
+    let closed = closed_tcp_port();
     let h = through(&snell_line(
         &fake,
         &format!("psk=s3same, version=5, udp-port={closed}"),

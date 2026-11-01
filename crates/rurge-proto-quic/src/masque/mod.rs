@@ -501,10 +501,7 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_is_quoted_by_its_status() {
         // a port nothing listens on
-        let closed = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        };
+        let closed = SocketAddr::from(([127, 0, 0, 1], rurge_net::testing::closed_tcp_port()));
         let fake = FakeH3Proxy::spawn(H3ProxyScript {
             users: users(),
             ..H3ProxyScript::default()

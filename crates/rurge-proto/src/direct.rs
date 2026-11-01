@@ -158,9 +158,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, OutboundError::Io(_)), "{err}");
         // a port nobody listens on
-        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = closed.local_addr().unwrap().port();
-        drop(closed);
+        let port = rurge_net::testing::closed_tcp_port();
         let err = direct
             .connect_tcp(
                 &Target::new(HostName::parse("127.0.0.1"), port),

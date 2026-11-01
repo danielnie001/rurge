@@ -178,9 +178,7 @@ pub(crate) async fn echo_server() -> SocketAddr {
 #[tokio::test]
 async fn dial_finishes_the_handle_on_connect_failure() {
     // A closed loopback port: nothing answers, so `connect` fails outright.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let closed = listener.local_addr().unwrap();
-    drop(listener);
+    let closed = SocketAddr::from(([127, 0, 0, 1], rurge_net::testing::closed_tcp_port()));
 
     let dialer = FakeDialer::new(closed, None);
     let session = SessionInfo::tcp(HostName::parse("echo.test"), 80);

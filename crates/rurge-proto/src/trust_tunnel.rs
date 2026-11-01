@@ -317,10 +317,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_target_and_other_statuses_are_quoted_by_number() {
         // a port nothing listens on: the server cannot connect, 502
-        let closed = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        };
+        let closed = SocketAddr::from(([127, 0, 0, 1], rurge_net::testing::closed_tcp_port()));
         let (fixture, fake) = proxy(&["127.0.0.1"], H2ProxyScript::default()).await;
         let out = outbound(&fake, "", &fixture);
         assert_eq!(

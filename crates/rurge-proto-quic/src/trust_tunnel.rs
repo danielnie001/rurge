@@ -352,10 +352,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_target_and_other_statuses_are_quoted_by_number() {
         // a port nothing listens on
-        let closed = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        };
+        let closed = SocketAddr::from(([127, 0, 0, 1], rurge_net::testing::closed_tcp_port()));
         let fake = endpoint(H3ProxyScript::default());
         let out = outbound(&fake, LOGIN);
         let err = failure(&out, &target(closed)).await;

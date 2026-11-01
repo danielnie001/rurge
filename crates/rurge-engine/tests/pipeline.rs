@@ -1372,16 +1372,6 @@ async fn reload_swaps_rules_without_changing_listeners() {
     assert!(h.engine.swap_runtime(next), "listen addr set changed");
 }
 
-/// A loopback port nothing listens on right now: bind `:0`, read the port,
-/// drop. Inherently a probe — another process can take it before the caller
-/// binds — so every caller retries once.
-async fn free_port() -> u16 {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    port
-}
-
 fn http_addr(listeners: &[(ListenerSpec, Running)]) -> SocketAddr {
     listeners
         .iter()
@@ -1435,7 +1425,7 @@ async fn reload_with_changed_password_rebinds_and_applies_it() {
     // password. Probing races other processes, hence the retry.
     let mut bound = None;
     for _ in 0..2 {
-        let port = free_port().await;
+        let port = common::closed_tcp_port();
         let runtime = build_runtime(
             dir.path(),
             &dns,
@@ -1517,7 +1507,7 @@ async fn rebind_moves_the_listener_to_the_new_address() {
     // listeners behind, which is exactly what the retry starts from.
     let mut moved = None;
     for _ in 0..2 {
-        let port = free_port().await;
+        let port = common::closed_tcp_port();
         let next = build_runtime(
             dir.path(),
             &dns,
@@ -2734,11 +2724,9 @@ async fn a_doq_carrier_that_outlives_a_port_unreachable_is_no_failed_session() {
     /// What QUIC pads the datagram of its first packet to (RFC 9000 14.1):
     /// a carrier that has sent more has sent again.
     const INITIAL: u64 = 1200;
-    // where the packets go, and no more: the port is never bound again
-    let addr = std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // where the packets go, and no more: nothing listens on the port, and
+    // no socket another test opens is handed it
+    let addr = SocketAddr::from(([127, 0, 0, 1], common::closed_udp_port()));
     let dir = tempfile::tempdir().unwrap();
     let profile = follow_profile(&format!("quic://{addr}"), "", "PROTOCOL,DOQ,REJECT");
     let engine = engine_from_profile(dir.path(), &profile).await;
