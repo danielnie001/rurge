@@ -68,6 +68,12 @@ pub struct RequestJson {
     /// The status the client was answered with; `null` when the request got
     /// no answer or is no HTTP request.
     pub status_code: Option<u16>,
+    /// The request body's bytes that went upstream; `null` for a session that
+    /// is no HTTP request.
+    pub request_body_bytes: Option<u64>,
+    /// The answer body's bytes handed to the client; `null` for a session
+    /// that is no HTTP request.
+    pub response_body_bytes: Option<u64>,
     pub up: u64,
     pub down: u64,
     pub started_ms: u64,
@@ -75,6 +81,9 @@ pub struct RequestJson {
     pub connect_ms: Option<u64>,
     pub first_byte_ms: Option<u64>,
     pub dns_ms: Option<u64>,
+    /// From the first byte that came back from upstream until the session
+    /// ended; `null` while it goes on and when no byte came back.
+    pub receive_ms: Option<u64>,
     pub status: &'static str,
     pub reject_kind: Option<String>,
     pub error: Option<String>,
@@ -114,6 +123,8 @@ impl From<&RequestRecord> for RequestJson {
             method: r.method.clone(),
             url: r.url.clone(),
             status_code: r.status_code,
+            request_body_bytes: r.request_body_bytes,
+            response_body_bytes: r.response_body_bytes,
             up: r.up,
             down: r.down,
             started_ms: r.started_ms,
@@ -121,6 +132,7 @@ impl From<&RequestRecord> for RequestJson {
             connect_ms: r.connect_ms,
             first_byte_ms: r.first_byte_ms,
             dns_ms: r.dns_ms,
+            receive_ms: r.receive_ms,
             status,
             reject_kind,
             error: r.error.clone(),
@@ -227,6 +239,8 @@ mod tests {
             method: None,
             url: None,
             status_code: None,
+            request_body_bytes: None,
+            response_body_bytes: None,
             up: 0,
             down: 0,
             started_ms: 0,
@@ -234,6 +248,7 @@ mod tests {
             connect_ms: None,
             first_byte_ms: None,
             dns_ms: None,
+            receive_ms: None,
             status: RecordStatus::Active,
             error: None,
             notes: vec![],
@@ -265,6 +280,8 @@ mod tests {
             method: Some("POST".into()),
             url: Some("https://example.com/a?b=1".into()),
             status_code: Some(201),
+            request_body_bytes: Some(5),
+            response_body_bytes: Some(1234),
             up: 1234,
             down: 56789,
             started_ms: 1_757_200_000_000,
@@ -272,6 +289,7 @@ mod tests {
             connect_ms: Some(35),
             first_byte_ms: Some(120),
             dns_ms: Some(14),
+            receive_ms: Some(30),
             status: RecordStatus::Rejected("REJECT-TINYGIF".into()),
             error: Some("an explanation".into()),
             notes: vec!["a note".into()],
@@ -295,6 +313,8 @@ mod tests {
                 "method": "POST",
                 "url": "https://example.com/a?b=1",
                 "statusCode": 201,
+                "requestBodyBytes": 5,
+                "responseBodyBytes": 1234,
                 "up": 1234,
                 "down": 56789,
                 "startedMs": 1_757_200_000_000_u64,
@@ -302,6 +322,7 @@ mod tests {
                 "connectMs": 35,
                 "firstByteMs": 120,
                 "dnsMs": 14,
+                "receiveMs": 30,
                 "status": "rejected",
                 "rejectKind": "REJECT-TINYGIF",
                 "error": "an explanation",
@@ -407,19 +428,43 @@ mod tests {
         );
     }
 
-    /// The two timing fields (M3c design 4.1): `null` until the moment has
-    /// come, milliseconds after.
+    /// The three keys of M4b (`phase 4 M4 design 10.1`): `null` until known,
+    /// numbers after, and `null` for a session that is no HTTP request.
     #[test]
     fn the_timings_are_null_until_known() {
         let mut r = record(1, ListenerKind::Http);
         let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
         assert_eq!(v["connectMs"], Value::Null);
         assert_eq!(v["firstByteMs"], Value::Null);
+        assert_eq!(v["receiveMs"], Value::Null);
+        assert_eq!(v["requestBodyBytes"], Value::Null);
+        assert_eq!(v["responseBodyBytes"], Value::Null);
         r.connect_ms = Some(12);
         r.first_byte_ms = Some(34);
+        r.receive_ms = Some(56);
+        r.request_body_bytes = Some(78);
+        r.response_body_bytes = Some(90);
         let v = serde_json::to_value(RequestJson::from(&r)).unwrap();
         assert_eq!(v["connectMs"], 12);
         assert_eq!(v["firstByteMs"], 34);
+        assert_eq!(v["receiveMs"], 56);
+        assert_eq!(v["requestBodyBytes"], 78);
+        assert_eq!(v["responseBodyBytes"], 90);
+    }
+
+    /// The three new keys sit where the design puts them (`phase 4 M4 design
+    /// 10.1`): `receiveMs` after `dnsMs`, the two body counts after
+    /// `statusCode`. The field order of `RequestJson` is the key order of the
+    /// JSON.
+    #[test]
+    fn the_new_keys_sit_where_the_design_puts_them() {
+        let s = serde_json::to_string(&RequestJson::from(&record(1, ListenerKind::Http))).unwrap();
+        let find = |key: &str| s.find(&format!("\"{key}\":")).expect("a key is missing");
+        assert!(find("dnsMs") < find("receiveMs"));
+        assert!(find("receiveMs") < find("status"));
+        assert!(find("statusCode") < find("requestBodyBytes"));
+        assert!(find("requestBodyBytes") < find("responseBodyBytes"));
+        assert!(find("responseBodyBytes") < find("up"));
     }
 
     /// The listener's port is a number, `null` for a session that came in on

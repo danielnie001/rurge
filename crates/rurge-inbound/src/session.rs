@@ -87,6 +87,15 @@ pub struct SessionHandle {
     protocol: Mutex<Option<ProtocolKind>>,
     up: AtomicU64,
     down: AtomicU64,
+    /// The request body's bytes that went upstream, as the HTTP engine counted
+    /// them while it handed each frame over (`phase 4 M4 design 10.1`). Apart
+    /// from `up`, which counts every byte upstream, the head included. The
+    /// record is made when the session finishes, so what is counted after that
+    /// reaches no record.
+    request_body: AtomicU64,
+    /// The answer body's bytes handed to the client, counted the same way as
+    /// `request_body`.
+    response_body: AtomicU64,
     /// Since `started`: when the outbound was ready (`mark_connected`).
     connected: OnceLock<Duration>,
     /// Since `started`: when the first byte came back from upstream.
@@ -153,6 +162,8 @@ impl SessionHandle {
             protocol: Mutex::new(None),
             up: AtomicU64::new(0),
             down: AtomicU64::new(0),
+            request_body: AtomicU64::new(0),
+            response_body: AtomicU64::new(0),
             connected: OnceLock::new(),
             first_byte: OnceLock::new(),
             method: OnceLock::new(),
@@ -318,6 +329,25 @@ impl SessionHandle {
         )
     }
 
+    /// Counts `n` more bytes of the request body that went upstream; the HTTP
+    /// engine calls this as it hands each frame over.
+    pub fn add_request_body(&self, n: u64) {
+        self.request_body.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Counts `n` more bytes of the answer body handed to the client.
+    pub fn add_response_body(&self, n: u64) {
+        self.response_body.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// (request body, answer body) bytes so far.
+    pub fn body_bytes(&self) -> (u64, u64) {
+        (
+            self.request_body.load(Ordering::Relaxed),
+            self.response_body.load(Ordering::Relaxed),
+        )
+    }
+
     /// The outbound connection is ready. Only the first call counts.
     pub fn mark_connected(&self) {
         let _ = self.connected.set(self.started.elapsed());
@@ -381,6 +411,14 @@ impl SessionHandle {
     /// matching, name resolution and any wait included).
     pub fn connect_time(&self) -> Option<Duration> {
         self.connected.get().copied()
+    }
+
+    /// Since the session's start: when the first byte came back from upstream
+    /// (`phase 4 M4 design 10.1`); `None` when none ever did. Where
+    /// `first_byte_time` counts from the outbound being ready, this counts
+    /// from the start.
+    pub fn first_byte_at(&self) -> Option<Duration> {
+        self.first_byte.get().copied()
     }
 
     /// From the outbound being ready until the first byte came back.
@@ -860,6 +898,36 @@ mod tests {
         h.mark_first_byte();
         assert_eq!(h.connect_time(), Some(connected), "the first mark stands");
         assert_eq!(h.first_byte_time(), Some(first), "the first mark stands");
+    }
+
+    /// The bytes the engine hands over as body are counted apart from the
+    /// bytes the session's own relay counts: `up` and `down` carry the head
+    /// too (`phase 4 M4 design 10.1`).
+    #[test]
+    fn the_body_counters_add_up_apart_from_the_bytes() {
+        let h = SessionHandle::new(4, SessionInfo::tcp(HostName::parse("a.test"), 80));
+        assert_eq!(h.body_bytes(), (0, 0));
+        h.add_request_body(3);
+        h.add_request_body(4);
+        h.add_response_body(10);
+        assert_eq!(h.body_bytes(), (7, 10));
+        assert_eq!(h.bytes(), (0, 0), "the body is counted apart");
+    }
+
+    /// The first byte is counted from the session's start by `first_byte_at`,
+    /// and from the outbound being ready by `first_byte_time`
+    /// (`phase 4 M4 design 10.1`).
+    #[test]
+    fn first_byte_at_is_counted_from_the_start() {
+        let h = SessionHandle::new(5, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        assert_eq!(h.first_byte_at(), None, "nothing came back yet");
+        h.mark_connected();
+        h.mark_first_byte();
+        let connected = h.connect_time().expect("marked");
+        let first = h.first_byte_at().expect("marked");
+        assert!(first <= h.elapsed(), "{first:?} is not past the start");
+        assert!(first >= connected, "{first:?} came before the outbound");
+        assert_eq!(h.first_byte_time(), Some(first - connected));
     }
 
     /// Bytes read from upstream through `Counting` mark the first byte; bytes

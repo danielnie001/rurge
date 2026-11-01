@@ -62,6 +62,18 @@ pub struct RequestRecord {
     /// no answer (a refusal that closes the connection) or is no HTTP request
     /// (`phase 4 M1 design 10.1`).
     pub status_code: Option<u16>,
+    /// The bytes of an HTTP request's body that went upstream, counted as the
+    /// engine handed each frame on, up to the moment the record was made
+    /// (`phase 4 M4 design 10.1`): a body still going up after the answer
+    /// ended counts what went before. `None` for a session that is no HTTP
+    /// request; `up` counts every byte that went upstream, the head included.
+    pub request_body_bytes: Option<u64>,
+    /// The bytes of the answer's body handed to the client, counted the same
+    /// way: the upstream's, or the body of an answer of rurge's own — an error
+    /// page, a refusal, a `[Map Local]` answer. `None` for a session that is no
+    /// HTTP request. A `HEAD` answered on HTTP/1.1 counts none: hyper sends no
+    /// body there.
+    pub response_body_bytes: Option<u64>,
     pub up: u64,
     pub down: u64,
     pub started_ms: u64,
@@ -76,6 +88,12 @@ pub struct RequestRecord {
     /// outbound's together; `None` when it made none — the target is an
     /// address, or the proxy resolves the name itself.
     pub dns_ms: Option<u64>,
+    /// From the first byte that came back from upstream until the session
+    /// ended (`phase 4 M4 design 10.1`); `None` while the session goes on,
+    /// and when no byte ever came back. With `connect_ms` and `first_byte_ms`
+    /// it makes the three spans of a request: the connection, the wait for
+    /// the answer, its body.
+    pub receive_ms: Option<u64>,
     pub status: RecordStatus,
     pub error: Option<String>,
     /// Remarks on how the session was handled that explain no failure — which
@@ -104,7 +122,8 @@ fn unix_millis() -> u64 {
 fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestRecord {
     let s = h.session();
     let (up, down) = h.bytes();
-    let elapsed_ms = h.elapsed().as_millis() as u64;
+    let elapsed = h.elapsed();
+    let elapsed_ms = elapsed.as_millis() as u64;
     let status = match outcome {
         None => RecordStatus::Active,
         Some(SessionOutcome::Completed) => RecordStatus::Completed,
@@ -117,6 +136,14 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         Some(SessionOutcome::Failed(m)) => Some(m.clone()),
         _ => None,
     });
+    // a session that is no HTTP request has no bodies to count, whatever the
+    // engine handed over on its behalf (`phase 4 M4 design 10.1`)
+    let method = h.method();
+    let is_http = method.is_some();
+    let (request_body, response_body) = h.body_bytes();
+    let receive_ms = outcome
+        .and(h.first_byte_at())
+        .map(|f| elapsed.saturating_sub(f).as_millis() as u64);
     RequestRecord {
         id: h.id(),
         listener: s.listener,
@@ -140,9 +167,11 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         // the method and the status are the two side slots `rurge-http` sets on
         // the handle as the request goes; the URL comes from the request the
         // engine was handed (`phase 4 M1 design 10.1`, `P5`)
-        method: h.method(),
+        method,
         url: s.url.clone(),
         status_code: h.status(),
+        request_body_bytes: is_http.then_some(request_body),
+        response_body_bytes: is_http.then_some(response_body),
         up,
         down,
         started_ms: unix_millis().saturating_sub(elapsed_ms),
@@ -150,6 +179,7 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         connect_ms: h.connect_time().map(|d| d.as_millis() as u64),
         first_byte_ms: h.first_byte_time().map(|d| d.as_millis() as u64),
         dns_ms: h.trail().dns().map(|d| d.as_millis() as u64),
+        receive_ms,
         status,
         error,
         notes: h.notes(),
@@ -594,6 +624,106 @@ mod tests {
         log.record_finished(&a, &SessionOutcome::Completed, &t);
         let done = log.recent(1).remove(0);
         assert_eq!((done.remote_addr, done.dns_ms), (None, Some(12)));
+    }
+
+    /// The receive span and the two body counts (`phase 4 M4 design 10.1`):
+    /// the body counts are read while the session runs and after, the receive
+    /// span only once the session ended, and only when a byte came back.
+    #[tokio::test]
+    async fn a_finished_record_has_its_receive_time_and_its_body_bytes() {
+        let log = RequestLog::new(2);
+        let t = TrafficStats::new();
+        let a = handle(1, "a.test");
+        a.set_method("GET");
+        log.mark_active(&a);
+        a.mark_connected();
+        a.mark_first_byte();
+        a.add_request_body(5);
+        a.add_response_body(11);
+        let live = log.active().remove(0);
+        assert_eq!(
+            (
+                live.receive_ms,
+                live.request_body_bytes,
+                live.response_body_bytes
+            ),
+            (None, Some(5), Some(11)),
+            "a session under way has no receive span yet"
+        );
+        a.finish(SessionOutcome::Completed);
+        log.record_finished(&a, &SessionOutcome::Completed, &t);
+        let elapsed_ms = a.elapsed().as_millis() as u64;
+        let done = log.recent(1).remove(0);
+        let receive = done.receive_ms.expect("a first byte came back");
+        assert!(receive <= elapsed_ms, "{receive} is past the session's end");
+        assert_eq!(
+            (done.request_body_bytes, done.response_body_bytes),
+            (Some(5), Some(11))
+        );
+    }
+
+    /// A session that is no HTTP request has no body counts even when bytes
+    /// went over it; its receive span is there for one that got a byte back
+    /// and `None` for one that did not (`phase 4 M4 design 10.1`).
+    #[tokio::test]
+    async fn a_session_that_is_no_http_request_has_no_body_bytes() {
+        let log = RequestLog::new(2);
+        let t = TrafficStats::new();
+        let with = handle(1, "a.test");
+        let without = handle(2, "b.test");
+        log.mark_active(&with);
+        log.mark_active(&without);
+        with.mark_connected();
+        with.mark_first_byte();
+        with.add_request_body(7);
+        with.add_response_body(9);
+        without.mark_connected();
+        let live = log.active();
+        let (one, two) = (&live[0], &live[1]);
+        assert_eq!(
+            (one.request_body_bytes, one.response_body_bytes),
+            (None, None)
+        );
+        assert_eq!(
+            (two.request_body_bytes, two.response_body_bytes),
+            (None, None)
+        );
+        for h in [&with, &without] {
+            h.finish(SessionOutcome::Completed);
+            log.record_finished(h, &SessionOutcome::Completed, &t);
+        }
+        let done = log.recent(2);
+        assert_eq!(done[0].receive_ms, None, "no byte came back");
+        assert!(done[1].receive_ms.is_some(), "a first byte came back");
+        assert_eq!(
+            (
+                done[0].request_body_bytes,
+                done[0].response_body_bytes,
+                done[1].request_body_bytes,
+                done[1].response_body_bytes
+            ),
+            (None, None, None, None)
+        );
+    }
+
+    /// No upstream byte ever came back: no receive span, though the request's
+    /// own bodies were counted (`phase 4 M4 design 10.1`).
+    #[tokio::test]
+    async fn the_receive_time_is_none_without_a_first_byte() {
+        let log = RequestLog::new(2);
+        let t = TrafficStats::new();
+        let a = handle(1, "a.test");
+        a.set_method("GET");
+        log.mark_active(&a);
+        a.mark_connected();
+        a.finish(SessionOutcome::Completed);
+        log.record_finished(&a, &SessionOutcome::Completed, &t);
+        let done = log.recent(1).remove(0);
+        assert_eq!(done.receive_ms, None);
+        assert_eq!(
+            (done.request_body_bytes, done.response_body_bytes),
+            (Some(0), Some(0))
+        );
     }
 
     #[test]
