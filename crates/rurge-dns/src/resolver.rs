@@ -745,7 +745,7 @@ impl Resolver {
             return Ok(literal(ip, Source::Literal, started));
         }
         // an address needed no lookup; every other way out of here is one
-        let _noted = Noted(started);
+        let _lookup = rurge_net::trail::Lookup::begin();
         let lower = trimmed.to_ascii_lowercase();
         let no_search = lower.ends_with('.');
         let name = lower.trim_end_matches('.').to_string();
@@ -1293,17 +1293,6 @@ fn no_server_outside() -> DnsError {
     )])
 }
 
-/// Notes a lookup on the trail of the session that is dialling when it ends,
-/// however it ends: a dial that gives up on a lookup drops it half way, and
-/// the session has spent that time on it all the same.
-struct Noted(Instant);
-
-impl Drop for Noted {
-    fn drop(&mut self) {
-        rurge_net::trail::looked_up(self.0.elapsed());
-    }
-}
-
 fn literal(ip: IpAddr, source: Source, started: Instant) -> DnsResult {
     from_ips(&[ip], Duration::ZERO, source, started)
 }
@@ -1782,6 +1771,41 @@ mod tests {
             .await;
         assert!(cut.is_err(), "the timeout fired first");
         assert!(trail.dns().unwrap() >= Duration::from_millis(50));
+    }
+
+    /// A lookup still under way shows on the trail while it waits, counting up
+    /// (`phase 4 M4 design 10.4`).
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_under_way_shows_on_the_trail_while_it_waits() {
+        let mock = MockDns::spawn().await;
+        mock.set("slow.test", &["10.0.0.1"], &[], 60);
+        mock.set_delay(Duration::from_secs(30));
+        let e = env(&profile(&format!("dns-server = {}", mock.addr()), ""));
+        // The fanout of `resolver_in_memory`'s `fast()` gives a lookup up after
+        // 300 ms, before the second this test watches it wait.
+        let (r, _) = resolver_with_fanout(
+            &e,
+            Arc::new(StaticSystemDns::default()),
+            FanoutOpts::default(),
+        );
+        r.primary.store(Arc::new(vec![mock.upstream()]));
+        let trail = Trail::new();
+        let task = tokio::spawn({
+            let trail = trail.clone();
+            async move {
+                trail
+                    .follow(r.lookup("slow.test", LookupOpts::default()))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let spent = trail.dns().expect("a lookup is under way");
+        assert!(
+            Duration::from_secs(1) <= spent && spent < Duration::from_secs(30),
+            "{spent:?}"
+        );
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
