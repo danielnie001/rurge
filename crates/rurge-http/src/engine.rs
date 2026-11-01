@@ -502,18 +502,17 @@ impl<U: Upstreams> Requests<U> {
             .upstreams
             .route(&handle, prepared.forwardable)
             .await;
-        if handle.token().is_cancelled() {
-            return Err(Close);
-        }
-        // Where this request is captured, taken before the match takes `routed`
-        // apart: `route` decides it, and an early return below leaves without
-        // it (`phase 4 M4 design 4.6`, the phase 4 / M4a plan's P9).
+        // Where this request is captured: `route` decides it (`phase 4 M4
+        // design 4.6`, the phase 4 / M4a plan's P9). It is armed before the
+        // token is looked at, so that a request killed or stopped while it was
+        // routed has its entry as it has its record, and before the match below
+        // takes `routed` apart; a request that is not captured makes no head.
         let capture = match &routed {
             Routed::Go { capture, .. } | Routed::Refused { capture, .. } => capture.clone(),
         };
         let sniffed = self.shared.conn.entry == Entry::Sniffed;
         let client_version = req.version();
-        {
+        slot.arm(capture, &handle, || {
             let mut headers = req.headers().clone();
             headers::strip(
                 &mut headers,
@@ -522,12 +521,15 @@ impl<U: Upstreams> Requests<U> {
                     proxy_authorization: sniffed,
                 },
             );
-            slot.arm(capture, &handle, || Head {
+            Head {
                 method: req.method().clone(),
                 url: captured_url(handle.session().url.as_deref(), &req),
                 version: req.version(),
                 headers,
-            });
+            }
+        });
+        if handle.token().is_cancelled() {
+            return Err(Close);
         }
         let (mut route, mut key, pages, rewrite) = match routed {
             Routed::Refused { refusal, pages, .. } => {
@@ -2338,6 +2340,18 @@ fn write_host<B>(
 /// Whether a request asks for an upgrade (WebSocket, `phase 4 M1 design 8.9`):
 /// HTTP/1.1, an `Upgrade` header, and a `Connection` that lists the `upgrade`
 /// token. The same reading Go's reverse proxy makes.
+fn wants_upgrade<B>(req: &Request<B>) -> bool {
+    req.version() == http::Version::HTTP_11
+        && req.headers().contains_key(header::UPGRADE)
+        && req
+            .headers()
+            .get_all(header::CONNECTION)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
 /// The URL a captured request is written down with (`phase 4 M4 design 6.1`):
 /// the one the connection came with, or for a `CONNECT` -- which has none --
 /// the authority of its request line, so that a tunnel says where it went
@@ -2350,18 +2364,6 @@ fn captured_url<B>(url: Option<&str>, req: &Request<B>) -> String {
         Some(authority) => authority.to_string(),
         None => String::new(),
     }
-}
-
-fn wants_upgrade<B>(req: &Request<B>) -> bool {
-    req.version() == http::Version::HTTP_11
-        && req.headers().contains_key(header::UPGRADE)
-        && req
-            .headers()
-            .get_all(header::CONNECTION)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
-            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
 }
 
 /// A request's head alone, kept so that an idempotent request with no body can
@@ -10565,6 +10567,55 @@ mod tests {
 
         let entry = one_entry(&store).await;
         assert!(entry.response.is_none());
+        assert_eq!(entry.outcome, crate::capture::Outcome::Failed);
+
+        drop(sender);
+        conn.abort();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 1);
+    }
+
+    /// A stream a client resets while its answer's body is coming is stored
+    /// as soon as hyper drops the body, with the answer's head and what went
+    /// by (`phase 4 M4 design 6.4`): the reset wakes the stream, no timeout
+    /// ends it.
+    #[tokio::test]
+    async fn an_http2_stream_reset_mid_body_is_captured_with_what_went_by() {
+        // the head of a ten-byte body and five of its bytes, then nothing
+        let origin = stalled_origin().await;
+        // a minute of idle: an entry within the five seconds `one_entry`
+        // waits came from the reset, not from the idle limit ending the body
+        let rig = rig_h2(origin, Duration::from_secs(60), Duration::from_secs(5)).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let mut resp = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/stall"))
+            .await
+            .expect("the answer's head");
+        assert_eq!(resp.status(), 200);
+        let mut got = Vec::new();
+        while got.len() < 5 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), resp.body_mut().frame())
+                .await
+                .expect("five bytes within 5 s")
+                .expect("a frame")
+                .expect("no error");
+            if let Some(data) = frame.data_ref() {
+                got.extend_from_slice(data);
+            }
+        }
+        assert_eq!(got, b"xxxxx");
+        // dropping the answer before its end resets the stream (`CANCEL`)
+        drop(resp);
+
+        let entry = one_entry(&store).await;
+        assert_eq!(
+            entry.response.as_ref().expect("the answer's head").status,
+            StatusCode::OK
+        );
+        assert_eq!(entry.response_body.data, Bytes::from_static(b"xxxxx"));
+        assert_eq!(entry.response_body.size, 5);
+        assert_eq!(entry.response_body.truncated, None);
         assert_eq!(entry.outcome, crate::capture::Outcome::Failed);
 
         drop(sender);
