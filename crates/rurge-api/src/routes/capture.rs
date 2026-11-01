@@ -12,11 +12,11 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rurge_engine::capture::{Body, Entry, Head, NotDecoded, Outcome, ResponseHead, Truncated};
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -237,9 +237,7 @@ fn head_json(head: &Head, body: &Body, decode: bool, body_limit: u64) -> Value {
         "method": head.method.as_str(),
         "url": head.url,
         "version": format!("{:?}", head.version),
-        "headers": headers_json(head.headers.iter().map(|(name, value)| {
-            (name.as_str().to_string(), text_of(value.as_bytes()))
-        })),
+        "headers": headers_json(&head.headers),
         "body": body_json(body, decoded),
     })
 }
@@ -253,34 +251,29 @@ fn response_json(head: &ResponseHead, body: &Body, decode: bool, body_limit: u64
     json!({
         "status": head.status.as_u16(),
         "version": format!("{:?}", head.version),
-        "headers": headers_json(head.headers.iter().map(|(name, value)| {
-            (name.as_str().to_string(), text_of(value.as_bytes()))
-        })),
+        "headers": headers_json(&head.headers),
         "body": body_json(body, decoded),
     })
 }
 
 /// The headers of one side in the order the map keeps them, each as a name and
-/// a value; the value is no text when the client sent bytes that are no UTF-8,
-/// and the four credential headers are masked (the store keeps them as they
-/// came).
-fn headers_json(pairs: impl Iterator<Item = (String, String)>) -> Value {
+/// a value: the bytes of a value that are no UTF-8 are shown as U+FFFD, and
+/// the values of the four credential headers are `***`, never read out (the
+/// store keeps them as they came).
+fn headers_json(headers: &HeaderMap) -> Value {
     Value::Array(
-        pairs
+        headers
+            .iter()
             .map(|(name, value)| {
                 let value = if MASKED.contains(&name.as_str()) {
                     "***".to_string()
                 } else {
-                    value
+                    String::from_utf8_lossy(value.as_bytes()).into_owned()
                 };
-                json!({ "name": name, "value": value })
+                json!({ "name": name.as_str(), "value": value })
             })
             .collect(),
     )
-}
-
-fn text_of(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// What was kept of a body, and, when `decode` asked, what it decodes to

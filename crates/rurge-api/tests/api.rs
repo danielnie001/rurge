@@ -3601,7 +3601,7 @@ async fn a_capture_session_lists_its_entries_newest_first() {
     let api = api().await;
     assert!(api.engine.capture().put(capture_entry(1, "a")));
     assert!(api.engine.capture().put(capture_entry(2, "a")));
-    // the newest one was refused without an answer, and its request body was
+    // the newest one failed without an answer, and its request body was
     // larger than what the store kept of it
     let mut newest = capture_entry(3, "a");
     newest.request_body = Body {
@@ -3612,6 +3612,8 @@ async fn a_capture_session_lists_its_entries_newest_first() {
     newest.response = None;
     newest.response_body = Body::empty();
     newest.outcome = Outcome::Failed;
+    // 35.999 ms: the summary gives whole milliseconds, rounded down
+    newest.timings.total = Duration::from_micros(35_999);
     assert!(api.engine.capture().put(newest));
 
     let (status, body) = get(&api, "/v1/rurge/capture/sessions/a").await;
@@ -3732,6 +3734,9 @@ async fn an_entry_is_shown_whole_with_four_headers_masked() {
         size: 1234,
         truncated: Some(Truncated::Limit),
     };
+    // a part of a millisecond is dropped, not rounded (`phase 4 M4 design 7.5`)
+    entry.timings.receive = Some(Duration::from_micros(12_999));
+    entry.timings.total = Duration::from_micros(35_999);
     let request_names: Vec<String> = entry
         .request
         .headers
