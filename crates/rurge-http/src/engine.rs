@@ -438,8 +438,10 @@ impl<U: Upstreams> Requests<U> {
             handle.set_method(req.method().as_str());
             self.shared.routed.fetch_add(1, Ordering::Relaxed);
             handle.set_status(StatusCode::NOT_IMPLEMENTED.as_u16());
+            let response = responses::not_implemented(CONNECT_NOT_SUPPORTED);
+            Self::own_body(&handle, &response, self.shared.conn.h2);
             handle.finish(SessionOutcome::Failed(CONNECT_NOT_SUPPORTED.to_string()));
-            return Ok(responses::not_implemented(CONNECT_NOT_SUPPORTED));
+            return Ok(response);
         }
         // 1. what the rules see (design 8.3). A listener request that is not
         // an absolute `http://` one is no request of this engine's (design 9).
@@ -664,6 +666,7 @@ impl<U: Upstreams> Requests<U> {
                             "The request was rejected by a URL Rewrite rule.".to_string(),
                         );
                         handle.set_status(StatusCode::FORBIDDEN.as_u16());
+                        Self::own_body(&handle, &page, self.shared.conn.h2);
                         handle.finish(SessionOutcome::Rejected(RejectKind::Reject));
                         return Ok(page);
                     }
@@ -971,8 +974,10 @@ impl<U: Upstreams> Requests<U> {
             };
             if let Err(e) = rewritten {
                 handle.set_status(StatusCode::BAD_REQUEST.as_u16());
+                let response = responses::bad_request("malformed request URI");
+                Self::own_body(&handle, &response, self.shared.conn.h2);
                 handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
-                return Ok(responses::bad_request("malformed request URI"));
+                return Ok(response);
             }
         }
         // A body whose length nobody named goes upstream chunked: hyper reads
@@ -994,8 +999,10 @@ impl<U: Upstreams> Requests<U> {
         // its own connection is left alone.
         if let Err(e) = fit(&mut req, sender.version(), &form) {
             handle.set_status(StatusCode::BAD_REQUEST.as_u16());
+            let response = responses::bad_request("malformed request URI");
+            Self::own_body(&handle, &response, self.shared.conn.h2);
             handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
-            return Ok(responses::bad_request("malformed request URI"));
+            return Ok(response);
         }
         // A `Host` a rule rewrote goes on once the form is settled
         // (`phase 4 M3 design 7.4`): for an HTTP/1.1 upstream as it was
@@ -1046,6 +1053,7 @@ impl<U: Upstreams> Requests<U> {
                 progress.clone(),
                 request_meter.clone(),
                 slot.request_tap(),
+                handle.clone(),
             )
             .boxed(),
         );
@@ -1499,20 +1507,21 @@ impl<U: Upstreams> Requests<U> {
         );
         rules.counters().map_local();
         guard.handle().set_status(status.as_u16());
-        let body: ResponseBody = match (file, data) {
+        // the file's answer ends when it was read to its end, and it ends the
+        // request itself (P16); every other answer ends here, once the bytes
+        // of its body are on the handle (`phase 4 M4 design 10.1`)
+        let (body, ending): (ResponseBody, Option<Guard>) = match (file, data) {
             (Some((opened, size, path)), _) => {
-                // the file's answer ends when it was read to its end, and it
-                // ends the request itself (P16)
                 let idle = self.shared.conn.idle;
-                LocalFile::new(opened, path, size, guard, &self.shared.conn, idle).boxed()
+                let file = LocalFile::new(opened, path, size, guard, &self.shared.conn, idle);
+                (file.boxed(), None)
             }
             (None, data) => {
-                guard.handle().finish(SessionOutcome::Completed);
-                drop(guard);
-                match data {
+                let body = match data {
                     Some(bytes) => responses::full(bytes),
                     None => responses::empty(),
-                }
+                };
+                (body, Some(guard))
             }
         };
         let mut response = Response::builder()
@@ -1520,6 +1529,11 @@ impl<U: Upstreams> Requests<U> {
             .body(body)
             .expect("a response of rurge's own");
         *response.headers_mut() = headers;
+        if let Some(guard) = ending {
+            Self::own_body(guard.handle(), &response, self.shared.conn.h2);
+            guard.handle().finish(SessionOutcome::Completed);
+            drop(guard);
+        }
         Ok(response)
     }
 
@@ -1635,8 +1649,10 @@ impl<U: Upstreams> Requests<U> {
         match refusal {
             Refusal::Reject(RejectKind::TinyGif) => {
                 handle.set_status(StatusCode::OK.as_u16());
+                let response = responses::tiny_gif();
+                Self::own_body(handle, &response, self.shared.conn.h2);
                 handle.finish(SessionOutcome::Rejected(RejectKind::TinyGif));
-                Ok(responses::tiny_gif())
+                Ok(response)
             }
             Refusal::Reject(kind @ (RejectKind::Reject | RejectKind::NoDrop)) => {
                 if !pages.reject {
@@ -1650,6 +1666,7 @@ impl<U: Upstreams> Requests<U> {
                     format!("The request was rejected by the {} policy.", kind.name()),
                 );
                 handle.set_status(StatusCode::FORBIDDEN.as_u16());
+                Self::own_body(handle, &page, self.shared.conn.h2);
                 handle.finish(SessionOutcome::Rejected(kind));
                 Ok(page)
             }
@@ -1689,6 +1706,7 @@ impl<U: Upstreams> Requests<U> {
         }
         let response = self.page(handle, StatusCode::BAD_GATEWAY, "Connection failed", page);
         handle.set_status(StatusCode::BAD_GATEWAY.as_u16());
+        Self::own_body(handle, &response, self.shared.conn.h2);
         handle.finish(SessionOutcome::Failed(record));
         Ok(response)
     }
@@ -1708,6 +1726,7 @@ impl<U: Upstreams> Requests<U> {
             "The upstream server did not answer in time.".to_string(),
         );
         handle.set_status(StatusCode::GATEWAY_TIMEOUT.as_u16());
+        Self::own_body(handle, &response, self.shared.conn.h2);
         handle.finish(SessionOutcome::Failed(record));
         Ok(response)
     }
@@ -1731,6 +1750,20 @@ impl<U: Upstreams> Requests<U> {
                 message,
             },
         )
+    }
+
+    /// Counts the body of an answer of rurge's own on the handle, before the
+    /// record is made (`phase 4 M4 design 10.1`). The bodies are `Full` ones
+    /// or empty, so their length is exact. hyper writes no body for a `HEAD`
+    /// answered on HTTP/1.1 (`hyper-1.11.1/src/proto/h1/role.rs`), so that
+    /// counts none; its HTTP/2 server sends the body it was given whatever the
+    /// method (`hyper-1.11.1/src/proto/h2/server.rs`), so a `HEAD` answered
+    /// there counts the page's length, which is what the client is handed.
+    fn own_body(handle: &SessionHandle, response: &Response<ResponseBody>, h2: bool) {
+        if !h2 && handle.method().as_deref() == Some("HEAD") {
+            return;
+        }
+        handle.add_response_body(response.body().size_hint().exact().unwrap_or(0));
     }
 
     /// Dials the route and starts its hyper client on the tracker
@@ -1990,8 +2023,10 @@ impl<U: Upstreams> Requests<U> {
         // M2 design 10.3`, `the phase 4 / M2b plan's P8`).
         if let Err(e) = fit(&mut req, sender.version(), form) {
             handle.set_status(StatusCode::BAD_REQUEST.as_u16());
+            let response = responses::bad_request("malformed request URI");
+            Self::own_body(handle, &response, self.shared.conn.h2);
             handle.finish(SessionOutcome::Failed(format!("bad request uri: {e}")));
-            return Err(Ok(responses::bad_request("malformed request URI")));
+            return Err(Ok(response));
         }
         // the rewritten `Host` goes back on this send as on the first, and the
         // note a value that is no authority needs is left once per request
@@ -2714,6 +2749,10 @@ struct Idle<B> {
     /// Takes the request's body as it goes by, when the request is captured
     /// (`phase 4 M4 design 6.1`).
     tap: Option<RequestTap>,
+    /// The session that records this request: the bytes of its body go on the
+    /// handle as they are handed over, so that the record made when the
+    /// session ends counts them (`phase 4 M4 design 10.1`).
+    handle: Arc<SessionHandle>,
 }
 
 impl<B> Idle<B> {
@@ -2723,6 +2762,7 @@ impl<B> Idle<B> {
         progress: Arc<Progress>,
         body: Meter,
         tap: Option<RequestTap>,
+        handle: Arc<SessionHandle>,
     ) -> Idle<B> {
         Idle {
             inner,
@@ -2731,6 +2771,7 @@ impl<B> Idle<B> {
             progress,
             body,
             tap,
+            handle,
         }
     }
 }
@@ -2765,6 +2806,9 @@ where
                 // of it (`the phase 4 / M2b plan's P11`)
                 if let Some(data) = frame.data_ref() {
                     this.body.count_up(data.len() as u64);
+                    // the record made when the session ends counts the bytes
+                    // handed over so far (`phase 4 M4 design 10.1`)
+                    this.handle.add_request_body(data.len() as u64);
                     // the same data, kept as the captured request's body; the
                     // trailers after it are not its body (`phase 4 M4 design
                     // 6.1`)
@@ -3244,6 +3288,10 @@ impl Body for LocalFile {
                     .reset(tokio::time::Instant::now() + this.idle);
                 this.progress.moved();
                 this.left -= data.len() as u64;
+                // before the frame that ends the file ends the record: a
+                // record made then counts every byte handed over, this one
+                // included (`phase 4 M4 design 10.1`)
+                this.guard.handle().add_response_body(data.len() as u64);
                 if this.left == 0 {
                     this.complete();
                 }
@@ -3377,6 +3425,13 @@ impl<U: Upstreams> Body for Tail<U> {
                     && counted
                 {
                     this.body.count_down(data.len() as u64);
+                }
+                // the record is made the moment the session ends, so the bytes
+                // of the answer have to be on the handle before that: counted
+                // here for both versions of the connection, and whatever was
+                // handed to the client counts (`phase 4 M4 design 10.1`)
+                if let Some(data) = frame.data_ref() {
+                    this.guard.handle().add_response_body(data.len() as u64);
                 }
                 // the frame just handed out was the last one: hyper will drop
                 // the body now instead of polling it again
@@ -3857,6 +3912,9 @@ mod tests {
         forward: Mutex<Option<Vec<(String, String)>>>,
         /// Where `route` says the request is captured: `None` for nowhere.
         capture: Mutex<Option<Capture>>,
+        /// The (request body, answer body) bytes of every handle, as `finish`
+        /// ran: what a record made of the handle would have counted.
+        bodies: Arc<Mutex<HashMap<u64, (u64, u64)>>>,
     }
 
     /// The engine side of `Upstreams`, scripted by the path of each request’s
@@ -3887,6 +3945,7 @@ mod tests {
                 }),
                 forward: Mutex::new(None),
                 capture: Mutex::new(None),
+                bodies: Arc::new(Mutex::new(HashMap::new())),
             }))
         }
 
@@ -3960,6 +4019,24 @@ mod tests {
             .expect("the handle was made within 5 s")
         }
 
+        /// The `n`th handle's (request body, answer body) bytes at the moment
+        /// `finish` ran, waiting for both. The hooks run after `finished` is
+        /// set, so a multi-threaded runtime may see this handle finished
+        /// before its hook filed the bytes: wait for the hook, within a limit.
+        async fn body_at_finish(&self, n: usize) -> (u64, u64) {
+            let handle = self.finished(n).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(bytes) = self.0.bodies.lock().unwrap().get(&handle.id()).copied() {
+                        return bytes;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the handle finished without its hook")
+        }
+
         /// The `n`th handle, waiting for it to finish.
         async fn finished(&self, n: usize) -> Arc<SessionHandle> {
             let handle = self.handle(n).await;
@@ -3990,6 +4067,12 @@ mod tests {
         fn open(&self, session: SessionInfo) -> Arc<SessionHandle> {
             let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
             let handle = SessionHandle::new_with_token(id, session, self.0.token.child_token());
+            // a hook added before the handle can finish is run by `finish`
+            // itself, in the same step that makes the record
+            let bodies = self.0.bodies.clone();
+            handle.on_finish(move |h, _| {
+                bodies.lock().unwrap().insert(h.id(), h.body_bytes());
+            });
             self.0.handles.lock().unwrap().push(handle.clone());
             handle
         }
@@ -5445,6 +5528,7 @@ mod tests {
         let (head, body) = rig.client.response().await;
         assert!(head.starts_with("HTTP/1.1 504"), "{head}");
         assert!(String::from_utf8_lossy(&body).contains("Gateway timeout"));
+        assert_eq!(rig.fake.body_at_finish(0).await.1, body.len() as u64);
         let handle = rig.fake.finished(0).await;
         assert_eq!(
             handle.outcome(),
@@ -5700,6 +5784,216 @@ mod tests {
         assert_eq!(body, b"third");
         assert_eq!(rig.fake.dials(), 1, "the third request borrows too");
         assert_eq!(origin.connections(), 1);
+    }
+
+    /// The bytes of a request's body that went upstream are on its handle at
+    /// the moment the record is made (`phase 4 M4 design 10.1`); a request
+    /// with none counts none.
+    #[tokio::test]
+    async fn the_request_body_sent_upstream_is_counted_before_the_record_ends() {
+        let (addr, records) = recording_origin().await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        let body = "x".repeat(3000);
+        // head and body in one write, as a client sends them
+        rig.client
+            .send(&format!(
+                "POST /post HTTP/1.1\r\nHost: target.test\r\nContent-Length: 3000\r\n\r\n{body}"
+            ))
+            .await
+            .unwrap();
+        let (head, answer) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(answer, b"ok");
+        assert_eq!(records.lock().unwrap()[0].body.len(), 3000);
+        assert_eq!(rig.fake.body_at_finish(0).await.0, 3000);
+
+        rig.client
+            .send("GET /plain HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, answer) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(answer, b"ok");
+        assert_eq!(rig.fake.body_at_finish(1).await.0, 0);
+    }
+
+    /// An answer whose whole body came in the frame that ended it is counted
+    /// before the record is made: the count happens before the frame ends the
+    /// session (`phase 4 M4 design 10.1`).
+    #[tokio::test]
+    async fn a_one_frame_answer_is_counted_before_the_record_ends() {
+        let addr = fixed_origin(b"hello".to_vec()).await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.client
+            .send("GET /one HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"hello");
+        let (request, answer) = rig.fake.body_at_finish(0).await;
+        assert_eq!(request, 0);
+        assert_eq!(answer, 5);
+    }
+
+    /// Every frame of a chunked answer counts, and its trailers do not: the
+    /// count is of what the client was handed as body (`phase 4 M4 design
+    /// 10.1`).
+    #[tokio::test]
+    async fn a_chunked_answer_counts_every_frame() {
+        // more than one read of the origin's answer, so that hyper hands the
+        // body over in more than one frame
+        let whole = vec![b'y'; 40_000];
+        let addr = chunked_origin(whole.clone()).await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.client
+            .send("GET /chunks HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response_chunked().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body.len(), whole.len());
+        assert_eq!(body, whole);
+        let (request, answer) = rig.fake.body_at_finish(0).await;
+        assert_eq!(request, 0);
+        assert_eq!(answer, body.len() as u64);
+    }
+
+    /// An answer of rurge's own counts the bytes of its page on the handle
+    /// before the record is made (`phase 4 M4 design 10.1`); the answers that
+    /// carry no body count none.
+    #[tokio::test]
+    async fn rurges_own_answers_count_their_length() {
+        let origin = TestServer::spawn().await;
+        let pages = Pages {
+            error: true,
+            reject: true,
+        };
+
+        // a failed dial's page, a refusal's page, and the tiny gif
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.script(
+            "/fail",
+            Step::Refused {
+                refusal: Refusal::Fail {
+                    kind: FailKind::Connect,
+                    message: "refused".to_string(),
+                },
+                pages,
+            },
+        );
+        rig.fake.script(
+            "/reject",
+            Step::Refused {
+                refusal: Refusal::Reject(RejectKind::Reject),
+                pages,
+            },
+        );
+        rig.fake.script(
+            "/gif",
+            Step::Refused {
+                refusal: Refusal::Reject(RejectKind::TinyGif),
+                pages,
+            },
+        );
+        for (n, path) in ["/fail", "/reject", "/gif"].iter().enumerate() {
+            rig.client
+                .send(&format!("GET {path} HTTP/1.1\r\nHost: target.test\r\n\r\n"))
+                .await
+                .unwrap();
+            let (head, body) = rig.client.response().await;
+            assert!(head.starts_with("HTTP/1.1 "), "{head}");
+            let (request, answer) = rig.fake.body_at_finish(n).await;
+            assert_eq!(request, 0, "{path}");
+            assert_eq!(answer, body.len() as u64, "{path}: {head}");
+        }
+
+        // a URL Rewrite `reject` answers with a page, its `302` with none
+        let (rules, _) = rewrite_of(
+            "[URL Rewrite]\n^http://target\\.test/no http://b.test/ reject\n\
+             ^http://target\\.test/away http://b.test/login 302",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /no HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert!(!body.is_empty());
+        assert_eq!(rig.fake.body_at_finish(0).await.1, body.len() as u64);
+        rig.client
+            .send("GET /away HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 302"), "{head}");
+        assert!(body.is_empty(), "a redirect carries no body");
+        assert_eq!(rig.fake.body_at_finish(1).await, (0, 0));
+
+        // a dropped request hands nothing over at all
+        let mut rig = rig_timed(
+            Entry::Sniffed,
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        )
+        .await;
+        rig.fake.script(
+            "/drop",
+            Step::Refused {
+                refusal: Refusal::Reject(RejectKind::Drop),
+                pages,
+            },
+        );
+        rig.client
+            .send("GET /drop HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(rig.fake.body_at_finish(0).await, (0, 0));
+        assert_eq!(rig.client.until_eof().await, "");
+    }
+
+    /// A `HEAD` answered on HTTP/1.1 counts no body (`phase 4 M4 design 10.1`):
+    /// hyper writes none for it (`hyper-1.11.1/src/proto/h1/role.rs`), so the
+    /// page's length is not what the client is handed.
+    #[tokio::test]
+    async fn a_head_answer_counts_no_body_on_http1() {
+        let origin = TestServer::spawn().await;
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        rig.fake.script(
+            "/reject",
+            Step::Refused {
+                refusal: Refusal::Reject(RejectKind::Reject),
+                pages: Pages {
+                    error: true,
+                    reject: true,
+                },
+            },
+        );
+        rig.client
+            .send("HEAD /reject HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert!(
+            header_value(&head, "content-length").is_some_and(|len| len != "0"),
+            "the page's length is named and no body follows it: {head}"
+        );
+        assert_eq!(rig.fake.body_at_finish(0).await.1, 0);
+        // nothing of the page follows that head: the next answer's head starts
+        // where this one ended
+        rig.client
+            .send("GET /reject HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (next, body) = rig.client.response().await;
+        assert!(next.starts_with("HTTP/1.1 403"), "{next}");
+        assert!(!body.is_empty(), "a `GET` is handed the page");
+        assert_eq!(rig.fake.body_at_finish(1).await.1, body.len() as u64);
     }
 
     #[tokio::test]
@@ -6006,6 +6300,69 @@ mod tests {
             ),
             "the bytes of the request and of the tunnel, each counted once"
         );
+    }
+
+    /// The bytes that followed a `101` are the tunnel's, not the answer's
+    /// body: none of them is counted as a body (`phase 4 M4 design 10.1`), and
+    /// the handle's `up` and `down` have them.
+    #[tokio::test]
+    async fn an_upgrade_counts_no_body() {
+        let answer =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let (addr, _, _, _) = upgrading_origin(answer).await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.client
+            .send(
+                "GET /ws HTTP/1.1\r\nHost: target.test\r\n\
+                 Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        rig.client.send("ping").await.unwrap();
+        assert_eq!(rig.client.take(4).await, b"ping");
+        rig.client.stream.shutdown().await.unwrap();
+        while rig.client.fill().await {}
+        let handle = rig.fake.finished(0).await;
+        let (up, down) = handle.bytes();
+        assert!(up > 0 && down > 0, "the tunnel moved bytes: {up} / {down}");
+        assert_eq!(rig.fake.body_at_finish(0).await, (0, 0));
+    }
+
+    /// A client that walks away in the middle of an answer counts the bytes of
+    /// the body handed to it up to then, and no more than the origin wrote
+    /// (`phase 4 M4 design 10.1`).
+    #[tokio::test]
+    async fn a_client_that_leaves_mid_body_counts_what_was_handed_over() {
+        let origin =
+            holding_origin(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789").await;
+        let rig = connected(Entry::Sniffed, origin.addr).await;
+        let Rig {
+            mut client,
+            fake,
+            token: _token,
+            served,
+        } = rig;
+        client
+            .send("GET /held HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let handed = client.take(10).await;
+        assert_eq!(handed, b"0123456789");
+        // the client goes with the answer still coming: the engine's next
+        // write to it fails and the record ends where it stands
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the connection ended within 5 s")
+            .expect("the serving task did not panic");
+        let (request, answer) = fake.body_at_finish(0).await;
+        assert_eq!(request, 0);
+        assert_eq!(answer, handed.len() as u64, "what went by so far");
+        assert_eq!(origin.accepted.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -6924,6 +7281,64 @@ mod tests {
         conn.abort();
         let served = served_within(rig.served, Duration::from_secs(5)).await;
         assert_eq!(served.routed, 1, "its record is its own");
+    }
+
+    /// The 501 an HTTP/2 `CONNECT` gets counts its page on the handle before
+    /// the record is made (`phase 4 M4 design 10.1`). HTTP/2 sends the body of
+    /// the answer it was given (`hyper-1.11.1/src/proto/h2/server.rs`), so the
+    /// page is what the client is handed, and it is what counts.
+    #[tokio::test]
+    async fn an_h2_connect_501_counts_its_page() {
+        let origin = TestServer::spawn().await;
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let resp = sender
+            .send_request(h2_request(http::Method::CONNECT, "target.test:443"))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 501);
+        let body = body_of(resp).await;
+        assert!(!body.is_empty());
+        assert_eq!(rig.fake.body_at_finish(0).await.1, body.len() as u64);
+        drop(sender);
+        conn.abort();
+        let _ = served_within(rig.served, Duration::from_secs(5)).await;
+    }
+
+    /// An HTTP/2 request counts its own body and the answer's on the handle
+    /// too (`phase 4 M4 design 10.1`): what the connection's `Meter` counts is
+    /// not the record's count.
+    #[tokio::test]
+    async fn an_h2_client_counts_its_bodies_too() {
+        let origin = TestServer::spawn().await;
+        origin.set("/up", "1234567");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let sent = Bytes::from(vec![b'z'; 100]);
+        let req = Request::builder()
+            .method(http::Method::POST)
+            .uri("http://target.test/up")
+            .body(Full::new(sent.clone()))
+            .expect("a request");
+        let resp = sender.send_request(req).await.expect("an answer");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await, b"1234567");
+        let (request, answer) = rig.fake.body_at_finish(0).await;
+        assert_eq!(request, sent.len() as u64);
+        assert_eq!(answer, 7);
+        drop(sender);
+        conn.abort();
+        let _ = served_within(rig.served, Duration::from_secs(5)).await;
     }
 
     #[tokio::test]
@@ -8831,6 +9246,42 @@ mod tests {
         assert_eq!(guarded.accepted.load(Ordering::Relaxed), 0);
     }
 
+    /// A `[Map Local]` answer counts the bytes of its data, or those of its
+    /// file, on the handle before the record is made (`phase 4 M4 design
+    /// 10.1`).
+    #[tokio::test]
+    async fn map_local_answers_count_their_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"a file of its own".to_vec();
+        std::fs::write(dir.path().join("small.txt"), &content).unwrap();
+        let guarded = guarded_origin().await;
+        let (rules, _) = map_local_rules(
+            "[Map Local]\n\
+             ^http://m\\.test/text data-type=text data=\"{}\"\n\
+             ^http://m\\.test/file data-type=file data=\"small.txt\"",
+            dir.path(),
+        );
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /text HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"{}");
+        assert_eq!(rig.fake.body_at_finish(0).await, (0, body.len() as u64));
+        rig.client
+            .send("GET /file HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, content);
+        assert_eq!(rig.fake.body_at_finish(1).await, (0, body.len() as u64));
+        assert_eq!(guarded.accepted.load(Ordering::Relaxed), 0);
+    }
+
     /// A `HEAD` a `[Map Local]` rule answers gets the length of the data and
     /// no body (`phase 4 M3 design 10.3`, the phase 4 / M3b plan's P15).
     #[tokio::test]
@@ -8986,6 +9437,7 @@ mod tests {
             page.contains("The file a Map Local rule names cannot be read."),
             "{page}"
         );
+        assert_eq!(rig.fake.body_at_finish(0).await.1, body.len() as u64);
         assert_eq!(rig.fake.dials(), 0);
         let handle = rig.fake.finished(0).await;
         assert_eq!(handle.status(), Some(502));
@@ -9056,6 +9508,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&body)
         );
+        assert_eq!(rig.fake.body_at_finish(0).await.1, body.len() as u64);
         assert_eq!(rig.fake.dials(), 0);
         let handle = rig.fake.finished(0).await;
         assert_eq!(
