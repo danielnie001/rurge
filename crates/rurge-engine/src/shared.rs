@@ -215,6 +215,10 @@ pub struct EngineShared {
     /// each generation's `Rewrite` counts into this one, so a reload keeps
     /// the counts.
     pub rewrite: Arc<rurge_http::RewriteCounters>,
+    /// The capture store (`phase 4 M4 design 4.1`): one for the engine's
+    /// lifetime, kept across reloads; `rurge run` replaces it with one of the
+    /// limits its options give.
+    pub capture: Arc<rurge_http::capture::CaptureStore>,
 }
 
 impl EngineShared {
@@ -233,6 +237,7 @@ impl EngineShared {
             sniff_wait: rurge_http::sniff::SNIFF_WAIT,
             mitm: Arc::new(MitmShared::new()),
             rewrite: Arc::new(rurge_http::RewriteCounters::default()),
+            capture: rurge_http::capture::CaptureStore::new(rurge_http::capture::Limits::default()),
         }
     }
 }

@@ -41,6 +41,9 @@ pub use observe::{RecordStatus, RequestLog, RequestRecord, TrafficStats, Traffic
 pub use outbounds::{EngineFactory, dry_build, load_checked};
 pub use owner::{OwnerLookup, OwnerQuery};
 pub use runtime::{Runtime, RuntimeOptions};
+/// The capture types and the store the API reads (`phase 4 M4 design 4.1`):
+/// handed over the way `ApiTls` is, so that `rurge-api` needs only this crate.
+pub use rurge_http::capture;
 pub use rurge_http::mitm::ApiTls;
 pub use rurge_inbound::{ProcessSlot, Running};
 pub use rurge_policy::EmptyGroup;

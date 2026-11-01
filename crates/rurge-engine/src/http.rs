@@ -163,8 +163,10 @@ impl Upstreams for ConnUpstreams {
                         key,
                         pages,
                         rewrite,
-                        // the phase 4 / M4a plan's task 4 gives the real one
-                        capture: None,
+                        // the name the matched rule gave, else the default
+                        // session while the switch is on (`phase 4 M4 design
+                        // 5.3`)
+                        capture: self.engine.capture_for(handle),
                     }
                 }
                 Err(refused) => {
@@ -172,8 +174,10 @@ impl Upstreams for ConnUpstreams {
                     Routed::Refused {
                         refusal: refused.into(),
                         pages,
-                        // the phase 4 / M4a plan's task 4 gives the real one
-                        capture: None,
+                        // the same capture a refusal keeps: REJECT answers
+                        // without a dial and is captured too, so the name is
+                        // read after `settle` (`phase 4 M4 design 5.3`)
+                        capture: self.engine.capture_for(handle),
                     }
                 }
             }

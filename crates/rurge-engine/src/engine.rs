@@ -205,6 +205,11 @@ pub struct Engine {
     /// generation: it is read when a request is routed, so it takes effect for
     /// the next request and does not end the requests that are open.
     rewrite_on: AtomicBool,
+    /// Whether this engine captures requests (`phase 4 M4 design 5.1`): off
+    /// unless `state.json` says otherwise. As `mitm_on`, it is not part of a
+    /// generation: it is read when a request is routed, so it takes effect for
+    /// the next request and does not end the requests that are open.
+    capture_on: AtomicBool,
     /// The pool of fake addresses of the TUN that runs, if one does (phase 3
     /// M3 design 13): the proxy listeners turn the fake addresses that come in
     /// at them back into names with it (`turn_back`). Set by `start_tun` and
@@ -290,6 +295,7 @@ impl Engine {
             global_warned: AtomicBool::new(false),
             mitm_on: AtomicBool::new(true),
             rewrite_on: AtomicBool::new(true),
+            capture_on: AtomicBool::new(false),
             fake_pool: ArcSwapOption::empty(),
             sniff_counts: crate::serve::SniffCounts::default(),
             mitm_counts: crate::mitm::MitmCounters::default(),
@@ -778,6 +784,46 @@ impl Engine {
         }
     }
 
+    /// Whether this engine captures the requests it serves (`phase 4 M4 design
+    /// 5.1`). Off unless `state.json` said otherwise at start.
+    pub fn capture_on(&self) -> bool {
+        self.capture_on.load(Ordering::Relaxed)
+    }
+
+    /// Sets the `capture` switch, and keeps it in `state.json` when one is
+    /// attached (the shape of `set_rewrite`). A request that is already being
+    /// served goes on uncaptured if nothing armed it; the next one reads this.
+    pub async fn set_capture(&self, on: bool) {
+        self.capture_on.store(on, Ordering::Relaxed);
+        if let Some(store) = self.state.get() {
+            store.update(|s| s.features.capture = Some(on)).await;
+        }
+    }
+
+    /// The store the captures of every generation go into (`phase 4 M4 design
+    /// 4.1`): one per engine, so a reload keeps them.
+    pub fn capture(&self) -> Arc<rurge_http::capture::CaptureStore> {
+        self.shared.capture.clone()
+    }
+
+    /// The capture a session goes into, if it is captured at all (`phase 4 M4
+    /// design 5.3`): the name the matched rule gave it, else the default
+    /// session while the switch is on, else nothing.
+    pub(crate) fn capture_for(
+        &self,
+        handle: &SessionHandle,
+    ) -> Option<rurge_http::capture::Capture> {
+        let session = match handle.capture_session() {
+            Some(name) => name,
+            None if self.capture_on() => Arc::from(rurge_http::capture::DEFAULT_SESSION),
+            None => return None,
+        };
+        Some(rurge_http::capture::Capture {
+            store: self.shared.capture.clone(),
+            session,
+        })
+    }
+
     /// The switches `state.json` recorded at start (the plan's P20): only what
     /// was set is taken, and nothing is written — a start does not write the
     /// file, so a file of the first version stays as it is until something is
@@ -788,6 +834,9 @@ impl Engine {
         }
         if let Some(on) = features.rewrite {
             self.rewrite_on.store(on, Ordering::Relaxed);
+        }
+        if let Some(on) = features.capture {
+            self.capture_on.store(on, Ordering::Relaxed);
         }
     }
 
@@ -995,6 +1044,12 @@ impl Engine {
             .await;
         if let Some(i) = decision.matched {
             handle.set_rule(rule_raw(&rt.rules, i));
+            // the session the matched line names, if any (`phase 4 M4 design
+            // 5.2`): the three early returns above read no rule, so they
+            // name none and the entry goes to the default session
+            if let Some(name) = always_capture(&rt.rules, i) {
+                handle.set_capture_session(name);
+            }
         }
         if process.timed_out() {
             // the rules went on without the process: the record says why a
@@ -1663,6 +1718,19 @@ pub(crate) fn rule_raw(rules: &rurge_rules::RuleEngine, index: usize) -> Option<
     all.binary_search_by_key(&index, |r| r.index)
         .ok()
         .map(|pos| all[pos].raw.clone())
+}
+
+/// The `always-capture` of the rule at `index` (phase 4 M4 design 5.2): the
+/// session the line names, or nothing when the line names none — an empty one
+/// is one of the latter, and the profile check says so (`W0012`).
+pub(crate) fn always_capture(rules: &rurge_rules::RuleEngine, index: usize) -> Option<Arc<str>> {
+    let all = rules.rules();
+    let pos = all.binary_search_by_key(&index, |r| r.index).ok()?;
+    let name = all[pos].params.always_capture.as_deref()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(Arc::from(name))
 }
 
 /// A session its routing refused, before or while dialing: whoever asked for
