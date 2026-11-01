@@ -993,7 +993,7 @@ M4a 做完了（2026-11-01；计划 `docs/superpowers/plans/2026-11-01-phase4-m4
 - **任务 5**（`398014c`、`d184717`，修正轮 1 `c09717b`，协调者 `d491a43`、`f94b7b1`）：`capture` 开关与五个端点；+9 条（93 / 5288；`outbounds_wireguard` 一次 `STATUS_HEAP_CORRUPTION`，单独重跑 16 条全过）。
 - **任务 6**（`5fb6ff2`、`5c6af62`、`1d67bc4` 只订正它自己两行的行数，修正轮 1 `7cab029`，协调者 `569e17e`、`608e172`）：HAR 1.2；+7 条（93 / 5295；`pipeline` 一次 `STATUS_HEAP_CORRUPTION`，单独重跑 78 条全过）。
 - **任务 7**（`a74a044`，修正轮 1 `212853a`，协调者 `b04f733`、`54f8da7`）：两个参数与命令行的端到端；+6 条（93 / 5301；`rurge-dns` 的单元测试二进制一次 `STATUS_HEAP_CORRUPTION`，单独重跑 287 条全过）。
-- **任务 8**（`6bfba7f`、`40f36c9`，修正轮 1 `c5993d8`，协调者 `39cb465`、`ca9170b`）：端到端的后一半与量内存；+9 条（93 / 5308，修正轮 1 之后 93 / 5309；`rurge-dns` 的 `resolver` 一次 `STATUS_HEAP_CORRUPTION`，单独重跑 11 条全过）。
+- **任务 8**（`6bfba7f`、`40f36c9`，修正轮 1 `c5993d8`，协调者 `39cb465`、`ca9170b`）：端到端的后一半与量内存；+9 条，其中 2 条是忽略的量内存用例（93 / 5308，忽略的从 13 条变成 15 条），修正轮 1 又加 1 条（93 / 5309；`rurge-dns` 的 `resolver` 一次 `STATUS_HEAP_CORRUPTION`，单独重跑 11 条全过）。
 - **任务 9a**（`ce9087f`，修正轮 1 `8c8f64a`，协调者 `fe17ebc`、`f83942e`）：手工清单、API 与测试的文档，只改文档，0 条用例（记录第 83 ～ 90 行）。
 - **任务 9b**（本节的提交）：M4a 的收尾文档，只改文档，0 条用例。
 
@@ -1016,7 +1016,7 @@ M4a 做完了（2026-11-01；计划 `docs/superpowers/plans/2026-11-01-phase4-m4
 - **P8 的状态机与锁的次序**（记录第 39、40、41 行）：`Armed` 里的 `pending`、`request`、`answer`、`finished` 各自什么时候写；`answer` 三态（`Waiting` / `Nothing` / `Given { head, done }`）；`try_commit` 只在 `pending` 还在、`finished` 是 `Some`，而且 `answer` 是 `Nothing`（应答之前就被丢下、升级、客户端重置流那几种）或 `Given { done: Some }` 时存进去；arm 之后在任何锁之外调 `when_finished`（句柄可能已经结束，那时回调就在那一句里跑）；锁的次序是 `Armed` → 存储。
 - **不许握着槽的锁 poll 正文**（P9，记录第 40 行）：包住应答正文的 `CaptureBody` 先 poll `inner`、再把数据交给 `tap`，`Idle` 的 `RequestTap` 也一样（先取数据、再锁住记账）；握着 `Armed` 的锁时不调 `finish`、不调 `when_finished`。
 - **`REJECT-DROP` 的认法**（P8，记录第 39、40 行）：由 `when_finished` 的回调认出——结局是 `Rejected(Drop)` 而 `answer` 还是 `Waiting` 的就是没有应答（引擎里只有它先结束记录、停留之后才 `Err(Close)`）；以后改 `answer` 里 `REJECT-DROP` 那一支要同时看 `CaptureSlot`。
-- **`rurge-http` 的 `testing` 特性**（P2，记录第 26、49 行）：只给别的 crate 的用例存进自己造的条目（`CaptureStore::put`），生产代码不开；`rurge-api` 的开发依赖开着它，`cargo test --workspace` 与 `cargo clippy --all-targets` 带着它编、`cargo build` / `cargo run` 不带，两种各一份产物；开它的那一次全量 D: 从 70G 掉到 46G。
+- **`rurge-http` 的 `testing` 特性**（P2，记录第 26、49 行）：只给别的 crate 的用例存进自己造的条目（`CaptureStore::put`），生产代码不开；`rurge-api` 的开发依赖开着它，`cargo test --workspace` 与 `cargo clippy --all-targets` 带着它编、`cargo build` / `cargo run` 不带，两种各一份产物；开它的那一次全量 D: 从 70G 掉到 46G（记录第 52 行）。
 - **量到的内存**（记录第 76、81、82 行，数也写在 `docs/api/phase4.md`）：调试构建、一台机器上的一次运行——基线 17473536 字节，装满（每侧 14 行头、4 KiB 正文、每 1024 条里一条 6 MiB 的）峰值 131170304，比值 1.0843；`ENTRY_OVERHEAD` 的 7168 是这么定的（512 + (多出的 − 总量) / 存着的条数，取整到 64 的倍数），缺省的上限不因此改（M4-D7）。
 - **存进去的条目复制自己的头**（`crates/rurge-http/src/capture/store.rs` 的 `owned`，`Pending::commit` 在拿存储的锁之前调；记录第 80、81 行）：hyper 1.11.1 的 HTTP/1 头值是那条连接读缓冲的切片，克隆只加引用计数，不复制的话一条条目会把 8 KiB ～ 约 408 KiB 的读缓冲留着而账上不计；h2 0.4.19 解出的值本来就是复制的。以后往条目里放从 hyper 来的 `Bytes`，同样先复制。
 - **`ENTRY_OVERHEAD` 的 7168 只对量的那种形状成立**（记录第 76、80 行）：头的行数多得多的条目实际的占用仍比账多；一条最小的条目的账也在 7168 字节以上，`--capture-size` 小于它时什么也存不下、不告警。
