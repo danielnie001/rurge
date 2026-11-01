@@ -276,6 +276,9 @@ impl<S: Datagram> Datagram for FinishOnDrop<S> {
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.inner.peer_addr()
     }
+    fn far_end(&self) -> Option<SocketAddr> {
+        self.inner.far_end()
+    }
     fn set_tos(&self, tos: u8) -> io::Result<()> {
         self.inner.set_tos(tos)
     }
@@ -347,6 +350,9 @@ impl Datagram for CountingDatagram {
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.inner.peer_addr()
     }
+    fn far_end(&self) -> Option<SocketAddr> {
+        self.inner.far_end()
+    }
     fn set_tos(&self, tos: u8) -> io::Result<()> {
         self.inner.set_tos(tos)
     }
@@ -362,6 +368,15 @@ pub(crate) fn wrap_internal_udp(
     via: Option<&str>,
 ) -> BoxedDatagram {
     handle.mark_connected();
+    // Where the carrier's datagrams leave rurge is where the session left it
+    // (`phase 4 M4 design 10.3`): a carrier opened in the session's `follow`
+    // may have noted the TCP connection it rides first — a SOCKS5 control
+    // connection — which is not this session's far end; one that cannot
+    // tell clears it, as a UDP flow's does (the phase 4 / M4b plan's P8 ③).
+    match datagram.far_end() {
+        Some(far) => handle.trail().set_peer(far),
+        None => handle.trail().clear_peer(),
+    }
     Box::new(FinishOnDrop::new(
         CountingDatagram {
             inner: datagram,

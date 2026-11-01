@@ -38,12 +38,13 @@ pub struct RequestRecord {
     /// when it is made: a process found after the session ended is there.
     pub process: ProcessSlot,
     pub dst: String,
-    /// Where the TCP connection the session's own dial made went: the first
-    /// hop when the policy chains. `None` when the dial made none — the
-    /// session was rejected, or its policy carried it over a connection that
-    /// was there already or over a tunnel —, and always for UDP: a flow has
-    /// no single far end, and the TCP connection a proxy's association rides
-    /// on is no address of it.
+    /// The far end of the connection or carrier the session left rurge by
+    /// (`phase 4 M4 design 10.3`): one its own dial made, one it borrowed
+    /// from a pool or shares with other sessions, or a UDP flow's carrier —
+    /// the first hop when the policy chains. `None` when it left by none
+    /// (rejected, failed before it was dialled) or when its carrier cannot
+    /// tell: the UDP carriers of `vmess`, `h2-connect` and MASQUE open their
+    /// connections in another task, target by target.
     pub remote_addr: Option<SocketAddr>,
     pub rule: Option<String>,
     pub policy: Vec<String>,
@@ -153,10 +154,7 @@ fn record_of(h: &SessionHandle, outcome: Option<&SessionOutcome>) -> RequestReco
         listen_port: s.in_port,
         process: h.process().clone(),
         dst: destination(&s.dst_host, s.dst_port),
-        remote_addr: match s.transport {
-            Transport::Tcp => h.trail().peer(),
-            Transport::Udp => None,
-        },
+        remote_addr: h.trail().peer(),
         rule: h.rule(),
         policy: h.policy_chain(),
         // The SNI a sniff read out of a whole ClientHello is on the session,
@@ -602,11 +600,11 @@ mod tests {
         );
     }
 
-    /// A flow has no single far end: the TCP connection its dial made — the
-    /// one a proxy's association rides on — is no address of its record, in
-    /// flight and after. The time it waited for lookups is.
+    /// A flow's record reads the trail as a TCP session's does (`phase 4 M4
+    /// design 10.3`): the far end of the carrier it leaves by, in flight and
+    /// after. The time it waited for lookups is read the same way.
     #[tokio::test]
-    async fn the_record_of_a_udp_session_has_no_remote_address() {
+    async fn a_udp_record_reads_the_trail_as_a_tcp_record_does() {
         let log = RequestLog::new(2);
         let t = TrafficStats::new();
         let a = SessionHandle::new(1, SessionInfo::udp(HostName::parse("a.test"), 443));
@@ -620,11 +618,11 @@ mod tests {
             .await;
         assert_eq!(a.trail().peer(), Some(peer), "the dial did note it");
         let live = log.active().remove(0);
-        assert_eq!((live.remote_addr, live.dns_ms), (None, Some(12)));
+        assert_eq!((live.remote_addr, live.dns_ms), (Some(peer), Some(12)));
         a.finish(SessionOutcome::Completed);
         log.record_finished(&a, &SessionOutcome::Completed, &t);
         let done = log.recent(1).remove(0);
-        assert_eq!((done.remote_addr, done.dns_ms), (None, Some(12)));
+        assert_eq!((done.remote_addr, done.dns_ms), (Some(peer), Some(12)));
     }
 
     /// The receive span and the two body counts (`phase 4 M4 design 10.1`):

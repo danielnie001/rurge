@@ -1522,6 +1522,10 @@ impl Engine {
                 Some(via),
             )),
             Err(e) => {
+                // the session opened no carrier: the TCP connection its dial
+                // rode first is no far end of it (the phase 4 / M4b plan's
+                // P8 ③)
+                handle.trail().clear_peer();
                 handle.finish(crate::udp::failed(&handle, e.to_string()));
                 Err(io::Error::other(format!("via {via}: {e}")))
             }

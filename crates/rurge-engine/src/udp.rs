@@ -561,6 +561,10 @@ async fn run_flow(
             waiting.close();
         }
         Err(outcome) => {
+            // a flow that opened no carrier left by nothing: the TCP connection
+            // a carrier's dial rides first (a SOCKS5 control connection) is no
+            // far end of it (the phase 4 / M4b plan's P8 ③)
+            trail.clear_peer();
             // it holds no room while the flow stays
             drop(first);
             // a refused flow stays until it is idle, and its client is told of
@@ -714,6 +718,7 @@ async fn open(
         })
         .map_err(|e| failed(handle, e.to_string()))?;
     handle.mark_connected();
+    note_far_end(handle, carrier.socket.as_ref(), &send_to);
     if let Some(pick) = &smart {
         book.used(&pick.group, &pick.member, Instant::now());
         crate::smart::watch(
@@ -728,6 +733,19 @@ async fn open(
     let flow = Arc::new(Flow::new(handle.clone(), destination.port, asked.clone()));
     carrier.routes.add(send_to.clone(), &flow);
     Ok((flow, carrier, send_to))
+}
+
+/// Notes where the flow's datagrams leave rurge on the session's trail
+/// (`phase 4 M4 design 10.3`): the carrier's far end for `to`, or nothing
+/// when it cannot tell. A carrier opened in the flow's `follow` may have
+/// noted the TCP connection it rides first — a SOCKS5 control connection —
+/// and that is not this flow's far end, so `None` clears it (the phase 4 /
+/// M4b plan's P8 ③).
+fn note_far_end(handle: &SessionHandle, socket: &dyn PacketSocket, to: &Target) {
+    match socket.far_end(to) {
+        Some(far) => handle.trail().set_peer(far),
+        None => handle.trail().clear_peer(),
+    }
 }
 
 /// Whether three silent seconds of a flow sending to `send_to` count
@@ -849,6 +867,7 @@ mod tests {
     use super::*;
     use rurge_net::BoxFuture;
     use rurge_proto::OutboundError;
+    use std::net::SocketAddr;
 
     /// A flow of `handle` to `port` that goes where the client wrote: the
     /// session's destination.
@@ -1247,7 +1266,6 @@ mod tests {
     /// A carrier whose sends never finish: a stream stuck behind a peer that
     /// reads no more.
     struct Stuck;
-
     impl PacketSocket for Stuck {
         fn send_to<'a>(&'a self, _: &'a [u8], _: &'a Target) -> BoxFuture<'a, io::Result<()>> {
             Box::pin(std::future::pending())
@@ -1277,6 +1295,46 @@ mod tests {
 
     fn queued(datagram: &[u8]) -> Queued {
         Queued::new(datagram.to_vec(), &Arc::default()).expect("room")
+    }
+
+    /// A carrier that answers one far end for every target, and is never
+    /// asked to send or receive.
+    struct Tells(Option<SocketAddr>);
+
+    impl PacketSocket for Tells {
+        fn send_to<'a>(&'a self, _: &'a [u8], _: &'a Target) -> BoxFuture<'a, io::Result<()>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn recv_from<'a>(&'a self, _: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn far_end(&self, _to: &Target) -> Option<SocketAddr> {
+            self.0
+        }
+    }
+
+    /// A flow's far end is its carrier's, not what a TCP connection the
+    /// carrier was opened over noted (`phase 4 M4 design 10.3`): a carrier
+    /// that cannot tell clears the note (the phase 4 / M4b plan's P8 ③).
+    #[tokio::test]
+    async fn the_far_end_replaces_what_the_carriers_dial_noted() {
+        let sentinel: SocketAddr = "192.0.2.7:1080".parse().unwrap();
+        let far: SocketAddr = "127.0.0.1:5353".parse().unwrap();
+        let to = Target::new(HostName::parse("127.0.0.1"), 5353);
+        let handle = SessionHandle::new(1, SessionInfo::udp(to.host.clone(), to.port));
+        let trail = handle.trail().clone();
+        trail
+            .follow(async {
+                trail.set_peer(sentinel);
+                note_far_end(&handle, &Tells(None), &to);
+                assert_eq!(trail.peer(), None);
+                trail.set_peer(sentinel);
+                note_far_end(&handle, &Tells(Some(far)), &to);
+                assert_eq!(trail.peer(), Some(far));
+            })
+            .await;
     }
 
     /// An association, one of its flows and a carrier that never sends.
