@@ -3900,6 +3900,9 @@ mod run {
     /// line. `spawn_command` cannot do this: it reads while it waits for the
     /// two `listening on` lines and drops what came before them, and the
     /// warning about a lowered body size is written before the API starts.
+    /// The `Daemon` it hands back has no listener ports (`http` and `socks`
+    /// are 0): the two `listening on` lines are among the lines handed back,
+    /// and the tests that use it talk to the API only.
     fn lines_until_the_api(mut cmd: Command) -> (Daemon, Vec<String>, u16) {
         let mut child = cmd
             .stdout(Stdio::piped())
@@ -4030,7 +4033,10 @@ mod run {
                 "size `17179869184g` is too large",
             ),
         ] {
-            let mut child = rurge_run(&conf, &data)
+            let mut cmd = rurge_run(&conf, &data);
+            cmd.env_remove("RURGE_CAPTURE_SIZE");
+            cmd.env_remove("RURGE_CAPTURE_BODY_SIZE");
+            let mut child = cmd
                 .arg(option)
                 .arg(written)
                 .stdout(Stdio::null())
@@ -4095,16 +4101,17 @@ mod run {
         let dir = tempfile::tempdir().unwrap();
         let conf = write_conf(dir.path(), API_GENERAL);
         let data = dir.path().join("data");
-        let daemon = tokio::task::spawn_blocking(move || {
+        let (daemon, api) = tokio::task::spawn_blocking(move || {
             let mut cmd = rurge_run(&conf, &data);
             cmd.env_remove("RURGE_CAPTURE_SIZE");
             cmd.env_remove("RURGE_CAPTURE_BODY_SIZE");
             cmd.args(["--capture-size", "1m"]);
-            spawn_command(cmd)
+            let daemon = spawn_command(cmd);
+            let api = api_port(&daemon);
+            (daemon, api)
         })
         .await
         .unwrap();
-        let api = api_port(&daemon);
         let switched = tokio::task::spawn_blocking(move || {
             api_call(
                 api,
@@ -4126,32 +4133,36 @@ mod run {
         assert!(asked.starts_with("HTTP/1.1 200"), "{asked}");
         // The entry is stored when the request's HTTP part ends, which is
         // after the answer has been written to the client.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let (status, body) = api_call(api, "GET", "/v1/rurge/capture/sessions", "k", None);
-            assert_eq!(status, 200, "{body}");
-            let read: serde_json::Value = serde_json::from_str(&body).unwrap();
-            let known = read
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|s| s["name"] == "default" && s["entries"].as_u64() == Some(1));
-            if known {
-                break;
+        let (status, har) = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let (status, body) = api_call(api, "GET", "/v1/rurge/capture/sessions", "k", None);
+                assert_eq!(status, 200, "{body}");
+                let read: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let known = read
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["name"] == "default" && s["entries"].as_u64() == Some(1));
+                if known {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no `default` entry within 5 s: {body}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no `default` entry within 5 s: {body}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let (status, har) = api_call(
-            api,
-            "GET",
-            "/v1/rurge/capture/sessions/default/har",
-            "k",
-            None,
-        );
+            api_call(
+                api,
+                "GET",
+                "/v1/rurge/capture/sessions/default/har",
+                "k",
+                None,
+            )
+        })
+        .await
+        .unwrap();
         assert_eq!(status, 200, "{har}");
         let har: serde_json::Value = serde_json::from_str(&dechunked(&har)).unwrap();
         assert_eq!(har["log"]["version"], "1.2", "{har}");

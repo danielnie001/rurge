@@ -1813,8 +1813,9 @@ pub fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
         if look_up_processes {
             shared.owners = Some(Arc::new(PlatformOwners::new()));
         }
-        // The store the captured requests go: the one limit of the run, made
-        // once here so that every generation sees the same one.
+        // The store the captured requests go into, with this run's limits:
+        // made once, here, so that every generation (each reload makes one)
+        // shares it.
         let (limits, lowered) = capture_limits(args.capture_size, args.capture_body_size);
         if let Some(w) = lowered {
             tracing::warn!("{w}");
