@@ -428,8 +428,8 @@ mod tests {
         );
     }
 
-    /// The three keys of M4b (`phase 4 M4 design 10.1`): `null` until known,
-    /// numbers after, and `null` for a session that is no HTTP request.
+    /// The two timing fields (M3c design 4.1) and the three keys of M4b
+    /// (`phase 4 M4 design 10.1`): `null` until known, numbers after.
     #[test]
     fn the_timings_are_null_until_known() {
         let mut r = record(1, ListenerKind::Http);
