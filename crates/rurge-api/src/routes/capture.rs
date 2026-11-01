@@ -8,11 +8,14 @@
 
 use crate::App;
 use crate::error::{ApiError, ApiResult, query_params};
+use crate::har::document;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::IntoResponse;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rurge_engine::capture::{Body, Entry, Head, NotDecoded, Outcome, ResponseHead, Truncated};
@@ -161,6 +164,25 @@ pub async fn session(
         })
         .collect();
     Ok(Json(listed))
+}
+
+/// `GET /v1/rurge/capture/sessions/{name}/har`: one session as HAR 1.2
+/// (`phase 4 M4 design 7.4`, `8`), oldest entry first. The entries are taken
+/// out of the store and the lock let go before the document is written: the
+/// snapshot keeps them whole, and each is serialized only when the connection
+/// asks for it.
+pub async fn har(State(app): State<App>, Path(name): Path<String>) -> ApiResult<impl IntoResponse> {
+    let store = app.engine.capture();
+    let entries = store.session(&name);
+    if entries.is_empty() {
+        return Err(ApiError::not_found(format!(
+            "unknown capture session `{name}`"
+        )));
+    }
+    Ok((
+        [(CONTENT_TYPE, "application/json")],
+        document(entries, store.limits().body),
+    ))
 }
 
 pub async fn entry(

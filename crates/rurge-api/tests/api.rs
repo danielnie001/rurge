@@ -4101,3 +4101,446 @@ async fn odd_session_names_are_reached_through_the_path() {
     assert_eq!(body.as_array().map(Vec::len), Some(1), "{body}");
     assert_eq!(body[0]["id"], 2, "{body}");
 }
+
+/// The HAR document of session `a`, parsed: every case here stores into that
+/// session and reads it back through the endpoint (`phase 4 M4 design 7.4`).
+async fn har_of_a(api: &Api) -> Value {
+    let (status, content_type, bytes) = call_raw(
+        api.addr,
+        "GET",
+        "/v1/rurge/capture/sessions/a/har",
+        Some(KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(content_type, "application/json");
+    serde_json::from_slice(&bytes).expect("a JSON document")
+}
+
+/// The exported entry whose `_rurgeId` is `id`.
+fn har_entry(doc: &Value, id: u64) -> &Value {
+    doc["log"]["entries"]
+        .as_array()
+        .expect("the document lists entries")
+        .iter()
+        .find(|entry| entry["_rurgeId"] == id)
+        .unwrap_or_else(|| panic!("entry {id} in {doc}"))
+}
+
+/// A session is exported as a HAR 1.2 document, its entries oldest first
+/// (`phase 4 M4 design 7.4`, `8.1`): the document's own keys, the start of
+/// each entry, and rurge's four keys beside the standard ones.
+#[tokio::test]
+async fn a_session_is_exported_as_har_oldest_first() {
+    let api = api().await;
+    assert!(api.engine.capture().put(capture_entry(1, "a")));
+    assert!(api.engine.capture().put(capture_entry(2, "a")));
+
+    let doc = har_of_a(&api).await;
+    assert_eq!(doc["log"]["version"], "1.2", "{doc}");
+    assert_eq!(
+        doc["log"]["creator"],
+        json!({ "name": "rurge", "version": env!("CARGO_PKG_VERSION") }),
+        "{doc}"
+    );
+    assert_eq!(doc["log"]["pages"], json!([]), "{doc}");
+    let entries = doc["log"]["entries"]
+        .as_array()
+        .expect("the document lists entries");
+    assert_eq!(entries.len(), 2, "{doc}");
+    assert_eq!(
+        (
+            entries[0]["_rurgeId"].as_u64(),
+            entries[1]["_rurgeId"].as_u64()
+        ),
+        (Some(1), Some(2)),
+        "oldest first: {doc}"
+    );
+    let first = &entries[0];
+    assert_eq!(
+        first["startedDateTime"],
+        capture_entry(1, "a").started_rfc3339(),
+        "{doc}"
+    );
+    assert_eq!(first["_session"], "a", "{doc}");
+    assert_eq!(first["_outcome"], "completed", "{doc}");
+    assert_eq!(first["_notes"], json!([]), "{doc}");
+
+    // a session nobody captured is the 404 the session's own endpoint gives
+    assert_eq!(
+        get(&api, "/v1/rurge/capture/sessions/nope/har").await,
+        (404, json!({ "error": "unknown capture session `nope`" }))
+    );
+}
+
+/// Bodies come out as text or as Base64, and what was left out says so in
+/// `comment` (`phase 4 M4 design 8.2`): a compressed answer is shown decoded,
+/// one that cannot be decoded is shown as stored with the reason, and a
+/// truncated one says how much of it was kept.
+#[tokio::test]
+async fn har_bodies_are_text_or_base64_and_say_what_was_left_out() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use rurge_engine::capture::{Body, Truncated};
+    use std::io::Write;
+
+    fn gzipped(data: &[u8]) -> Bytes {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).expect("in memory");
+        Bytes::from(encoder.finish().expect("in memory"))
+    }
+
+    /// `capture_entry` with `body` as its response body and `encoding` on it.
+    fn answered(
+        id: u64,
+        encoding: Option<&'static str>,
+        body: rurge_engine::capture::Body,
+    ) -> rurge_engine::capture::Entry {
+        let mut entry = capture_entry(id, "a");
+        if let Some(name) = encoding {
+            entry
+                .response
+                .as_mut()
+                .expect("a response")
+                .headers
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static(name));
+        }
+        entry.response_body = body;
+        entry
+    }
+
+    let api = api().await;
+    let plain = b"hello hello hello".to_vec();
+    let gz = gzipped(&plain);
+    assert!(api.engine.capture().put(answered(
+        1,
+        Some("gzip"),
+        Body {
+            size: gz.len() as u64,
+            data: gz.clone(),
+            truncated: None,
+        }
+    )));
+    assert!(api.engine.capture().put(answered(
+        2,
+        None,
+        Body {
+            size: 3,
+            data: Bytes::from_static(&[0x00, 0x9c, 0xff]),
+            truncated: None,
+        }
+    )));
+    assert!(api.engine.capture().put(answered(
+        3,
+        None,
+        Body {
+            size: 10,
+            data: Bytes::from_static(b"0123"),
+            truncated: Some(Truncated::Limit),
+        }
+    )));
+    // br is not decoded: the bytes as they came, which here are no UTF-8
+    let stored = Bytes::from_static(&[0x1b, 0x9c, 0xff, 0x00, 0x80]);
+    assert!(api.engine.capture().put(answered(
+        4,
+        Some("br"),
+        Body {
+            size: stored.len() as u64,
+            data: stored.clone(),
+            truncated: None,
+        }
+    )));
+    let half = gz.len() / 2;
+    assert!(api.engine.capture().put(answered(
+        5,
+        Some("gzip"),
+        Body {
+            size: gz.len() as u64,
+            data: Bytes::copy_from_slice(&gz[..half]),
+            truncated: Some(Truncated::Limit),
+        }
+    )));
+
+    // a request body of its own, one UTF-8 with a type and one binary
+    let mut typed = capture_entry(6, "a");
+    typed.request.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let sent = Bytes::from_static(b"{\"a\":1}");
+    typed.request_body = Body {
+        size: sent.len() as u64,
+        data: sent,
+        truncated: None,
+    };
+    assert!(api.engine.capture().put(typed));
+    let mut binary = capture_entry(7, "a");
+    binary.request_body = Body {
+        size: 2,
+        data: Bytes::from_static(&[0x80, 0x81]),
+        truncated: None,
+    };
+    assert!(api.engine.capture().put(binary));
+
+    let doc = har_of_a(&api).await;
+
+    // a gzip answer is shown decoded, and what the transfer saved is the
+    // difference between the two sizes
+    assert_eq!(
+        har_entry(&doc, 1)["response"]["content"],
+        json!({
+            "mimeType": "text/plain",
+            "size": plain.len(),
+            "compression": plain.len() as i64 - gz.len() as i64,
+            "text": "hello hello hello",
+        }),
+        "{doc}"
+    );
+    assert_eq!(
+        har_entry(&doc, 1)["response"]["bodySize"],
+        gz.len(),
+        "{doc}"
+    );
+
+    // what is no UTF-8 goes out as Base64, and says so
+    assert_eq!(
+        har_entry(&doc, 2)["response"]["content"],
+        json!({
+            "mimeType": "text/plain",
+            "size": 3,
+            "text": STANDARD.encode([0x00, 0x9c, 0xff]),
+            "encoding": "base64",
+        }),
+        "{doc}"
+    );
+
+    // truncated: `bodySize` is what went by, `size` what was kept
+    assert_eq!(
+        har_entry(&doc, 3)["response"]["content"],
+        json!({
+            "mimeType": "text/plain",
+            "size": 4,
+            "text": "0123",
+            "comment": "4 of 10 bytes stored",
+        }),
+        "{doc}"
+    );
+    assert_eq!(har_entry(&doc, 3)["response"]["bodySize"], 10, "{doc}");
+
+    // an encoding rurge cannot undo: the bytes as they came, and why
+    assert_eq!(
+        har_entry(&doc, 4)["response"]["content"],
+        json!({
+            "mimeType": "text/plain",
+            "size": stored.len(),
+            "text": STANDARD.encode(&stored),
+            "encoding": "base64",
+            "comment": "not decoded: content-encoding br is not supported",
+        }),
+        "{doc}"
+    );
+
+    // both reasons, the truncation first
+    assert_eq!(
+        har_entry(&doc, 5)["response"]["content"],
+        json!({
+            "mimeType": "text/plain",
+            "size": half,
+            "text": STANDARD.encode(&gz[..half]),
+            "encoding": "base64",
+            "comment": format!(
+                "{half} of {} bytes stored; not decoded: the body was truncated",
+                gz.len()
+            ),
+        }),
+        "{doc}"
+    );
+
+    // the request's side: text with its type, Base64 with `_encoding`
+    assert_eq!(
+        har_entry(&doc, 6)["request"]["postData"],
+        json!({ "mimeType": "application/json", "text": "{\"a\":1}" }),
+        "{doc}"
+    );
+    assert_eq!(har_entry(&doc, 6)["request"]["bodySize"], 7, "{doc}");
+    assert_eq!(
+        har_entry(&doc, 7)["request"]["postData"],
+        json!({
+            "mimeType": "",
+            "text": STANDARD.encode([0x80, 0x81]),
+            "_encoding": "base64",
+        }),
+        "{doc}"
+    );
+    // a request of no bytes has no `postData` at all
+    assert!(
+        har_entry(&doc, 1)["request"].get("postData").is_none(),
+        "{doc}"
+    );
+    assert_eq!(har_entry(&doc, 1)["request"]["bodySize"], 0, "{doc}");
+}
+
+/// An entry the engine never answered is written the way mitmproxy writes one
+/// (`phase 4 M4 design 8.2`): status 0 and nothing else; the failure's own
+/// words are in `_error`, and `serverIPAddress` is there only when a remote
+/// address was captured.
+#[tokio::test]
+async fn har_says_no_response_as_mitmproxy_does() {
+    use rurge_engine::capture::{Body, Outcome};
+
+    let api = api().await;
+    let mut failed = capture_entry(1, "a");
+    failed.response = None;
+    failed.response_body = Body::empty();
+    failed.outcome = Outcome::Failed;
+    failed.error = Some("connection reset by peer".to_string());
+    failed.remote = None;
+    assert!(api.engine.capture().put(failed));
+
+    let mut far = capture_entry(2, "a");
+    far.remote = Some(SocketAddr::from(([10, 0, 0, 1], 8443)));
+    assert!(api.engine.capture().put(far));
+
+    let doc = har_of_a(&api).await;
+    assert_eq!(
+        &har_entry(&doc, 1)["response"],
+        &json!({
+            "status": 0,
+            "statusText": "",
+            "httpVersion": "",
+            "cookies": [],
+            "headers": [],
+            "content": { "size": 0, "mimeType": "" },
+            "redirectURL": "",
+            "headersSize": -1,
+            "bodySize": -1,
+        }),
+        "{doc}"
+    );
+    assert_eq!(
+        har_entry(&doc, 1)["_error"],
+        "connection reset by peer",
+        "{doc}"
+    );
+    assert!(har_entry(&doc, 1).get("serverIPAddress").is_none(), "{doc}");
+    // the address of the server, without the port of the connection
+    assert_eq!(har_entry(&doc, 2)["serverIPAddress"], "10.0.0.1", "{doc}");
+}
+
+/// The four credential headers are `***` in a HAR as well and no cookie is
+/// read out of one of them, `redirectURL` is the `location` header, and
+/// `statusText` is the status' own reason (`phase 4 M4 design 6.6`, `8.2`).
+#[tokio::test]
+async fn har_masks_the_four_headers_and_leaves_cookies_empty() {
+    let api = api().await;
+    let mut masked = capture_entry(1, "a");
+    masked.request.headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer s3cret"),
+    );
+    masked.request.headers.insert(
+        header::PROXY_AUTHORIZATION,
+        HeaderValue::from_static("Basic c2VjcmV0"),
+    );
+    masked
+        .request
+        .headers
+        .insert(header::COOKIE, HeaderValue::from_static("sid=s3cret"));
+    masked
+        .response
+        .as_mut()
+        .expect("a response")
+        .headers
+        .insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("sid=s3cret; HttpOnly"),
+        );
+    assert!(api.engine.capture().put(masked));
+    let mut moved = capture_entry(2, "a");
+    {
+        let response = moved.response.as_mut().expect("a response");
+        response.status = StatusCode::FOUND;
+        response.headers.insert(
+            header::LOCATION,
+            HeaderValue::from_static("https://b.test/next"),
+        );
+    }
+    assert!(api.engine.capture().put(moved));
+
+    let doc = har_of_a(&api).await;
+    let value = |an: &Value, side: &str, name: &str| {
+        an[side]["headers"]
+            .as_array()
+            .and_then(|headers| headers.iter().find(|h| h["name"] == name))
+            .and_then(|h| h["value"].as_str())
+            .map(str::to_string)
+    };
+    let first = har_entry(&doc, 1);
+    for (side, name) in [
+        ("request", "authorization"),
+        ("request", "proxy-authorization"),
+        ("request", "cookie"),
+        ("response", "set-cookie"),
+    ] {
+        assert_eq!(
+            value(first, side, name).as_deref(),
+            Some("***"),
+            "the {name} of the {side}: {doc}"
+        );
+    }
+    assert_eq!(first["request"]["cookies"], json!([]), "{doc}");
+    assert_eq!(first["response"]["cookies"], json!([]), "{doc}");
+    assert_eq!(first["response"]["statusText"], "OK", "{doc}");
+    assert_eq!(first["response"]["redirectURL"], "", "{doc}");
+    assert_eq!(
+        har_entry(&doc, 2)["response"]["redirectURL"],
+        "https://b.test/next",
+        "{doc}"
+    );
+    assert_eq!(
+        har_entry(&doc, 2)["response"]["statusText"],
+        "Found",
+        "{doc}"
+    );
+}
+
+/// The query string is split into names and values, a `CONNECT` has none to
+/// split, versions are written the way `http::Version` prints them, and the
+/// sizes nobody measured are `-1` (`phase 4 M4 design 8.2`, M4-D26).
+#[tokio::test]
+async fn har_splits_query_strings_and_gives_connect_none() {
+    use rurge_engine::capture::{Body, Outcome};
+
+    let api = api().await;
+    let mut queried = capture_entry(1, "a");
+    queried.request.url = "https://a.test/p?x=1&y=%20z".to_string();
+    queried.request.version = Version::HTTP_2;
+    assert!(api.engine.capture().put(queried));
+
+    let mut tunnel = capture_entry(2, "a");
+    tunnel.request.method = Method::CONNECT;
+    tunnel.request.url = "a.test:443".to_string();
+    tunnel.response = None;
+    tunnel.response_body = Body::empty();
+    tunnel.outcome = Outcome::Upgraded;
+    assert!(api.engine.capture().put(tunnel));
+
+    let doc = har_of_a(&api).await;
+    let request = &har_entry(&doc, 1)["request"];
+    assert_eq!(
+        request["queryString"],
+        json!([{ "name": "x", "value": "1" }, { "name": "y", "value": " z" }]),
+        "{doc}"
+    );
+    assert_eq!(request["httpVersion"], "HTTP/2.0", "{doc}");
+    assert_eq!(request["headersSize"], -1, "{doc}");
+    assert_eq!(har_entry(&doc, 1)["cache"], json!({}), "{doc}");
+    let tunnel = har_entry(&doc, 2);
+    assert_eq!(tunnel["request"]["method"], "CONNECT", "{doc}");
+    assert_eq!(tunnel["request"]["url"], "a.test:443", "{doc}");
+    assert_eq!(tunnel["request"]["queryString"], json!([]), "{doc}");
+    assert_eq!(tunnel["request"]["httpVersion"], "HTTP/1.1", "{doc}");
+    assert_eq!(tunnel["response"]["headersSize"], -1, "{doc}");
+    assert_eq!(har_entry(&doc, 1)["response"]["headersSize"], -1, "{doc}");
+}

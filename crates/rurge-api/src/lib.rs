@@ -3,8 +3,6 @@
 
 mod auth;
 mod error;
-// the handler of the phase 4 / M4a plan's task 6 (b) uses it
-#[allow(dead_code)]
 mod har;
 mod linger;
 mod routes;
@@ -112,6 +110,10 @@ pub(crate) fn router(key: String, ctx: ApiContext) -> Router {
         .route(
             "/v1/rurge/capture/sessions/{name}",
             get(routes::capture::session),
+        )
+        .route(
+            "/v1/rurge/capture/sessions/{name}/har",
+            get(routes::capture::har),
         )
         .route(
             "/v1/rurge/capture/entries/{id}",
