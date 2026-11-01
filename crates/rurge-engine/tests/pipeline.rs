@@ -3740,6 +3740,54 @@ async fn sessions_dialling_together_record_their_own_address_and_lookup_time() {
     assert_eq!(quick.dns_ms, None, "{quick:?}");
 }
 
+/// A session whose lookup is still under way has the time it has taken so far
+/// in its live record, and the whole of it once it ends (`phase 4 M4 design
+/// 10.4`).
+#[tokio::test]
+async fn an_active_session_shows_the_time_its_lookup_has_taken_so_far() {
+    let h = common::harness(common::Profile {
+        rules: "IP-CIDR,127.0.0.0/8,DIRECT",
+        ..common::Profile::default()
+    })
+    .await;
+    h.dns.set("slow.test", &["127.0.0.1"], &[], 60);
+    h.dns.set_delay(Duration::from_secs(3));
+    let echo = rurge_proto::testing::echo_server().await;
+    let authority = format!("slow.test:{}", echo.port());
+    let dialling = tokio::spawn({
+        let proxy = h.http();
+        let authority = authority.clone();
+        async move { common::connect_via_http(proxy, &authority).await }
+    });
+    let log = h.engine.request_log();
+    let live_dns = || {
+        log.active()
+            .iter()
+            .find(|r| r.dst.starts_with("slow.test:"))
+            .and_then(|r| r.dns_ms)
+    };
+    let mut seen = 0;
+    common::wait_until_within(
+        "the lookup to show in the live record",
+        Duration::from_secs(10),
+        || {
+            seen = live_dns().unwrap_or(0);
+            seen >= 300
+        },
+    )
+    .await;
+    common::wait_until_within("the lookup to count up", Duration::from_secs(10), || {
+        live_dns().is_some_and(|taken| taken > seen)
+    })
+    .await;
+    let mut tunnel = dialling.await.expect("the dialling task");
+    common::echo_through(&mut tunnel, b"slow").await;
+    drop(tunnel);
+    let record = common::the_records(&h, 1).await.remove(0);
+    assert!(record.dst.starts_with("slow.test:"), "{record:?}");
+    assert!(record.dns_ms.unwrap() >= 3000, "{record:?}");
+}
+
 /// When a `smart` group moves on from a member it could not reach, the
 /// record has the address of the member that connected.
 #[tokio::test]
