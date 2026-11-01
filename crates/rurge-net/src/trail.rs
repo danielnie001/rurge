@@ -1,7 +1,7 @@
-//! What a dial leaves of itself for the session that made it: where its TCP
-//! connection went and how long it waited for name lookups. The connector
-//! and the resolver sit far below the session, with a handful of options
-//! structs between them, so instead of every one of those carrying a
+//! What a dial leaves of itself for the session that made it: the far end its
+//! traffic leaves rurge by, and how long it waited for name lookups.
+//! The connector and the resolver sit far below the session, with a handful of
+//! options structs between them, so instead of every one of those carrying a
 //! parameter the session's dial runs inside `Trail::follow` and they write
 //! to "the trail of whoever is dialling, if anybody".
 //!
@@ -28,6 +28,9 @@ struct Left {
     /// `None` until a lookup ended: no lookup is not a lookup that took no
     /// time.
     dns: Option<Duration>,
+    /// The lookups under way, by their number, and when each began.
+    under_way: Vec<(u64, tokio::time::Instant)>,
+    next: u64,
 }
 
 impl Trail {
@@ -41,7 +44,10 @@ impl Trail {
         CURRENT.scope(self.clone(), f).await
     }
 
-    /// The address the last TCP connection made under this trail went to.
+    /// The far end the session's traffic leaves rurge by, as the dials and
+    /// leases under this trail last noted it: the TCP connection a dial made,
+    /// or the connection or carrier a pool or a shared connection lent
+    /// (`phase 4 M4 design 10.3`).
     pub fn peer(&self) -> Option<SocketAddr> {
         self.left().peer
     }
@@ -61,9 +67,20 @@ impl Trail {
         self.left().peer = Some(canonical(addr));
     }
 
-    /// The time spent on name lookups; `None` when none was made.
+    /// The time spent on name lookups: those that ended, and those under way up
+    /// to now (`phase 4 M4 design 10.4`); `None` when none was begun.
     pub fn dns(&self) -> Option<Duration> {
-        self.left().dns
+        let now = tokio::time::Instant::now();
+        let left = self.left();
+        if left.dns.is_none() && left.under_way.is_empty() {
+            return None;
+        }
+        let under_way = left
+            .under_way
+            .iter()
+            .map(|(_, start)| now.saturating_duration_since(*start))
+            .fold(Duration::ZERO, |total, one| total.saturating_add(one));
+        Some(left.dns.unwrap_or_default().saturating_add(under_way))
     }
 
     fn left(&self) -> std::sync::MutexGuard<'_, Left> {
@@ -71,9 +88,11 @@ impl Trail {
     }
 }
 
-/// A TCP connection was made to `addr`; an IPv4-mapped address
-/// (`::ffff:a.b.c.d`) is noted as the IPv4 address it is, as the project
-/// reads it at every door. Does nothing outside a `follow`.
+/// The session's traffic leaves rurge by a connection or carrier whose far end
+/// is `addr`: a TCP connection just made, or a pooled or shared one just lent
+/// to the session (`phase 4 M4 design 10.3`). An IPv4-mapped address
+/// (`::ffff:a.b.c.d`) is noted as the IPv4 address it is, as the project reads
+/// it at every door. Does nothing outside a `follow`.
 pub fn connected(addr: SocketAddr) {
     let addr = canonical(addr);
     let _ = CURRENT.try_with(|trail| trail.left().peer = Some(addr));
@@ -95,6 +114,59 @@ pub fn looked_up(spent: Duration) {
         let mut left = trail.left();
         left.dns = Some(left.dns.unwrap_or_default().saturating_add(spent));
     });
+}
+
+/// A name lookup under way (`phase 4 M4 design 10.4`): `begin` registers it on
+/// the trail being followed, if any; dropping it — when the lookup ends,
+/// however it ends, or when a dial gives up on it half way — adds the time it
+/// took and lets it go. It ends on the trail it began on, whichever task drops
+/// it.
+pub struct Lookup {
+    trail: Option<Trail>,
+    id: u64,
+    started: tokio::time::Instant,
+}
+
+impl Lookup {
+    pub fn begin() -> Lookup {
+        let started = tokio::time::Instant::now();
+        let trail = current();
+        let id = match &trail {
+            Some(trail) => {
+                let mut left = trail.left();
+                let id = left.next;
+                left.next = left.next.wrapping_add(1);
+                left.under_way.push((id, started));
+                id
+            }
+            None => 0,
+        };
+        Lookup { trail, id, started }
+    }
+}
+
+impl Drop for Lookup {
+    fn drop(&mut self) {
+        let Some(trail) = &self.trail else {
+            return;
+        };
+        let mut left = trail.left();
+        if let Some(at) = left.under_way.iter().position(|(id, _)| *id == self.id) {
+            left.under_way.swap_remove(at);
+        }
+        left.dns = Some(
+            left.dns
+                .unwrap_or_default()
+                .saturating_add(self.started.elapsed()),
+        );
+    }
+}
+
+/// The trail being followed now, a clone that shares its record; `None` outside
+/// a `follow`. For what notes a far end later and elsewhere: a redial in the
+/// relay, a carrier's far end read after its dial.
+pub fn current() -> Option<Trail> {
+    CURRENT.try_with(Trail::clone).ok()
 }
 
 #[cfg(test)]
@@ -341,5 +413,96 @@ mod tests {
             (inner.peer(), inner.dns()),
             (Some(addr("192.0.2.2:2")), Some(ms(2)))
         );
+    }
+
+    /// A lookup still under way counts up to now, and stops counting when it
+    /// ends (`phase 4 M4 design 10.4`).
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_under_way_counts_up_to_now() {
+        let trail = Trail::new();
+        let under_way = trail.follow(async { Lookup::begin() }).await;
+        tokio::time::advance(ms(30)).await;
+        assert_eq!(trail.dns(), Some(ms(30)));
+        tokio::time::advance(ms(20)).await;
+        assert_eq!(trail.dns(), Some(ms(50)));
+        drop(under_way);
+        assert_eq!(trail.dns(), Some(ms(50)));
+        tokio::time::advance(ms(100)).await;
+        assert_eq!(trail.dns(), Some(ms(50)));
+    }
+
+    /// What ended and what is under way add up; two lookups under way at once
+    /// each count the time they have taken, not once between them.
+    #[tokio::test(start_paused = true)]
+    async fn lookups_done_and_under_way_add_up() {
+        let trail = Trail::new();
+        let under_way = trail
+            .follow(async {
+                looked_up(ms(5));
+                Lookup::begin()
+            })
+            .await;
+        tokio::time::advance(ms(10)).await;
+        assert_eq!(trail.dns(), Some(ms(15)));
+        drop(under_way);
+        assert_eq!(trail.dns(), Some(ms(15)));
+
+        let trail = Trail::new();
+        let (one, two) = trail
+            .follow(async { (Lookup::begin(), Lookup::begin()) })
+            .await;
+        tokio::time::advance(ms(10)).await;
+        assert_eq!(trail.dns(), Some(ms(20)));
+        drop((one, two));
+        assert_eq!(trail.dns(), Some(ms(20)));
+    }
+
+    /// A lookup begun outside any `follow` has no trail to be noted on;
+    /// dropping it writes nowhere.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_begun_outside_a_follow_notes_nothing() {
+        let trail = Trail::new();
+        let under_way = Lookup::begin();
+        tokio::time::advance(ms(10)).await;
+        drop(under_way);
+        assert_eq!(trail.dns(), None);
+        assert!(current().is_none());
+    }
+
+    /// A lookup ends on the trail it began on, whichever task drops it: the
+    /// ticket carries its trail.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_ends_on_the_trail_it_began_on() {
+        let (a, b) = (Trail::new(), Trail::new());
+        let under_way = a.follow(async { Lookup::begin() }).await;
+        tokio::time::advance(ms(10)).await;
+        b.follow(async move { drop(under_way) }).await;
+        assert_eq!(a.dns(), Some(ms(10)));
+        assert_eq!(b.dns(), None);
+    }
+
+    /// `current` is what is followed now: none outside a `follow`, the outer
+    /// trail inside one, the inner one where a `follow` of another trail takes
+    /// over.
+    #[tokio::test]
+    async fn current_is_the_trail_followed_now() {
+        let (outer, inner) = (Trail::new(), Trail::new());
+        assert!(current().is_none());
+        outer
+            .follow(async {
+                current()
+                    .expect("inside a follow")
+                    .set_peer(addr("192.0.2.1:1"));
+                inner
+                    .follow(async {
+                        current()
+                            .expect("inside a follow")
+                            .set_peer(addr("192.0.2.2:2"));
+                    })
+                    .await;
+            })
+            .await;
+        assert_eq!(outer.peer(), Some(addr("192.0.2.1:1")));
+        assert_eq!(inner.peer(), Some(addr("192.0.2.2:2")));
     }
 }
