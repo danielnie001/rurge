@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 mod slot;
 mod store;
 
-pub(crate) use slot::RequestTap;
+pub(crate) use slot::{CaptureSlot, RequestTap};
 pub(crate) use store::Pending;
 pub use store::{CaptureStore, SessionSummary, Status};
 

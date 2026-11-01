@@ -19,9 +19,6 @@
 //! are asked of it through `Upstreams`, so this crate never rules, never
 //! dials and never opens a socket of its own.
 
-// the engine uses `Capture::begin` and `Pending` from the phase 4 / M4a
-// plan's task 3 on; until then nothing outside this module calls them.
-#[allow(dead_code)]
 pub mod capture;
 pub mod engine;
 pub mod headers;

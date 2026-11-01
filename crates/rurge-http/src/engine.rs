@@ -21,7 +21,7 @@ use super::rewrite::{
     retarget_request, write_back_host,
 };
 use super::version::{Form, fit};
-use crate::capture::{Capture, RequestTap};
+use crate::capture::{Capture, CaptureSlot, Head, RequestTap};
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use http_body_util::BodyExt;
@@ -406,6 +406,19 @@ impl<U: Upstreams> Requests<U> {
     }
 
     pub async fn handle(&self, req: Request<Incoming>) -> Result<Response<ResponseBody>, Close> {
+        // One slot per request, told what the rules decided and what came back
+        // (`phase 4 M4 design 6`); it stores the entry itself when the record
+        // and the answer are both over (the phase 4 / M4a plan's P9).
+        let slot = CaptureSlot::new();
+        let answer = self.serve(req, &slot).await;
+        slot.answered(answer, self.shared.conn.h2)
+    }
+
+    async fn serve(
+        &self,
+        req: Request<Incoming>,
+        slot: &CaptureSlot,
+    ) -> Result<Response<ResponseBody>, Close> {
         let mut req = req;
         // 0. A `CONNECT` on an HTTP/2 connection is the tunnel of RFC 9113
         // §8.5, which rurge does not carry: answered 501 and recorded, so that
@@ -492,12 +505,32 @@ impl<U: Upstreams> Requests<U> {
         if handle.token().is_cancelled() {
             return Err(Close);
         }
+        // Where this request is captured, taken before the match takes `routed`
+        // apart: `route` decides it, and an early return below leaves without
+        // it (`phase 4 M4 design 4.6`, the phase 4 / M4a plan's P9).
+        let capture = match &routed {
+            Routed::Go { capture, .. } | Routed::Refused { capture, .. } => capture.clone(),
+        };
+        let sniffed = self.shared.conn.entry == Entry::Sniffed;
+        let client_version = req.version();
+        {
+            let mut headers = req.headers().clone();
+            headers::strip(
+                &mut headers,
+                Keep {
+                    upgrade: wants_upgrade(&req),
+                    proxy_authorization: sniffed,
+                },
+            );
+            slot.arm(capture, &handle, || Head {
+                method: req.method().clone(),
+                url: captured_url(handle.session().url.as_deref(), &req),
+                version: req.version(),
+                headers,
+            });
+        }
         let (mut route, mut key, pages, rewrite) = match routed {
-            Routed::Refused {
-                refusal,
-                pages,
-                capture: _,
-            } => {
+            Routed::Refused { refusal, pages, .. } => {
                 return self.answer(&guard, refusal, pages).await;
             }
             Routed::Go {
@@ -505,7 +538,7 @@ impl<U: Upstreams> Requests<U> {
                 key,
                 pages,
                 rewrite,
-                capture: _,
+                ..
             } => (route, key, pages, rewrite),
         };
         if prepared.unknown {
@@ -520,7 +553,6 @@ impl<U: Upstreams> Requests<U> {
         // connection that speaks HTTP/1.1 (`phase 4 M2 design 10.4`, `the
         // phase 4 / M2b plan's P12`). Read before the hop-by-hop headers go:
         // `Upgrade` and `Connection` are two of them.
-        let sniffed = self.shared.conn.entry == Entry::Sniffed;
         // A `CONNECT` on a sniffed connection is a tunnel of the client's, and
         // an absolute request line on one is the request it already made:
         // neither is a URL this engine rewrites (`phase 4 M3 design 8.1`,
@@ -834,6 +866,11 @@ impl<U: Upstreams> Requests<U> {
             self.shared
                 .borrow_h2(key.as_ref().expect("the key is still in hand"))
         };
+        // Whether this request borrowed an upstream connection rather than
+        // dialling one (`phase 4 M4 design 6.5`). A request sent again on a
+        // fresh connection keeps it: it was lent one, and the connect time is
+        // the lending dial's.
+        let mut reused = false;
         // The route of a borrowed connection is still unused: a request the
         // borrowed connection does not carry is sent again on a connection
         // dialled with it (design 8.6).
@@ -842,6 +879,7 @@ impl<U: Upstreams> Requests<U> {
                 // a shared connection is live now, and its dial is the one the
                 // record's peer address belongs to (its bytes were the dialling
                 // request's: `the phase 4 / M2b plan's P11`)
+                reused = true;
                 handle.mark_connected();
                 if let Some(peer) = peer {
                     handle.trail().set_peer(peer);
@@ -864,6 +902,7 @@ impl<U: Upstreams> Requests<U> {
                     Some(pooled) => {
                         // a borrowed connection is ready now, and its dial is the
                         // one the record's peer address and bytes belong to
+                        reused = true;
                         handle.mark_connected();
                         if let Some(peer) = pooled.peer {
                             handle.trail().set_peer(peer);
@@ -908,6 +947,21 @@ impl<U: Upstreams> Requests<U> {
                 proxy_authorization: sniffed && !retargeted,
             },
         );
+        // The request as it leaves, before anything an upstream proxy form
+        // adds goes on: what it carries is what rurge sends, not what rurge
+        // adds for an upstream of its own (`phase 4 M4 design 6.1`, the
+        // phase 4 / M4a plan's P9).
+        if slot.armed() {
+            slot.leaving(
+                Head {
+                    method: req.method().clone(),
+                    url: captured_url(url.as_deref(), &req),
+                    version: client_version,
+                    headers: req.headers().clone(),
+                },
+                reused,
+            );
+        }
         if !sniffed {
             let rewritten = match &forward {
                 Some(extra) => absolute_form(&mut req, extra),
@@ -989,7 +1043,7 @@ impl<U: Upstreams> Requests<U> {
                 idle,
                 progress.clone(),
                 request_meter.clone(),
-                None,
+                slot.request_tap(),
             )
             .boxed(),
         );
@@ -1183,6 +1237,10 @@ impl<U: Upstreams> Requests<U> {
             }
             let upstream_upgrade = hyper::upgrade::on(&mut resp);
             let client_upgrade = client_upgrade.expect("an upgrade was asked for");
+            // the HTTP part of this request is over here: what is captured is
+            // the 101 or the tunnel's 2xx, and the bytes after it belong to
+            // the tunnel (`phase 4 M4 design 6.4`)
+            slot.upgrading();
             return Ok(self.promote(guard, resp, client_upgrade, upstream_upgrade, meter, tunnel));
         }
         // An answer that came over HTTP/2 is shown to an HTTP/1.1 client as
@@ -2280,6 +2338,20 @@ fn write_host<B>(
 /// Whether a request asks for an upgrade (WebSocket, `phase 4 M1 design 8.9`):
 /// HTTP/1.1, an `Upgrade` header, and a `Connection` that lists the `upgrade`
 /// token. The same reading Go's reverse proxy makes.
+/// The URL a captured request is written down with (`phase 4 M4 design 6.1`):
+/// the one the connection came with, or for a `CONNECT` -- which has none --
+/// the authority of its request line, so that a tunnel says where it went
+/// (`M4-D26`).
+fn captured_url<B>(url: Option<&str>, req: &Request<B>) -> String {
+    if let Some(url) = url {
+        return url.to_string();
+    }
+    match req.uri().authority() {
+        Some(authority) => authority.to_string(),
+        None => String::new(),
+    }
+}
+
 fn wants_upgrade<B>(req: &Request<B>) -> bool {
     req.version() == http::Version::HTTP_11
         && req.headers().contains_key(header::UPGRADE)
@@ -3867,6 +3939,11 @@ mod tests {
             self.0.seen.lock().unwrap().clone()
         }
 
+        /// Makes `route` hand the request a place to be captured into.
+        fn capture(&self, capture: Capture) {
+            *self.0.capture.lock().unwrap() = Some(capture);
+        }
+
         /// The `n`th handle, waiting for it to be made.
         async fn handle(&self, n: usize) -> Arc<SessionHandle> {
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -3973,6 +4050,12 @@ mod tests {
                     })?;
                 let peer = stream.peer_addr().ok();
                 handle.mark_connected();
+                // what the engine's own `dial` leaves on the trail through the
+                // follow: a fresh dial is where the peer came from (`phase 4
+                // M4 design 6.5`)
+                if let Some(peer) = peer {
+                    handle.trail().set_peer(peer);
+                }
                 let forward = self.0.forward.lock().unwrap().clone();
                 Ok(Upstream {
                     stream: Box::new(stream),
@@ -4962,6 +5045,48 @@ mod tests {
         })
         .await
         .expect("the condition held within 5 s");
+    }
+
+    /// A store of `limits`, given to `fake` as the place its requests are
+    /// captured into, in the session `t`.
+    fn capturing(fake: &Fake, limits: crate::capture::Limits) -> Arc<crate::capture::CaptureStore> {
+        let store = crate::capture::CaptureStore::new(limits);
+        fake.capture(Capture {
+            store: store.clone(),
+            session: Arc::from("t"),
+        });
+        store
+    }
+
+    /// The one entry of the session `t`, waiting (5 s at most) for it to be
+    /// stored; says what the store counted when none came.
+    async fn one_entry(store: &crate::capture::CaptureStore) -> Arc<crate::capture::Entry> {
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut entries = store.session("t");
+                if entries.len() == 1 {
+                    return entries.remove(0);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        match got {
+            Ok(entry) => entry,
+            Err(_) => {
+                let status = store.status();
+                panic!(
+                    "no single entry in \"t\" within 5 s: entries {}, stored {}, evicted {}, \
+                     dropped {}, truncated {}, used {}",
+                    status.entries,
+                    status.stored,
+                    status.evicted,
+                    status.dropped,
+                    status.truncated,
+                    status.used
+                )
+            }
+        }
     }
 
     /// An origin that answers a chunked body of `body` with a trailer `x-t: 1`
@@ -9920,5 +10045,630 @@ mod tests {
                 ..counted(0, 0, 0, 0)
             }
         );
+    }
+
+    // The captured entries (`phase 4 M4 design 6`, the phase 4 / M4a plan's
+    // task 3).
+
+    /// The first value of `name` in a captured head, as text.
+    fn captured_header(headers: &http::HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string())
+    }
+
+    /// A request and its answer as they were: the id of its record, its
+    /// session, what it carried, what came back and when (`phase 4 M4 design
+    /// 6`).
+    #[tokio::test]
+    async fn a_request_and_its_answer_are_captured() {
+        let (addr, _records) = recording_origin().await;
+        let mut rig = connected(Entry::Listener, addr).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.client
+            .send(
+                "GET http://a.test/x?y=1 HTTP/1.1\r\n\
+                 Host: a.test\r\n\
+                 X-A: 1\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n",
+            )
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        let handle = rig.fake.finished(0).await;
+
+        let entry = one_entry(&store).await;
+        assert_eq!(entry.id, handle.id());
+        assert_eq!(entry.session.as_ref(), "t");
+        assert_eq!(entry.request.method, Method::GET);
+        assert_eq!(entry.request.url, "http://a.test/x?y=1");
+        assert_eq!(entry.request.version, http::Version::HTTP_11);
+        assert_eq!(
+            captured_header(&entry.request.headers, "x-a").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            captured_header(&entry.request.headers, "host").as_deref(),
+            Some("a.test")
+        );
+        assert_eq!(captured_header(&entry.request.headers, "connection"), None);
+
+        let response = entry.response.as_ref().expect("the answer was captured");
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.version, http::Version::HTTP_11);
+        assert_eq!(
+            captured_header(&response.headers, "content-length").as_deref(),
+            Some("2")
+        );
+        assert_eq!(entry.response_body.data, Bytes::from_static(b"ok"));
+        assert_eq!(entry.response_body.size, 2);
+        assert_eq!(entry.response_body.truncated, None);
+        assert_eq!(entry.request_body.size, 0);
+
+        assert_eq!(entry.outcome, crate::capture::Outcome::Completed);
+        assert_eq!(entry.error, None);
+        let timings = &entry.timings;
+        let connect = timings.connect.expect("a dial was captured");
+        let wait = timings.wait.expect("a first byte was captured");
+        let receive = timings.receive.expect("the answer's body was captured");
+        assert_eq!(connect + wait + receive, timings.total);
+        assert!(!timings.reused);
+        assert_eq!(entry.remote, Some(addr));
+    }
+
+    /// A second request on a kept connection borrows the upstream one and says
+    /// so (`phase 4 M4 design 6.5`).
+    #[tokio::test]
+    async fn a_second_request_on_a_kept_connection_is_captured_as_reused() {
+        let (addr, _records) = recording_origin().await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        for path in ["/one", "/two"] {
+            rig.client
+                .send(&format!("GET {path} HTTP/1.1\r\nHost: target.test\r\n\r\n"))
+                .await
+                .unwrap();
+            let (head, body) = rig.client.response().await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            assert_eq!(body, b"ok", "{path}");
+        }
+        wait_until(|| store.session("t").len() == 2).await;
+        let entries = store.session("t");
+        assert_eq!(rig.fake.dials(), 1, "one connection served both");
+        assert!(!entries[0].timings.reused, "the first one dialled");
+        assert!(entries[1].timings.reused, "the second one was lent it");
+    }
+
+    /// What is captured is the request as it leaves: with what a header rule
+    /// added, and without the credentials rurge adds for an upstream proxy of
+    /// its own (`phase 4 M4 design 6.1`, `M4-D15`).
+    #[tokio::test]
+    async fn the_captured_request_is_the_one_that_leaves_without_rurges_forward_headers() {
+        let (addr, records) = recording_origin().await;
+        let (rules, _counters) = rewrite_of(
+            "[Header Rewrite]\n^http://a\\.test header-add X-Added 1",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Listener, addr).await;
+        rig.fake.rewrite(rules);
+        rig.fake.forward(vec![(
+            "Proxy-Authorization".to_string(),
+            "Basic cnVyZ2U6c2VjcmV0".to_string(),
+        )]);
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.client
+            .send("GET http://a.test/x HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, _body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one request reached the origin");
+        assert_eq!(
+            header_value(&seen[0].head, "proxy-authorization").as_deref(),
+            Some("Basic cnVyZ2U6c2VjcmV0"),
+            "rurge's own credential went to the proxy: {}",
+            seen[0].head
+        );
+
+        let entry = one_entry(&store).await;
+        assert_eq!(
+            captured_header(&entry.request.headers, "x-added").as_deref(),
+            Some("1"),
+            "the rule's header is what left"
+        );
+        assert_eq!(
+            captured_header(&entry.request.headers, "proxy-authorization"),
+            None,
+            "rurge's own credential was captured"
+        );
+    }
+
+    /// A request that never left is captured as it was routed
+    /// (`phase 4 M4 design 5.3`): the hop-by-hop headers are gone, the answer
+    /// is the page, and there is no dial to time.
+    #[tokio::test]
+    async fn a_request_that_never_left_is_captured_as_it_was_routed() {
+        let origin = TestServer::spawn().await;
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.fake.script(
+            "/no",
+            Step::Refused {
+                refusal: Refusal::Reject(RejectKind::Reject),
+                pages: Pages {
+                    error: true,
+                    reject: true,
+                },
+            },
+        );
+        rig.client
+            .send(
+                "GET /no HTTP/1.1\r\n\
+                 Host: target.test\r\n\
+                 Connection: keep-alive\r\n\
+                 Keep-Alive: timeout=5\r\n\
+                 X-A: 1\r\n\
+                 \r\n",
+            )
+            .await
+            .unwrap();
+        let (head, _body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+
+        let entry = one_entry(&store).await;
+        assert_eq!(
+            captured_header(&entry.request.headers, "x-a").as_deref(),
+            Some("1")
+        );
+        assert_eq!(captured_header(&entry.request.headers, "connection"), None);
+        assert_eq!(captured_header(&entry.request.headers, "keep-alive"), None);
+        assert_eq!(
+            entry.response.as_ref().expect("a page").status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            entry.outcome,
+            crate::capture::Outcome::Rejected(RejectKind::Reject)
+        );
+        assert_eq!(entry.timings.connect, None);
+        assert_eq!(entry.remote, None);
+        assert_eq!(entry.request_body.size, 0);
+    }
+
+    /// The answer put into the store is the one the client gets: its length
+    /// and its last frame are not lost on the way (`phase 4 M4 design 6.3`).
+    #[tokio::test]
+    async fn the_wrapped_answer_keeps_its_length_and_its_last_frame() {
+        let addr = fixed_origin(b"0123456789".to_vec()).await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.client
+            .send("GET /ten HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(header_value(&head, "content-length").as_deref(), Some("10"));
+        assert_eq!(body, b"0123456789");
+
+        let entry = one_entry(&store).await;
+        assert_eq!(entry.response_body.data, Bytes::from_static(b"0123456789"));
+        assert_eq!(entry.response_body.size, 10);
+        assert_eq!(entry.response_body.truncated, None);
+    }
+
+    /// A chunked answer is captured whole, and its trailers are not part of
+    /// what is kept of its head (`phase 4 M4 design 6.3`).
+    #[tokio::test]
+    async fn a_chunked_answer_is_captured_whole_without_its_trailers() {
+        let addr = chunked_origin(b"chunked body".to_vec()).await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.client
+            .send("GET /chunks HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response_chunked().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"chunked body");
+
+        let entry = one_entry(&store).await;
+        assert_eq!(
+            entry.response_body.data,
+            Bytes::from_static(b"chunked body")
+        );
+        assert_eq!(entry.response_body.size, 12);
+        let response = entry.response.as_ref().expect("an answer");
+        assert_eq!(captured_header(&response.headers, "x-t"), None);
+        assert_eq!(
+            captured_header(&response.headers, "x-o").as_deref(),
+            Some("1"),
+            "the origin's own headers are kept"
+        );
+    }
+
+    /// A body over the per-body limit keeps its beginning, counts every byte
+    /// and the client gets it whole (`phase 4 M4 design 4.4`).
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_captured_truncated() {
+        let addr = fixed_origin(b"0123456789".to_vec()).await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::new(1_000_000, 4));
+        rig.client
+            .send("GET /ten HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"0123456789", "the client takes what it always did");
+
+        let entry = one_entry(&store).await;
+        assert_eq!(entry.response_body.data, Bytes::from_static(b"0123"));
+        assert_eq!(entry.response_body.size, 10);
+        assert_eq!(
+            entry.response_body.truncated,
+            Some(crate::capture::Truncated::Limit)
+        );
+        assert_eq!(store.status().truncated, 1);
+    }
+
+    /// An answer the client walks away from mid-body is stored as failed,
+    /// with what went by so far, and what it reserved goes back
+    /// (`phase 4 M4 design 6.4`).
+    #[tokio::test]
+    async fn a_client_that_leaves_mid_body_is_captured_as_failed() {
+        let origin =
+            holding_origin(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789").await;
+        let rig = connected(Entry::Sniffed, origin.addr).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        let Rig {
+            mut client,
+            fake,
+            token: _token,
+            served,
+        } = rig;
+        client
+            .send("GET /held HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(client.take(10).await, b"0123456789");
+        // the client goes with the answer still coming: the engine's next
+        // write to it fails and the record ends where it stands
+        drop(client);
+        let served = tokio::time::timeout(Duration::from_secs(5), served)
+            .await
+            .expect("the connection ended within 5 s")
+            .expect("the serving task did not panic");
+        assert_eq!(served.routed, 1);
+        assert!(fake.finished(0).await.is_finished());
+
+        let entry = one_entry(&store).await;
+        assert_eq!(entry.outcome, crate::capture::Outcome::Failed);
+        assert_eq!(
+            entry.response.as_ref().expect("the answer's head").status,
+            StatusCode::OK
+        );
+        assert_eq!(entry.response_body.data, Bytes::from_static(b"0123456789"));
+        assert_eq!(entry.response_body.size, 10);
+
+        store.clear(None);
+        assert_eq!(store.status().used, 0, "the reservation went back");
+    }
+
+    /// A request whose handle is killed while its body is coming leaves an
+    /// entry, and nothing reserved (`phase 4 M4 design 6.4`).
+    #[tokio::test]
+    async fn a_killed_request_leaves_no_reservation_behind() {
+        let origin =
+            holding_origin(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789").await;
+        let rig = connected(Entry::Sniffed, origin.addr).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        let Rig {
+            mut client,
+            fake,
+            token: _token,
+            served,
+        } = rig;
+        client
+            .send("GET /held HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        client.take(10).await;
+        let handle = fake.handle(0).await;
+        handle.kill();
+        let _ = tokio::time::timeout(Duration::from_secs(5), served).await;
+
+        let entry = one_entry(&store).await;
+        assert_eq!(entry.outcome, crate::capture::Outcome::Failed);
+
+        store.clear(None);
+        assert_eq!(store.status().used, 0, "the reservation went back");
+    }
+
+    /// An upgrade is captured at its `101`, before the tunnel ends, and the
+    /// bytes after it are nobody's body (`phase 4 M4 design 6.4`).
+    #[tokio::test]
+    async fn an_upgrade_is_captured_at_its_101() {
+        let (addr, _read, _written, _heads) = upgrading_origin(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        )
+        .await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.client
+            .send(
+                "GET /ws HTTP/1.1\r\nHost: target.test\r\n\
+                 Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+        // the entry is there while the tunnel is still open
+        let entry = one_entry(&store).await;
+        assert_eq!(entry.outcome, crate::capture::Outcome::Upgraded);
+        assert_eq!(
+            entry.response.as_ref().expect("the 101").status,
+            StatusCode::SWITCHING_PROTOCOLS
+        );
+        assert_eq!(entry.response_body.size, 0);
+        assert_eq!(
+            captured_header(&entry.request.headers, "upgrade").as_deref(),
+            Some("websocket")
+        );
+        assert!(
+            captured_header(&entry.request.headers, "connection").is_some(),
+            "an upgrade keeps its connection header"
+        );
+        let id = entry.id;
+
+        rig.client.stream.shutdown().await.unwrap();
+        while rig.client.fill().await {}
+        // a second entry can only come from a second store; this waits past
+        // the 10 ms that one would need, and finds none
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(store.status().entries, 1, "no entry came after the tunnel");
+        assert_eq!(store.session("t")[0].id, id);
+    }
+
+    /// A `CONNECT` tunnel is captured at its 2xx, named by the authority of
+    /// its request line (`phase 4 M4 design 6.1`, `M4-D26`).
+    #[tokio::test]
+    async fn a_connect_tunnel_is_captured_at_its_2xx_with_host_and_port_as_its_url() {
+        let (addr, _read, _written, _heads) =
+            upgrading_origin(b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.client
+            .send("CONNECT a.test:443 HTTP/1.1\r\nHost: a.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        let entry = one_entry(&store).await;
+        assert_eq!(entry.request.method, Method::CONNECT);
+        assert_eq!(entry.request.url, "a.test:443");
+        assert_eq!(entry.outcome, crate::capture::Outcome::Upgraded);
+        assert_eq!(
+            entry.response.as_ref().expect("the 2xx").status,
+            StatusCode::OK
+        );
+    }
+
+    /// An answer that is a closed connection is captured with no response
+    /// (`phase 4 M4 design 6.4`).
+    #[tokio::test]
+    async fn a_closed_answer_is_captured_with_no_response() {
+        let origin = TestServer::spawn().await;
+        let mut rig = connected(Entry::Sniffed, addr_of(&origin)).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.fake.script(
+            "/closed",
+            Step::Refused {
+                refusal: Refusal::Reject(RejectKind::Reject),
+                pages: Pages {
+                    error: true,
+                    reject: false,
+                },
+            },
+        );
+        rig.client
+            .send("GET /closed HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.client.until_eof().await,
+            "",
+            "a closed answer says nothing"
+        );
+
+        let entry = one_entry(&store).await;
+        assert!(entry.response.is_none());
+        assert_eq!(entry.response_body.size, 0);
+        assert_eq!(
+            entry.outcome,
+            crate::capture::Outcome::Rejected(RejectKind::Reject)
+        );
+    }
+
+    /// A dropped request is captured when its record ends, not when its hold
+    /// does (`phase 4 M4 design 6.4`, `M4-D29`).
+    #[tokio::test]
+    async fn a_dropped_request_is_captured_before_its_hold_ends() {
+        let origin = TestServer::spawn().await;
+        let mut rig = rig_timed(
+            Entry::Sniffed,
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        )
+        .await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.fake.script(
+            "/drop",
+            Step::Refused {
+                refusal: Refusal::Reject(RejectKind::Drop),
+                pages: Pages {
+                    error: true,
+                    reject: true,
+                },
+            },
+        );
+        rig.client
+            .send("GET /drop HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        // the five seconds `one_entry` waits are the assertion: the entry is
+        // there long before the sixty-second hold ends
+        let entry = one_entry(&store).await;
+        assert!(entry.response.is_none());
+        assert_eq!(
+            entry.outcome,
+            crate::capture::Outcome::Rejected(RejectKind::Drop)
+        );
+        assert!(
+            entry.timings.total < Duration::from_secs(5),
+            "the entry waited for the hold: {:?}",
+            entry.timings.total
+        );
+        rig.stop();
+    }
+
+    /// A stream a client resets before its answer leaves an entry with no
+    /// response (`phase 4 M4 design 6.4`).
+    #[tokio::test]
+    async fn an_http2_stream_reset_before_its_answer_is_captured_with_no_response() {
+        // an origin that takes the request and says nothing: the reset has to
+        // come before any answer, and `stalled_origin` answers the head at
+        // once, which would race it
+        let origin = holding_origin(b"").await;
+        let rig = rig_h2(origin.addr, Duration::from_secs(5), Duration::from_secs(5)).await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let hang = tokio::spawn(
+            sender.send_request(h2_request(http::Method::GET, "http://target.test/hang")),
+        );
+        let _ = rig.fake.handle(0).await;
+        hang.abort();
+
+        let entry = one_entry(&store).await;
+        assert!(entry.response.is_none());
+        assert_eq!(entry.outcome, crate::capture::Outcome::Failed);
+
+        drop(sender);
+        conn.abort();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 1);
+    }
+
+    /// An HTTP/2 client over an HTTP/1.1 origin is captured as HTTP/2 on both
+    /// sides (`phase 4 M4 design 6.3`, `M4-D28`).
+    #[tokio::test]
+    async fn an_http2_client_over_an_http1_upstream_is_captured_as_http2() {
+        let origin = TestServer::spawn().await;
+        origin.set("/hello", "hi there");
+        let rig = rig_h2(
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        let (mut sender, conn) = h2_client(rig.client).await;
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "http://target.test/hello"))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_of(resp).await, b"hi there");
+
+        let entry = one_entry(&store).await;
+        assert_eq!(entry.request.version, http::Version::HTTP_2);
+        assert_eq!(
+            entry.response.as_ref().expect("an answer").version,
+            http::Version::HTTP_2,
+            "the client's side of the answer is what was captured"
+        );
+        assert_eq!(entry.response_body.data, Bytes::from_static(b"hi there"));
+
+        drop(sender);
+        conn.abort();
+        let served = served_within(rig.served, Duration::from_secs(5)).await;
+        assert_eq!(served.routed, 1);
+    }
+
+    /// A request body a rule rewrote is captured as it was sent
+    /// (`phase 4 M4 design 6.1`).
+    #[tokio::test]
+    async fn a_rewritten_request_body_is_captured_as_sent() {
+        let (addr, records) = recording_origin().await;
+        let (rules, _counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-request ^http://b\\.test/ a b",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.client
+            .send("POST /x HTTP/1.1\r\nHost: b.test\r\nContent-Length: 3\r\n\r\naaa")
+            .await
+            .unwrap();
+        let (head, _body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one request reached the origin");
+        assert_eq!(seen[0].body, b"bbb", "the rule's body is what left");
+
+        let entry = one_entry(&store).await;
+        assert_eq!(entry.request_body.data, Bytes::from_static(b"bbb"));
+        assert_eq!(entry.request_body.size, 3);
+        assert_eq!(entry.request_body.truncated, None);
+    }
+
+    /// An answer `[Map Local]` gives is captured like any other, with no dial
+    /// behind it (`phase 4 M4 design 5.3`).
+    #[tokio::test]
+    async fn a_map_local_answer_is_captured() {
+        let guarded = guarded_origin().await;
+        let (rules, _counters) = rewrite_of(
+            "[Map Local]\n^http://m\\.test/ data-type=text data=hello",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, guarded.addr).await;
+        rig.fake.rewrite(rules);
+        let store = capturing(&rig.fake, crate::capture::Limits::default());
+        rig.client
+            .send("GET /x HTTP/1.1\r\nHost: m.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"hello");
+        assert_eq!(
+            guarded.accepted.load(Ordering::Relaxed),
+            0,
+            "Map Local dials nothing"
+        );
+
+        let entry = one_entry(&store).await;
+        assert_eq!(
+            entry.response.as_ref().expect("an answer").status,
+            StatusCode::OK
+        );
+        assert_eq!(entry.response_body.data, Bytes::from_static(b"hello"));
+        assert_eq!(entry.timings.connect, None);
+        assert_eq!(entry.remote, None);
     }
 }
