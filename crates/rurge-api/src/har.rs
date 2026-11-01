@@ -3,15 +3,15 @@
 //!
 //! One entry maps the way the table of `phase 4 M4 design 8.2` says; an entry
 //! the engine never answered is written the way mitmproxy writes one. The
-//! entries are written one at a time (`phase 4 M4 design 8.3`): the export
+//! entries are written one at a time (`phase 4 M4 design 8.4`): the export
 //! does not build the whole file in memory first, and the `Arc` of the
 //! snapshot keeps an entry whole until it is written, even when the store
 //! evicts or clears it in between.
 
 use crate::routes::capture::{headers_json, outcome_name, reject_kind};
 use axum::body::Body;
-use axum::http::HeaderMap;
-use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE, LOCATION};
+use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE, HeaderName, LOCATION};
+use axum::http::{HeaderMap, Method};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rurge_engine::capture::{Body as CapturedBody, Entry, Timings};
@@ -137,8 +137,8 @@ fn request(e: &Entry) -> Value {
 
 /// The query of a URL as names and values; a `CONNECT` has a `host:port` for
 /// a URL and no query to split (`phase 4 M4 design 8.2`).
-fn query_string(method: &axum::http::Method, url: &str) -> Value {
-    if *method == axum::http::Method::CONNECT {
+fn query_string(method: &Method, url: &str) -> Value {
+    if *method == Method::CONNECT {
         return json!([]);
     }
     let Ok(parsed) = Url::parse(url) else {
@@ -153,8 +153,9 @@ fn query_string(method: &axum::http::Method, url: &str) -> Value {
 }
 
 /// The request body as `postData`: the text itself only when it was kept
-/// whole, is no UTF-8 and has no encoding on top of it; Base64 otherwise,
-/// which HAR 1.2 spells `_encoding` here (`phase 4 M4 design 8.2`).
+/// whole, is UTF-8 and has no encoding on top of it; Base64 otherwise, marked
+/// with rurge's own `_encoding`, since HAR 1.2 gives `postData` no `encoding`
+/// (`phase 4 M4 design 8.2`).
 fn post_data(headers: &HeaderMap, body: &CapturedBody) -> Value {
     let mut value = json!({
         "mimeType": header_text(headers, CONTENT_TYPE),
@@ -250,7 +251,7 @@ fn stored_comment(body: &CapturedBody) -> Option<String> {
 }
 
 /// The first value of a header, when it is there and readable.
-fn header_text(headers: &HeaderMap, name: axum::http::header::HeaderName) -> &str {
+fn header_text(headers: &HeaderMap, name: HeaderName) -> &str {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -273,12 +274,8 @@ pub(crate) fn document(entries: Vec<Arc<Entry>>, body_limit: u64) -> Body {
         if i > 0 {
             bytes.push(b',');
         }
-        if serde_json::to_writer(&mut bytes, &entry(&e, body_limit)).is_err() {
-            // `entry` makes a value, which always serializes; a document that
-            // cannot be finished still has to be a document
-            bytes.truncate(usize::from(i > 0));
-            bytes.extend_from_slice(b"null");
-        }
+        serde_json::to_writer(&mut bytes, &entry(&e, body_limit))
+            .expect("a JSON value serializes into memory");
         Ok::<Vec<u8>, Infallible>(bytes)
     });
     let closing = std::iter::once(Ok::<Vec<u8>, Infallible>(b"]}}".to_vec()));
@@ -319,7 +316,7 @@ mod tests {
         }
     }
 
-    fn seconds(n: u64) -> Duration {
+    fn millis(n: u64) -> Duration {
         Duration::from_millis(n)
     }
 
@@ -327,10 +324,7 @@ mod tests {
     /// the same in every case here.
     fn kept_entry(id: u64) -> Entry {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain"),
-        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
         Entry {
             id,
             session: Arc::from("a"),
@@ -353,11 +347,11 @@ mod tests {
                 truncated: None,
             },
             timings: taken(
-                Some(seconds(3)),
+                Some(millis(3)),
                 None,
-                Some(seconds(20)),
-                Some(seconds(12)),
-                seconds(35),
+                Some(millis(20)),
+                Some(millis(12)),
+                millis(35),
                 false,
             ),
             remote: None,
@@ -378,11 +372,11 @@ mod tests {
         // A connection dialled for this request: the lookups come out of the
         // connect time.
         let (h, time) = timings(&taken(
-            Some(seconds(30)),
-            Some(seconds(10)),
-            Some(seconds(20)),
-            Some(seconds(5)),
-            seconds(55),
+            Some(millis(30)),
+            Some(millis(10)),
+            Some(millis(20)),
+            Some(millis(5)),
+            millis(55),
             false,
         ));
         assert_eq!(
@@ -397,11 +391,11 @@ mod tests {
         // A borrowed one: nothing was dialled, so the connect time is the
         // wait for the connection instead.
         let (h, time) = timings(&taken(
-            Some(seconds(4)),
-            Some(seconds(3)),
-            Some(seconds(10)),
-            Some(seconds(2)),
-            seconds(16),
+            Some(millis(4)),
+            Some(millis(3)),
+            Some(millis(10)),
+            Some(millis(2)),
+            millis(16),
             true,
         ));
         assert_eq!(
@@ -415,14 +409,7 @@ mod tests {
 
         // Never connected: the lookup is pressed into the whole request and
         // the rest of it is the wait.
-        let (h, time) = timings(&taken(
-            None,
-            Some(seconds(7)),
-            None,
-            None,
-            seconds(12),
-            false,
-        ));
+        let (h, time) = timings(&taken(None, Some(millis(7)), None, None, millis(12), false));
         assert_eq!(
             (
                 h.blocked, h.dns, h.connect, h.ssl, h.send, h.wait, h.receive
@@ -434,14 +421,7 @@ mod tests {
 
         // Connected, but no first byte came: the wait is what is left of the
         // request after the connection.
-        let (h, time) = timings(&taken(
-            Some(seconds(8)),
-            None,
-            None,
-            None,
-            seconds(20),
-            false,
-        ));
+        let (h, time) = timings(&taken(Some(millis(8)), None, None, None, millis(20), false));
         assert_eq!(
             (
                 h.blocked, h.dns, h.connect, h.ssl, h.send, h.wait, h.receive
@@ -454,11 +434,11 @@ mod tests {
         // The lookups for the rules took longer than the dial: what is left of
         // the connect time is nothing, not less than nothing.
         let (h, time) = timings(&taken(
-            Some(seconds(30)),
-            Some(seconds(50)),
-            Some(seconds(1)),
-            Some(seconds(1)),
-            seconds(32),
+            Some(millis(30)),
+            Some(millis(50)),
+            Some(millis(1)),
+            Some(millis(1)),
+            millis(32),
             false,
         ));
         assert_eq!(

@@ -167,10 +167,10 @@ pub async fn session(
 }
 
 /// `GET /v1/rurge/capture/sessions/{name}/har`: one session as HAR 1.2
-/// (`phase 4 M4 design 7.4`, `8`), oldest entry first. The entries are taken
-/// out of the store and the lock let go before the document is written: the
-/// snapshot keeps them whole, and each is serialized only when the connection
-/// asks for it.
+/// (`phase 4 M4 design 7.4`, `8`), oldest entry first. A snapshot of the
+/// session's entries is taken, and the store's lock let go, before the
+/// document is written: the snapshot's `Arc`s keep the entries whole, and each
+/// is serialized only when the connection asks for it.
 pub async fn har(State(app): State<App>, Path(name): Path<String>) -> ApiResult<impl IntoResponse> {
     let store = app.engine.capture();
     let entries = store.session(&name);
