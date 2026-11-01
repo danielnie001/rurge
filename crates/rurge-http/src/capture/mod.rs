@@ -39,10 +39,12 @@ pub const DEFAULT_TOTAL: u64 = 100 * 1024 * 1024;
 pub const DEFAULT_BODY: u64 = 5 * 1024 * 1024;
 
 /// What each entry costs besides its headers, texts and bodies: the entry
-/// itself, a slot of the queue and a few `String` and `Vec` headers
-/// (`phase 4 M4 design 4.3`); the phase 4 / M4a plan's task 8 measures it and
-/// may change it.
-pub const ENTRY_OVERHEAD: u64 = 512;
+/// itself, a slot of the queue, a few `String` and `Vec` headers, and what the
+/// allocator adds around them (`phase 4 M4 design 4.3`). Measured by the
+/// phase 4 / M4a plan's task 8, in a debug build on one machine: a store of
+/// the default limits cost 1.52 times its total with 512, and 7168 is what
+/// brings that to about one (see the plan's execution record).
+pub const ENTRY_OVERHEAD: u64 = 7168;
 
 /// What the store holds at most: in all, and of each body (`phase 4 M4
 /// design 4.2`). A body limit above the total is lowered to it.
@@ -500,3 +502,6 @@ mod tests {
         assert_eq!(why.to_string(), "the decoded body is over 10 bytes");
     }
 }
+
+#[cfg(test)]
+mod memory;

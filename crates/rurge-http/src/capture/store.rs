@@ -481,10 +481,16 @@ mod tests {
         }
     }
 
-    /// An entry of `session` with no body, which costs 695 bytes.
+    /// An entry of `session` with no body, which costs `PLAIN` bytes.
     fn plain(id: u64, session: &str) -> Entry {
         made(id, session, Body::empty())
     }
+
+    /// What an entry of `made` costs with no body: 183 bytes of heads, texts
+    /// and notes, and the overhead. `ENTRY_OVERHEAD` is the measured one (the
+    /// phase 4 / M4a plan's `P15`), so the totals below are worked out from it
+    /// rather than written down.
+    const PLAIN: u64 = 183 + ENTRY_OVERHEAD;
 
     /// A capture into a fresh store of `limits`, in session `a` by default.
     fn capture(limits: Limits) -> Capture {
@@ -565,7 +571,7 @@ mod tests {
     /// (`phase 4 M4 design 4.4`).
     #[test]
     fn the_oldest_entries_go_first_whatever_their_session() {
-        let capture = capture(Limits::new(695 * 3, 1000));
+        let capture = capture(Limits::new(PLAIN * 3, 1000));
         for (id, session) in [(1, "a"), (2, "b"), (3, "a"), (4, "b")] {
             assert!(capture.store.put(plain(id, session)), "{id} fits");
         }
@@ -585,7 +591,9 @@ mod tests {
     /// (`phase 4 M4 design 4.4`).
     #[test]
     fn a_chunk_evicts_older_entries_to_find_room() {
-        let capture = capture(Limits::new(695 * 3, 2000));
+        // two entries fit, and the thousand bytes the chunk reserves do not fit
+        // beside them
+        let capture = capture(Limits::new(PLAIN * 2 + 500, 2000));
         assert!(capture.store.put(plain(1, "b")));
         assert!(capture.store.put(plain(2, "b")));
 
@@ -602,7 +610,7 @@ mod tests {
         assert_eq!(capture.store.status().entries, 1);
         assert_eq!(
             capture.store.status().used,
-            695 + 1000,
+            PLAIN + 1000,
             "the entry costs its head and the body the chunk reserved"
         );
     }
@@ -611,25 +619,27 @@ mod tests {
     /// on, and nothing is evicted for it (`phase 4 M4 design 4.4`).
     #[test]
     fn a_chunk_that_cannot_fit_even_in_an_empty_store_is_truncated_for_the_budget() {
-        let capture = capture(Limits::new(2000, 2000));
-        assert!(capture.store.put(plain(1, "b")), "695 bytes");
+        // an entry and A's reservation fit with 100 bytes to spare; B asks for
+        // more than what is left once A's reservation is held
+        let capture = capture(Limits::new(PLAIN + 900, PLAIN + 900));
+        assert!(capture.store.put(plain(1, "b")), "PLAIN bytes");
 
         let mut a = capture.begin();
         a.response_chunk(&[b'a'; 800]);
-        assert_eq!(capture.store.status().used, 695 + 800);
+        assert_eq!(capture.store.status().used, PLAIN + 800);
         assert_eq!(capture.store.status().evicted, 0);
 
         let mut b = capture.begin();
-        b.response_chunk(&[b'b'; 1300]);
+        b.response_chunk(&[b'b'; PLAIN as usize + 101]);
         let status = capture.store.status();
         assert_eq!(status.evicted, 0, "nothing can be evicted for it");
-        assert_eq!(status.used, 695 + 800, "A's reservation is untouched");
+        assert_eq!(status.used, PLAIN + 800, "A's reservation is untouched");
         assert!(capture.store.entry(1).is_some());
 
         assert!(b.commit(|_, response| made(2, "b", response)));
         let stored = capture.store.entry(2).expect("B is stored, its body cut");
         assert_eq!(stored.response_body.data.len(), 0);
-        assert_eq!(stored.response_body.size, 1300);
+        assert_eq!(stored.response_body.size, PLAIN + 101);
         assert_eq!(stored.response_body.truncated, Some(Truncated::Budget));
     }
 
@@ -643,7 +653,7 @@ mod tests {
         assert_eq!(none.store.status().used, 0);
         assert_eq!(none.store.status().entries, 0);
 
-        let head_only = capture(Limits::new(695, 500));
+        let head_only = capture(Limits::new(PLAIN - 1, 500));
         let mut pending = head_only.begin();
         pending.response_chunk(&[b'x'; 400]);
         assert_eq!(head_only.store.status().used, 400, "the body reserved");
@@ -671,7 +681,8 @@ mod tests {
     /// never adds up to more than the total (`phase 4 M4 design 4.3`).
     #[test]
     fn the_store_never_holds_more_than_its_total() {
-        let capture = capture(Limits::new(3000, 800));
+        let total = PLAIN + 3000;
+        let capture = capture(Limits::new(total, 800));
         let mut pendings: Vec<Pending> = Vec::new();
         let mut next = 0u64;
         let mut x = 0x2545_f491_4f6c_dd1du64;
@@ -710,7 +721,7 @@ mod tests {
                 }
             }
             let used = capture.store.status().used;
-            assert!(used <= 3000, "step {step}: {used} over the total");
+            assert!(used <= total, "step {step}: {used} over the total");
         }
 
         drop(pendings);
@@ -722,7 +733,7 @@ mod tests {
     /// (`phase 4 M4 design 4.6`, `7.2`).
     #[test]
     fn entries_are_listed_by_session_and_found_by_id() {
-        let capture = capture(Limits::new(695 * 4, 1000));
+        let capture = capture(Limits::new(PLAIN * 4, 1000));
         assert!(capture.store.put(plain(1, "a")));
         assert!(capture.store.put(plain(2, "b")));
         assert!(capture.store.put(plain(3, "a")));
@@ -736,10 +747,10 @@ mod tests {
         assert_eq!(sessions.len(), 2, "only sessions with entries");
         assert_eq!(sessions[0].name.as_ref(), "a");
         assert_eq!(sessions[0].entries, 2);
-        assert_eq!(sessions[0].bytes, 695 * 2);
+        assert_eq!(sessions[0].bytes, PLAIN * 2);
         assert_eq!(sessions[1].name.as_ref(), "b");
         assert_eq!(sessions[1].entries, 1);
-        assert_eq!(sessions[1].bytes, 695);
+        assert_eq!(sessions[1].bytes, PLAIN);
 
         assert_eq!(capture.store.entry(2).expect("there").id, 2);
         assert!(capture.store.entry(9).is_none());
@@ -749,14 +760,14 @@ mod tests {
     /// (`phase 4 M4 design 7.6`).
     #[test]
     fn clearing_one_session_or_all_keeps_the_four_counts() {
-        let capture = capture(Limits::new(695 * 4, 1000));
+        let capture = capture(Limits::new(PLAIN * 4, 1000));
         assert!(capture.store.put(plain(1, "a")));
         assert!(capture.store.put(plain(2, "a")));
         assert!(capture.store.put(plain(3, "b")));
 
         assert_eq!(capture.store.clear(Some("a")), 2);
         assert_eq!(capture.store.session("b").len(), 1);
-        assert_eq!(capture.store.status().used, 695);
+        assert_eq!(capture.store.status().used, PLAIN);
         assert_eq!(capture.store.clear(Some("nope")), 0);
         assert_eq!(capture.store.clear(None), 1);
         assert_eq!(capture.store.status().used, 0);
@@ -773,7 +784,7 @@ mod tests {
     /// (`phase 4 M4 design 4.4`, `8.4`).
     #[test]
     fn an_evicted_entry_lives_on_while_it_is_held() {
-        let capture = capture(Limits::new(695 * 2, 1000));
+        let capture = capture(Limits::new(PLAIN * 2, 1000));
         let mut pending = capture.begin();
         pending.response_chunk(b"the body");
         assert!(pending.commit(|_, response| made(1, "a", response)));
