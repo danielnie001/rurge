@@ -84,9 +84,10 @@ pub struct RequestRecord {
     /// From the outbound being ready until the first byte came back from
     /// upstream; `None` until one does.
     pub first_byte_ms: Option<u64>,
-    /// The time the dial spent on name lookups, the rules' and the
-    /// outbound's together; `None` when it made none — the target is an
-    /// address, or the proxy resolves the name itself.
+    /// The time the dial spent on name lookups, the rules' and the outbound's
+    /// together, a lookup still under way counted up to the moment the record
+    /// is read (`phase 4 M4 design 10.4`); `None` when it made none — the
+    /// target is an address, or the proxy resolves the name itself.
     pub dns_ms: Option<u64>,
     /// From the first byte that came back from upstream until the session
     /// ended (`phase 4 M4 design 10.1`); `None` while the session goes on,
