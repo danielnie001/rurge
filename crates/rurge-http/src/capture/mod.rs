@@ -38,7 +38,8 @@ pub const DEFAULT_BODY: u64 = 5 * 1024 * 1024;
 
 /// What each entry costs besides its headers, texts and bodies: the entry
 /// itself, a slot of the queue and a few `String` and `Vec` headers
-/// (`phase 4 M4 design 4.3`; task 8 measured it and left it as it was).
+/// (`phase 4 M4 design 4.3`); the phase 4 / M4a plan's task 8 measures it and
+/// may change it.
 pub const ENTRY_OVERHEAD: u64 = 512;
 
 /// What the store holds at most: in all, and of each body (`phase 4 M4
@@ -210,7 +211,7 @@ impl Body {
         let names = layers(&encodings).map_err(|why| match why {
             Undo::Unsupported(name) => NotDecoded::Unsupported(name),
             Undo::Corrupt(name) => NotDecoded::Corrupt(name),
-            // a value nothing was read from is no layer
+            // `layers` reads no body, so it never says `Over`
             Undo::Over => NotDecoded::Unsupported(None),
         })?;
         if names.is_empty() {
