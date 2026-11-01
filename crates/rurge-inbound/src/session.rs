@@ -96,6 +96,10 @@ pub struct SessionHandle {
     /// first of each counts; a session that is no HTTP request has neither.
     method: OnceLock<String>,
     status: OnceLock<u16>,
+    /// The `always-capture` session the matched rule names (phase 4 M4 design
+    /// 5.3). A session that is no HTTP request may have one too; nobody reads
+    /// it then.
+    capture_session: OnceLock<Arc<str>>,
     on_first_byte: Mutex<Vec<FirstByteHook>>,
     /// Upstream ended, before sending anything, while the client was still
     /// there (`mark_upstream_failed`).
@@ -153,6 +157,7 @@ impl SessionHandle {
             first_byte: OnceLock::new(),
             method: OnceLock::new(),
             status: OnceLock::new(),
+            capture_session: OnceLock::new(),
             on_first_byte: Mutex::new(Vec::new()),
             upstream_failed: AtomicBool::new(false),
             client_gone: AtomicBool::new(false),
@@ -286,6 +291,17 @@ impl SessionHandle {
         self.status.get().copied()
     }
 
+    /// The `always-capture` session the matched rule names. Only the first
+    /// call counts.
+    pub fn set_capture_session(&self, name: Arc<str>) {
+        let _ = self.capture_session.set(name);
+    }
+
+    /// The capture session, or `None` when no rule named one.
+    pub fn capture_session(&self) -> Option<Arc<str>> {
+        self.capture_session.get().cloned()
+    }
+
     pub fn add_up(&self, n: u64) {
         self.up.fetch_add(n, Ordering::Relaxed);
     }
@@ -381,6 +397,27 @@ impl SessionHandle {
             .lock()
             .expect("finish hooks")
             .push(Box::new(f));
+    }
+
+    /// Runs `f` once the session is over: the same as `on_finish` while it is
+    /// still going, and right away when it is already over (`phase 4 M4 design
+    /// 6.4`) — a hook added through `on_finish` after `finish` took the hooks
+    /// would never run.
+    ///
+    /// `finish` sets `finished`, then writes `outcome`, then takes the hooks
+    /// under this lock: a hook pushed while `outcome` is `None` is taken by
+    /// `finish`, and one that finds an `outcome` runs at once, so no hook is
+    /// lost and none runs twice. `f` runs outside every lock, so it may ask
+    /// for another one itself.
+    pub fn when_finished(&self, f: impl FnOnce(&SessionHandle, &SessionOutcome) + Send + 'static) {
+        let mut hooks = self.on_finish.lock().expect("finish hooks");
+        match self.outcome() {
+            Some(outcome) => {
+                drop(hooks);
+                f(self, &outcome);
+            }
+            None => hooks.push(Box::new(f)),
+        }
     }
 
     pub fn finish(&self, outcome: SessionOutcome) {
@@ -659,6 +696,110 @@ mod tests {
         assert_eq!(h.outcome(), Some(SessionOutcome::Completed));
         assert_eq!(h.rule().as_deref(), Some("DOMAIN,a.test,DIRECT"));
         assert_eq!(h.policy_chain(), vec!["DIRECT".to_string()]);
+    }
+
+    #[test]
+    fn when_finished_waits_for_an_open_session() {
+        let h = SessionHandle::new(8, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        h.when_finished(move |_, outcome| {
+            assert_eq!(*outcome, SessionOutcome::Completed);
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        h.finish(SessionOutcome::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        h.finish(SessionOutcome::Failed("late".into()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn when_finished_runs_at_once_on_a_finished_session() {
+        let h = SessionHandle::new(9, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        h.finish(SessionOutcome::Rejected(RejectKind::Drop));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        h.when_finished(move |_, outcome| {
+            assert_eq!(*outcome, SessionOutcome::Rejected(RejectKind::Drop));
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn when_finished_hooks_keep_their_order() {
+        let h = SessionHandle::new(10, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let first = seen.clone();
+        h.on_finish(move |_, _| first.lock().expect("order").push("a"));
+        let second = seen.clone();
+        h.when_finished(move |_, _| second.lock().expect("order").push("b"));
+        let third = seen.clone();
+        h.on_finish(move |_, _| third.lock().expect("order").push("c"));
+        h.finish(SessionOutcome::Completed);
+        assert_eq!(*seen.lock().expect("order"), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_hook_may_ask_for_another_from_inside() {
+        let h = SessionHandle::new(11, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        h.finish(SessionOutcome::Completed);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let outer = calls.clone();
+        let inner_calls = calls.clone();
+        h.when_finished(move |handle, _| {
+            outer.fetch_add(1, Ordering::SeqCst);
+            let inner = inner_calls.clone();
+            handle.when_finished(move |_, _| {
+                inner.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn when_finished_and_finish_race_without_losing_or_repeating() {
+        for round in 0..10_000 {
+            let h = SessionHandle::new(12, SessionInfo::tcp(HostName::parse("a.test"), 443));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let finisher = {
+                let h = Arc::clone(&h);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    h.finish(SessionOutcome::Completed);
+                })
+            };
+            let hooker = {
+                let h = Arc::clone(&h);
+                let barrier = Arc::clone(&barrier);
+                let calls = Arc::clone(&calls);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    h.when_finished(move |_, _| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    });
+                })
+            };
+            finisher.join().expect("the finishing thread");
+            hooker.join().expect("the hooking thread");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "round {round}: the hook ran a wrong number of times"
+            );
+        }
+    }
+
+    #[test]
+    fn the_capture_session_is_the_first_name_set() {
+        let h = SessionHandle::new(13, SessionInfo::tcp(HostName::parse("a.test"), 443));
+        assert_eq!(h.capture_session(), None);
+        h.set_capture_session(Arc::from("a"));
+        h.set_capture_session(Arc::from("b"));
+        assert_eq!(h.capture_session().as_deref(), Some("a"));
     }
 
     #[test]
