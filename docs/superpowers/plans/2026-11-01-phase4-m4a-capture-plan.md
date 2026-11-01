@@ -1,0 +1,851 @@
+# 阶段 4 / M4a「抓包」实施计划
+
+> **执行方式**：交给 Pi，由协调的会话逐个任务派工、逐个任务评审（设计第 2 节、M4-D1；做法同 M1a ～ M3b）。
+>
+> - 协调的会话每个任务开一个 Pi 会话，交给它这个任务的全文与要用的接口（派工文件）。Pi 做完把报告写进派工文件指定的路径，在本地提交。
+> - 协调者读改动、重跑门禁、评审。有问题回到同一个 Pi 会话修正，再评审；过了才派下一个任务。
+> - 每个任务：先写失败的用例、看到红；再实现到绿；跑门禁；对照本任务的「判据」与「全局约束」逐条自查；最后提交（**只在本地，不推送**）。钉住现有行为的用例（任务里写明"不要求先红"的）可以一写就绿。
+> - 与计划的出入记进末尾的「执行期修正记录」，**不改计划的正文**。
+>
+> **停点**：没有。M4a 没有平台代码、没有只在 CI 上编译的代码（设计第 2 节）。M4a 之后不单独停下来等推送；M4b 的计划在 M4a 合并之后对着那时的代码写。
+
+**目标**：让抓包生效（FR-HTTP-11、FR-RULE-14、FR-HTTP-13 的 `capture`）。
+
+- `rurge-inbound`：`SessionHandle::when_finished`（已经结束就当场调）与抓包会话的槽；`rurge-config`：空的 `always-capture=` 给 `W0012`。
+- `rurge-http` 新 `capture` 模块：只在内存里的存储、总量与单条正文两个上限、按块记账、挤掉最早的、两种截断与丢掉、命名会话、读出时解开 `gzip` / `x-gzip` / `deflate`。
+- HTTP 引擎里每个请求一个 `CaptureSlot`：请求的两个取样点、在 `Idle` 里抄请求正文、包住交给客户端的应答正文、在 HTTP 部分结束的那一刻存进去。
+- `rurge-engine`：一个引擎一份存储、`capture` 开关与 `state.json`、`choose_policy_with` 填抓包会话的槽、`ConnUpstreams::route` 给 `capture`。
+- `rurge-api`：`/v1/features/capture` 生效，`/v1/rurge/capture/…` 六个端点（含 HAR 1.2）。
+- 可执行文件：`--capture-size` / `RURGE_CAPTURE_SIZE` 与 `--capture-body-size` / `RURGE_CAPTURE_BODY_SIZE`。
+- 量一次内存；手工清单加 M4a 的条目；M4a 的收尾文档。
+
+**架构**：
+
+- 不加工作区边、不加外部包（M4-D2，P2 订正）：`rurge-api` 新增正式依赖 `base64` 与 `futures-util`（都已在工作区的依赖表与 `Cargo.lock` 里）；`rurge-http` 加一个 `testing` 特性（只给别的 crate 的用例存进自己造的条目）。锁文件的包数不变（520）。
+- `rurge-http::capture` 是不碰网络的函数与类型（任务 2）；`capture/slot.rs` 的 `CaptureSlot` 是引擎与存储之间的那一层（任务 3）；引擎里只多几个调用点，`answer`、`failed`、`page`、`map_local`、`Tail`、`LocalFile`、`Guard` 一行不改（P9）。
+- `rurge-engine` 经 `pub use rurge_http::capture` 把类型交给 `rurge-api`（同 `ApiTls`）：`rurge-api` 的正式依赖仍只有 `rurge-engine` 与 `rurge-config` 两条工作区边。
+
+**技术栈**：都已在 `Cargo.lock` 里，源码在本机 cargo 注册表里。**不下载、不加新包**（M4-D2）。
+
+- http 1.5.0：`HeaderMap`、`Method`、`StatusCode::canonical_reason`、`Version`（`Debug` 写 `HTTP/1.1`、`HTTP/2.0`）。
+- http-body 1 与 http-body-util 0.1：`Body::poll_frame`、`is_end_stream`、`size_hint`、`Frame::data_ref`、`BodyExt::boxed`。
+- bytes 1：`Bytes::copy_from_slice`。
+- flate2 1.1.10：经 M3b 的 `rewrite::body` 用（P7），不另写解码。
+- time 0.3.45：`OffsetDateTime::from(SystemTime)`（`src/interop/offsetdatetime_systemtime.rs`）与它的 `year`、`month`、`day`、`hour`、`minute`、`second`、`millisecond`。不开 `formatting` 特性。
+- axum 0.8.9 / axum-core 0.5.6：`Path<String>`、`Query`、`Bytes` 的提取与 `BytesRejection`、`Body::from_stream`（要 `TryStream + Send + 'static`，`Ok: Into<Bytes>`，`Error: Into<BoxError>`）。
+- futures-util 0.3.34：`stream::iter`（`src/stream/mod.rs` 里不在任何特性之后；工作区给它关了缺省特性）。
+- base64 0.22：`engine::general_purpose::STANDARD`。
+- url 2：`Url::parse`、`query_pairs`（`rurge-api` 已经依赖它）。
+
+**依据**：
+
+- M4 细化设计（下面写"设计"指它）：`docs/superpowers/specs/2026-11-01-phase4-m4-capture-records-design.md`。
+  - M4a 用到第 1 ～ 9、11 ～ 14、16、17 节，与已决事项 M4-D1 ～ D20、D26 ～ D29。
+  - **先读它第 18 节**：本计划改了设计正文的地方随本计划写在那里（"写 M4a 计划时"之下）。
+  - 设计与本计划的「计划期决定」不一致的，以计划为准。
+- M3b 计划（`docs/superpowers/plans/2026-10-31-phase4-m3b-body-rewrite-map-local-plan.md`）的 P9 ～ P16 与执行期修正记录：`ReadAhead`、`Tail`、`LocalFile`、`rewrite::body::decode` 的来历；`docs/status.md` 阶段 4 / M3b 一节「以后的会话必须知道的事」整段适用，M3a、M2b 两节的同名段落也适用。
+- M2b 计划的 P11（`Meter` 与一个请求自己的上下行字节）、P6（HTTP/2 上的 `CONNECT` 答 501）。
+- HAR 1.2 的字段与 `-1` 的约定：`docs/reports/2026-10-29-phase4-http-mitm-survey.md` 第 5 节。
+- 写计划时对着 `a6e78ad`（分支 `phase4-m4`）核对过的事实写在「计划期决定」里。外部库的事实对着注册表里锁定版本的源码。
+
+## 全局约束
+
+**依赖**
+
+- 只改两处 `Cargo.toml`：`crates/rurge-http/Cargo.toml` 加 `[features]` 一节 `testing = []`（任务 2）；`crates/rurge-api/Cargo.toml` 的正式依赖加 `base64.workspace = true`（任务 5）与 `futures-util.workspace = true`（任务 6），开发依赖的 `rurge-http.workspace = true` 改成 `rurge-http = { workspace = true, features = ["testing"] }`（任务 5）。
+- `Cargo.lock` 的 `[[package]]` 今天 520 个，每个任务之后照旧 520 个；锁文件里只有 `rurge-api` 一个包的 `dependencies` 列表变（多 `base64` 与 `futures-util`），别的不变。`cargo` 要下载任何东西就停下报告。
+- 依赖方向不变：`rurge-api` 的正式依赖里工作区的 crate 仍只有 `rurge-engine` 与 `rurge-config`，抓包的类型经 `rurge_engine::capture` 用；`rurge-http` 不依赖 `rurge-engine`；`rurge-inbound` 不依赖 `rurge-http`。
+- `unsafe_code`：不加放开的函数，`crates/rurge-platform/tests/unsafe_functions.rs` 的 `LISTED` 仍是 23 项。
+- `crates/rurge/tests/sockets.rs` 的 `LISTED` 仍是 26 行：抓包不建套接字、不问解析库。名单之外的原因让那条扫描用例变红，就停下报告。
+
+**缺省的 `cargo test` 不碰系统**
+
+- 同 M3b：不建网卡，不改系统的任何设置；不执行 `netsh`、`route`、`ipconfig`、`ip`、`resolvectl`、`networksetup`。
+- **测试从不把任何 CA 装进信任库，也不读系统的信任库**：建引擎的用例一律给 `EngineShared.roots`（M3a 记录第 20、32 行）；解密的用例用 `TlsFixture` 的根。
+- 量内存的两条用例带 `#[ignore]`，缺省的 `cargo test` 不跑；它们读峰值工作集时起的 PowerShell 是只读的系统工具（同 `crates/rurge-tun/src/tests/bench/peak.rs`）。
+
+**测试的约定**
+
+`CLAUDE.md`「测试约定」整节适用。写用例之前读 `docs/testing.md`「测试约定（全文）」的阶段 4 各节。与本计划直接相关的：
+
+- 只用回环与端口 0。端到端的示例主机名经一行 `[Host]` 钉到 `127.0.0.1`，第二道防线是共用夹具的 `dns-server`（回环上的 `MockDns`，M3a P19）；源站是回环上的 `TestServer`，目标端口写在请求里。
+- **大正文**在用例里生成字节（重复的 ASCII），不读写磁盘上的大文件。
+- 等待都有时限。"条目存进去了"用有时限的轮询等（`wait_until`），不用固定的等待；固定等待只许"断言什么都没发生"，注释写它等的是什么、余量多大。新写的、带等待或并发的用例提交前单独循环跑二十次以上（任务 1、3、4、7、8）。
+- 抓日志的用例用 `LogCapture`，跑在当前线程运行时。测试里手写的 HTTP/1.1 客户端把每个请求——请求头与正文——在一次写里发出。
+- **内联的测试模块放在文件的末尾**：`crates/rurge/tests/sockets.rs` 读生产代码，读到第一个 `#[cfg(test)] mod … {` 为止。
+
+**门禁与这台开发机**（每个任务末尾一次；说"通过"之前必跑）
+
+- 门禁：`cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test -j 8 --workspace --no-fail-fast`。
+- 本机 msvc 工具链没有 rustfmt。跑 `cargo fmt` 之前让环境变量 `RUSTFMT` 指向 gnu 工具链里同版本的 rustfmt：用户目录下的 `.rustup\toolchains\stable-x86_64-pc-windows-gnu\bin\rustfmt.exe`。不要为此安装或升级工具链。
+- **门禁的日志用重定向写、再追加退出码，不用 `Tee-Object`**（M3a 记录第 54 行）；单独重跑的结果也写进日志再引，引之前先看它在、看它写的是什么。
+- 聚焦地跑用例也经整个工作区：
+  - 单元测试：`cargo test -j 8 --workspace --lib -- <过滤词>`；
+  - 集成测试：`cargo test -j 8 --workspace --test <名字> -- <过滤词>`。
+- **不用 `-p`**：它另编一份依赖，`target/` 涨得很快，写满过 D: 盘。**也不用 `--release`**：量内存的用例在调试构建里跑（P15）。
+- 跑全量之前 `df -h /d`：剩余不足约 15 GiB 就停下报告。
+- 测试二进制以 `STATUS_HEAP_CORRUPTION`（本机管控软件注入的钩子 DLL）或 `STATUS_ACCESS_VIOLATION` 退出：单独重跑那一个二进制，报告里写明。
+- `cli` 的用例偶发 `give_up` 20 秒超时：单独重跑 `cli`，把标准错误原样抄进报告。
+- rustc 在增量编译里报内部编译器错误：删掉出错的那个目标在 `target/debug/incremental/` 下的目录再编。
+- 回环的 TCP / UDP 7、9、13、17、19 号端口在这台机器上开着，CI 上关着：用例不假定任何固定端口的状态。
+- 结果照实记：本机的全量运行是"一台机器上的一次运行，不是 CI"；需要参照服务端的互操作用例在本机立刻返回、算在通过的数里，要说出来。
+
+**仓库的规矩**（`CLAUDE.md`「必须遵守的规矩」整节适用；与本计划直接相关的）
+
+- **凭据与用户流量**（设计第 6.6 节，M4-D15）：抓到的头、正文、URL 从不进日志、错误文本与 `Debug`；`Entry`、`Head`、`ResponseHead`、`Body`、`Capture`、`CaptureStore` 与 crate 里的 `Pending`、`CaptureSlot` 不实现 `Debug`（P5）。`authorization`、`proxy-authorization`、`cookie`、`set-cookie` 四个头的值在 API 与 HAR 里写 `***`，存储里原样。rurge 自己的凭据（监听器的口令、对上游 HTTP 代理的 `Proxy-Authorization`）从不进抓包（任务 3、8 各有用例）。抓包的值是不是"API 输出"的凭据，是所有者的 Q1（设计第 17 节），不要自己改这个做法。
+- **诊断**：不设新码；`W0012` 照 `codes::hint` 里已有的决定（任务 0 核对）。
+- **日志的分级**：M4a 只加两行：开关切换的 INFO（`capture switched via http-api`）与单条上限被降到总量的启动 WARN（P13）。条目的任何内容不进任何日志，任何一级都不（任务 8 有用例）。
+- 文档与报告用写文件 / 改文件的工具改。**永远不要用把一个文件的内容经管道写回同一个文件的命令**（2026-10-27 这样写满过 D: 盘）。
+- 计划末尾两张表里已写下的行不改写、不删除。追加新行时**不要把已有的行当成锚点替换掉**（M2a 任务 9 这样删掉过一行）。
+
+**写法**
+
+- 注释、日志、错误文本与诊断用英文，照所在文件的写法：文档注释写"为什么"与前提，句子完整。注释里提到设计或计划，写 `phase 4 M4 design 6.4`、`the phase 4 / M4a plan's P8`。
+- 提交说明照 `git log` 的样子写，标题用中文：`feat(inbound): …`、`feat(config): …`、`feat(http): …`、`feat(engine): …`、`feat(api): …`、`feat(cli): …`、`test(engine): …`、`refactor(http): …`、`docs: …`。正文说做了什么、改了哪些现有用例的期望、为什么。Pi 的提交不带署名行。
+- 只在本地提交：不 `push`、不 `pull`、不 `fetch` 远端、不 `amend`、不改写历史。
+
+**不做的事**
+
+- 只运行本仓库构建出来的二进制与 Pi 自己。不下载、不安装任何东西。不手动跑 `rurge run`、`rurge dns lookup`；`rurge service` 只用 `--dry-run`。
+- 参考实现：GPL 的（sing-box、mihomo、Xray-core）只取事实，代码不抄。
+- 不做设计第 1 节「不做」一栏的事，也不做这些：
+  - M4b 的事：记录的 `receiveMs`、`requestBodyBytes`、`responseBodyBytes`，直通的原因，`remoteAddr` 的新口径，`dnsMs` 在途（设计第 10 节）；
+  - `br` 与 `zstd` 的解码（总设计 Q4）；落盘；导入 HAR；拆 `cookies`；
+  - 让 `always-capture` 把连接留在 HTTP 引擎里或让 TLS 被解密（M4-D8，归所有者）；
+  - 改 `redact.rs`、`crates/rurge-config/tests/secrets.rs`、`RuleParams`、`--request-log-size` 的缺省。
+
+**计划没有写到、要做决定的地方**
+
+- 能按设计与总设计的原则定的：自己定，记进修正记录，写"执行者的裁定"。
+- 要停下来列出、交给协调者的：去向写着"项目所有者"的（设计第 17 节）；会改变 M4-D1 ～ D31 的。
+- 现有用例变红：P16 的表点了名的，照计划改，在提交说明里说；没点名的，停下来，记进修正记录，不顺手改期望值。
+
+## 评审要点
+
+设计没写透、而最可能咬到使用者的几种输入，与负责它们的任务和用例：
+
+1. **巨大的与没有尽头的正文**：几百 MB 的下载、一直不结束的流式应答、开着抓包上传大文件。
+   - 期望：每个正文至多存单条上限、之后的字节只计数；存储记着的字节在任何时刻不超过总量；挤不出地方时从那一块起不再存（`budget`）；客户端照样收到全部字节；内存不随正文无限地涨。
+   - 用例（任务 2、3、8）：`a_body_over_its_limit_keeps_its_beginning`、`the_store_never_holds_more_than_its_total`、`a_chunk_that_cannot_fit_even_in_an_empty_store_is_truncated_for_the_budget`、`a_body_over_the_limit_is_captured_truncated`、量内存的 `a_full_store_at_the_default_limits`。
+2. **读出与导出 HAR 的途中条目被挤掉或清除**：一个会话导出到一半，新的请求把它的条目挤掉了；有人在导出时清除。
+   - 期望：读到的、正在导出的条目完整，内存到读完、写完才放掉；导出的 HAR 是取快照那一刻的全部条目。
+   - 用例（任务 2、6）：`an_evicted_entry_lives_on_while_it_is_held`、`an_export_holds_its_entries_while_they_are_cleared`。
+3. **断开、重置与终止**：客户端在正文中途走掉、HTTP/2 上在应答之前重置流、`kill`、`REJECT-DROP` 的停留。
+   - 期望：每一种都存成一条（结局失败或没有应答），预留在存进去或丢下时还回去，`used` 回到存进去的条目之和；`REJECT-DROP` 的条目不等停留结束。
+   - 用例（任务 2、3）：`a_pending_entry_dropped_gives_its_reservation_back`、`a_client_that_leaves_mid_body_is_captured_as_failed`、`a_killed_request_leaves_no_reservation_behind`、`an_http2_stream_reset_before_its_answer_is_captured_with_no_response`、`a_dropped_request_is_captured_before_its_hold_ends`。
+4. **不是 UTF-8 的、二进制的、压缩的正文与头，路径里奇怪的会话名**：图片、`br` 压缩的应答、头的值里有 0x80 ～ 0xFF 的字节、会话名带空格、斜杠或中文。
+   - 期望：API 的正文照原样给 Base64，头的值按 U+FFFD 替换（存储里照原样）；`decode=true` 解得开的解开、解不开的说原因；HAR 里不是 UTF-8 的写 Base64 并标 `encoding`；会话名经百分号编码到达那个会话。
+   - 用例（任务 2、5、6）：`what_cannot_be_decoded_says_why`、`an_entry_is_shown_whole_with_four_headers_masked`、`decode_undoes_gzip_and_says_why_it_cannot`、`odd_session_names_are_reached_through_the_path`、`har_bodies_are_text_or_base64_and_say_what_was_left_out`。
+5. **凭据与日志**：带口令的监听器、带凭据的上游 HTTP 代理、请求里的 `Cookie` 与 `Authorization`、DEBUG 级的日志。
+   - 期望：rurge 自己的两种凭据从不进抓包；四个头在 API 与 HAR 里写 `***`；任何一级的日志里没有抓到的内容。
+   - 用例（任务 3、5、6、8）：`the_captured_request_is_the_one_that_leaves_without_rurges_forward_headers`、`an_entry_is_shown_whole_with_four_headers_masked`、`har_masks_the_four_headers_and_leaves_cookies_empty`、`a_listener_password_is_not_captured`、`an_upstream_proxy_credential_is_not_captured`、`captured_content_never_reaches_the_log`。
+
+---
+
+## 文件结构
+
+| 文件 | 任务 | 职责 |
+| --- | --- | --- |
+| `crates/rurge-inbound/src/session.rs` | 1 | `when_finished`；抓包会话的槽 |
+| `crates/rurge-config/src/config.rs` | 1 | 空的 `always-capture=` 给 `W0012` |
+| `crates/rurge-http/Cargo.toml`、`crates/rurge-http/src/lib.rs`、`crates/rurge-http/src/capture/{mod.rs,store.rs}`（新）、`crates/rurge-http/src/rewrite/body.rs` | 2 | 类型、存储、记账、挤掉与截断、读出时解开；`decode` 拆出带类型的两步 |
+| `crates/rurge-http/src/capture/slot.rs`（新）、`crates/rurge-http/src/engine.rs`、`crates/rurge-engine/src/http.rs`（只补 `capture: None`） | 3 | `CaptureSlot`、两个取样点、`Idle` 里抄请求正文、包住应答正文的一层 |
+| `crates/rurge-engine/src/{shared.rs,engine.rs,http.rs,lib.rs}`、`crates/rurge-engine/tests/capture.rs`（新） | 4 | 一份存储、`capture` 开关、填槽、给 `capture`；端到端的前一半 |
+| `crates/rurge-api/Cargo.toml`、`crates/rurge-api/src/lib.rs`、`crates/rurge-api/src/routes/{mod.rs,features.rs,capture.rs（新）}`、`crates/rurge-api/tests/api.rs` | 5 | 开关与五个端点 |
+| `crates/rurge-api/Cargo.toml`、`crates/rurge-api/src/{lib.rs,har.rs（新）}`、`crates/rurge-api/src/routes/capture.rs`、`crates/rurge-api/tests/api.rs` | 6 | HAR |
+| `crates/rurge/src/cli/run.rs`、`crates/rurge/tests/cli.rs` | 7 | 两个参数、大小的写法、降低与 WARN；命令行的端到端 |
+| `crates/rurge-engine/tests/capture.rs`、`crates/rurge-http/src/capture/{memory.rs（新）,mod.rs}` | 8 | 端到端的后一半；量内存 |
+| `docs/acceptance/phase4-manual.md`、`docs/api/phase4.md`、`docs/testing.md` | 9a | 手工清单加 M4a 的条目；M4a 的 API 与测试文档 |
+| 收尾文档（任务 9b 列全） | 9b | M4a 的收尾 |
+
+模块的名字与拆法可以照实际调整，调了记进修正记录。
+
+---
+
+## Task 0：开工前核对
+
+**做什么**：对着当时的分支核对下面每一项。有出入的记进「执行期修正记录」，一项一行，写"计划写 X，代码是 Y，按 Y 做"；按记录调整后面的任务。**不改计划的正文。** 没有出入也记一行。
+
+1. **工作树**：`git status --short` 空；当前分支 `phase4-m4`；`a6e78ad`（M4 设计）在历史里，之后只多了本计划的提交。
+2. **读**：设计第 18 节（先读）、第 1 ～ 9、11 ～ 14、16、17 节；本计划的「计划期决定」与 P16 的表；`docs/status.md` 阶段 4 / M3b 一节（「以后的会话必须知道的事」整段）与 M3a、M2b 两节的同名段落。
+3. **名字与签名**（设计第 14 节 V1 ～ V12）：用 `git grep -n` 逐项找到、记下行号；与「计划期决定」写的不同的照实记。
+   - `rurge-inbound` 的 `session.rs`：`SessionOutcome`、`FinishHook`、`SessionHandle` 的字段（`method`、`status`、`finished`、`outcome`、`on_finish`）、`new`、`new_with_token`、`id`、`elapsed`、`on_first_byte`、`on_finish`、`finish`、`outcome`、`connect_time`、`first_byte_time`、`error`、`rule`、`policy_chain`、`notes`、`trail`、`kill`；它的测试模块。`rurge-net` 的 `trail.rs`：`Trail::{peer, dns, set_peer}`。
+   - `rurge-config`：`rule.rs` 的 `RuleParams`（`always_capture`、`unknown`）与 `RuleParams::parse` 里 `always-capture` 那一支——`always-capture=`、`always-capture= `（等号后一个空格）与不带 `=` 的 `always-capture` 各读成什么；`config.rs` 读 `[Rule]` 的循环（给 `W0003` 的那两段）与测试模块里断言 `W0003` 的用例（任务 1 照它写）；`diagnostic.rs` 的 `W_INVALID_VALUE`、`codes::hint` 对它的决定、`every_code_is_decided_once`；语料库 `kitchen-sink.conf` 里的 `always-capture=debug`。
+   - `rurge-rules`：`CompiledRule`（`index`、`raw`、`params`）、`RuleEngine::rules`；命中 `RULE-SET`、`DOMAIN-SET` 与逻辑规则时 `Decision.matched` 是哪一行的下标；逻辑规则（`AND`）在 `[Rule]` 里的写法与一条现有的用例。
+   - `rurge-http`：
+     - `lib.rs` 的模块与再导出；`Cargo.toml`（今天没有 `[features]`）；
+     - `rewrite/body.rs` 的 `Limit`、`REQUEST`、`RESPONSE`、`decode`、`zlib_header`、`is_token` 与 `decode` 的现有用例；
+     - `engine.rs` 的 `Entry`（连接的入口，与 `capture::Entry` 同名）、`Conn`（`h2`、`idle`、`drop_hold`、`entry`）、`Routed`、`Requests::handle` 的各步：HTTP/2 上 `CONNECT` 的 501、监听器的 400、`prepare`、`open`、`Guard::new`、`route`、`token` 的检查、`Routed` 的解出、`prepared.unknown`、`sniffed`、`url`、`wants_upgrade`、`tunnel`、`needs_h1`、`borrow_h2` 交回 `Some` 的那一支、`pool.take` 交回 `Some` 的那一支、`redial`、`Form::of`、第 5 步的 `headers::strip` 与 `Keep`、`absolute_form` / `origin_form`、补 chunked 的那一句、`fit`、`write_host`、`head_of`、`client_upgrade`、`request_meter`、`method`、`Idle::new`（唯一的调用处）、发送的 `select!` 与重发、升级那一支与 `promote`、HTTP/2 的应答改成 HTTP/1.1 的那一句、应答的 `strip`、`set_status`、`Tail::new`；
+     - `engine.rs` 的 `answer`（`REJECT-DROP` 那一支）、`failed`、`page`、`timed_out`、`map_local`、`promote`；`Idle`（字段、`new`、`poll_frame`）；`Tail::poll_frame` 里"先 `complete()`、再交出最后一帧"的那一支；`Tail`、`LocalFile` 与 `Guard` 的 `Drop`；`headers.rs` 的 `Keep`、`strip`、`HOP_BY_HOP`；
+     - `engine.rs` 的测试模块：`Step`、`Inner`、`Fake`（`new`、`script`、`rewrite`、`forward`、`go_pages`、`handle`、`finished`）、`Fake::route` 的两处 `Routed`、`Client`、`Rig`、`connected`、`rig_timed`（参数各是什么）、`rig_h2`、`h2_client`、`h2_request`、`recording_origin`、`streaming_origin` 与 `Holding`、`fixed_origin`、`chunked_origin`、`origin_answering`、`stalled_origin`、`upgrading_origin`、`body_and_trailers`、`wait_until`、建 `Rewrite` 的夹具（`rewrite_of` 等）；现有用例 `a_dropped_request_is_held_then_closed`、`a_killed_request_closes_its_connection`、`a_websocket_upgrade_is_relayed_and_counted_once`、`a_connect_on_a_sniffed_connection_goes_to_its_target`、`proxy_authorization_is_forwarded_only_on_a_sniffed_connection`、`a_stream_the_client_resets_is_cancelled_and_the_connection_stays`、`an_h2_client_is_served_over_an_http1_upstream` 与测 Map Local 文字数据的那一条。
+   - `rurge-engine`：
+     - `shared.rs` 的 `EngineShared`（字段、`new`、`Default` 的写法）；`engine.rs` 的 `mitm_on` / `rewrite_on` 两个字段与它们的初值、`rewrite_on`、`set_rewrite`、`restore_switches`、`shared()`、`http_counts`、`choose_policy_with`（三处早退与 `set_rule` 那一句）、`rule_raw`、`settle`（它结不结束句柄）、出站模式怎样切换（用例里怎样切到直连）；`http.rs` 的 `ConnUpstreams::route`；`lib.rs` 的再导出；`state.rs` 的 `Features.capture`、`STATE_VERSION`；
+     - 用例：`tests/common/mod.rs` 的 `Harness`、`Profile`、`harness`、`harness_with`、`plain_get`、`wait_until`、`the_records`、`LogCapture`；`tests/rewrite.rs` 的 `RecordingProxy`、`harness_mitm`、`decrypted_get`、`mitm_section`；`tests/mitm.rs` 的 `the_switch_is_restored_from_state_json`；`TlsFixture::with_ca_name`；用例怎样重载一次 Profile；`tests/pipeline.rs` 里带 `password@` 的 `http-listen` 与它的 Basic 载荷。
+   - `rurge-api`：`lib.rs` 的路由与 `App`；`routes/mod.rs`；`features.rs`（`FEATURES`、`get_feature`、`set_feature`、模块的文档注释）；`requests.rs`（`DEFAULT_LIMIT`、`recent` 里 `limit` 的读法）；`error.rs`；`profiles.rs` 的 `requested_name` 与 `BAD_BODY`；`tests/api.rs` 的 `Api`（`engine`、`state_path`）、`api()`、`get`、`post`、`call`、`wait_until`、`features_collections_stop_and_unknown_paths`、`the_rewrite_switch_is_read_switched_and_kept`。
+   - `rurge`：`cli/run.rs` 的 `request_log_size` 参数、`RunOptions`、`parse_log_level`（`value_parser` 的写法）、`EngineShared::new` 与其后改字段的几句、`restore_switches` 的调用；它的测试模块；`tests/cli.rs` 的 `run` 模块：`write_conf`、`rurge_run`、`spawn_command`、`Daemon`（`http`、`lines`）、`wait_for_line`、`api_port`、`api_call`、`http_get`、`API_GENERAL`，`the_request_log_holds_as_many_requests_as_request_log_size_says`，别处怎样断言 clap 的错误与退出码。
+   - `crates/rurge-tun/src/tests/bench/peak.rs` 的 `peak_resident_bytes`、`parse_count`、`parse_vm_hwm` 与它的用例；`crates/rurge-rules/tests/memory.rs` 开头的说明。
+   - 外部库（注册表源码），行号写进记录：
+     - hyper 1.11.1：HTTP/1.1 服务端在应答正文 `is_end_stream` 为真时不再 poll、写完头就丢下它（`proto/h1/dispatch.rs`）；`size_hint` 确切时写 `content-length`（`proto/h1/role.rs`）；HTTP/2 服务端不看应答的 `version()`、客户端重置流时丢下服务的 future；
+     - http 1.5.0：`Version` 的 `Debug`、`StatusCode::canonical_reason`、`HeaderMap::iter` 的次序；
+     - time 0.3.45、axum-core 0.5.6、futures-util 0.3.34、base64 0.22：「技术栈」里列的几处。
+4. **数**：
+   - `Cargo.lock` 里 `[[package]]` 的个数（520）；
+   - `unsafe_functions.rs` 的 `LISTED` 的项数（23）；
+   - `sockets.rs` 的 `LISTED` 的行数（26）；
+   - 带本机账户名的文件数：派工文件给出要数的那个名字，数出来是 26。
+5. **现有用例**（P16 的表）：逐条找到、读它断言什么，把"预计要改 / 预计照过"逐条写进修正记录，一条用例一句。表里没有的照实补一行。另扫一遍：`git grep -n 'Routed::'`、`git grep -n 'Idle::new'`、`git grep -n 'always_capture\|always-capture'`、`git grep -n '"capture"'`、`git grep -n 'EngineShared {'`。
+6. **门禁**：跑一遍，记下测试二进制数、通过数、失败数与忽略数（M3b 收尾时是 92 / 5227 / 0 / 13，一台机器上的一次运行，不是 CI）。
+
+**判据**：修正记录里有任务 0 的行；门禁的数字记下。
+
+---
+
+## Task 1：`when_finished`、抓包会话的槽与空的 `always-capture=`
+
+**改哪里**：
+
+- `crates/rurge-inbound/src/session.rs`：`SessionHandle` 多一个字段 `capture_session: OnceLock<Arc<str>>`（与 `method`、`status` 并排，三个构造函数都初始化）；`when_finished`、`set_capture_session`、`capture_session`；测试模块里的用例。
+- `crates/rurge-config/src/config.rs`：读 `[Rule]` 的循环里给 `W0012`；测试模块里一条用例。
+
+**接口**
+
+- 消费：现有的 `on_finish`、`finish`、`outcome`。
+- 产出：
+
+```rust
+impl SessionHandle {
+    /// 记录还没有结束：同 `on_finish`；已经结束：当场以它的结局调 `f`。与 `finish` 并发时不漏、不调两次（P3）
+    pub fn when_finished(&self, f: impl FnOnce(&SessionHandle, &SessionOutcome) + Send + 'static);
+    /// 命中的那一行的 `always-capture`：只有第一次设的算（P3）
+    pub fn set_capture_session(&self, name: Arc<str>);
+    pub fn capture_session(&self) -> Option<Arc<str>>;
+}
+```
+
+**用例（先红）**
+
+- `session.rs`：
+  - `when_finished_waits_for_an_open_session`：先注册，`finish` 之前没有调；`finish(Completed)` 之后恰好调了一次、结局是 `Completed`；再 `finish(Failed(..))` 不多调。
+  - `when_finished_runs_at_once_on_a_finished_session`：先 `finish(Rejected(RejectKind::Drop))`，再注册：在 `when_finished` 返回之前就调了，恰好一次，结局是 `Rejected(Drop)`。
+  - `when_finished_hooks_keep_their_order`：`on_finish` 记 A、`when_finished` 记 B、`on_finish` 记 C，`finish` 之后次序是 A、B、C。
+  - `a_hook_may_ask_for_another_from_inside`：在已经结束的句柄上 `when_finished`，它的 `f` 里再调一次 `when_finished`：两个都调了，没有死锁（钉住"`f` 在锁之外调"）。
+  - `when_finished_and_finish_race_without_losing_or_repeating`：一万轮，每轮一个新句柄与一个 `std::sync::Barrier::new(2)`，一个线程 `finish(Completed)`、另一个线程 `when_finished(计数加一)`，两个都先等在屏障上；`join` 之后计数恰好是 1。提交前单独循环跑二十次。
+  - `the_capture_session_is_the_first_name_set`：新句柄是 `None`；先设 `"a"`、再设 `"b"`，读到 `Some("a")`。
+- `config.rs`：`an_empty_always_capture_is_ignored_with_w0012`（照同一模块断言 `W0003` 的用例的写法）：`[Rule]` 里
+  - `FINAL,DIRECT,always-capture=` → 恰好一条 `W0012`，级别警告，消息恰好是表后「原文」的 P4，`span` 是这一行；规则照常在 `config.rules` 里；
+  - `DOMAIN,c.test,DIRECT,always-capture= ` → 同样一条 `W0012`（任务 0 记下它读成了什么，读法不同就照实改这一条、记进修正记录）；
+  - `DOMAIN,a.test,DIRECT,always-capture=debug` → 没有诊断；
+  - `DOMAIN,b.test,DIRECT,always-capture` → 一条 `W0003`（照今天），没有 `W0012`（不要求先红）。
+
+**实现**
+
+- `when_finished`、`set_capture_session`、`capture_session`：照 P3。
+- `W0012`：照 P4。
+
+**判据**
+
+- 上面的用例都在、都绿；并发的那一条单独循环跑过二十次，次数与结果写进报告。
+- 语料库快照不变（`always-capture=debug` 不是空的）；不设新的诊断码。
+- 门禁绿。
+
+---
+
+## Task 2：`capture` 模块
+
+**改哪里**：
+
+- `crates/rurge-http/Cargo.toml`：`[features]` 一节，`testing = []`（P2）。
+- `crates/rurge-http/src/lib.rs`：`pub mod capture;`。
+- `crates/rurge-http/src/capture/mod.rs`（新）：类型、常量、`Capture`、`Body::decoded`、`NotDecoded`、`Entry` 的两个时间方法；测试模块在文件末尾。
+- `crates/rurge-http/src/capture/store.rs`（新）：`CaptureStore`、`Status`、`SessionSummary`、`Pending`、条目的账；测试模块在文件末尾。
+- `crates/rurge-http/src/rewrite/body.rs`：`decode` 拆出 `layers`、`undo` 与 `Undo`（P7），现有用例不改。
+
+**接口**
+
+- 消费：`rewrite::body` 的 `zlib_header`、`is_token` 与三种解码器（经 `undo`）。
+- 产出（`rurge_http::capture`；细节见 P5、P6、P7）：
+
+```rust
+pub const DEFAULT_SESSION: &str = "default";
+pub const DEFAULT_TOTAL: u64 = 100 * 1024 * 1024;
+pub const DEFAULT_BODY: u64 = 5 * 1024 * 1024;
+/// 每个条目在头与文字之外另记的字节（设计第 4.3 节；任务 8 量过之后可以改）
+pub const ENTRY_OVERHEAD: u64 = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits { pub total: u64, pub body: u64 }
+impl Limits { pub fn new(total: u64, body: u64) -> Limits; }      // body 降到 total
+impl Default for Limits { /* DEFAULT_TOTAL、DEFAULT_BODY */ }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Status { pub limits: Limits, pub used: u64, pub entries: usize,
+                    pub stored: u64, pub evicted: u64, pub dropped: u64, pub truncated: u64 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary { pub name: Arc<str>, pub entries: usize, pub bytes: u64 }
+
+pub struct CaptureStore { /* limits；Mutex：队列、kept、reserved、四个数 */ }
+impl CaptureStore {
+    pub fn new(limits: Limits) -> Arc<CaptureStore>;
+    pub fn limits(&self) -> Limits;
+    pub fn status(&self) -> Status;
+    pub fn sessions(&self) -> Vec<SessionSummary>;          // 只有有条目的，按名字（字节序）排
+    pub fn session(&self, name: &str) -> Vec<Arc<Entry>>;   // 由旧到新；锁只握到拿完 Arc
+    pub fn entry(&self, id: u64) -> Option<Arc<Entry>>;
+    pub fn clear(&self, session: Option<&str>) -> usize;
+    #[cfg(any(test, feature = "testing"))]
+    pub fn put(&self, entry: Entry) -> bool;                 // 照同样的账存进一条做好的（P6）
+}
+
+#[derive(Clone)]
+pub struct Capture { pub store: Arc<CaptureStore>, pub session: Arc<str> }
+impl Capture { pub(crate) fn begin(&self) -> Pending; }
+
+pub(crate) struct Pending { /* store、两个正文的 Taking、held */ }
+impl Pending {
+    pub(crate) fn request_chunk(&mut self, data: &[u8]);
+    pub(crate) fn response_chunk(&mut self, data: &[u8]);
+    /// 把两个正文交给 `make` 造出条目，存进去；false：丢掉了
+    pub(crate) fn commit(self, make: impl FnOnce(Body, Body) -> Entry) -> bool;
+}
+impl Drop for Pending { /* 没有存进去：预留还回去 */ }
+
+pub struct Entry {
+    pub id: u64, pub session: Arc<str>, pub started: SystemTime,
+    pub request: Head, pub request_body: Body,
+    pub response: Option<ResponseHead>, pub response_body: Body,
+    pub timings: Timings, pub remote: Option<SocketAddr>,
+    pub outcome: Outcome, pub error: Option<String>,
+    pub rule: Option<String>, pub policy: Vec<String>, pub notes: Vec<String>,
+}
+impl Entry {
+    pub fn started_ms(&self) -> u64;                 // Unix 毫秒
+    pub fn started_rfc3339(&self) -> String;         // `YYYY-MM-DDTHH:MM:SS.mmmZ`
+}
+pub struct Head { pub method: Method, pub url: String, pub version: Version, pub headers: HeaderMap }
+pub struct ResponseHead { pub status: StatusCode, pub version: Version, pub headers: HeaderMap }
+pub struct Body { pub data: Bytes, pub size: u64, pub truncated: Option<Truncated> }
+impl Body {
+    pub fn empty() -> Body;
+    /// `headers` 是这一侧的头；Ok(None)：没有要解的编码（P7）
+    pub fn decoded(&self, headers: &HeaderMap, limit: u64) -> Result<Option<Bytes>, NotDecoded>;
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Truncated { Limit, Budget }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Timings { pub connect: Option<Duration>, pub dns: Option<Duration>, pub wait: Option<Duration>,
+                     pub receive: Option<Duration>, pub total: Duration, pub reused: bool }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome { Completed, Upgraded, Rejected(RejectKind), Failed }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotDecoded { Truncated, Unsupported(Option<String>), Corrupt(String), TooLarge(u64) }
+impl fmt::Display for NotDecoded { /* 原文 P7 */ }
+
+// rewrite/body.rs（crate 内）
+pub(crate) enum Undo { Unsupported(Option<String>), Corrupt(String), Over }
+pub(crate) fn layers(encodings: &[HeaderValue]) -> Result<Vec<String>, Undo>;
+pub(crate) fn undo(layers: &[String], body: &Bytes, limit: u64) -> Result<Bytes, Undo>;
+```
+
+**用例（先红）**
+
+- `capture/mod.rs`：
+  - `limits_lower_the_body_to_the_total`：`Limits::new(10, 20)` 是 `{10, 10}`；`Limits::new(20, 10)` 是 `{20, 10}`；`Limits::default()` 是 `{104857600, 5242880}`。
+  - `started_is_written_as_rfc3339_in_utc_with_milliseconds`：`started = UNIX_EPOCH + 1_761_984_000_123 ms` 的条目：`started_ms()` 是 `1761984000123`，`started_rfc3339()` 是 `"2025-11-01T08:00:00.123Z"`；`UNIX_EPOCH + 5 ms` 是 `"1970-01-01T00:00:00.005Z"`。
+  - `bodies_are_decoded_layer_by_layer`：`content-encoding: deflate, gzip`（先 deflate 再 gzip 压的）解回原文；`x-gzip` 同 `gzip`；`Content-Encoding` 分两行写同样；空的 `gzip` 正文解成空的（`Ok(Some(空))`）。
+  - `a_body_without_an_encoding_is_not_decoded`：没有 `content-encoding`、只有 `identity` 或空的项 → `Ok(None)`，截断的也是。
+  - `what_cannot_be_decoded_says_why`：截断的 `gzip` → `Truncated`；`br` → `Unsupported(Some("br"))`；值里有 `@` 的 → `Unsupported(None)`；坏的 `gzip` → `Corrupt("gzip")`；解开之后超过 `limit`（10）→ `TooLarge(10)`。每一种的 `to_string()` 恰好是原文 P7 那一句。
+- `capture/store.rs`（用一个自己造的条目的夹具：几个头、URL、规则、策略、备注各定好长度）：
+  - `an_entry_costs_its_headers_texts_bodies_and_the_overhead`：两个头各 `名字 + 值 + 32`、URL、方法、规则、策略、备注、错误的字节、两个正文存下的字节与 `ENTRY_OVERHEAD`，用例里逐项写出加起来的数；`put` 之后 `status().used` 恰好是它，`sessions()[0].bytes` 也是。
+  - `a_body_over_its_limit_keeps_its_beginning`：单条上限 4，应答的块 `"012"`、`"345"`、`"6"` → `data == "0123"`、`size == 7`、`truncated == Some(Limit)`；存进去之后 `status().truncated == 1`。
+  - `a_body_limit_of_zero_keeps_the_heads_only`：单条 0，块 `"abc"` → `data` 空、`size == 3`、`Some(Limit)`；条目照样存进去。
+  - `the_oldest_entries_go_first_whatever_their_session`：总量刚好放得下三条，依次存 `a`、`b`、`a`、`b` 四个会话的条目 → `evicted == 1`，留下的是后三条，最早那条 `a` 不在了。
+  - `a_chunk_evicts_older_entries_to_find_room`：队列里有两条，一个进行中的条目的一块要的地方只有挤掉最早那条才够 → 那一条被挤掉、`evicted == 1`、这一块整块存下。
+  - `a_chunk_that_cannot_fit_even_in_an_empty_store_is_truncated_for_the_budget`：总量 2000、单条 2000；队列里先 `put` 一条账在 1000 以内的条目（用例里写出它的账）；进行中的 A 存下一块 800（`kept + 800 <= 2000`，不挤）；进行中的 B 的一块 1300 → `reserved + 1300 > 2000`，挤光队列也放不下：B 是 `Some(Budget)`、`evicted == 0`、那一条还在；A 的预留不变（`used` 是那一条的账加 800）。
+  - `an_entry_whose_head_does_not_fit_is_dropped`：总量 0 → `put` 交回 `false`、`dropped == 1`、`used == 0`；总量放得下正文而放不下头的 → 同样丢掉，正文的预留还回去（`used == 0`）。
+  - `a_pending_entry_dropped_gives_its_reservation_back`：开始一条、存下 100 字节的块、不存进去就丢下 → `used == 0`。
+  - `the_store_never_holds_more_than_its_total`：确定的伪随机序列（例如线性同余，种子写在用例里）跑一千步：开始、喂块、存进去、丢下；每一步之后 `status().used <= limits.total`；最后全部丢下、清除之后 `used == 0`。
+  - `entries_are_listed_by_session_and_found_by_id`：`session("a")` 由旧到新；`sessions()` 按名字排、带条数与字节；`entry(id)` 找得到、不在的是 `None`；没有条目的会话不在 `sessions()` 里，`session(..)` 是空的。
+  - `clearing_one_session_or_all_keeps_the_four_counts`：`clear(Some("a"))` 交回 `a` 的条数、`b` 的还在；`clear(Some("nope"))` 是 0；`clear(None)` 交回余下的条数、`used == 0`；四个数不变。
+  - `an_evicted_entry_lives_on_while_it_is_held`：拿着 `session(..)` 交回的 `Arc<Entry>`，把它挤掉、再清除，它的正文照样读得出、与存进去的相同。
+  - `put_stores_an_entry_made_elsewhere`：`put` 存进去的条目与 `commit` 的一样记账、计 `stored`。
+- `rewrite/body.rs`：现有的 `decode` 用例一条不改、照过（不要求先红）。
+
+**实现**
+
+- 类型、`Display`、两个时间方法：照 P5、P7。
+- 存储与记账：照 P6。
+- `decode` 的拆法：照 P7。
+
+**判据**
+
+- 上面的用例都在、都绿；`rewrite` 的现有用例照过。
+- `Entry`、`Head`、`ResponseHead`、`Body`、`Capture`、`CaptureStore`、`Pending` 没有 `Debug`（不派生、不手写）。
+- `Cargo.lock` 的包数仍是 520，锁文件不变。
+- 门禁绿。
+
+---
+
+## Task 3：引擎里的抓包
+
+**改哪里**：
+
+- `crates/rurge-http/src/capture/slot.rs`（新）：`CaptureSlot`、`RequestTap`、包住应答正文的一层（P8）。它的用例在 `engine.rs` 的测试模块里（要用那里的夹具）。
+- `crates/rurge-http/src/capture/mod.rs`：`mod slot;` 与 crate 内的再导出。
+- `crates/rurge-http/src/engine.rs`：`Routed` 的两个变体多 `capture: Option<Capture>`；`Requests::handle` 改成包着 `serve` 的一层；求规则之后 `arm`；第 1 个取样点与 `reused`；`Idle` 多一个参数；升级那一支先 `upgrading()`（P9）；测试模块的 `Fake` 多一个格子、用例。
+- `crates/rurge-engine/src/http.rs`：`ConnUpstreams::route` 的两处 `Routed` 补 `capture: None`（任务 4 换成真的）。
+
+**接口**
+
+- 消费：任务 1 的 `when_finished`；任务 2 的 `Capture`、`Pending`、`Entry` 等。
+- 产出：
+
+```rust
+// engine.rs
+pub enum Routed<R, K> {
+    Go { route: R, key: K, pages: Pages, rewrite: Option<Arc<Rewrite>>, capture: Option<Capture> },
+    Refused { refusal: Refusal, pages: Pages, capture: Option<Capture> },
+}
+// capture/slot.rs（crate 内）
+pub(crate) struct CaptureSlot { /* OnceLock<Arc<Mutex<Armed>>> */ }
+impl CaptureSlot {
+    pub(crate) fn new() -> CaptureSlot;
+    pub(crate) fn arm(&self, capture: Option<Capture>, handle: &Arc<SessionHandle>, head: impl FnOnce() -> Head);
+    pub(crate) fn armed(&self) -> bool;
+    pub(crate) fn leaving(&self, head: Head, reused: bool);
+    pub(crate) fn request_tap(&self) -> Option<RequestTap>;
+    pub(crate) fn upgrading(&self);
+    pub(crate) fn answered(self, result: Result<Response<ResponseBody>, Close>, h2: bool)
+        -> Result<Response<ResponseBody>, Close>;
+}
+impl Drop for CaptureSlot { /* 没有回答过：没有应答 */ }
+#[derive(Clone)]
+pub(crate) struct RequestTap(/* Arc<Mutex<Armed>> */);
+impl RequestTap { pub(crate) fn chunk(&self, data: &[u8]); }
+```
+
+**用例（先红）**（`engine.rs` 的测试模块；`Fake` 多一个 `capture: Mutex<Option<Capture>>` 与 `fn capture(&self, capture: Capture)`，`route` 把它的克隆放进两个变体。夹具 `fn capturing(fake: &Fake, limits: Limits) -> Arc<CaptureStore>` 建一份存储、以会话 `"t"` 交给 `fake`；`async fn one_entry(store: &CaptureStore) -> Arc<capture::Entry>` 以 `wait_until` 等 `"t"` 里恰好有一条再交回。`capture::Entry` 与连接的 `Entry` 同名，测试里写全路径）
+
+1. `a_request_and_its_answer_are_captured`：`recording_origin`，经监听器问 `http://a.test/x?y=1`、带 `host: a.test`、`x-a: 1` 与 `connection: keep-alive`：
+   - 条目的 `id` 是这个请求的句柄的 `id()`，`session` 是 `"t"`；
+   - 请求：`GET`、`url` 是记录的 URL、`HTTP/1.1`，头里有 `x-a` 与 `host`、没有 `connection`；
+   - 应答：200、`HTTP/1.1`、源站给的头在、正文是客户端收到的正文；
+   - `Outcome::Completed`、`error` 是 `None`；`connect`、`wait`、`receive` 都是 `Some`，`connect + wait + receive == total`；`reused` 是假；`remote` 是源站的地址。
+2. `a_second_request_on_a_kept_connection_is_captured_as_reused`：同一条客户端连接上的第二个请求借了池里的连接：它的条目 `reused` 为真、第一个的为假。
+3. `the_captured_request_is_the_one_that_leaves_without_rurges_forward_headers`：`fake.forward(vec![("Proxy-Authorization", "Basic cnVyZ2U6c2VjcmV0")])` 让请求以绝对形式交给"上游代理"，另用 `rewrite_of` 给一条加 `x-added: 1` 的 Header Rewrite：源站收到了 `proxy-authorization`；抓到的请求头里有 `x-added`、没有 `proxy-authorization`。
+4. `a_request_that_never_left_is_captured_as_it_was_routed`：`Step::Refused { Reject(Reject), pages.reject: true }`，请求带 `connection: keep-alive`、`keep-alive: timeout=5`、`x-a: 1`：抓到的请求头有 `x-a`、没有那两个逐跳头；应答 403；`Rejected(Reject)`；`connect` 与 `remote` 是 `None`；请求正文 `size == 0`。
+5. `the_wrapped_answer_keeps_its_length_and_its_last_frame`：`fixed_origin(b"0123456789")`：客户端收到的头里 `content-length: 10`；抓到的应答正文恰好是这十个字节、`truncated` 是 `None`。
+6. `a_chunked_answer_is_captured_whole_without_its_trailers`：源站以 chunked 答、带一个 trailer `x-t: 1`：抓到的正文是全部数据，应答头里没有 `x-t`。
+7. `a_body_over_the_limit_is_captured_truncated`：单条上限 4、`fixed_origin` 十个字节：`data == "0123"`、`size == 10`、`Some(Limit)`；`status().truncated == 1`；客户端照样收到十个字节。
+8. `a_client_that_leaves_mid_body_is_captured_as_failed`：`streaming_origin` 答 `content-length: 100` 与十个字节、然后停住；客户端读到这十个字节之后关掉连接：条目 `Outcome::Failed`、应答 200、正文恰好是那十个字节；`store.clear(None)` 之后 `status().used == 0`。
+9. `a_killed_request_leaves_no_reservation_behind`：同上的源站，客户端读到一部分之后 `kill` 这个请求的句柄：条目 `Outcome::Failed`；清除之后 `used == 0`。
+10. `an_upgrade_is_captured_at_its_101`：`upgrading_origin`：在隧道还开着的时候条目就在了：`Outcome::Upgraded`、应答 101、应答正文 `size == 0`、请求头里留着 `upgrade` 与 `connection`；之后关掉隧道，条目不变、没有第二条。
+11. `a_connect_tunnel_is_captured_at_its_2xx_with_host_and_port_as_its_url`：嗅探到的连接上 `CONNECT a.test:443`：条目的 `method` 是 `CONNECT`、`url` 是 `"a.test:443"`、`Outcome::Upgraded`、应答 200。
+12. `a_closed_answer_is_captured_with_no_response`：`Step::Refused { Reject(Reject), pages.reject: false }`（关掉连接作答）：`response` 是 `None`、应答正文 `size == 0`、`Rejected(Reject)`。
+13. `a_dropped_request_is_captured_before_its_hold_ends`：`rig_timed` 把 `drop_hold` 设成 60 秒，`Step::Refused { Reject(Drop) }`：五秒之内条目就在了，`response` 是 `None`、`Rejected(Drop)`、`timings.total < 5 s`；然后 `rig.stop()`。
+14. `an_http2_stream_reset_before_its_answer_is_captured_with_no_response`：`rig_h2` 对着 `stalled_origin`，发出请求之后重置这个流（照现有的 `a_stream_the_client_resets_is_cancelled_and_the_connection_stays` 的做法）：条目 `response` 是 `None`、`Outcome::Failed`。
+15. `an_http2_client_over_an_http1_upstream_is_captured_as_http2`：`rig_h2` 对着 HTTP/1.1 的源站：请求与应答的 `version` 都是 `HTTP_2`，正文在。
+16. `a_rewritten_request_body_is_captured_as_sent`：`rewrite_of` 给一条把 `a` 换成 `b` 的请求 Body Rewrite，`POST` 正文 `aaa`：源站收到 `bbb`；抓到的请求正文是 `bbb`、`size == 3`。
+17. `a_map_local_answer_is_captured`：`rewrite_of` 给一条 `data-type=text`、`data=hello` 的 Map Local：抓到的应答 200、正文 `hello`；`connect` 与 `remote` 是 `None`。
+
+用例 8、9、10、13、14 带等待：提交前各自单独循环跑二十次。
+
+**实现**
+
+- `CaptureSlot`：照 P8。
+- 引擎里的位置：照 P9。
+- `crates/rurge-engine/src/http.rs`：两处 `Routed` 补 `capture: None`，注释写"the phase 4 / M4a plan's task 4 gives the real one"。
+
+**判据**
+
+- 上面的用例都在、都绿；`engine.rs` 测试模块的现有用例一条不改期望、照过（P16）。
+- `answer`、`failed`、`page`、`map_local`、`timed_out`、`Tail`、`LocalFile`、`Guard` 的函数体没有改动（`git diff` 里没有它们的行）。
+- 带等待的用例各自循环二十次的结果写进报告。
+- 门禁绿。
+
+---
+
+## Task 4：`rurge-engine`：存储、开关、填槽与给 `capture`
+
+**改哪里**：
+
+- `crates/rurge-engine/src/shared.rs`：`EngineShared.capture`。
+- `crates/rurge-engine/src/engine.rs`：`capture_on` 字段、`capture_on`、`set_capture`、`restore_switches`、`capture`、`capture_for`；`always_capture`；`choose_policy_with` 填槽。
+- `crates/rurge-engine/src/http.rs`：两处 `capture` 换成 `self.engine.capture_for(handle)`。
+- `crates/rurge-engine/src/lib.rs`：`pub use rurge_http::capture;`。
+- `crates/rurge-engine/tests/capture.rs`（新）：端到端的前一半。
+
+**接口**
+
+- 消费：任务 1 的 `set_capture_session` / `capture_session`；任务 2 的 `CaptureStore`、`Capture`、`Limits`、`DEFAULT_SESSION`；任务 3 的 `Routed`。
+- 产出（细节见 P10）：
+
+```rust
+// shared.rs
+pub capture: Arc<rurge_http::capture::CaptureStore>,
+// engine.rs
+impl Engine {
+    pub fn capture(&self) -> Arc<CaptureStore>;
+    pub fn capture_on(&self) -> bool;
+    pub async fn set_capture(&self, on: bool);
+    pub(crate) fn capture_for(&self, handle: &SessionHandle) -> Option<Capture>;
+}
+pub(crate) fn always_capture(rules: &rurge_rules::RuleEngine, index: usize) -> Option<Arc<str>>;
+// lib.rs
+pub use rurge_http::capture;
+```
+
+**用例（先红）**（`tests/capture.rs`，做法见 P14；`[Host] example.test = 127.0.0.1`，源站是回环上的 `TestServer`，经 HTTP 监听器以 `plain_get` 问 `http://example.test:{端口}/…`）
+
+- `nothing_is_captured_while_the_switch_is_off`：开关缺省关、规则没有 `always-capture`：记录结束之后（`the_records`），固定等待 200 ms（注释：等一个本来就不该来的存进去；存进去在记录结束与正文交完两者之后，回环上是微秒级）→ `status().stored == 0`、`capture_on()` 为假。
+- `the_switch_captures_into_default`：`set_capture(true).await` 之后的请求进 `default`：`sessions()` 恰好是 `[default, 1 条]`，条目的 `id` 是记录的 `id`。
+- `always_capture_captures_with_the_switch_off`：`DOMAIN,example.test,DIRECT,always-capture=debug-1`、开关关着：条目在 `debug-1`，`default` 不在。
+- `always_capture_on_final_captures_too`：`FINAL,DIRECT,always-capture=last`：条目在 `last`。
+- `a_logical_rule_names_the_session_of_its_line`：`AND,((DOMAIN,example.test),(DEST-PORT,{端口})),DIRECT,always-capture=logic`（逻辑规则的写法照任务 0 找到的现有用例）：条目在 `logic`。
+- `the_session_a_rule_names_comes_before_default`：开关开着、规则写 `always-capture=named`：条目在 `named`、`default` 没有条目。
+- `the_direct_mode_reads_no_rule_and_so_no_always_capture`：出站模式切到直连（照任务 0 找到的写法）、规则写着 `always-capture=named`：开关关着时什么也不存（同第一条的等待与注释）；开关开着时进 `default`。
+- `turning_the_switch_off_keeps_what_was_captured`：开着存进一条、关掉：那一条还在；之后的请求不存（同上的等待）。
+- `the_capture_switch_is_kept_in_state_json_and_restored`：照 `tests/mitm.rs` 的 `the_switch_is_restored_from_state_json` 写：`set_capture(true)` 之后 `state.json` 的 `features.capture` 是 `true`；用这份 `state.json` 起的新引擎 `restore_switches` 之后 `capture_on()` 为真；`false` 同样。
+
+带等待的用例提交前各自单独循环跑二十次。
+
+**实现**：照 P10。
+
+**判据**
+
+- 上面的用例都在、都绿；`rurge-engine` 的现有用例照过（P16）。
+- 门禁绿。
+
+---
+
+## Task 5：API：开关与五个端点
+
+**改哪里**：
+
+- `crates/rurge-api/Cargo.toml`：正式依赖加 `base64.workspace = true`；开发依赖的 `rurge-http` 带 `features = ["testing"]`（P2）。
+- `crates/rurge-api/src/lib.rs`：五条路由（P11）。
+- `crates/rurge-api/src/routes/mod.rs`：`pub mod capture;`。
+- `crates/rurge-api/src/routes/features.rs`：`capture` 生效；模块的文档注释加上它。
+- `crates/rurge-api/src/routes/capture.rs`（新）：五个处理函数与它们的 JSON。
+- `crates/rurge-api/tests/api.rs`：用例；`features_collections_stop_and_unknown_paths` 照 P16 改。
+
+**接口**
+
+- 消费：任务 4 的 `Engine::capture`、`capture_on`、`set_capture`；`rurge_engine::capture` 的类型。
+- 产出：`GET /v1/rurge/capture`、`GET /v1/rurge/capture/sessions`、`GET /v1/rurge/capture/sessions/{name}`、`GET /v1/rurge/capture/entries/{id}`、`POST /v1/rurge/capture/clear`；`/v1/features/capture` 的 `GET` 与 `POST`。形状与错误照 P11。
+
+**用例（先红）**（`api.rs`；条目经 `api.engine.capture().put(..)` 存进去，用例里写一个造条目的夹具，字段都是 `pub`）
+
+- `the_capture_switch_is_read_switched_and_kept`：照 `the_rewrite_switch_is_read_switched_and_kept`：`GET` 是 `{"enabled":false}`；`POST {"enabled":true}` 之后 `GET` 是 `true`、`state.json` 的 `features.capture` 是 `true`；再关掉同样。
+- `the_capture_status_says_the_limits_and_the_counts`：起始恰好是 `{"limits":{"total":104857600,"body":5242880},"used":0,"entries":0,"stored":0,"evicted":0,"dropped":0,"truncated":0}`；`put` 两条之后 `entries == 2`、`stored == 2`、`used` 等于 `api.engine.capture().status().used`（不是 0）。
+- `capture_sessions_are_listed_by_name`：会话 `b`、`a` 各有条目：`[{"name":"a",…},{"name":"b",…}]`，`entries` 与 `bytes` 对。
+- `a_capture_session_lists_its_entries_newest_first`：三条：摘要由新到旧、键与值照设计第 7.3 节（`totalMs` 是 `total` 向下取整的毫秒、`truncated` 是两个正文有一个截断就真、没有应答的 `status` 是 `null`）；`?limit=1` 只有最新的一条；`?limit=0` 是 400、`limit must be at least 1`；没有的会话是 404、消息照原文 P11。
+- `an_entry_is_shown_whole_with_four_headers_masked`：一条带 `authorization`、`proxy-authorization`、`cookie`、`set-cookie` 与 `x-other: v` 的条目：四个头的值是 `***`、`x-other` 照原样；一个值里有 `0xFF` 字节的头读出来带 U+FFFD；两个 `body` 的 `base64` 解回存下的字节、`size` 与 `stored` 与 `truncated`（`"limit"`）对；`timings`、`remoteAddr`、`outcome`、`rejectKind`（`REJECT-DROP` 的写法照 `RejectKind::name`）、`error`、`rule`、`policy`、`notes` 照设计第 7.5 节的键；没有应答的条目 `"response": null`；没有 `decode` 时 `body` 里没有 `decoded` 与 `notDecoded`。
+- `entry_ids_are_numbers_of_entries_that_are_there`：`/entries/abc` 是 400、`entry id must be a number`；`/entries/99` 是 404、`unknown capture entry 99`。
+- `decode_undoes_gzip_and_says_why_it_cannot`：`?decode=true`：gzip 的应答 `decoded: true`、`base64` 是解开之后的、`notDecoded: null`；`br` 的 `decoded: false`、`notDecoded` 是原文 P7 那一句；截断的 gzip 是 `the body was truncated`；没有编码的 `decoded: false`、`notDecoded: null`。`?decode=false` 同没有写；`?decode=yes` 是 400、`decode must be true or false`。
+- `clearing_takes_one_session_or_all`：没有请求体的 `POST` 清除全部、答 `{"cleared":N}`；`{}` 同；`{"session":"a"}` 只清 `a`；`{"session":"nope"}` 答 `{"cleared":0}`；`{"session":5}`、`[]`、`x` 各是 400、消息是原文 P11 的 `BAD_BODY`；四个数不清零。
+- `odd_session_names_are_reached_through_the_path`：会话 `a b/c` 与 `调试` 各有一条：`/sessions/a%20b%2Fc` 与 `/sessions/%E8%B0%83%E8%AF%95` 各读到自己的那一条。
+- 现有的 `features_collections_stop_and_unknown_paths`：照 P16 改。
+
+**实现**：照 P11。
+
+**判据**
+
+- 上面的用例都在、都绿；`features_collections_stop_and_unknown_paths` 改了的地方写进提交说明。
+- `Cargo.lock` 的包数仍是 520，只有 `rurge-api` 的依赖列表多了 `base64`。
+- 门禁绿。
+
+---
+
+## Task 6：API：HAR
+
+**改哪里**：
+
+- `crates/rurge-api/Cargo.toml`：正式依赖加 `futures-util.workspace = true`。
+- `crates/rurge-api/src/har.rs`（新）：一条的映射、`timings`、逐条写出的正文；单元用例在文件末尾。
+- `crates/rurge-api/src/lib.rs`：`mod har;` 与第六条路由 `GET /v1/rurge/capture/sessions/{name}/har`。
+- `crates/rurge-api/src/routes/capture.rs`：`har` 处理函数。
+- `crates/rurge-api/tests/api.rs`：用例。
+
+**接口**
+
+- 消费：任务 5 的会话查找与 404；`Body::decoded`、`NotDecoded`、`Entry::started_rfc3339`。
+- 产出（crate 内）：
+
+```rust
+// har.rs
+pub(crate) struct HarTimings { pub blocked: i64, pub dns: i64, pub connect: i64, pub ssl: i64,
+                               pub send: i64, pub wait: i64, pub receive: i64 }
+/// 各项与 `time`（P12）
+pub(crate) fn timings(t: &Timings) -> (HarTimings, i64);
+pub(crate) fn entry(e: &Entry, body_limit: u64) -> serde_json::Value;
+/// `{"log":…}`，条目由旧到新、一条一条序列化（P12）
+pub(crate) fn document(entries: Vec<Arc<Entry>>, body_limit: u64) -> axum::body::Body;
+```
+
+**用例（先红）**
+
+- `har.rs` 的单元用例：
+  - `har_timings_add_up_to_the_total`：三种情形各一条，都带求规则时的一次解析：
+    - 新拨的：`connect 30 ms`、`dns 10 ms`、`wait 20 ms`、`receive 5 ms`、`total 55 ms` → `blocked -1`、`dns 10`、`connect 20`、`ssl -1`、`send 0`、`wait 20`、`receive 5`，`time 55`；
+    - 借来的：`connect 4 ms`、`dns 3 ms`、`wait 10 ms`、`receive 2 ms`、`total 16 ms`、`reused` → `blocked 1`、`dns 3`、`connect -1`、`wait 10`、`receive 2`，`time 16`；
+    - 没连上的：`dns 7 ms`、`total 12 ms` → `blocked -1`、`dns 7`、`connect -1`、`wait 5`、`receive 0`，`time 12`；
+    - 连上了而没有第一个字节的：`connect 8 ms`、`total 20 ms`、没有 `dns` → `dns -1`、`connect 8`、`wait 12`、`receive 0`，`time 20`；
+    - 解析比连接长的：`dns 50 ms`、`connect 30 ms`、`wait 1 ms`、`receive 1 ms`、`total 32 ms` → `dns 30`、`connect 0`，`time 32`；
+    - 带零头的（各段带几百微秒）：`time` 等于不是 `-1` 的各项之和，`totalMs − time` 在 0 到 3 之间。
+  - `an_export_holds_its_entries_while_they_are_cleared`：存进三条、取 `session(..)` 建 `document`，在读第一块之前 `clear(None)`；读完整个正文、`serde_json` 解析：三条都在、正文完整。
+- `api.rs`：
+  - `a_session_is_exported_as_har_oldest_first`：`Content-Type: application/json`；`log.version == "1.2"`、`creator == {"name":"rurge","version":env!("CARGO_PKG_VERSION")}`、`pages == []`；条目由旧到新；`startedDateTime` 是 `started_rfc3339()`；`_rurgeId`、`_session`、`_outcome`、`_notes` 在；没有这个会话是 404、消息同任务 5。
+  - `har_bodies_are_text_or_base64_and_say_what_was_left_out`：
+    - gzip 的文字应答：`content.size` 是解开之后的字节数、`compression` 是 `size − bodySize`、`text` 是解开之后的文字、没有 `encoding`；
+    - 二进制的应答：`text` 是 Base64、`"encoding":"base64"`；
+    - 截断的应答：`comment` 是 `"{存下} of {见过} bytes stored"`；
+    - `br` 的应答：`size` 是存下的字节数、`text` 是存下的字节的 Base64、`comment` 是 `"not decoded: content-encoding br is not supported"`；截断的 gzip 两种都有，以 `"; "` 接起来、截断在前；
+    - 请求：UTF-8 的 JSON 正文 `postData.text` 照写、`mimeType` 取 `content-type`；二进制的写 Base64 与 `"_encoding":"base64"`；没有见过字节的请求没有 `postData`；`request.bodySize` 与 `response.bodySize` 是见过的字节数。
+  - `har_says_no_response_as_mitmproxy_does`：没有应答的条目：`response.status 0`、`statusText ""`、`httpVersion ""`、`headers []`、`bodySize -1`、`content` 是 `{"size":0,"mimeType":""}`；`_error` 是条目的 `error`；没有 `remote` 时没有 `serverIPAddress` 这个键、有时是 IP（不带端口）。
+  - `har_masks_the_four_headers_and_leaves_cookies_empty`：四个头写 `***`；`request.cookies` 与 `response.cookies` 是 `[]`；`redirectURL` 取 `location`、没有时空串；`statusText` 是 `canonical_reason`。
+  - `har_splits_query_strings_and_gives_connect_none`：`https://a.test/p?x=1&y=%20z` → `[{"name":"x","value":"1"},{"name":"y","value":" z"}]`；`CONNECT` 的条目（`url` 是 `a.test:443`）是 `[]`；`request.httpVersion` 是 `HTTP/1.1` / `HTTP/2.0`；`headersSize` 两个都是 `-1`；`cache` 是 `{}`。
+
+**实现**：照 P12。
+
+**判据**
+
+- 上面的用例都在、都绿。
+- 导出不先在内存里拼出整个文件：`document` 交给 `Body::from_stream` 的是一条一条序列化的流（读代码可见）。
+- `Cargo.lock` 的包数仍是 520，只有 `rurge-api` 的依赖列表多了 `futures-util`。
+- 门禁绿。
+
+---
+
+## Task 7：可执行文件：两个参数与命令行的端到端
+
+**改哪里**：
+
+- `crates/rurge/src/cli/run.rs`：两个参数、`parse_size`、`capture_limits`、`EngineShared::new` 之后换上存储与 WARN；测试模块里的单元用例。
+- `crates/rurge/tests/cli.rs`：`run` 模块里的用例。
+
+**接口**
+
+- 消费：任务 2 的 `CaptureStore::new`、`Limits::new`、`DEFAULT_TOTAL`、`DEFAULT_BODY`；任务 4 的 `EngineShared.capture`；任务 5、6 的 API。
+- 产出：`--capture-size` / `RURGE_CAPTURE_SIZE`、`--capture-body-size` / `RURGE_CAPTURE_BODY_SIZE`；`pub(crate) fn parse_size(s: &str) -> Result<u64, String>`；`pub(crate) fn capture_limits(size: Option<u64>, body: Option<u64>) -> (Limits, Option<String>)`（P13）。
+
+**用例（先红）**
+
+- `run.rs` 的单元用例：
+  - `sizes_are_bytes_with_an_optional_binary_suffix`：`"0"` → 0；`"1"` → 1；`"1k"`、`"1K"` → 1024；`"2m"` → 2 097 152；`"3G"` → 3 221 225 472；`"100M"` → 104 857 600；`"18446744073709551615"` → `u64::MAX`。`""`、`"k"`、`"1.5m"`、`"-1"`、`"+1"`、`"1kb"`、`" 1"`、`"1 k"`、`"0x10"`、`"1t"` 各是"invalid size"那一句；`"18446744073709551616"`、`"17179869184g"` 各是"too large"那一句（原文 P13，反引号里是写的原样）。
+  - `the_body_size_is_lowered_to_the_capture_size`：`(Some(1024), Some(2048))` → `({1024, 1024}, Some(WARN 那一句，2048 与 1024))`；`(Some(1024), None)` → `({1024, 1024}, None)`；`(None, None)` → 缺省、`None`；`(None, Some(200 MiB))` → `({100 MiB, 100 MiB}, Some(..))`；`(Some(10), Some(10))` → `({10, 10}, None)`。
+- `cli.rs` 的 `run` 模块（每条都 `env_remove` 两个环境变量，照 `the_request_log_holds_as_many_requests_as_request_log_size_says`）：
+  - `the_capture_limits_come_from_the_options_or_the_variables`：三轮（参数、环境变量、都没有）：参数 `--capture-size 2m --capture-body-size 3k`、环境变量 `RURGE_CAPTURE_SIZE=2M` 与 `RURGE_CAPTURE_BODY_SIZE=3K` 都让 `GET /v1/rurge/capture` 的 `limits` 是 `{"total":2097152,"body":3072}`；都没有是 `{"total":104857600,"body":5242880}`。
+  - `a_body_size_over_the_capture_size_is_lowered_with_a_warning`：`--capture-size 1k --capture-body-size 2k`：读到 `api on http://` 那一行之前的行里恰好有一行含 WARN 那一句（2048、1024）；`limits` 是 `{1024, 1024}`。`--capture-size 1k` 单独：`limits` 是 `{1024, 1024}`，`api on http://` 之前的行里没有 `capture body size`。日志与 `api on` 都写在守护进程的标准输出上（`init_logging` 的层写标准输出，`daemon.lines` 读的就是它），WARN 在起 API 之前写，所以读到 `api on` 时它要么已经读到、要么不会有。`wait_for_line` 丢掉它跳过的行：这一条自己从 `daemon.lines` 有时限地读到 `api on http://`，留着之前的行。
+  - `bad_capture_sizes_are_refused`：`rurge run -c <conf> --capture-size 12x` 与 `--capture-body-size 17179869184g` 各以 clap 写错参数的退出码退出（照任务 0 找到的现有写法断言），标准错误里有原文 P13 的那一句。
+  - `a_capture_switched_on_over_the_api_is_exported_as_har`：回环上的 `TestServer` 给 `/hello` 答 `hi from target`；守护进程带 `--capture-size 1m`；`POST /v1/features/capture {"enabled":true}` 答 200；经 HTTP 监听器问 `http://127.0.0.1:{端口}/hello`；有时限地（五秒）轮询 `GET /v1/rurge/capture/sessions` 到 `default` 有一条；`GET /v1/rurge/capture/sessions/default/har` 用 `serde_json` 解析：`log.version == "1.2"`、一条、`request.url` 以 `/hello` 结尾、`response.status == 200`、`response.content.text == "hi from target"`。
+
+命令行的用例提交前各自单独循环跑二十次（经 `--test cli -- <名字>`）。
+
+**实现**：照 P13。
+
+**判据**
+
+- 上面的用例都在、都绿；`cli` 的现有用例照过。
+- `rurge run --help` 里有两个参数与原文 P13 的帮助（读帮助输出核一次，写进报告）。
+- 门禁绿。
+
+---
+
+## Task 8：端到端的后一半与量内存
+
+**改哪里**：
+
+- `crates/rurge-engine/tests/capture.rs`：用例（夹具照 P14 从 `tests/rewrite.rs` 照抄）。
+- `crates/rurge-http/src/capture/memory.rs`（新，只在 `#[cfg(test)]` 下）与 `capture/mod.rs` 末尾的 `#[cfg(test)] mod memory;`：量内存的两条忽略的用例与读峰值工作集的函数（P15）。
+
+**接口**
+
+- 消费：前面各任务的全部；`CaptureStore`、`Capture::begin`、`Pending`（量内存的用例在 crate 里，用得上 `Pending`）。
+- 产出：没有新的生产接口；`ENTRY_OVERHEAD` 可能照量到的数改（P15）。
+
+**用例（先红）**
+
+- `tests/capture.rs`（开关都由用例 `set_capture(true)` 打开，除非写明）：
+  - `a_request_a_reject_rule_refuses_is_captured`：`DOMAIN,example.test,REJECT`：条目 `Rejected(Reject)`、应答的状态码是记录的 `statusCode`（有拒绝页时 403，照这一代的 `show-error-page-for-reject`）、`remote` 是 `None`。
+  - `a_listener_password_is_not_captured`：`http-listen` 带 `password@`（照 `tests/pipeline.rs` 的写法），客户端以 Basic 口令问：请求照常到源站；抓到的请求头里没有 `proxy-authorization`。
+  - `an_upstream_proxy_credential_is_not_captured`：规则选一个带用户名与口令的 HTTP 代理（`P = http, 127.0.0.1, {端口}, user, pass`，以绝对形式转发，照 `RecordingProxy` 的写法）：代理收到了 `proxy-authorization`；抓到的请求头里没有。
+  - `a_decrypted_request_is_captured_as_https`：`[MITM]` 解密的 HTTPS（`TlsFixture`，两张 CA 不同名，照 `tests/rewrite.rs` 的 `harness_mitm` 与 `decrypted_get`）：条目的 `url` 以 `https://` 开头、应答正文是源站的正文。
+  - `entries_outlive_a_reload`：存进一条、重载一次 Profile（照任务 0 找到的写法）：条目还在、开关仍开着；重载之后的请求照样存进去。
+  - `captured_content_never_reaches_the_log`：`LogCapture` 接最详细的一级（当前线程运行时），一个请求的头 `x-marker: rurge-capture-marker-1` 与正文 `rurge-capture-marker-2` 经引擎被抓：条目里有这两样；抓到的日志里没有一行含 `rurge-capture-marker`。红了而写出它的那一行日志不是 M4a 加的：停下报告，不改那一行、不放宽断言。
+- `capture/memory.rs`（`#[ignore]`，各自单独跑，P15）：
+  - `a_full_store_at_the_default_limits`；
+  - `an_empty_store_is_the_baseline`；
+  - 读峰值的解析照抄 `peak.rs` 的那条用例（不忽略，缺省就跑）。
+
+带等待的用例提交前各自单独循环跑二十次。
+
+**实现**
+
+- 端到端：照 P14。
+- 量内存：照 P15；两条各跑一次，命令与输出原样写进修正记录与报告（写明是调试构建、一台机器上的一次运行）；照 P15 判断要不要改 `ENTRY_OVERHEAD`，改了就重跑那一条一次、两次的数都记下。
+
+**判据**
+
+- 上面的用例都在、都绿；量内存的两条在缺省的 `cargo test` 里是"ignored"。
+- 量到的数、比值与对 `ENTRY_OVERHEAD` 的决定在修正记录里。
+- 门禁绿。
+
+---
+
+## Task 9a：手工清单、API 与测试的文档
+
+**改哪里**：`docs/acceptance/phase4-manual.md`、`docs/api/phase4.md`、`docs/testing.md`。
+
+**做什么**
+
+- `docs/acceptance/phase4-manual.md`：照文件里已有条目的格式加 M4a 的条目（设计第 13 节）：
+  - 真实浏览器的流量：开着抓包浏览几个站（明文与 `[MITM]` 解密的），`/v1/rurge/capture/sessions` 与一条的读出合乎实际；
+  - 导出的 HAR 能被 Chrome 与 Firefox 的开发者工具导入，耗时的瀑布图合乎实际；
+  - `always-capture` 在开关关着时把命中的请求存进那个名字的会话；
+  - 截断与挤掉在真实的大下载上（例如 `--capture-size 20m` 下载几十 MB 的文件）：客户端完整收到，条目截断，更早的条目被挤掉；
+  - 清除与开关的持久化（重启之后还原）。
+  - 文件开头的项数随之改。
+- `docs/api/phase4.md`：「M4a　抓包」一节：`capture` 开关；六个端点的形状、错误与例子（照 P11、P12）；HAR 的映射与 `timings` 的算法；两个上限与命令行（写法、缺省、降低与 WARN）；量到的内存（任务 8 的数，写明是调试构建、一台机器上的一次运行）；两行日志；登记的几件（设计第 11 节第 1 ～ 5、9、10 条，本计划 P5 的 `error`，P8 的 REJECT-DROP，P9 ④ 的重发）。
+- `docs/testing.md`：阶段 4 的一节加一条：量抓包内存的做法（P15：调试构建、`rurge-http` 的库内用例、怎样单独跑两条、峰值怎样读），与 `crates/rurge-rules/tests/memory.rs` 的不同写明；另一条：抓包的用例用小的上限、以有时限的轮询等条目存进去。
+
+**判据**：三份文档改了；`docs/api/phase4.md` 里的数与修正记录一致；不写"通过"。
+
+---
+
+## Task 9b：M4a 的收尾文档
+
+**改哪里与做什么**（P17）
+
+- `docs/surge-compatibility-matrix.md`：L271（`always-capture`：M4a 起生效；备注写 M4-D8：只作用于本来就经 HTTP 引擎的请求、不让连接进引擎；规则集文件里的行上的不读）、L569（抓包视图：API 与 HAR 有了，Dashboard 在阶段 6；备注写设计第 11 节第 3、9、10 条）、L863（`rurge run` 的两个参数）、L871（`capture` 生效）；开头"最近一次"的括号。行号以任务 0 那时为准。
+- `docs/status.md`：阶段 4 下新的一节「M4a」：做了什么、没做的与不要当成已经有的（M4b 的事、`br` / `zstd`、Dashboard、手工验收）、以后的会话必须知道的事（P3 的锁的次序、P8 的状态机与锁的次序、P9 里不许握着槽的锁 poll 正文、REJECT-DROP 的认法、`testing` 特性、量到的内存）、去向写着项目所有者的事（设计第 17 节）；细节指到计划的两张表。
+- `README.md` 与 `README_en.md`：状态一段与特性表的 HTTP 处理一行（抓包：M4a 做完，本地提交，CI 没有见过）；两份内容一致。
+- `docs/requirements.md` 第 7 节阶段 4 的状态一句：加 M4a。
+- `CLAUDE.md`：只改「现在在哪里」：M4a 做完、M4b 的计划在下一步写。
+- 设计第 18 节：执行期改了设计正文的意思的，接着写（没有就不写）。
+- `docs/README.md`：本计划那一项末尾加"做完了"的一句（同 M3b 那一项的写法）。
+
+**判据**：上面的文档都改了；README 两份一致；`CLAUDE.md` 只动了「现在在哪里」；不写"通过"，不写"齐备"。
+
+---
+
+## 计划期决定
+
+写计划时对着 `a6e78ad` 核对过下面引的名字与行号。行号会随前面任务的改动漂移，以名字为准；名字不同就照实改、记进修正记录，不改语义。标了"订正设计"的，已随本计划写进设计第 18 节。
+
+| # | 事项 | 决定 |
+| - | ---- | ---- |
+| P1 | 任务的拆法（订正设计） | 设计第 2 节的 M4a 任务表拆成任务 0 ～ 8、9a、9b，次序与设计有两处不同：<br>• API 的两个任务提前：设计的任务 6（端点）、7（HAR）在这里是任务 5、6，设计的任务 5（可执行文件）在这里是任务 7——可执行文件的用例要经 API 读上限、取 HAR；设计第 12 节第 3 条那一条命令行的端到端用例随它在任务 7。<br>• 设计的任务 9 分成 9a（手工清单、`docs/api/phase4.md`、`docs/testing.md`）与 9b（其余的收尾文档）：一个 Pi 任务写不完全部的收尾文档（同 M3b 的任务 8、9）。<br>设计第 12 节第 3 条的端到端用例分在任务 4（开关、`always-capture`、`FINAL`、逻辑规则、直连模式、关掉之后、`state.json`）与任务 8（拒绝、两种凭据、解密的、重载、日志），P14 |
+| P2 | 依赖（订正设计 M4-D2） | `rurge-api` 正式依赖只加工作区的 `base64`（任务 5）与 `futures-util`（任务 6），**不加 `time`**：HAR 的 `startedDateTime` 由 `rurge-http` 的 `Entry::started_rfc3339()` 写（`rurge-http` 本来就依赖 `time`；用 `OffsetDateTime::from(SystemTime)` 与它的取值方法拼成 `YYYY-MM-DDTHH:MM:SS.mmmZ`，不开 `formatting`）。<br>`rurge-http` 加 `[features]` 一节 `testing = []`，注释照 `rurge-net` 那一行的写法写"`CaptureStore::put` for the tests of other crates, which store entries they made; enabled by dependants' dev-dependencies."；`rurge-api` 的开发依赖带上它。生产代码不开它：`put` 不在任何生产路径上。<br>`futures-util` 只用 `stream::iter`：`document` 交给 `axum::body::Body::from_stream` 一条 `Stream<Item = Result<Vec<u8>, Infallible>>`。<br>锁文件只有 `rurge-api` 的依赖列表变（特性不进锁文件），包数 520 |
+| P3 | `when_finished` 与抓包会话的槽 | **`when_finished(f)`**：先锁 `on_finish`，在这把锁里读一次 `outcome`（它自己的锁，读完就放）：是 `Some(o)` → 放掉 `on_finish` 的锁，再 `f(self, &o)`；是 `None` → 推进 `on_finish`、放锁。`finish` 不改：它先置 `finished`、再写 `outcome`（写完放锁）、最后在 `on_finish` 的锁里取走全部钩子。所以 `when_finished` 读到 `None` 时 `finish` 还没有取钩子，推进去的会被它取到；读到 `Some` 时当场调，`finish` 取走的钩子里没有它；不漏、不调两次。`finish` 从不同时握两把锁，`when_finished` 的次序是 `on_finish` → `outcome`，不会死锁。`f` 在任何锁之外调：`f` 里再调 `when_finished` 或 `on_finish` 不死锁。文档注释写这段道理（同 `on_first_byte` 的写法）。<br>**`capture_session`**：`OnceLock<Arc<str>>`，`set_capture_session` 只有第一次的算（同 `method`、`status`）。文档注释："The `always-capture` session the matched rule names (phase 4 M4 design 5.3). A session that is no HTTP request may have one too; nobody reads it then." |
+| P4 | 空的 `always-capture=` | 在 `config.rs` 读 `[Rule]` 的循环里、给 `W0003` 的两段之后：`r.params.always_capture` 是 `Some(v)` 而 `v.trim()` 是空的 → 一条 `Diagnostic::warning(codes::W_INVALID_VALUE, 原文 P4)`，`.at(e.span.clone())`；规则照常进 `rules`。`RuleParams` 不改，引擎读它时去掉空白、空的不填（P10）。不设新码；不带 `=` 的照旧 `W0003`；规则集文件里的行上的参数不读、不告警（设计第 5.2 节） |
+| P5 | `capture` 模块的类型（订正设计） | 设计第 3 节的接口改三处：<br>① `Outcome::Failed` 不带文字，`Entry` 多 `pub error: Option<String>`：记录的 `error` 是 `set_error` 写的说明、没有时是失败的消息（`observe.rs` 的 `record_of`），被拒绝的请求也可能有（`engine.rs` 里 `set_error(why)` 那几处），所以条目照它取，与记录同一句；<br>② `Body::decoded` 交回 `Result<Option<Bytes>, NotDecoded>`：`Ok(None)` 是没有要解的编码；<br>③ 多 `Status`、`SessionSummary`、`NotDecoded`、`ENTRY_OVERHEAD`、`Body::empty`、`Entry::started_ms` / `started_rfc3339`、`Capture::begin` 与 crate 里的 `Pending`；`put` 只在 `test` 或 `testing` 下。<br>**派生**：`Limits`、`Status`、`Truncated`、`Outcome` 派生 `Clone, Copy, Debug, PartialEq, Eq`；`Timings`、`NotDecoded`、`SessionSummary` 派生 `Clone, Debug, PartialEq, Eq`；`Capture` 只派生 `Clone`；`Entry`、`Head`、`ResponseHead`、`Body`、`CaptureStore`、`Pending` 什么也不派生——它们与 `Capture` 都**不实现 `Debug`**（设计第 6.6 节）。<br>**`started_ms`**：`started.duration_since(UNIX_EPOCH)` 的毫秒，早于纪元的是 0。**`started_rfc3339`**：`OffsetDateTime::from(started)`（UTC），`format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", ..)`，月份写数字 |
+| P6 | 记账、挤掉、截断与丢掉 | **存储**：`limits` 与一把锁里的 `queue: VecDeque<Kept { entry: Arc<Entry>, cost: u64 }>`（由旧到新）、`kept`（队列里的账之和）、`reserved`（进行中的预留之和）与 `stored`、`evicted`、`dropped`、`truncated`。`used = kept + reserved`。<br>**一条的账** `cost(e)`：请求头与应答头每一行 `名字.len() + 值.len() + 32`（没有应答时 0）+ `url.len()` + 方法的长度 + 规则、每个策略、每条备注、`error` 的字节 + 两个正文 `data.len()` + `ENTRY_OVERHEAD`。<br>**`reserve(n)`**：`reserved + n > total` → 假，什么也不挤（队列空了也放不下）；否则从队头一条一条挤掉（`kept` 减它的账、`evicted` 加一）直到 `kept + reserved + n <= total`，`reserved += n`，真。<br>**`insert(entry, held)`**（`held` 是这一条已有的预留）：`reserved -= held`；`reserved + cost > total` → `dropped` 加一、假；否则同样从队头挤到放得下，推到队尾，`kept += cost`、`stored` 加一，两个正文有一个截断就 `truncated` 加一，真。<br>**`Pending`**：两个正文各一份 `{ chunks: Vec<Bytes>, stored, size, truncated }` 与 `held`。一块 `data` 进来：空的不理；`size += len`；已经截断的到此为止；`n = min(limits.body − stored, len)`；`n == 0` → `Limit`；`reserve(n)` 是假 → `Budget`；否则 `chunks.push(Bytes::copy_from_slice(&data[..n]))`（**抄，不切**：切出来的 `Bytes` 握着 hyper 整块的缓冲，账就不对了）、`stored += n`、`held += n`，`n < len` → `Limit`。<br>**`commit(make)`**：两个正文接成一份（只有一块的就是它；多块的接进一块恰好那么大的内存），交给 `make` 造条目，`insert(entry, held)`，然后 `held = 0`。**`Drop`**：`held > 0` 时锁住、`reserved -= held`。<br>**`put(entry)`** 是 `insert(entry, 0)`。<br>**读**：`sessions` 遍历队列按名字合计（`BTreeMap`）；`session`、`entry` 遍历队列（`entry` 按 `id` 找）；`clear` 去掉相应的、`kept` 减它们的账，四个数不动。锁只握到拿完 `Arc` |
+| P7 | 读出时解开（`decode` 拆开） | `rewrite/body.rs` 拆出两步，`decode` 改成调它们、消息逐字不变：<br>• `layers(encodings)`：照今天的读法交回各项的名字（字段的次序，去掉空的与 `identity`）；某一行不是可见的 ASCII → `Err(Undo::Unsupported(None))`。<br>• `undo(layers, body, limit)`：从最后一个往前逐层解，每层的做法照今天（空的 `gzip` / `x-gzip` / `deflate` 一层解成空的、`take(limit + 1)`）；不认识的名字：是 token → `Unsupported(Some(名字))`、否则 `Unsupported(None)`；解不开 → `Corrupt(名字)`；超过 → `Over`。<br>• `decode` = `undo(&layers(e)?, body, limit.bytes)`，`Undo` 照今天的四句转成文字（`Over` 用 `limit.text`）。<br>**`Body::decoded(headers, limit)`**：取 `headers` 里全部的 `content-encoding` 行 → `layers`（`Err` 照转）；没有名字 → `Ok(None)`（截断的也是）；截断的 → `Err(Truncated)`；`undo(.., &self.data, limit)`：`Ok(b)` → `Ok(Some(b))`，`Unsupported(x)` → `Unsupported(x)`，`Corrupt(n)` → `Corrupt(n)`，`Over` → `TooLarge(limit)`。`NotDecoded` 的 `Display` 照抄原文 P7 |
+| P8 | `CaptureSlot`（订正设计：REJECT-DROP 的认法） | **状态**：`Arc<Mutex<Armed>>`，`Armed` 有 `handle: Arc<SessionHandle>`、`session`、`started: SystemTime`（`SystemTime::now()` 减去句柄的 `elapsed()`，减不了就是现在）、`pending: Option<Pending>`（存进去之后是 `None`）、`request: Option<Head>`（最后一次取样）、`reused`、`upgrading`、`finished: Option<(Duration, SessionOutcome)>`、`answer: Waiting \| Nothing \| Given { head: ResponseHead, done: Option<Duration> }`。<br>**`arm(capture, handle, head)`**：`capture` 是 `None` 或已经 arm 过 → 什么也不做（`head` 不调）。否则建 `Armed`（`pending = Some(capture.begin())`、`request = Some(head())`），放进 `OnceLock`，**然后在任何锁之外** `handle.when_finished(回调)`——句柄可能已经结束（`settle`），那时回调就在这一句里跑。<br>**回调(h, outcome)**：锁住；`finished = Some((h.elapsed(), outcome.clone()))`；结局是 `Rejected(Drop)` 而 `answer` 还是 `Waiting` → `answer = Nothing`：REJECT-DROP 先结束记录、再停留，停留完才 `Err(Close)`，引擎里只有它这样结束而后没有应答（订正设计：第 6.4 节写"在停留之前告诉 `CaptureSlot`"，这里改成由回调认出，`answer` 一行不改）；`try_commit`。<br>**`leaving(head, reused)`**、**`upgrading()`**：锁住，写进去。**`RequestTap::chunk(data)`**：锁住，`pending` 还在就 `request_chunk(data)`。<br>**`answered(self, result, h2)`**：没有 arm → 原样交回。`Err(Close)` → 锁住，`Waiting` 改 `Nothing`，`try_commit`，交回 `Err(Close)`。`Ok(resp)` → 锁住；`pending` 已经没有了 → 原样交回；`head = ResponseHead { status, version: if h2 { HTTP_2 } else { resp.version() }, headers: resp.headers().clone() }`（M4-D28）；`upgrading` → 当场存进去：应答是这个头、应答正文空、结局 `Upgraded`、结束的那一刻是此刻的 `handle.elapsed()`，交回原样的 `resp`（不包）；否则 `answer = Given { head, done: None }`，放锁，交回 `resp.map(\|b\| CaptureBody { inner: b, tap: ResponseTap { .. } }.boxed())`。<br>**`Drop for CaptureSlot`**：arm 了而 `answer` 还是 `Waiting` → `Nothing`，`try_commit`（`handle` 的 future 被丢下：HTTP/2 上客户端在应答之前重置了流）。<br>**`try_commit`**：`pending` 在，`finished` 是 `Some((at, outcome))`，而且 `answer` 是 `Nothing`（应答 `None`、结束 = `at`）或 `Given { head, done: Some(d) }`（应答是 `head`、结束 = `max(at, d)`）→ 存进去，结局 `Completed` / `Rejected(k)` / `Failed` 照 `outcome`。<br>**存进去**：`pending.take().commit(\|请求正文, 应答正文\| Entry { .. })`：`id`、`session`、`started`、`request`（`take`）；`timings`：`connect = handle.connect_time()`、`wait = handle.first_byte_time()`、`dns = handle.trail().dns()`、两者都有时 `receive = 结束.saturating_sub(connect + wait)`、`total = 结束`、`reused`；`remote = handle.trail().peer()`；`error = handle.error()`、没有时是 `Failed(m)` 的 `m`；`rule`、`policy_chain`、`notes` 从句柄读。<br>**`CaptureBody { inner, tap }`**（字段的次序就是丢下的次序：先丢下 `inner`——`Tail`、`LocalFile` 与守卫在那时结束记录——再丢下 `tap`；`CaptureBody` 自己**不**实现 `Drop`）：`poll_frame` 先 poll `inner`（不握锁）：数据帧 → `tap.chunk(data)`，之后 `inner.is_end_stream()` 为真 → `tap.done()`；`None` 或错误 → `tap.done()`；帧与错误原样交出。`is_end_stream`、`size_hint` 照 `inner`。`ResponseTap::chunk` 锁住、`response_chunk`；`done()` 只做一次：锁住，`Given { done: None }` 改成 `Some(handle.elapsed())`，`try_commit`；`Drop for ResponseTap` 调 `done()`。<br>**锁**：次序是 `Armed` → 存储；握着 `Armed` 的锁时不 poll 正文、不调 `finish`、不调 `when_finished`，所以回调（在 `finish` 里跑）与 `done`（在 poll 与 `Drop` 里跑）都不会重入。<br>**环**：回调握着 `Arc<Mutex<Armed>>`，`Armed` 握着 `Arc<SessionHandle>`，句柄的 `on_finish` 里握着回调：句柄结束之前这是一个环。句柄结束时 `finish` 取走并调掉钩子，环就断了；引擎里每个请求的句柄都会结束（`Guard` 的 `Drop`、`settle`、`answer`），所以回调握强引用、不用 `Weak`——用 `Weak` 的话，槽与应答正文都先丢下、句柄后结束时条目就丢了。任务 3 的用例 8、9 的 `used == 0` 钉住它不漏 |
+| P9 | 引擎里的位置 | ① 今天的 `Requests::handle` 的函数体改名为私有的 `serve(&self, req, slot: &CaptureSlot)`；新的 `pub async fn handle(&self, req)`：`let slot = CaptureSlot::new(); let answer = self.serve(req, &slot).await; slot.answered(answer, self.shared.conn.h2)`。签名不变；`serve` 里早退的地方（HTTP/2 的 `CONNECT`、监听器的 400）没有 arm，原样交回。<br>② 第 3 步 `route(..).await` 之后、`token` 的检查之前：取 `routed` 两个变体里 `capture` 的克隆，`slot.arm(capture, &handle, \|\| Head { method, url: captured_url(handle.session().url.as_deref(), &req), version: req.version(), headers })`，`headers` 是 `req.headers()` 的克隆再 `headers::strip(&mut h, Keep { upgrade: wants_upgrade(&req), proxy_authorization: sniffed })`（`sniffed` 照 `self.shared.conn.entry == Entry::Sniffed`，挪到这里先算）。同一处记下 `let client_version = req.version();`。解出 `Routed` 的两处 `match` 加上 `..`。<br>③ `fn captured_url<B>(url: Option<&str>, req: &Request<B>) -> String`：`url` 有就是它；没有（`CONNECT`）是 `req.uri().authority()` 的文字，再没有是空串（M4-D26）。<br>④ `let mut reused = false;`，`borrowed_h2` 是 `Some` 的那一支与 `pool.take` 交回 `Some` 的那一支各置真；`redial` 那一支照旧假。借来的连接没有接下请求、在新拨的连接上再发一次的（`resend`）不改 `reused`：`connect_time` 也是借的那一刻（`connected` 是 `OnceLock`，只有第一次的算），两者一致；任务 9a 登记。<br>⑤ **第 1 个取样点**：第 5 步 `headers::strip(req.headers_mut(), Keep { upgrade, proxy_authorization: sniffed && !retargeted })` 之后、`if !sniffed {` 之前：`slot.armed()` 时 `slot.leaving(Head { method: req.method().clone(), url: captured_url(url.as_deref(), &req), version: client_version, headers: req.headers().clone() }, reused)`。`absolute_form` 加的 `Proxy-Authorization`、补的 `Transfer-Encoding`、`fit` 与 `write_host` 都在它之后。<br>⑥ `Idle::new` 多一个参数 `tap: Option<RequestTap>`（调用处给 `slot.request_tap()`），存成字段；`poll_frame` 里数据帧计数的那一句旁边 `if let Some(tap) = &this.tap { tap.chunk(data) }`；trailer 不抄。<br>⑦ 升级那一支 `return Ok(self.promote(..))` 之前 `slot.upgrading();`。<br>⑧ 别处一行不改：`answer`、`failed`、`page`、`map_local`、`timed_out`、`Tail`、`LocalFile`、`Guard`。<br>⑨ `engine.rs` 里连接的入口也叫 `Entry`、`http_body::Body` 也叫 `Body`：抓包的类型一律写 `capture::Entry`、`capture::Body`，不 `use` 进来 |
+| P10 | `rurge-engine` | **存储**：`EngineShared.capture: Arc<CaptureStore>`，文档注释"The capture store (phase 4 M4 design 4.1): one for the engine's lifetime, kept across reloads; `rurge run` replaces it with one of the limits its options give."；`new` 给 `CaptureStore::new(Limits::default())`。<br>**开关**：`Engine` 多 `capture_on: AtomicBool`（与 `rewrite_on` 并排，初值 `false`：缺省关，设计第 5.1 节）；`capture_on()`；`set_capture(on)` 照 `set_rewrite`，写 `s.features.capture = Some(on)`；`restore_switches` 加 `features.capture`；`capture()` 交回 `self.shared.capture.clone()`。文档注释照 `rewrite_on` 的写法。<br>**`always_capture(rules, index)`**：在 `rule_raw` 旁边，同样二分查找；`params.always_capture` 去掉首尾空白，空的是 `None`，否则 `Arc::from`。<br>**`choose_policy_with`**：`handle.set_rule(rule_raw(..))` 那一句之后，`always_capture(&rt.rules, i)` 是 `Some(name)` → `handle.set_capture_session(name)`。早退的三处（`external`、直连、全局代理）不填：没有命中的那一行（设计第 5.2 节）。<br>**`capture_for(handle)`**：`handle.capture_session()`，没有而 `capture_on()` 为真时是 `DEFAULT_SESSION`，都没有是 `None`；`store` 是 `self.shared.capture.clone()`。<br>**`ConnUpstreams::route`**：两个分支都 `capture: self.engine.capture_for(handle)`；`Refused` 那一支在 `settle` 之后取（REJECT 一族照样带着，设计第 5.3 节）。<br>**`lib.rs`**：`pub use rurge_http::capture;`，注释照 `ApiTls` 那一行写"for `rurge-api`" |
+| P11 | API 的五个端点与开关 | **路由**（`lib.rs`，放在 `/v1/rurge/http` 之后）：`/v1/rurge/capture`（`GET`）、`/v1/rurge/capture/sessions`（`GET`）、`/v1/rurge/capture/sessions/{name}`（`GET`）、`/v1/rurge/capture/entries/{id}`（`GET`）、`/v1/rurge/capture/clear`（`POST`）；任务 6 加 `/v1/rurge/capture/sessions/{name}/har`。鉴权与错误体照阶段 1。<br>**`/v1/features/capture`**：`get_feature` 给 `app.engine.capture_on()`；`set_feature` 调 `set_capture(..).await`、一行 INFO（原文 P11，字段 `enabled`）。<br>**`GET /v1/rurge/capture`**：设计第 7.1 节的形状，取自 `status()`。<br>**`GET …/sessions`**：设计第 7.2 节，取自 `sessions()`。<br>**`GET …/sessions/{name}`**：`Path<String>`（axum 已解开百分号）；`limit` 照 `requests.rs` 的 `recent`（缺省 `DEFAULT_LIMIT`、`0` 答 400）；`session(name)` 是空的 → 404；由新到旧取 `limit` 条。摘要的键照设计第 7.3 节：`id`、`startedMs`、`method`、`url`、`status`（没有应答 `null`）、`outcome`（`completed` / `upgraded` / `rejected` / `failed`）、`requestBodySize`、`responseBodySize`（`size`）、`truncated`（两个正文有一个截断）、`totalMs`。<br>**`GET …/entries/{id}`**：`Path<String>` 读成 `u64`，读不了 → 400；`entry(id)` 没有 → 404。键照设计第 7.5 节的例子：`id`、`session`、`startedMs`、`request {method, url, version, headers, body}`、`response`（`null` 或 `{status, version, headers, body}`）、`timings {connectMs, dnsMs, waitMs, receiveMs, totalMs, reused}`（`as_millis()` 向下取整，没有是 `null`）、`remoteAddr`（`SocketAddr` 的文字）、`outcome`、`rejectKind`（`RejectKind::name()`，不是拒绝的 `null`）、`error`、`rule`、`policy`、`notes`。`version` 是 `format!("{:?}", v)`；`headers` 是 `[{name, value}]`，照 `HeaderMap::iter` 的次序，值 `String::from_utf8_lossy`，名字（小写）是 `authorization`、`proxy-authorization`、`cookie`、`set-cookie` 的值写 `***`；`body` 是 `{size, stored, truncated, base64}`（`truncated` 是 `null` / `"limit"` / `"budget"`，`base64` 是 `STANDARD` 编码的 `data`）。<br>**`?decode=`**：只认 `true` 与 `false`（缺省 `false`），别的 → 400。`true` 时两个 `body` 各多 `decoded` 与 `notDecoded`：`body.decoded(这一侧的头, limits.body)` 是 `Ok(Some(b))` → `decoded: true`、`base64` 改成 `b` 的、`notDecoded: null`；`Ok(None)` → `false`、`null`；`Err(r)` → `false`、`r.to_string()`。没有应答的 `response` 照旧 `null`。<br>**`POST …/clear`**：请求体读成 `Result<Bytes, BytesRejection>`（照 `profiles.rs` 的 `requested_name`）：读不了 → 400；全是空白 → 全部；是 JSON 对象 → `session` 没有是全部、是字符串是那个会话、别的 → 400；不是对象 → 400；消息都是原文 P11 的 `BAD_BODY`。应答 `{"cleared":N}`。<br>**`features.rs`** 的模块注释加上"from phase 4 / M4a `capture`" |
+| P12 | HAR | **`timings(t)`**：`reach = t.connect.unwrap_or(t.total)`；`d = t.dns.map(\|x\| x.min(reach))`；`dd = d.unwrap_or(0)`；各项（`ms(x)` 是 `x.as_millis() as i64`）：<br>• `blocked`：`reused` 而 `connect` 是 `Some(c)` → `ms(c − dd)`，否则 `-1`；<br>• `dns`：`d` 的 `ms`，没有是 `-1`；<br>• `connect`：不 `reused` 而 `connect` 是 `Some(c)` → `ms(c − dd)`，否则 `-1`；<br>• `ssl`：`-1`；`send`：`0`；<br>• `wait`：`connect` 与 `wait` 都有 → `ms(wait)`；只有 `connect`（`c`）→ `ms(total − c)`；没有 `connect` → `ms(total − dd)`；<br>• `receive`：`ms(receive)`，没有是 `0`；<br>• `time`：不是 `-1` 的各项之和。减法都用 `saturating_sub`。<br>**一条**（`entry(e, body_limit)`）照设计第 8.2 节的表，补全：`request` 是 `{method, url, httpVersion, cookies: [], headers, queryString, headersSize: -1, bodySize, postData?}`；`queryString`：方法是 `CONNECT` 的 `[]`，否则 `url::Url::parse(url)` 的 `query_pairs()`，读不了的 `[]`；`postData` 只在 `request_body.size > 0` 时有：`{mimeType, text}`，正文没有截断、请求没有 `content-encoding`、是 UTF-8 时 `text` 照写，否则 `text` 是 Base64 并加 `"_encoding":"base64"`，截断的加 `comment`。`response` 是 `{status, statusText, httpVersion, cookies: [], headers, content, redirectURL, headersSize: -1, bodySize}`；`content`：`decoded(应答的头, body_limit)` 是 `Ok(Some(b))` → `size = b.len()`、`compression = size − bodySize`（可以是负的）、文字是 `b`；`Ok(None)` → `size = data.len()`、文字是 `data`；`Err(r)` → `size = data.len()`、文字是 `data`、`comment` 加 `not decoded: {r}`；文字是 UTF-8 照写，否则 Base64 加 `"encoding":"base64"`；截断的 `comment` 加 `{stored} of {size} bytes stored`（截断在前，两句以 `"; "` 接）；`mimeType` 取 `content-type`（没有是空串）。没有应答：`status 0`、`statusText ""`、`httpVersion ""`、`headers []`、`content {"size":0,"mimeType":""}`、`redirectURL ""`、`bodySize -1`。另有 `startedDateTime`、`time`、`cache: {}`、`timings`、`serverIPAddress`（`remote` 的 IP，没有时不写这个键）、`_rurgeId`、`_session`、`_outcome`、`_rejectKind`（没有时不写）、`_error`（没有时不写）、`_notes`。头与遮住同 P11。<br>**`document(entries, body_limit)`**：一条流：先 `{"log":{"version":"1.2","creator":{"name":"rurge","version":"<CARGO_PKG_VERSION>"},"pages":[],"entries":[`，再每条一块（第二条起前面带 `,`，在 poll 到它时才序列化），最后 `]}}`；`Body::from_stream(futures_util::stream::iter(..))`。处理函数先取 `session(name)` 的快照（空的 404），交 `([(CONTENT_TYPE, "application/json")], document(..))` |
+| P13 | 命令行 | **参数**（`RunArgs`，紧跟 `request_log_size`）：`capture_size: Option<u64>`（`#[arg(long, env = "RURGE_CAPTURE_SIZE", value_name = "SIZE", value_parser = parse_size)]`）与 `capture_body_size`（`RURGE_CAPTURE_BODY_SIZE`），帮助照抄原文 P13。<br>**`parse_size(s)`**：最后一个字是 `k`/`m`/`g`（ASCII 不分大小写）时去掉它、乘数是 1024、1024²、1024³，否则乘数 1；余下必须是一个以上的 ASCII 十进制数字（没有符号、空白、小数点、前缀）；数字读不成 `u64` 或乘积溢出 → "too large"；别的 → "invalid size"（原文 P13，反引号里是 `s` 的原样）。<br>**`capture_limits(size, body)`**：`total = size.unwrap_or(DEFAULT_TOTAL)`；`Limits::new(total, body.unwrap_or(DEFAULT_BODY))`；`body` 是 `Some(b)` 且 `b > total` 时第二项是 WARN 那一句。<br>**启动**：`EngineShared::new(..)` 之后、`empty_group` 那几句旁边：`let (limits, lowered) = capture_limits(args.capture_size, args.capture_body_size); if let Some(w) = lowered { tracing::warn!("{w}"); } shared.capture = CaptureStore::new(limits);`。只有 `rurge run` 有这两个参数。WARN 与别的启动告警一样写在标准输出上、排在 `api on` 之前（没有告警时 `api on` 是第三行，见 `run.rs` 起 API 那一段的注释） |
+| P14 | 端到端的做法（订正设计：用例的文件） | 设计第 12 节第 3 条写的是 `tests/http.rs` 与 `tests/mitm.rs`；本计划改成新文件 `crates/rurge-engine/tests/capture.rs`（`mod common;`）：那两个文件已经很长，抓包的用例集中在一处。要的夹具（`RecordingProxy`、`harness_mitm`、`decrypted_get`、`mitm_section`）从 `tests/rewrite.rs` 照抄，注释写它从哪里来、为什么不挪进 `common`（别的文件也在用它们的原样）。<br>• Profile 照 `common::Profile`；示例主机 `example.test` 经 `[Host]` 钉到 `127.0.0.1`；源站是 `TestServer`，URL 带它的端口；经 HTTP 监听器以 `plain_get` 问。<br>• 存进去用 `wait_until`（`common` 的，有时限）等 `h.engine.capture().session(..)` 不空。<br>• "什么也不存"的断言：记录结束之后固定等待 200 ms，注释写它等的是什么、余量多大。<br>• 解密：`TlsFixture`，两张 CA 不同名（同名的 CA 会让握手报 `BadSignature`）。<br>• 带口令的监听器、带凭据的上游代理照 `tests/pipeline.rs` 与 `RecordingProxy` 的写法；凭据用用例里的常量，不用真的口令 |
+| P15 | 量内存（订正设计） | 设计第 4.5 节写"各自单独以 release 运行"；本计划改成**调试构建、`rurge-http` 的库内用例**：`--release` 要把整个工作区另编一份（`target/` 的盘位，见「门禁与这台开发机」）；条目、`HeaderMap`、`Bytes` 在两种构建里分配的大小相同，量的是装满与基线两次运行的差。库内的用例用得上 `Pending`，走的是真实的按块记账。<br>**文件**：`crates/rurge-http/src/capture/memory.rs`，`capture/mod.rs` 末尾 `#[cfg(test)] mod memory;`；开头的模块注释照 `crates/rurge-rules/tests/memory.rs` 写这是量、不是门，与跑的命令。`peak_resident_bytes`、`parse_count`、`parse_vm_hwm` 与它们的用例从 `crates/rurge-tun/src/tests/bench/peak.rs` 照抄，注释写来处。<br>**`a_full_store_at_the_default_limits`**（`#[ignore]`）：`Limits::default()` 的存储；条目像真实的页面请求：请求头与应答头各 14 行（名字约 12 字节、值约 40 字节）、URL 约 80 字节、一条备注、请求正文空、应答正文 4 KiB（四块，每块 1 KiB）；每 1024 条里有一条 6 MiB 的应答正文（64 KiB 一块，截断在 5 MiB）。经 `Capture::begin`、`response_chunk`、`commit` 存，直到 `evicted` 超过已存条数的十分之一。打印 `status()` 的各个数与 `peak_resident_bytes()`。<br>**`an_empty_store_is_the_baseline`**（`#[ignore]`）：只建一份空的存储，打印峰值。<br>**跑法**：`cargo test -j 8 --workspace --lib -- capture::memory::<名字> --ignored --exact --nocapture`，两条各单独跑一次。<br>**判断**：多出的 = 装满的峰值 − 基线的峰值；比值 = 多出的 / `limits.total`。比值超过 1.25 时把 `ENTRY_OVERHEAD` 调到使记的账接近实际（新值 ≈ 512 + (多出的 − total) / 存着的条数，取整到 64 的倍数），重跑装满的那一条一次；不超过就不改。缺省的上限不因此改（M4-D7）。两次的数、比值与决定写进修正记录，任务 9a 写进 `docs/api/phase4.md` |
+| P16 | 现有的用例 | 见下面的表。表里"预计照过"的若红，停下报告，不改期望 |
+| P17 | 收尾文档的清单 | 见任务 9a、9b。兼容性清单登记设计第 11 节第 1 ～ 5、9、10 条与本计划的三处：条目的 `error` 与记录同一句（P5）；REJECT-DROP 的条目在记录结束时存进去（P8，同设计 M4-D29）；量内存在调试构建里（P15） |
+
+### 表后的原文（照抄）
+
+P4、P7、P11、P12、P13 要照抄的文字含反引号与引号，放在这里。每个代码块里的文字就是要的那一串，没有为 Markdown 加的转义；`{…}` 是要填的值。
+
+**P4：`W0012` 的消息（`codes::W_INVALID_VALUE`）**
+
+```text
+`always-capture` needs a capture session name; the parameter is ignored
+```
+
+**P7：`NotDecoded` 的 `Display`**
+
+```text
+Truncated              the body was truncated
+Unsupported(Some(名字)) content-encoding {名字} is not supported
+Unsupported(None)      the content-encoding is not supported
+Corrupt(名字)           the body cannot be decoded as {名字}
+TooLarge(上限)          the decoded body is over {上限} bytes
+```
+
+**P11：API 的日志与错误**
+
+```text
+INFO（字段 enabled）
+capture switched via http-api
+
+404
+unknown capture session `{名字}`
+unknown capture entry {id}
+
+400
+entry id must be a number
+decode must be true or false
+limit must be at least 1
+the body must be a JSON object; "session", when given, must be a string
+```
+
+**P12：HAR 的 `comment`**
+
+```text
+{存下的字节数} of {见过的字节数} bytes stored
+not decoded: {NotDecoded 的 Display}
+```
+
+两句都有时以 `; ` 接起来，截断的那一句在前。
+
+**P13：命令行**
+
+```text
+--capture-size 的帮助
+Keep at most this much of the captured requests in memory: bytes, or a number with k, m or g (default 100m)
+
+--capture-body-size 的帮助
+Keep at most this much of each captured body (default 5m)
+
+parse_size 的两种错误
+invalid size `{写的}`: expected a number of bytes, optionally followed by k, m or g
+size `{写的}` is too large
+
+启动时的 WARN
+the capture body size ({单条} bytes) is larger than the capture size; lowered to {总量} bytes
+```
+
+### P16 的表：要改的、要留意的现有用例
+
+| 用例 | 为什么 | 任务 | 预计 |
+| ---- | ------ | ---- | ---- |
+| `crates/rurge-inbound/src/session.rs` 的现有用例 | 多一个字段、两个方法 | 1 | 照过 |
+| `crates/rurge-config` 的 `config.rs` 里断言 `W0003` 的用例与 `rule.rs` 里 `always_capture = Some("debug-1")` 的那一条 | 只加 `W0012` | 1 | 照过 |
+| 语料库快照 `corpus__corpus__kitchen-sink.snap` | `always-capture=debug` 不是空的 | 1 | 照过 |
+| `crates/rurge-config/src/diagnostic.rs` 的 `every_code_is_decided_once` | 不加新码 | 1 | 照过 |
+| `crates/rurge-http/src/rewrite/body.rs` 里 `decode` 的用例 | 拆成两步、消息不变 | 2 | 照过 |
+| `crates/rurge-http/src/engine.rs` 测试模块的 `Fake::route` | `Routed` 多 `capture` | 3 | 改：只补字段（`Fake` 多一个格子） |
+| `crates/rurge-http/src/engine.rs` 测试模块的其余全部 | 外面多一层 `CaptureSlot`；没有 `capture` 时不 arm、不包 | 3 | 照过 |
+| `crates/rurge-engine/src/http.rs` 的 `ConnUpstreams::route` | `Routed` 多 `capture` | 3、4 | 改：任务 3 补 `None`，任务 4 换成 `capture_for` |
+| `crates/rurge-engine/src/state.rs` 的用例 | `features.capture` 本来就有 | 4 | 照过 |
+| `crates/rurge-engine/tests/` 的 `http.rs`、`mitm.rs`、`rewrite.rs`、`sniff.rs`、`pipeline.rs` 与其余 | 开关缺省关 | 3 ～ 8 | 照过 |
+| `crates/rurge-api/tests/api.rs` 的 `features_collections_stop_and_unknown_paths` | `capture` 生效了，它拿 `capture` 当"没有生效的开关" | 5 | 改：换成 `scripting`；说明"只有哪几个生效"的文字加上 `capture` |
+| `crates/rurge-api/tests/api.rs` 的其余 | 只加端点 | 5、6 | 照过 |
+| `crates/rurge/tests/cli.rs` 的 `run` 模块的其余 | 多两个参数 | 7 | 照过 |
+| `crates/rurge/tests/sockets.rs` 的扫描用例 | 不建套接字 | 全部 | 照过 |
+| `crates/rurge-platform/tests/unsafe_functions.rs` | 不加放开的函数 | 全部 | 照过 |
+| `crates/rurge-config/tests/secrets.rs` | 不加带凭据的配置写法 | 全部 | 照过 |
+
+---
+
+## 执行期修正记录
+
+下面写"执行者的裁定"的，是 Pi 在设计与计划的原则下定的；写"协调者的裁定"的，是协调的会话代项目所有者定的。项目所有者都可以改。计划的正文不改：正文里说得不对的地方，以这张表的行为准。
+
+| # | 任务 | 内容 | 提交 |
+| - | ---- | ---- | ---- |
+
+## 延后事项
+
+| # | 事项 | 去向 |
+| - | ---- | ---- |

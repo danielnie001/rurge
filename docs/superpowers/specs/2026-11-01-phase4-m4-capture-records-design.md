@@ -573,3 +573,19 @@ pub enum Routed<R, K> {
 ## 18. 计划与执行期的订正
 
 （写计划与执行时在这里接着写。）
+
+写计划与执行时对本文正文的改动记在这里，一条一段：改了正文哪一处、以哪一处为准。正文不逐处改，读正文之前先读这一节。
+
+写 M4a 计划时（`docs/superpowers/plans/2026-11-01-phase4-m4a-capture-plan.md`，对着 `a6e78ad` 核对）：
+
+1. 第 2 节 M4a 的任务表是任务 0 ～ 9；计划拆成任务 0 ～ 8、9a、9b，次序有两处不同：本文的任务 6（API 的端点）、7（HAR）是计划的任务 5、6，本文的任务 5（可执行文件）是计划的任务 7——命令行的用例要经 API 读上限、取 HAR；本文的任务 9 分成 9a（手工清单、`docs/api/phase4.md`、`docs/testing.md`）与 9b（其余的收尾文档）。第 12 节第 3 条的端到端用例分在计划的任务 4 与任务 8。以计划 P1 为准。
+
+2. 第 3 节与 M4-D2"`rurge-api` 新增三条正式依赖……`time`（开 `formatting`）" → 只加 `base64` 与 `futures-util`，不加 `time`：HAR 的 `startedDateTime` 由 `rurge-http` 的 `Entry::started_rfc3339()` 写（`rurge-http` 本来就依赖 `time`，用 `OffsetDateTime::from(SystemTime)` 的取值方法拼成 `YYYY-MM-DDTHH:MM:SS.mmmZ`，不开 `formatting`）。另有：`rurge-http` 加一个 `testing` 特性（只给别的 crate 的用例存进自己造的条目），`rurge-api` 的开发依赖开它。`Cargo.lock` 的包数照旧不变。以计划 P2 为准。
+
+3. 第 3 节的接口改三处：`Outcome::Failed` 不带文字，`Entry` 多 `error: Option<String>`（取自记录的 `error`，没有时是失败的消息，同 `observe.rs` 的 `record_of`：被拒绝的请求也可能有说明）；`Body::decoded` 交回 `Result<Option<Bytes>, NotDecoded>`（`Ok(None)` 是没有要解的编码）；另有 `Status`、`SessionSummary`、`NotDecoded`、`ENTRY_OVERHEAD`、`Body::empty`、`Entry::started_ms` / `started_rfc3339`、`Capture::begin` 与 crate 里的 `Pending`、只在用例里的 `CaptureStore::put`。第 6.5 节"`Failed(消息)` 取自记录的结局"随之读作"结局是 `Failed`，说明在 `error`"。以计划 P5 为准。
+
+4. 第 6.4 节第 3 条与 M4-D29"`REJECT-DROP` 在停留之前告诉 `CaptureSlot` 这个请求没有应答" → 由 `CaptureSlot` 在 `when_finished` 的回调里认出：结局是 `Rejected(Drop)` 而还没有应答的，就是没有应答（引擎里只有它先结束记录、停留之后才 `Err(Close)`）；`answer` 一行不改。条目存进去的时刻与 `total` 照旧：记录结束时，不含停留。以计划 P8 为准。
+
+5. 第 12 节第 3 条"`rurge-engine` 的 `tests/http.rs` 与 `tests/mitm.rs`" → 新文件 `crates/rurge-engine/tests/capture.rs`，要的夹具从 `tests/rewrite.rs` 照抄。以计划 P14 为准。
+
+6. 第 4.5 节"各自单独以 release 运行" → 调试构建、`rurge-http` 的库内用例（`crates/rurge-http/src/capture/memory.rs`）：`--release` 要把整个工作区另编一份（这台开发机的 D: 盘被 `target/` 写满过）；条目、`HeaderMap`、`Bytes` 在两种构建里分配的大小相同，量的是装满与基线两次运行的差；库内的用例走真实的按块记账（`Pending`）。以计划 P15 为准。
