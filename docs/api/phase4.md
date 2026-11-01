@@ -649,7 +649,7 @@ enabled=false capture switched via http-api
 - **空的 `always-capture=`**：`rurge check` 给一条 `` `always-capture` needs a capture session name; the parameter is ignored ``（`W0012`），这一行**照常进规则**；引擎读它时去掉首尾空白、空的不填（`crates/rurge-engine/src/engine.rs` 的 `always_capture`）。不带 `=` 的 `always-capture` 照旧是未知参数 `W0003`。
 - **`FINAL` 上的照样起作用**（用例 `always_capture_on_final_captures_too`，`crates/rurge-engine/tests/capture.rs`）。
 - **命中 `RULE-SET`、`DOMAIN-SET` 与逻辑规则时**，读的是那一行顶层规则在 `[Rule]` 里的参数（`decision.matched` 就是那一行的下标）；规则集文件里的行上写的 `always-capture` **不读**（设计第 5.2 节；任务 0 的核对 V4）。
-- **只在求规则时**：出站模式是直连或全局代理、或会话属于 `external` 程序时，`choose_policy_with` 不求规则就定了策略，抓包的槽是空的——这些请求只有在开关开着时进 `default`，`always-capture` 不起作用（用例 `the_direct_mode_reads_no_rule_and_so_no_always_capture`）。
+- **只在求规则时**：出站模式是直连、出站模式是全局代理而全局策略设了且认得、或会话属于 `external` 程序时，`choose_policy_with` 不求规则就定了策略，抓包的槽是空的——这些请求只有在开关开着时进 `default`，`always-capture` 不起作用（用例 `the_direct_mode_reads_no_rule_and_so_no_always_capture`）。全局代理而全局策略没设或不认得时，`choose_policy_with` 告警一次（WARN `outbound mode is proxy but the global policy is unset or unknown; routing by rules`）、照规则走，`always-capture` 照读（`crates/rurge-engine/src/engine.rs`）。
 - **只抓本来就经 HTTP 引擎的请求**（M4-D8）：`always-capture` 不让一条连接进引擎、也不让 TLS 被解密；要抓原样转发的连接，另写 `force-http-engine-hosts` 或 `[MITM]`。
 
 抓不到的（设计第 5.4 节，一条也不存）：
@@ -796,7 +796,7 @@ the capture body size ({单条} bytes) is larger than the capture size; lowered 
 **`?decode=true`** 时两个 `body` 各多两个键：`decoded` 与 `notDecoded`（都在字母序里，`decoded` 在 `base64` 之后、`notDecoded` 在 `size` 之前）。三种情形（设计第 7.5 节，计划 P7）：
 
 - 解开了（`Ok(Some(b))`）：`decoded` 是 `true`、`base64` 换成解开之后的字节、`notDecoded` 是 `null`；
-- 没有要解的编码（`Ok(None)`）：`decoded` 是 `false`、`notDecoded` 是 `null`，`base64` 不动；被截断的正文也走这一支；
+- 没有要解的编码（`Ok(None)`）：`decoded` 是 `false`、`notDecoded` 是 `null`，`base64` 不动；没有要解的层的正文被截断了也走这一支，有要解的层而被截断的是下一支（`the body was truncated`）；
 - 解不开（`Err(r)`）：`decoded` 是 `false`、`notDecoded` 是 `r` 的那一句。
 
 `notDecoded` 的五句照 `NotDecoded` 的 `Display`：
@@ -809,7 +809,7 @@ the body cannot be decoded as {名字}
 the decoded body is over {上限} bytes
 ```
 
-`br` 与 `zstd` 是第二句（`content-encoding br is not supported`）；名字不是 RFC 9110 的 token、或那一行不是可见的 ASCII 时是第三句；解开之后超过单条上限时是第五句（上限是这一个进程的单条上限）。用例 `decode_undoes_gzip_and_says_why_it_cannot`、`what_cannot_be_decoded_says_why`。
+判的次序照 `Body::decoded`（`crates/rurge-http/src/capture/mod.rs`）：先读 `content-encoding` 的各层（空的项与 `identity` 不算层），那一行不是可见的 ASCII 时就是第三句；没有要解的层是上面的 `Ok(None)`；有层而正文被截断的，不管层叫什么都是第一句；其余的从最后一层往前解，第一个解不了的那一层定是哪一句——`br` 与 `zstd` 是第二句（`content-encoding br is not supported`），名字不是 RFC 9110 的 token 时是第三句，数据解不开是第四句，解开之后超过单条上限时是第五句（上限是这一个进程的单条上限）。用例 `decode_undoes_gzip_and_says_why_it_cannot`、`what_cannot_be_decoded_says_why`。
 
 ### `POST /v1/rurge/capture/clear`
 
