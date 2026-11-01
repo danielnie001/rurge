@@ -291,24 +291,58 @@ pub(crate) fn decode(
     body: &Bytes,
     limit: Limit,
 ) -> Result<Bytes, String> {
-    // what the last layer was written as, the innermost last: the field's
-    // order is the order the body was encoded in
+    layers(encodings)
+        .and_then(|names| undo(&names, body, limit.bytes))
+        .map_err(|why| reason(why, limit))
+}
+
+/// `why` as the note a skipped rewrite writes (`phase 4 M3 design 9.4`, the
+/// phase 4 / M4a plan's P7).
+fn reason(why: Undo, limit: Limit) -> String {
+    match why {
+        Undo::Unsupported(Some(name)) => format!("content-encoding {name} is not supported"),
+        Undo::Unsupported(None) => "the content-encoding is not supported".to_string(),
+        Undo::Corrupt(name) => format!("the body cannot be decoded as {name}"),
+        Undo::Over => format!("the decoded body is over {}", limit.text),
+    }
+}
+
+/// Why a body cannot be decoded, kept typed by the two steps `decode` is made
+/// of (`phase 4 M3 design 9.4`, the phase 4 / M4a plan's P7): a captured body
+/// is reported with the same reasons a note is written with.
+pub(crate) enum Undo {
+    /// A layer nobody supports, named when its name may be written down.
+    Unsupported(Option<String>),
+    /// A layer that does not decode: the name it was written as.
+    Corrupt(String),
+    /// The layers decode to more than the limit.
+    Over,
+}
+
+/// The `Content-Encoding` layers of a body, innermost last (`phase 4 M3
+/// design 9.4`, the phase 4 / M4a plan's P7): the field's order is the order
+/// the body was encoded in. Empty items and `identity` are no layer. A value
+/// that is not visible ASCII is a layer nobody supports, with no name.
+pub(crate) fn layers(encodings: &[HeaderValue]) -> Result<Vec<String>, Undo> {
     let mut names = Vec::new();
     for value in encodings {
-        let text = value
-            .to_str()
-            .map_err(|_| "the content-encoding is not supported".to_string())?;
+        let text = value.to_str().map_err(|_| Undo::Unsupported(None))?;
         for item in text.split(',') {
             let name = item.trim();
             if name.is_empty() || name.eq_ignore_ascii_case("identity") {
                 continue;
             }
-            names.push(name);
+            names.push(name.to_string());
         }
     }
+    Ok(names)
+}
 
+/// `layers` undone from the last one on, no layer decoding past `limit`
+/// bytes (`phase 4 M3 design 9.4`, the phase 4 / M4a plan's P7).
+pub(crate) fn undo(layers: &[String], body: &Bytes, limit: u64) -> Result<Bytes, Undo> {
     let mut data = body.clone();
-    for name in names.into_iter().rev() {
+    for name in layers.iter().rev() {
         let empty_known = data.is_empty()
             && (name.eq_ignore_ascii_case("gzip")
                 || name.eq_ignore_ascii_case("x-gzip")
@@ -317,7 +351,7 @@ pub(crate) fn decode(
             continue;
         }
         let mut out = Vec::new();
-        let bounded = limit.bytes.saturating_add(1);
+        let bounded = limit.saturating_add(1);
         let read = if name.eq_ignore_ascii_case("gzip") || name.eq_ignore_ascii_case("x-gzip") {
             MultiGzDecoder::new(&data[..])
                 .take(bounded)
@@ -333,13 +367,13 @@ pub(crate) fn decode(
                     .read_to_end(&mut out)
             }
         } else if is_token(name) {
-            return Err(format!("content-encoding {name} is not supported"));
+            return Err(Undo::Unsupported(Some(name.clone())));
         } else {
-            return Err("the content-encoding is not supported".to_string());
+            return Err(Undo::Unsupported(None));
         };
-        read.map_err(|_| format!("the body cannot be decoded as {name}"))?;
-        if out.len() as u64 > limit.bytes {
-            return Err(format!("the decoded body is over {}", limit.text));
+        read.map_err(|_| Undo::Corrupt(name.clone()))?;
+        if out.len() as u64 > limit {
+            return Err(Undo::Over);
         }
         data = Bytes::from(out);
     }
