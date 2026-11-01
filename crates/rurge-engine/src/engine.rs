@@ -1045,8 +1045,9 @@ impl Engine {
         if let Some(i) = decision.matched {
             handle.set_rule(rule_raw(&rt.rules, i));
             // the session the matched line names, if any (`phase 4 M4 design
-            // 5.2`): the three early returns above read no rule, so they
-            // name none and the entry goes to the default session
+            // 5.2`): the three early returns above read no rule, so they name
+            // none, and their requests are captured only while the switch is
+            // on, into the default session
             if let Some(name) = always_capture(&rt.rules, i) {
                 handle.set_capture_session(name);
             }

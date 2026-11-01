@@ -165,7 +165,9 @@ impl Upstreams for ConnUpstreams {
                         rewrite,
                         // the name the matched rule gave, else the default
                         // session while the switch is on (`phase 4 M4 design
-                        // 5.3`)
+                        // 5.3`); unlike the rewrite, a request routed to a
+                        // REJECT keeps it, so that the refusal its dial gives
+                        // it (`M3-D27`) is captured too
                         capture: self.engine.capture_for(handle),
                     }
                 }
@@ -174,9 +176,11 @@ impl Upstreams for ConnUpstreams {
                     Routed::Refused {
                         refusal: refused.into(),
                         pages,
-                        // the same capture a refusal keeps: REJECT answers
-                        // without a dial and is captured too, so the name is
-                        // read after `settle` (`phase 4 M4 design 5.3`)
+                        // the same for a request its routing refused (the
+                        // managed profile requires an update, a lookup
+                        // failed, an `evaluate-before-use` group had no
+                        // member pass): it is captured as it was answered
+                        // (`phase 4 M4 design 5.3`)
                         capture: self.engine.capture_for(handle),
                     }
                 }
