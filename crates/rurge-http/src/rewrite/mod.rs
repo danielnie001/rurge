@@ -37,7 +37,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 pub(crate) use body::{
-    Ahead, Buffer, REQUEST, RESPONSE, ReadAhead, read_ahead, request_buffer, response_buffer,
+    Ahead, Buffer, REQUEST, RESPONSE, ReadAhead, Undo, layers, read_ahead, request_buffer,
+    response_buffer, undo,
 };
 pub(crate) use header::{Headers, HostChange, write_back_host};
 pub(crate) use url::{UrlOutcome, candidates, redirect, retarget_request};

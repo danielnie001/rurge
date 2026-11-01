@@ -11,11 +11,18 @@
 //! `[URL Rewrite]` and `[Header Rewrite]` evaluated for one request, and the
 //! counts the API reports.
 //!
+//! M4a brings `capture`: what the engine kept of each request and response it
+//! served, held in memory up to two limits (`phase 4 M4 design 4`).
+//!
 //! The engine stays outside this crate: which policy a request takes, how
 //! its outbound connection is made and how an upgraded exchange is relayed
 //! are asked of it through `Upstreams`, so this crate never rules, never
 //! dials and never opens a socket of its own.
 
+// the engine uses `Capture::begin` and `Pending` from the phase 4 / M4a
+// plan's task 3 on; until then nothing outside this module calls them.
+#[allow(dead_code)]
+pub mod capture;
 pub mod engine;
 pub mod headers;
 pub mod mitm;
