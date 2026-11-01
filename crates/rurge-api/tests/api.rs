@@ -683,10 +683,10 @@ async fn the_global_policy_cannot_be_cleared_while_in_proxy_mode() {
 async fn features_collections_stop_and_unknown_paths() {
     let api = api().await;
     assert_eq!(
-        get(&api, "/v1/features/capture").await,
+        get(&api, "/v1/features/scripting").await,
         (200, json!({ "enabled": false }))
     );
-    let (status, _) = post(&api, "/v1/features/capture", json!({ "enabled": true })).await;
+    let (status, _) = post(&api, "/v1/features/scripting", json!({ "enabled": true })).await;
     assert_eq!(status, 501);
     assert_eq!(
         get(&api, "/v1/features/system_proxy").await,
@@ -706,9 +706,9 @@ async fn features_collections_stop_and_unknown_paths() {
         (200, json!({ "enabled": true }))
     );
     assert_eq!(
-        get(&api, "/v1/features/capture").await,
+        get(&api, "/v1/features/scripting").await,
         (200, json!({ "enabled": false })),
-        "only system_proxy, enhanced_mode, mitm and rewrite are live"
+        "only system_proxy, enhanced_mode, mitm, capture and rewrite are live"
     );
     assert_eq!(
         post(
@@ -798,6 +798,45 @@ async fn the_rewrite_switch_is_read_switched_and_kept() {
         get(&api, "/v1/features/rewrite").await,
         (200, json!({ "enabled": true }))
     );
+}
+
+/// The `capture` switch (phase 4 M4 design 5.1, 7.7): off unless `state.json`
+/// said otherwise, switched through the API, and what is switched is written
+/// to the second version of that file.
+#[tokio::test]
+async fn the_capture_switch_is_read_switched_and_kept() {
+    let api = api().await;
+    assert_eq!(
+        get(&api, "/v1/features/capture").await,
+        (200, json!({ "enabled": false }))
+    );
+    assert_eq!(
+        post(&api, "/v1/features/capture", json!({ "enabled": true })).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/features/capture").await,
+        (200, json!({ "enabled": true }))
+    );
+    let saved: Value = std::fs::read_to_string(&api.state_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(saved["version"], 2);
+    assert_eq!(saved["features"]["capture"], true);
+    assert_eq!(
+        post(&api, "/v1/features/capture", json!({ "enabled": false })).await,
+        (200, json!({}))
+    );
+    assert_eq!(
+        get(&api, "/v1/features/capture").await,
+        (200, json!({ "enabled": false }))
+    );
+    let saved: Value = std::fs::read_to_string(&api.state_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(Value::Null);
+    assert_eq!(saved["features"]["capture"], false);
 }
 
 /// The `mitm` switch (phase 4 M2 design 11.1): on unless `state.json` said
