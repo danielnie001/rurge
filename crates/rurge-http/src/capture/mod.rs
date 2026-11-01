@@ -38,12 +38,18 @@ pub const DEFAULT_TOTAL: u64 = 100 * 1024 * 1024;
 /// 5 MiB (`phase 4 M4 design 4.2`).
 pub const DEFAULT_BODY: u64 = 5 * 1024 * 1024;
 
-/// What each entry costs besides its headers, texts and bodies: the entry
-/// itself, a slot of the queue, a few `String` and `Vec` headers, and what the
-/// allocator adds around them (`phase 4 M4 design 4.3`). Measured by the
-/// phase 4 / M4a plan's task 8, in a debug build on one machine: a store of
-/// the default limits cost 1.52 times its total with 512, and 7168 is what
-/// brings that to about one (see the plan's execution record).
+/// What each entry costs besides what `cost` counts for its header lines,
+/// texts and bodies (`phase 4 M4 design 4.3`): the entry itself and its slot
+/// in the queue, the `String`s and `Vec`s it is made of, the two header maps'
+/// own tables and the allocation of every name and value in them, and what
+/// the allocator adds around each of these. Measured, not worked out: the
+/// phase 4 / M4a plan's task 8 filled a store of the default limits with
+/// entries shaped like a page's (fourteen header lines on each side, a 4 KiB
+/// body, one entry in 1024 cut at the body limit), in a debug build on one
+/// machine; with 512 it cost 1.52 times its total, and 7168 brings that to
+/// about one (the phase 4 / M4a plan's execution record row 76). Most of it is
+/// the header maps, so an entry with many more header lines than that still
+/// costs more than it is counted at.
 pub const ENTRY_OVERHEAD: u64 = 7168;
 
 /// What the store holds at most: in all, and of each body (`phase 4 M4

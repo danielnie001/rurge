@@ -1,10 +1,10 @@
 //! What a capture store costs in memory at its default limits. A measurement,
-//! not a gate: the two tests that fill a store are ignored, and the one that
-//! reads the peak is the guard of the reading itself. Each test that fills
-//! prints what the store holds and the peak working set of the process, taken
-//! from the operating system while the test runs (`PeakWorkingSet64` of
-//! `Get-Process` on Windows, `VmHWM` in `/proc/<pid>/status` on Linux), so
-//! every test is run alone, in a debug build:
+//! not a gate: the two tests that measure are ignored, and the one that reads
+//! the peak is the guard of the reading itself. Each of the two prints what
+//! its store holds and the peak working set of the process, taken from the
+//! operating system while the test runs (`PeakWorkingSet64` of `Get-Process`
+//! on Windows, `VmHWM` in `/proc/<pid>/status` on Linux), so every test is run
+//! alone, in a debug build:
 //!
 //! ```text
 //! cargo test -j 8 --workspace --lib -- capture::memory::<name> --ignored --exact --nocapture
@@ -15,7 +15,8 @@
 //! `Bytes` allocate the same bytes in either build — what is measured is the
 //! difference between a full store and an empty one.
 //!
-//! `an_empty_store_is_the_baseline` is the same process with no entry in it.
+//! `an_empty_store_is_the_baseline` is the same test binary run alone, with a
+//! store that holds nothing: what the process costs before any entry.
 //! Nothing here prints an entry's headers, URL or body: the numbers only.
 
 use super::{Capture, CaptureStore, Entry, Head, Limits, Outcome, ResponseHead, Timings};
@@ -170,8 +171,8 @@ fn parse_vm_hwm(status: &str) -> Option<u64> {
     Some(kib * 1024)
 }
 
-/// A store filled at the default limits until the oldest entries start to be
-/// evicted faster than one in ten, and the peak this process reached.
+/// A store at the default limits, filled until more than a tenth of the
+/// entries it stored have been evicted, and the peak this process reached.
 ///
 /// What to read: this test's peak less `an_empty_store_is_the_baseline`'s, and
 /// that difference against the store's total (`the phase 4 / M4a plan's P15`).
@@ -217,7 +218,8 @@ fn a_full_store_at_the_default_limits() {
     );
 }
 
-/// The same process with no entry in it (`the phase 4 / M4a plan's P15`).
+/// The same test binary, run alone, with a store that holds nothing (`the
+/// phase 4 / M4a plan's P15`).
 #[test]
 #[ignore = "a measurement, not a gate: run on its own, in a debug build"]
 fn an_empty_store_is_the_baseline() {

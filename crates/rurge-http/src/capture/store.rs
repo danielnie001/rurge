@@ -228,12 +228,17 @@ impl Pending {
     }
 
     /// Let `make` build the entry from the two bodies and store it; false
-    /// when the entry was dropped (`phase 4 M4 design 4.4`).
+    /// when the entry was dropped (`phase 4 M4 design 4.4`). The entry's two
+    /// header sets are copied before it goes in (`owned`).
     pub(crate) fn commit(mut self, make: impl FnOnce(Body, Body) -> Entry) -> bool {
         let held = std::mem::take(&mut self.held);
         let request = std::mem::replace(&mut self.request, Taking::empty()).finish();
         let response = std::mem::replace(&mut self.response, Taking::empty()).finish();
-        let entry = make(request, response);
+        let mut entry = make(request, response);
+        entry.request.headers = owned(&entry.request.headers);
+        if let Some(response) = &mut entry.response {
+            response.headers = owned(&response.headers);
+        }
         let mut inner = lock(&self.store.inner);
         inner.insert(entry, held, self.store.limits.total)
     }
@@ -420,6 +425,24 @@ fn head_cost(headers: &http::HeaderMap) -> u64 {
         .iter()
         .map(|(name, value)| name.as_str().len() as u64 + value.len() as u64 + 32)
         .sum()
+}
+
+/// `headers` with every value in an allocation of its own, in the same order
+/// and as sensitive as it was. hyper reads an HTTP/1 head into its
+/// connection's read buffer and hands every value out as a slice of it, so a
+/// value cloned into an entry would keep that whole buffer alive -- 8 KiB, and
+/// up to about 400 KiB after a big body -- while the store counts the value's
+/// own bytes only (`phase 4 M4 design 4.3`; the phase 4 / M4a plan's execution
+/// record row 80).
+fn owned(headers: &http::HeaderMap) -> http::HeaderMap {
+    let mut copy = http::HeaderMap::with_capacity(headers.keys_len());
+    for (name, value) in headers {
+        let mut fresh = http::HeaderValue::from_bytes(value.as_bytes())
+            .expect("the bytes of a header value are a header value");
+        fresh.set_sensitive(value.is_sensitive());
+        copy.append(name.clone(), fresh);
+    }
+    copy
 }
 
 /// Hold the store's lock; a panic elsewhere is no reason to stop capturing.
@@ -798,6 +821,85 @@ mod tests {
         assert_eq!(held.response_body.data, Bytes::from_static(b"the body"));
         assert_eq!(held.response_body.size, 8);
         assert_eq!(capture.store.status().used, 0);
+    }
+
+    /// A stored entry owns the bytes of its headers: a value that is a slice of
+    /// a larger buffer (hyper's are slices of its connection's read buffer)
+    /// leaves no reference to that buffer behind (`phase 4 M4 design 4.3`).
+    #[test]
+    fn the_stored_headers_hold_none_of_the_buffer_they_were_read_from() {
+        let buffer = Bytes::from(vec![b'v'; 8192]);
+        let mut secret = HeaderValue::from_maybe_shared(buffer.slice(0..10)).expect("a value");
+        secret.set_sensitive(true);
+        let plain_value = HeaderValue::from_maybe_shared(buffer.slice(100..110)).expect("a value");
+
+        let capture = capture(Limits::default());
+        let pending = capture.begin();
+        let lines = |headers: &HeaderMap| -> Vec<(String, String)> {
+            headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.to_string(),
+                        value.to_str().expect("a visible value").to_string(),
+                    )
+                })
+                .collect()
+        };
+        let mut before = None;
+        let stored = pending.commit(|_, response| {
+            let mut entry = made(1, "a", response);
+            entry.request.headers.insert("x-secret", secret.clone());
+            entry.request.headers.insert("x-plain", plain_value.clone());
+            entry
+                .response
+                .as_mut()
+                .expect("a response")
+                .headers
+                .insert("x-plain", plain_value.clone());
+            before = Some(lines(&entry.request.headers));
+            entry
+        });
+        assert!(stored);
+        drop(secret);
+        drop(plain_value);
+
+        assert!(
+            buffer.is_unique(),
+            "a header of the stored entry still points into the buffer it was read from"
+        );
+        let read_back = capture.store.session("a");
+        assert_eq!(read_back.len(), 1);
+        let entry = &read_back[0];
+        assert_eq!(Some(lines(&entry.request.headers)), before);
+        assert!(
+            entry
+                .request
+                .headers
+                .get("x-secret")
+                .expect("the sensitive value")
+                .is_sensitive()
+        );
+        assert!(
+            !entry
+                .request
+                .headers
+                .get("x-plain")
+                .expect("the plain value")
+                .is_sensitive()
+        );
+        assert_eq!(
+            entry
+                .response
+                .as_ref()
+                .expect("a response")
+                .headers
+                .get("x-plain")
+                .expect("the response's value")
+                .as_bytes(),
+            b"vvvvvvvvvv",
+            "the response's value is the one that was there"
+        );
     }
 
     /// An entry made elsewhere is costed and counted as one that came in
