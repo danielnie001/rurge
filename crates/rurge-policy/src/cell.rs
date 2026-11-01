@@ -215,6 +215,10 @@ impl Datagram for Relayed {
         self.carrier.peer_addr()
     }
 
+    fn far_end(&self) -> Option<SocketAddr> {
+        self.carrier.far_end()
+    }
+
     fn set_tos(&self, tos: u8) -> io::Result<()> {
         self.carrier.set_tos(tos)
     }
@@ -505,6 +509,7 @@ mod tests {
 
     impl Failing {
         const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 51820);
+        const FAR_END: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)), 1080);
     }
 
     impl Datagram for Failing {
@@ -524,6 +529,10 @@ mod tests {
 
         fn peer_addr(&self) -> Option<SocketAddr> {
             Some(Failing::PEER)
+        }
+
+        fn far_end(&self) -> Option<SocketAddr> {
+            Some(Failing::FAR_END)
         }
 
         fn set_tos(&self, tos: u8) -> io::Result<()> {
@@ -569,6 +578,19 @@ mod tests {
             (received.kind(), received.to_string().as_str()),
             (io::ErrorKind::ConnectionReset, "via U: reset by the relay")
         );
+    }
+
+    /// A relay that rides another carrier tells that carrier's far end, not
+    /// the target it stands for (`phase 4 M4 design 10.3`).
+    #[test]
+    fn a_relays_carrier_tells_the_far_end_of_the_carrier_under_it() {
+        let relayed = Relayed {
+            carrier: Box::new(Failing {
+                marked: Arc::new(Mutex::new(Vec::new())),
+            }),
+            via: "U".into(),
+        };
+        assert_eq!(relayed.far_end(), Some(Failing::FAR_END));
     }
 
     /// A carrier that cannot send until it is opened, and tells whoever
