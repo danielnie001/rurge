@@ -1273,10 +1273,19 @@ async fn a_sniff_that_waits_out_its_time_is_noted() {
 
     let (reply, s) = socks5_connect(h.socks(), "quiet.test", 443).await;
     assert_eq!(reply[1], 0x00, "{reply:?}");
-    // nothing is sent: the 300 ms wait runs out and the session is dialed. The
-    // fixed wait is the margin over it, and what it waits for is the dial that
-    // follows the wait — not for nothing to happen
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // nothing is sent: the wait runs out and the session is dialed. That dial is
+    // what is waited for, bounded as every wait here is: the handle, and with it
+    // the note, is made when the dial starts, so a session in the log means the
+    // sniff is over. Closing the client before that would let the sniff judge
+    // the end of the stream instead, which is another ending
+    wait_until("the session to be dialed after the wait", || {
+        h.engine
+            .request_log()
+            .active()
+            .iter()
+            .any(|record| record.dst == "quiet.test:443")
+    })
+    .await;
     drop(s);
 
     let record = the_records(&h, 1).await.remove(0);

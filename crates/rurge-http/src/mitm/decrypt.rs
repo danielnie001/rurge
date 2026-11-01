@@ -166,7 +166,8 @@ impl Mitm {
     }
 
     /// Whether this connection is decrypted (`phase 4 M2 design 7.1`), in the
-    /// order of the design: the list, the source, the name, the ALPN.
+    /// order the record's note needs: the list, the source, the name, the ALPN
+    /// (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's P6).
     ///
     /// The list comes before the source because the answer says why a session
     /// is passed through (`phase 4 M4 design 10.2`, the phase 4 / M4b plan's
@@ -544,10 +545,10 @@ mod tests {
     }
 
     /// The list is asked first, then the source, then whether the name can be
-    /// signed for, and the ALPN last (`phase 4 M2 design 7.1`): the list
-    /// comes first because a session it does not take must not be said to be
-    /// passed for its source (`phase 4 M4 design 10.2`, the phase 4 / M4b
-    /// plan's P6).
+    /// signed for, and the ALPN last (`phase 4 M4 design 10.2`, the phase 4 /
+    /// M4b plan's P6): the list comes first because a session it does not take
+    /// must not be said to be passed for its source. The conditions are the
+    /// ones of `phase 4 M2 design 7.1`.
     #[test]
     fn decides_lists_first_then_source_name_and_alpn() {
         let local = IpAddr::from(Ipv4Addr::LOCALHOST);
