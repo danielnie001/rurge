@@ -12,7 +12,7 @@ use rurge_net::connector::{
 };
 use rustls::RootCertStore;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -315,6 +315,10 @@ impl PacketSocket for Socks5Udp {
                 }
             }
         })
+    }
+
+    fn far_end(&self, _to: &Target) -> Option<SocketAddr> {
+        self.socket.far_end(&self.relay)
     }
 }
 

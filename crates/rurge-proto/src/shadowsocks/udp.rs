@@ -33,7 +33,7 @@ use rurge_config::HostName;
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedPacketSocket, PacketSocket, Target};
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -435,6 +435,10 @@ impl PacketSocket for SsUdp {
                 }
             }
         })
+    }
+
+    fn far_end(&self, _to: &Target) -> Option<SocketAddr> {
+        self.socket.far_end(&self.server)
     }
 }
 

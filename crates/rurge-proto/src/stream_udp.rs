@@ -9,6 +9,7 @@ use crate::addr::{AddrError, parse_socks_addr, socks_addr};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, PacketSocket, Target};
 use std::io;
+use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 
@@ -115,12 +116,20 @@ pub(crate) struct StreamUdp {
     framing: Framing,
     writer: Mutex<Writer>,
     reader: Mutex<ReadHalf<BoxedStream>>,
+    /// Where the stream's far end was when it was opened, if it was known:
+    /// the server, or the proxy the stream rides (`phase 4 M4 design 10.3`).
+    far_end: Option<SocketAddr>,
 }
 
 impl StreamUdp {
     /// `head` is the request head up to the target, which the first
-    /// datagram supplies.
-    pub(crate) fn new(stream: BoxedStream, framing: Framing, head: Vec<u8>) -> StreamUdp {
+    /// datagram supplies; `far_end` is where the stream leaves rurge.
+    pub(crate) fn new(
+        stream: BoxedStream,
+        framing: Framing,
+        head: Vec<u8>,
+        far_end: Option<SocketAddr>,
+    ) -> StreamUdp {
         let (reader, half) = tokio::io::split(stream);
         StreamUdp {
             framing,
@@ -129,6 +138,7 @@ impl StreamUdp {
                 head: Some(head),
             }),
             reader: Mutex::new(reader),
+            far_end,
         }
     }
 
@@ -224,6 +234,10 @@ impl PacketSocket for StreamUdp {
             }
         })
     }
+
+    fn far_end(&self, _to: &Target) -> Option<SocketAddr> {
+        self.far_end
+    }
 }
 
 #[cfg(test)]
@@ -236,7 +250,7 @@ mod tests {
     fn carrier() -> (StreamUdp, DuplexStream) {
         let (ours, theirs) = tokio::io::duplex(1 << 16);
         (
-            StreamUdp::new(Box::new(ours), Framing::Trojan, b"HEAD".to_vec()),
+            StreamUdp::new(Box::new(ours), Framing::Trojan, b"HEAD".to_vec(), None),
             theirs,
         )
     }
@@ -348,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn udp_over_tcp_has_its_own_address_types() {
         let (ours, mut server) = tokio::io::duplex(1 << 16);
-        let udp = StreamUdp::new(Box::new(ours), Framing::Uot, vec![0]);
+        let udp = StreamUdp::new(Box::new(ours), Framing::Uot, vec![0], None);
         udp.send_to(b"q", &Target::new(HostName::parse("1.2.3.4"), 53))
             .await
             .unwrap();

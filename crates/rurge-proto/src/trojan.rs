@@ -133,7 +133,13 @@ impl Outbound for TrojanOutbound {
             head.extend_from_slice(&self.hash);
             head.extend_from_slice(b"\r\n");
             head.push(UDP_ASSOCIATE);
-            Ok(Box::new(StreamUdp::new(stream, Framing::Trojan, head)) as BoxedPacketSocket)
+            // where the stream went, read while the trail is still followed:
+            // the server, or the proxy it rides
+            let far_end = rurge_net::trail::current().and_then(|trail| trail.peer());
+            Ok(
+                Box::new(StreamUdp::new(stream, Framing::Trojan, head, far_end))
+                    as BoxedPacketSocket,
+            )
         })
     }
 }

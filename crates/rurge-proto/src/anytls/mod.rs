@@ -195,7 +195,11 @@ impl Outbound for AnyTlsOutbound {
                 Err(_) => return Err(OutboundError::Timeout),
             };
             // `isConnect` false; the target comes with the first datagram
-            Ok(Box::new(StreamUdp::new(stream, Framing::Uot, vec![0])) as BoxedPacketSocket)
+            let far_end = rurge_net::trail::current().and_then(|trail| trail.peer());
+            Ok(
+                Box::new(StreamUdp::new(stream, Framing::Uot, vec![0], far_end))
+                    as BoxedPacketSocket,
+            )
         })
     }
 }

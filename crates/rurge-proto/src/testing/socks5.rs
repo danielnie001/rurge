@@ -53,6 +53,7 @@ pub struct FakeSocks5 {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<RecordedSocks5>>>,
     datagrams: Arc<Mutex<Vec<Target>>>,
+    relays: Arc<Mutex<Vec<SocketAddr>>>,
     _task: AbortOnDrop,
 }
 
@@ -79,10 +80,12 @@ async fn relay_udp(
     mut control: BoxedStream,
     script: &Socks5Script,
     datagrams: Arc<Mutex<Vec<Target>>>,
+    relays: Arc<Mutex<Vec<SocketAddr>>>,
 ) -> io::Result<()> {
     let relay = UdpSocket::bind("127.0.0.1:0").await?;
     let outside = UdpSocket::bind("127.0.0.1:0").await?;
     let port = relay.local_addr()?.port();
+    relays.lock().expect("relays").push(relay.local_addr()?);
     let mut bound = vec![1];
     bound.extend_from_slice(&if script.udp_unspecified {
         [0, 0, 0, 0]
@@ -170,6 +173,7 @@ async fn serve(
     script: Socks5Script,
     requests: Arc<Mutex<Vec<RecordedSocks5>>>,
     datagrams: Arc<Mutex<Vec<Target>>>,
+    relays: Arc<Mutex<Vec<SocketAddr>>>,
 ) -> io::Result<()> {
     let greeting = read_vec(&mut stream, 2).await?;
     let methods = read_vec(&mut stream, usize::from(greeting[1])).await?;
@@ -231,7 +235,7 @@ async fn serve(
         port,
     });
     if request[1] == 3 {
-        return relay_udp(stream, &script, datagrams).await;
+        return relay_udp(stream, &script, datagrams, relays).await;
     }
     tokio::time::sleep(script.delay).await;
     let bound: &[u8] = script.reply_bound.as_deref().unwrap_or(&DEFAULT_BOUND);
@@ -277,15 +281,21 @@ impl FakeSocks5 {
         let addr = listener.local_addr().expect("local addr");
         let requests: Arc<Mutex<Vec<RecordedSocks5>>> = Arc::default();
         let datagrams: Arc<Mutex<Vec<Target>>> = Arc::default();
-        let (log, udp_log) = (requests.clone(), datagrams.clone());
+        let relays: Arc<Mutex<Vec<SocketAddr>>> = Arc::default();
+        let (log, udp_log, relay_log) = (requests.clone(), datagrams.clone(), relays.clone());
         let tls = tls.map(|(fixture, require)| {
             let acceptor = fixture.acceptor(require);
             (fixture, acceptor)
         });
         let task = tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                let (script, log, udp_log, tls) =
-                    (script.clone(), log.clone(), udp_log.clone(), tls.clone());
+                let (script, log, udp_log, relay_log, tls) = (
+                    script.clone(),
+                    log.clone(),
+                    udp_log.clone(),
+                    relay_log.clone(),
+                    tls.clone(),
+                );
                 tokio::spawn(async move {
                     let stream: BoxedStream = match &tls {
                         Some((fixture, acceptor)) => match fixture.accept(acceptor, tcp).await {
@@ -294,7 +304,7 @@ impl FakeSocks5 {
                         },
                         None => Box::new(tcp),
                     };
-                    let _ = serve(stream, script, log, udp_log).await;
+                    let _ = serve(stream, script, log, udp_log, relay_log).await;
                 });
             }
         });
@@ -302,6 +312,7 @@ impl FakeSocks5 {
             addr,
             requests,
             datagrams,
+            relays,
             _task: AbortOnDrop(task),
         }
     }
@@ -318,5 +329,10 @@ impl FakeSocks5 {
     /// Where every datagram relayed so far was addressed, in arrival order.
     pub fn datagrams(&self) -> Vec<Target> {
         self.datagrams.lock().expect("datagrams").clone()
+    }
+
+    /// Where the relay of every UDP association was bound, in arrival order.
+    pub fn relays(&self) -> Vec<SocketAddr> {
+        self.relays.lock().expect("relays").clone()
     }
 }

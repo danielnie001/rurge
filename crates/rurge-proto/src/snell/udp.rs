@@ -24,7 +24,7 @@ use rurge_net::BoxFuture;
 use rurge_net::connector::{PacketSocket, Target};
 use std::future::poll_fn;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -130,11 +130,18 @@ pub(crate) struct SnellUdp {
     sending: tokio::sync::Mutex<()>,
     /// One receiver at a time, and the datagram that came with the answer.
     receiving: tokio::sync::Mutex<Option<Vec<u8>>>,
+    /// Where the connection's far end was when it was opened, if it was
+    /// known (`phase 4 M4 design 10.3`).
+    far_end: Option<SocketAddr>,
 }
 
 impl SnellUdp {
-    /// Asks `stream` (a fresh connection) for UDP and waits for the answer.
-    pub(super) async fn open(mut stream: SnellStream) -> io::Result<SnellUdp> {
+    /// Asks `stream` (a fresh connection) for UDP and waits for the answer;
+    /// `far_end` is where the connection leaves rurge.
+    pub(super) async fn open(
+        mut stream: SnellStream,
+        far_end: Option<SocketAddr>,
+    ) -> io::Result<SnellUdp> {
         stream.write_all(&[REQUEST_VERSION, UDP, 0]).await?;
         stream.flush().await?;
         let first = answer(&mut stream).await?;
@@ -142,6 +149,7 @@ impl SnellUdp {
             stream: std::sync::Mutex::new(stream),
             sending: tokio::sync::Mutex::new(()),
             receiving: tokio::sync::Mutex::new(first),
+            far_end,
         })
     }
 
@@ -198,6 +206,10 @@ impl PacketSocket for SnellUdp {
                 }
             }
         })
+    }
+
+    fn far_end(&self, _to: &Target) -> Option<SocketAddr> {
+        self.far_end
     }
 }
 
@@ -295,7 +307,7 @@ mod tests {
         server: &mut SnellStream,
         answers: &[&[u8]],
     ) -> io::Result<SnellUdp> {
-        let open = tokio::spawn(SnellUdp::open(client));
+        let open = tokio::spawn(SnellUdp::open(client, None));
         assert_eq!(next_record(server).await.unwrap(), [1, 6, 0]);
         for answer in answers {
             server.write_all(answer).await.unwrap();
@@ -376,7 +388,7 @@ mod tests {
         let err = opened(client, &mut server, &[&[1]]).await.err().unwrap();
         assert_eq!(err.to_string(), UNKNOWN_REPLY);
         let (client, mut server) = pair().await;
-        let open = tokio::spawn(SnellUdp::open(client));
+        let open = tokio::spawn(SnellUdp::open(client, None));
         next_record(&mut server).await.unwrap();
         server.shutdown().await.unwrap();
         let err = open.await.unwrap().err().unwrap();

@@ -228,7 +228,11 @@ impl Outbound for SnellOutbound {
             // server's answer, which comes at once
             let open = async {
                 let stream = self.dialer.fresh(opts).await?;
-                let udp = SnellUdp::open(stream).await?;
+                // where the connection went, read while the trail is still
+                // followed: a redial of the relay (phase 4 / M4b plan's P9 ②)
+                // will have it hand its own back instead
+                let far_end = rurge_net::trail::current().and_then(|trail| trail.peer());
+                let udp = SnellUdp::open(stream, far_end).await?;
                 Ok(Box::new(udp) as BoxedPacketSocket)
             };
             match tokio::time::timeout(opts.timeout, open).await {
