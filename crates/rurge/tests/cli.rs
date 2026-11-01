@@ -6493,9 +6493,23 @@ Inner = external, exec = {}, args = run, args = -c, args = {}, args = --no-netwo
             log_to_file(&mut cmd, &logs);
             let (mut daemon, errors) = spawn_command_reading_stderr(cmd);
             up(&daemon);
-            wait_for("the log to say what the run waits for", 30, || {
-                until(&log_text(&logs))
-            });
+            // what the run waits for, or a panic that carries all the run has
+            // said: the log and the two streams go with it, before the
+            // temporary directory that holds the log is removed
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !until(&log_text(&logs)) {
+                if Instant::now() >= deadline {
+                    let _ = daemon.child.kill();
+                    let _ = daemon.child.wait();
+                    panic!(
+                        "timed out waiting for the log to say what run {run} waits for\n  the log:\n{}\n  standard error:\n{}\n  standard output after the start:\n{}",
+                        log_text(&logs),
+                        the_rest(&errors),
+                        the_rest(&daemon.lines),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
             let mut shown = String::new();
             for (method, path, body) in [
                 ("GET", "/v1/profiles/current", None),
