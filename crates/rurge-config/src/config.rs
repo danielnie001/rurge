@@ -837,6 +837,24 @@ pub fn from_profile(
                             .at(e.span.clone()),
                         );
                     }
+                    // An empty `always-capture=` names no session: the
+                    // parameter stays on the rule (the profile is not
+                    // rewritten) and the loader says nothing is done with it
+                    // (`phase 4 M4 design 5.2`, the phase 4 / M4a plan's P4).
+                    // A value of blanks reads as empty too.
+                    if r.params
+                        .always_capture
+                        .as_deref()
+                        .is_some_and(|v| v.trim().is_empty())
+                    {
+                        diags.push(
+                            Diagnostic::warning(
+                                codes::W_INVALID_VALUE,
+                                "`always-capture` needs a capture session name; the parameter is ignored",
+                            )
+                            .at(e.span.clone()),
+                        );
+                    }
                     rules.push(r);
                 }
                 Err(err) => diags.push(line_failure(err, e.span.clone())),
@@ -2689,6 +2707,70 @@ G = select, A, S\n[Rule]\nFINAL,DIRECT\n",
         assert!(c.contains(&codes::W_DEVICE_POLICY_AS_REJECT));
         assert_eq!(l.config.unknown_sections, ["Weird"]);
         assert_eq!(l.config.deferred.sections.len(), 1);
+    }
+
+    /// `always-capture=` with nothing after it names no session, so the rule
+    /// keeps the parameter (the profile is not rewritten) and the loader warns
+    /// (`phase 4 M4 design 5.2`, the phase 4 / M4a plan's P4). A value made of
+    /// blanks reads as empty too, and `always-capture` without `=` is a
+    /// parameter nobody knows.
+    #[test]
+    fn an_empty_always_capture_is_ignored_with_w0012() {
+        let l = load_text(concat!(
+            "[Rule]\n",
+            "DOMAIN,c.test,DIRECT,always-capture= \n",
+            "DOMAIN,a.test,DIRECT,always-capture=debug\n",
+            "DOMAIN,b.test,DIRECT,always-capture\n",
+            "FINAL,DIRECT,always-capture=\n",
+        ));
+        assert!(!l.diagnostics.has_errors(), "{:#?}", l.diagnostics);
+        let diags: Vec<(&'static str, Option<u32>)> = l
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.span.as_ref().map(|s| s.line)))
+            .collect();
+        assert_eq!(
+            diags,
+            vec![
+                (codes::W_INVALID_VALUE, Some(2)),
+                (codes::W_UNKNOWN_RULE_PARAM, Some(4)),
+                (codes::W_INVALID_VALUE, Some(5)),
+            ],
+            "{:?}",
+            l.diagnostics
+                .iter()
+                .map(|d| d.headline().to_string())
+                .collect::<Vec<_>>()
+        );
+        let empty: Vec<&Diagnostic> = l
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == codes::W_INVALID_VALUE)
+            .collect();
+        assert_eq!(empty.len(), 2);
+        for d in &empty {
+            assert_eq!(d.severity, Severity::Warning);
+            assert_eq!(
+                d.message,
+                "`always-capture` needs a capture session name; the parameter is ignored"
+            );
+        }
+        assert_eq!(l.config.rules.len(), 4);
+        let captures: Vec<Option<&str>> = l
+            .config
+            .rules
+            .iter()
+            .map(|r| r.params.always_capture.as_deref())
+            .collect();
+        assert_eq!(
+            captures,
+            vec![Some(""), Some("debug"), None, Some("")],
+            "{:?}",
+            l.diagnostics
+                .iter()
+                .map(|d| d.headline().to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// `[IP Rewrite]` is in effect (phase 3 M5): its active lines are read in
