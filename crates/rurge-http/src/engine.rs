@@ -5896,13 +5896,20 @@ mod tests {
                 pages,
             },
         );
-        for (n, path) in ["/fail", "/reject", "/gif"].iter().enumerate() {
+        for (n, (path, status)) in [("/fail", "502"), ("/reject", "403"), ("/gif", "200")]
+            .iter()
+            .enumerate()
+        {
             rig.client
                 .send(&format!("GET {path} HTTP/1.1\r\nHost: target.test\r\n\r\n"))
                 .await
                 .unwrap();
             let (head, body) = rig.client.response().await;
-            assert!(head.starts_with("HTTP/1.1 "), "{head}");
+            assert!(
+                head.starts_with(&format!("HTTP/1.1 {status}")),
+                "{path}: {head}"
+            );
+            assert!(!body.is_empty(), "{path}: {head}");
             let (request, answer) = rig.fake.body_at_finish(n).await;
             assert_eq!(request, 0, "{path}");
             assert_eq!(answer, body.len() as u64, "{path}: {head}");
