@@ -204,6 +204,16 @@ cargo test -j 8 --workspace --test rewrite   # 阶段 4 / M3a，经引擎的端�
 cargo test -j 8 --workspace --lib -- body   # 阶段 4 / M3b：这个过滤词一共选中 90 条（一台机器上的一次运行，`-- --list` 数）——`rurge-http` 34 条（`rewrite::body::tests::` 的 23 条是任务 3、4 的全部单元用例，另有 `engine::tests::` 里名字带 `body` 的 11 条）、`rurge-config` 9 条（`dialect::tests::` 里 `BodyPattern` 的 5 条、`rewrite::tests::` 2 条、`config::tests::` 1 条、`keystore::tests::` 1 条）、`rurge-net` 27 条（大多是名字里带 `nobody` 的，与正文无关）、`rurge-engine` 7 条、`rurge-dns` 4 条、`rurge-policy` 3 条、`rurge-proto-quic` 2 条、`rurge-tun` 2 条、`rurge-platform` 与 `rurge-rules` 各 1 条；`body` 也命中 `nobody`，所以 90 条不是 Body Rewrite 的条数
 cargo test -j 8 --workspace --lib -- map_local   # 阶段 4 / M3b：20 条（一台机器上的一次运行，`-- --list` 数）——`rurge-config` 11 条（`rewrite::tests::` 8 条、`config::tests::` 2 条、`reach::tests::` 1 条）、`rurge-http` 9 条（`rewrite::map_local::tests::` 5 条、`engine::tests::` 4 条）
 cargo test -j 8 --workspace --test rewrite   # 阶段 4 / M3b 之后 50 条：M3a 的 23 条，加 M3b 的 27 条（任务 6 的 3 条与任务 7 的 24 条）
+cargo test -j 8 --workspace --lib -- capture::   # 阶段 4 / M4a，`rurge-http` 的 `capture` 模块（22 条，其中 2 条带 `#[ignore]`、量内存的两条见本组最后两行）：一条的账与记账、单条与总量两种截断、跨会话的挤掉、丢掉与预留在放下时还回去、清除与四个数、按 ID 找、`put`、`Limits` 的降低、两个正文的解开（多层、没有编码、截断、`br` 一类）、存进去的头不与 hyper 的读缓冲共享，以及 `started_rfc3339`
+cargo test -j 8 --workspace --lib -- captured   # 阶段 4 / M4a，`rurge-http` 引擎测试模块里抓包的 16 条（名字里都带 `captured`，`capture::` 选不到它们）：两个取样点各自的样子、借来的连接、改写过的请求正文、被拒绝的、Map Local、101 与 `CONNECT`、没有应答的、客户端走掉、HTTP/2 上重置、截断过的正文、trailer、HTTP/2 客户端的版本
+cargo test -j 8 --workspace --test capture   # 阶段 4 / M4a，`rurge-engine` 的端到端（15 条）：开关与 `always-capture`、`FINAL`、逻辑规则、直连模式、关掉之后、`state.json`、日志、拒绝、监听器的口令、上游代理的凭据、解密、重载。这一条不写过滤词：写 `-- capture` 只选中 12 条，另外 3 条的名字里没有这个词（`a_logical_rule_names_the_session_of_its_line`、`entries_outlive_a_reload`、`the_session_a_rule_names_comes_before_default`）
+cargo test -j 8 --workspace --test api -- capture   # 阶段 4 / M4a，`rurge-api` 的四个（4 条）：开关的读 / 切 / 写进 `state.json`、状态、会话列表、一个会话的摘要（由新到旧）
+cargo test -j 8 --workspace --test api -- har   # 阶段 4 / M4a，`rurge-api` 的 HAR（5 条，名字里没有 `capture` 这个词）：旧到新、正文的文字与 Base64、没有应答、遮住与空的 `cookies`、查询串与 `CONNECT`
+cargo test -j 8 --workspace --test api -- entry decode clearing odd_session   # 阶段 4 / M4a，`rurge-api` 的另外五条（5 条）：一条的全部与四个遮住的头、ID 与 `404`、`?decode` 的三种情形、清除一个会话或全部、名字奇怪的会话
+cargo test -j 8 --workspace --bin rurge -- sizes_are_bytes_with_an_optional_binary_suffix the_body_size_is_lowered_to_the_capture_size   # 阶段 4 / M4a，可执行文件的两个单元用例（2 条）：大小的写法与两种错误、单条大于总量时降到总量
+cargo test -j 8 --workspace --test cli -- capture   # 阶段 4 / M4a，命令行的端到端（4 条）：两个参数从选项或环境变量来、单条被降低的那一行 WARN、写错的参数以 2 退出、经 API 打开开关之后导出 HAR
+cargo test -j 8 --workspace --lib -- capture::memory::an_empty_store_is_the_baseline --ignored --exact --nocapture   # 阶段 4 / M4a，量内存的基线（1 条，`#[ignore]`；缺省的 `cargo test` 与上面那两行都不跑它）：只建一份空的存储、读出峰值工作集
+cargo test -j 8 --workspace --lib -- capture::memory::a_full_store_at_the_default_limits --ignored --exact --nocapture   # 阶段 4 / M4a，量内存的装满（1 条，`#[ignore]`）：按缺省的两个上限装满、读出峰值工作集与 `status()` 的各个数；与基线各自单独跑，两条不并在一起（两次读的是两个进程各自的峰值，见 `docs/api/phase4.md` 的「量到的内存」）
 # 阶段 3 / M5 重跑的基准读数（一台机器上的一次运行、**不是 CI**；release，`TUN_BENCH_FAR=memory`；命令仍是上面 B1 / B2 / b3 那三条）：B1 八个量出来的行都过 0.7 Gbit/s 的线（最低的一行 4.065，是线的 5.8 倍），四个计数都是 0，中位数上行 8.03、下行 4.84 Gbit/s（两个 MTU 混在一起，只作量级）；同设置（MTU 1500、`tx_max` 256 KiB）的 5.717 / 5.172 是上一次的 79.7% 与 94.7%。B2 门槛读数（峰值减去全部测试一侧的项）403,671,140 字节（403.7 MB / 385.0 MiB），在线 429,000,000 字节以内、余量 25.3 MB；保守读数（只减去准的应用端套接字缓冲）445,333,604 字节（445.3 MB），超线 16.3 MB——这个读数照旧归项目所有者，这里只记数。b3 中位数 0.9 微秒、p99 2.9 微秒，最大 4542.2 微秒（4.5 ms，落在第 28,673 个查询上，是线的 22.7 倍，两处都是池的 `HashMap` 的翻倍处，读代码与算术得出）。细节与上一次不同的原因见计划「执行期修正记录」第 61 ～ 63 行
 cargo insta test -p rurge-config --review       # 语料库快照有变化时审阅
 cargo clippy --all-targets -- -D warnings       # 零警告（CI 设 RUSTUP_TOOLCHAIN=1.89.0，与本机的 MSRV 工具链一致；更新的 clippy 会多出 lint）
@@ -529,3 +539,49 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 十五、**`rurge-net` 的单元测试要关着的端口时用 `rurge_net::testing` 的 `closed_udp_port` / `closed_tcp_port`**（第 69 ～ 71 行；同 `rurge-engine` 测试 `common` 里的那两个），不要取 0 号端口、放掉再用；全工作区还没改的五处在延后事项第 1 行。任务 10（第 97 ～ 100 行）改了那五处与补扫出的三处，共八处；`rurge-proto` 的单元测试从那时起也经开发依赖里带 `testing` 特性的 `rurge-net` 用这两个函数。
 
 十六、**带等待的 M3b 用例提交前各自单独循环跑二十次以上**（全过才算数）：任务 5 的 Map Local 3 条（`rurge-http` 的 `engine::tests::` 里的 `a_local_file_nobody_reads_is_let_go`、`kill_ends_a_local_file_answer` 与 `a_file_that_becomes_shorter_ends_the_answer_with_an_error`）一圈、请求正文的 3 条一圈、应答正文的 4 条一圈；任务 6 的 `map_local_urls_are_listed_as_data`、`map_local_url_data_that_never_came_answers_502` 与 `the_same_map_local_url_is_one_resource` 三条各 20 次（共 60 次）；任务 6a 的整个 `rurge_net` 测试二进制 20 次（每次 336 条全过）；任务 7 的 10 条各 20 次、修正轮 1 的 2 条各 20 次。日志与命令行在工作区（git 忽略）：`loop-task-5b-map-local.log`、`loop-task-5c-body-request.log`、`loop-task-5d-body-response.log`、`loop-task-6.log`、`loop-task-6a.log`、`loop-task-7.log`、`loop-task-7-fix1.log`。任务 10 改过的九条各 20 次、`crates/rurge/tests/cli.rs` 的 `run::remote_sources::the_link_to_the_managed_profile_is_shown_as_where_it_goes_and_nothing_more` 10 次：`loop-task-10.log`。
+
+### 阶段 4 / M4a 起：抓包
+
+阶段 4 / M4a 起另有几条（计划 `docs/superpowers/plans/2026-11-01-phase4-m4a-capture-plan.md`，下面写“M4a 记录第 N 行”指它末尾的「执行期修正记录」，写“延后事项第 N 行”指同一份计划的另一张表；M1a、M1b、M2a、M2b、M2c、M3a、M3b 与 M4a 的提交都在本地，CI 都没有见过）：
+
+一、**抓包的内存是量出来的，不是门**（P15，M4a 记录第 76、81 行）：两条带 `#[ignore]` 的用例在 `crates/rurge-http/src/capture/memory.rs`，**调试构建**、`rurge-http` 的**库内**用例，各单独跑一次——`cargo test -j 8 --workspace --lib -- capture::memory::<名字> --ignored --exact --nocapture`，不用 `--release`。峰值工作集由操作系统读：`peak_resident_bytes`、`parse_count`、`parse_vm_hwm` 与它们的用例照抄自 `crates/rurge-tun/src/tests/bench/peak.rs`（Windows 上起一个 `powershell` 读本进程的 `PeakWorkingSet64`，Linux 读 `/proc/self/status` 的 `VmHWM`）。它与 `crates/rurge-rules/tests/memory.rs` 的做法不同：那里是 **release** 的**集成测试**，这里是调试构建的库内用例。为什么：`--release` 要把整个工作区另编一份（`target/` 的盘位，见 `CLAUDE.md`「这台开发机」），而条目、`HeaderMap` 与 `Bytes` 在两种构建里分配的大小相同，量的是“装满”与“基线”两次运行的差；库内的用例用得上 `Pending`，走的是真实的按块记账（P15）。**这是量、不是门**：缺省的 `cargo test` 不跑这两条，也没有一条用例断言它们的数。
+
+二、**抓包的用例用小的上限，等条目存进去用有时限的轮询**（P14，M4a 记录第 20、24 行）：验机制的单元用例用几十、几百字节的 `Limits`，正文的两个真实上限（100 MiB 与 5 MiB）只在说缺省值与量内存的那几条里出现。引擎与端到端用例用 `common` 的 `wait_until` 等 `capture().session(..)` 不空（5 秒、每 10 毫秒看一次），命令行的用例轮询 API 5 秒、每次隔 50 毫秒；“**什么也不存**”是记录结束之后固定等 200 毫秒（`crates/rurge-engine/tests/capture.rs` 的 `QUIET`，注释写它等的是什么、余量多大——回环上存一条只要几微秒）。
+
+三、**`[Rule]` 的 `FINAL` 写在最后**（M4a 记录第 22 行）：写在前面会让它之后的第一行得一条 `W0019`（`rule(s) after FINAL never take effect`），与用例无关的诊断会混进来。
+
+四、**`rurge-engine` 测试的 `common::Profile` 总在 `rules` 之后补一行 `FINAL,DIRECT`**（M4a 记录第 44 行）：引擎编到第一个 `FINAL` 为止、把最后一个放在表尾，写进 `rules` 的 `FINAL` 到不了引擎。要在 `FINAL` 上带参数的用例用 `harness_edited` 改最后一条规则的参数，不要另写一行 `FINAL`。
+
+五、**别的 crate 的用例要往存储里放自己造的条目，经 `rurge-http` 的 `testing` 特性开的 `CaptureStore::put`**（计划 P2）：`rurge-api` 的开发依赖带着 `features = ["testing"]`，生产代码不开它——`put` 不在任何生产路径上。`rurge-api` 的测试另有一个 `flate2` 开发依赖，用来当场压 gzip（M4a 记录第 49 行）；`rurge-engine` 的测试仍没有它，照旧当场写 gzip 的字节（「阶段 4 / M3b 起」第十三条）。
+
+六、**要断言启动时那一行 WARN 的用例自己起进程、从第一行读起**（M4a 记录第 63、69 行）：命令行的 WARN 写在两行 `listening on` 之前，而 `spawn_command` 读到两行 `listening on` 就返回、把之前的行丢掉；夹具 `lines_until_the_api` 自己起进程、有时限地（20 秒）逐行读到 `api on http://` 那一行为止，交回 `(Daemon, 之前的行, 端口)`——它交回的 `Daemon` 的 `http` 与 `socks` 是 0，不要拿它当 `spawn_command` 用。
+
+七、**断言 clap 拒绝写错的参数的用例写成不带平台条件的 `#[test]`，有时限地等进程退出**（M4a 记录第 20 行）：`bad_capture_sizes_are_refused` 用 `try_wait` 等 20 秒，超时就 `kill`、`wait` 再 `panic!`；不用会一直等下去的 `output()`——值要是被错收下，守护进程会一直跑。断言的是退出码 `2` 与标准错误里 `parse_size` 的两句原文。
+
+八、**两张 CA 不同名**（P14）：同名的 CA 让握手报 `BadSignature`，不报 `UnknownIssuer`（`TlsFixture::with_ca_name`）。
+
+九、**循环跑二十次时每一次记下 `test result:` 那一行**（M4a 记录第 24 行）：只记退出码不够——过滤词没对上时退出码也是 0。`cmd /c "… & echo %ERRORLEVEL%"` 里的 `%ERRORLEVEL%` 在 `cmd` 读这一行时就展开，记下的总是 0：要用 `cmd /v:on` 与 `!ERRORLEVEL!`，或在 PowerShell 里同步调用之后读 `$LASTEXITCODE`；`Start-Process` 不能同时给 `-NoNewWindow` 与 `-WindowStyle`（进程起不来，每次都等到时限）（M4a 记录第 75 行，第 80 行订正 ①）。
+
+十、**`GET /v1/rurge/capture/sessions/{name}/har` 的应答是分帧的流**（M4a 记录第 64 行）：`Body::from_stream` 让 hyper 用 `Transfer-Encoding: chunked` 分帧，而 `crates/rurge/tests/cli.rs` 的 `api_call` 交回分帧之后的原文；命令行的用例解析 HAR 之前先去掉块头（`dechunked`）。
+
+十一、**`tests/cli.rs` 里起守护进程的 `async` 用例，阻塞的调用都放进 `spawn_blocking`**（M4a 记录第 69 行 ②、第 70 行）：`spawn_command`、`api_port`、`api_call`、`http_get` 都不写在运行时的工作线程上；要等就按系统时钟等（`std::thread::sleep`），不在 `async fn` 里等 `tokio::time::sleep`。这是上面「阶段 1 补遗（M5b）」那一条（本文第 266 行：会让一个工作线程停住的用例在用例自己的线程上按系统时钟等，不等运行时的定时器）的一个实例，不是新规矩。
+
+十二、**`rurge-http` 引擎测试的 `Fake::dial` 连上之后在 trail 上留下地址**（M4a 记录第 34 行 ②）：`handle.trail().set_peer(peer)`，照真的 `ConnUpstreams::dial` 经 `trail().follow(..)` 留的那样；断言新拨的连接上条目的 `remote` 的用例靠它（`Fake` 原来只在借来的连接上留地址）。
+
+十三、**测“应答之前重置”的 HTTP/2 用例用收下请求、什么也不答的源站**（M4a 记录第 35 行，第 40 行订正它说的原因）：`holding_origin(b"")`，不用当场就写应答头与五个字节的 `stalled_origin`——后者让重置与应答赛跑，跑二十次里十次左右应答先到，条目要等 `Tail` 被丢下才存得进去，5 秒的等待就等不到。用例要的是重置落在应答之前。
+
+十四、**`rurge-api` 的用例要的 `HeaderMap`、`Method`、`StatusCode`、`Version` 从已有的开发依赖 `hyper` 的重新导出拿**（M4a 记录第 51 行）：axum 0.8.9 有 `pub use http;`，生产代码写 `axum::http::HeaderMap`，不为用例加 `http` 依赖。钉住“毫秒向下取整”的用例给一个不整的时长（35.999 毫秒、12.999 毫秒）：改成四舍五入时它会红（M4a 记录第 53 行 ③、第 54 行）。
+
+十五、**进程内跑引擎的端到端用例的客户端一律是 tokio 的套接字**（M4a 记录第 72 行）：`crates/rurge-engine/tests/capture.rs` 的 `get_with`、`post_with`、`send_with` 照 `common` 的 `plain_get` 写（`async`、读的时限 5 秒、整个请求——头与正文——在**一次写**里发出）。
+
+十六、**别的用例文件要 `[MITM]` 的夹具时从 `tests/rewrite.rs` 照抄**（P14，M4a 记录第 72、79 行 ④）：`mitm_section`、`mitm_ca`、`client_config`、`handshake`、`read_head`、`read_response`、`decrypted_get`、`harness_mitm`、`decrypted`，每个前面一句英文注释写来处与为什么不挪进 `common`（别的文件也在用它们的原样）。`tests/capture.rs` 抄来的 `RecordingProxy` 记**整个请求头**，不只请求行（M4a 记录第 79 行 ⑤）——看监听器的口令那一条问的就是头。
+
+十七、**断言被拒绝的请求的应答（状态码、拒绝页）的用例给 `show-error-page-for-reject = true`**（M4a 记录第 79 行 ③）：缺省关着时拒绝不答话、条目的应答是 `None`，就没有应答头可以比。
+
+十八、**看“监听器的口令不进条目”的用例红，要三处一起放开**（M4a 记录第 73 行，第 80 行订正派工）：监听器入站的 `remove`（`crates/rurge-inbound/src/http.rs` 的 `req.headers_mut().remove(header::PROXY_AUTHORIZATION)`）、`slot.arm` 闭包里的头与 `slot.leaving` 的头——`leaving` 那一处的 `Keep` 同时决定发出去的请求与条目的头（设计第 6.1 节的第 1 个取样点）。只放开前两处时用例仍是绿的。
+
+十九、**“存储里没有一个头还引用交进来的缓冲”用 `Bytes::is_unique` 钉**（M4a 记录第 81 行）：头值做成一块 `Bytes` 的切片交进去，`commit` 之后丢掉用例自己的克隆再断言；用例是 `the_stored_headers_hold_none_of_the_buffer_they_were_read_from`。
+
+二十、**量内存的两条各自单独跑**（`--exact`），读的是**整个进程**的峰值（M4a 记录第 76、81 行）：两条并在一起跑时，基线读到的会是装过满的那个进程的峰值。
+
+二十一、**带等待与并发的 M4a 用例提交前各自单独循环跑二十次以上**（全过才算数）：任务 1 的 `when_finished_and_finish_race_without_losing_or_repeating`（第 21 行）；任务 3 的五条——`a_client_that_leaves_mid_body_is_captured_as_failed`、`a_killed_request_leaves_no_reservation_behind`、`an_upgrade_is_captured_at_its_101`、`a_dropped_request_is_captured_before_its_hold_ends`、`an_http2_stream_reset_before_its_answer_is_captured_with_no_response`——各二十次（第 36 行），修正轮 1 补的 `an_http2_stream_reset_mid_body_is_captured_with_what_went_by` 二十次（第 40 行）；任务 4 的九条各二十次（第 43 行）；任务 7 的四条 `cli` 用例各二十次（第 62 行），修正轮 1 之后改过的两条再各二十次（第 70 行）；任务 8 的六条端到端用例各二十次（第 75 行）。结论凭**每一次的 `test result:` 那一行**，那一次记的退出码不作数（第 80 行订正 ①）。日志在工作区（git 忽略）：`loop-task-1.log`、`loop-task-3.log`、`loop-task-3-fix-1.log`、`loop-task-4.log`、`loop-task-7.log`、`loop-task-7-fix-1.log`、`loop-task-8.log`。

@@ -2,11 +2,11 @@
 
 需要真实的浏览器、真实的网站、真实的手机与真实的信任库的项目。自动化测试只用回环地址：源站是测试自己的 TLS 服务器，客户端是 rustls 的客户端，MITM 的 CA 在内存里或用例的临时目录里生成，**从不装进任何信任库**（总设计 P4-D26、M2-D24），`rurge mitm ca generate` 打印的装 CA 命令与 `curl --pinnedpubkey` 一类只有真客户端才有的行为都没有执行过。所以下面这些覆盖不了：真浏览器与真站点的握手与 ALPN、真源站的证书链（过期的、自签的）、浏览器与操作系统怎么看待 rurge 装的 CA、证书固定的真实表现、Android 与 iOS 上的信任设置、局域网里别的设备经 rurge 上网。由项目所有者在自己的机器上验收；每一项记下日期、系统版本与结果。**一项也没有做过。**
 
-清单随里程碑逐节增加：下面是 M1（会话入口与明文 HTTP 引擎）与 M2（MITM：M2a 的 HTTP/1.1、M2b 的 HTTP/2 与 M2c 的 CA 工具与 `http-api-tls`，合成一节），M3 ～ M6 的项随各自的里程碑加。M1 的设计见 `docs/superpowers/specs/2026-10-29-phase4-m1-session-entry-http-engine-design.md`，M2 的设计见 `docs/superpowers/specs/2026-10-30-phase4-m2-mitm-design.md`（先读它第 23 节，第 22 ～ 27 条是 M2c 对正文的订正）；API、记录字段与日志行见 `docs/api/phase4.md`，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 2.1、7.1、7.2、10.4 节。**M1 的项在 `rurge run` 上就能做（增强模式那三条除外：W2、M2、L2）；M2 的项都要先装 CA 并让浏览器信任它，做完要把 CA 卸掉。**M3（重写与 Map Local）的项 2026-10-31 加在这一份里，四级表的编号接着 M2 的数（W6、M6、L6 与 P7 起）。
+清单随里程碑逐节增加：下面是 M1（会话入口与明文 HTTP 引擎）与 M2（MITM：M2a 的 HTTP/1.1、M2b 的 HTTP/2 与 M2c 的 CA 工具与 `http-api-tls`，合成一节），M3 ～ M6 的项随各自的里程碑加。M1 的设计见 `docs/superpowers/specs/2026-10-29-phase4-m1-session-entry-http-engine-design.md`，M2 的设计见 `docs/superpowers/specs/2026-10-30-phase4-m2-mitm-design.md`（先读它第 23 节，第 22 ～ 27 条是 M2c 对正文的订正）；API、记录字段与日志行见 `docs/api/phase4.md`，兼容性清单里的差异见 `docs/surge-compatibility-matrix.md` 的 2.1、7.1、7.2、10.4 节。**M1 的项在 `rurge run` 上就能做（增强模式那三条除外：W2、M2、L2）；M2 的项都要先装 CA 并让浏览器信任它，做完要把 CA 卸掉。**M3（重写与 Map Local）的项 2026-10-31 加在这一份里，四级表的编号接着 M2 的数（W6、M6、L6 与 P7 起）。M4（抓包与请求记录的完整）的项 2026-11-01 加在这一份里，四级表的编号接着 M3 的数（W9、M9、L9 与 P11 起）；本节现在只有 M4a 的项。
 
 ## 怎么用
 
-**先做哪一节。** 建议的次序是 M1 → M2：M1 不需要 CA，先把三种入口与明文 HTTP 的记录认下来；M2 先做「生成与安装 CA」那一条，其余都是拿着这份 CA 做。每一节里先做不改系统设置的项，再做装 CA、开增强模式、改系统代理的项；做完一项就恢复一次（卸 CA、关增强模式、把系统代理改回去），别把几项叠在一起做。M3 一节接在 M2 之后：先做它明文的项（W6 与 W8，其余平台同号）与 P7 ～ P9，再做要 CA 的 W7、M7、L7 与 P10；CA 照样做完就卸。
+**先做哪一节。** 建议的次序是 M1 → M2：M1 不需要 CA，先把三种入口与明文 HTTP 的记录认下来；M2 先做「生成与安装 CA」那一条，其余都是拿着这份 CA 做。每一节里先做不改系统设置的项，再做装 CA、开增强模式、改系统代理的项；做完一项就恢复一次（卸 CA、关增强模式、把系统代理改回去），别把几项叠在一起做。M3 一节接在 M2 之后：先做它明文的项（W6 与 W8，其余平台同号）与 P7 ～ P9，再做要 CA 的 W7、M7、L7 与 P10；CA 照样做完就卸。M4 一节接在 M3 之后：先做明文的项与 P11 ～ P13，再做要 CA 的 W9、M9、L9 里解密的那个站点（明文的那一半不用 CA）。
 
 **共用的前置条件。**
 - `cargo build --release`，用得到的二进制（`target/release/rurge`，Windows 下是 `target\release\rurge.exe`）。下文按平台写作 `rurge.exe`（Windows）或 `./rurge`（macOS / Linux）。
@@ -23,7 +23,7 @@
   FINAL,DIRECT
   ```
 
-  M2 的 Profile 在这一份之后多一个 `[MITM]` 节，内容见 M2 一节的前置条件。每一项要加的规则写在 `[Rule]` 里 `FINAL,DIRECT` 的前面；改完重启 `rurge run`（`[General]` 里的 `http-api` 与 `http-api-tls` 只在重启时才生效，见 M2 一节的 W4）。M3 的 Profile 在 M2 那一份之后再多四个节（`[URL Rewrite]`、`[Header Rewrite]`、`[Body Rewrite]` 与 `[Map Local]`），内容见 M3 一节的前置条件。
+  M2 的 Profile 在这一份之后多一个 `[MITM]` 节，内容见 M2 一节的前置条件。每一项要加的规则写在 `[Rule]` 里 `FINAL,DIRECT` 的前面；改完重启 `rurge run`（`[General]` 里的 `http-api` 与 `http-api-tls` 只在重启时才生效，见 M2 一节的 W4）。M3 的 Profile 在 M2 那一份之后再多四个节（`[URL Rewrite]`、`[Header Rewrite]`、`[Body Rewrite]` 与 `[Map Local]`），内容见 M3 一节的前置条件。M4 的 Profile 就是 M1 那一份（`[General]` 与 `[Rule]`，日志照样用 `--log-level debug`），不要 M3 的四个节：它们会改流量，抓到的就不是站点本来的样子，做 M4 的项之前把它们去掉。
 - 你自己的浏览器（M1 用惯用的那个即可；M2 每个平台用两个：Windows 的 Edge 与 Chrome、macOS 的 Safari 与 Chrome、Linux 的 Firefox 与 Chromium）与 `curl`（Windows 用 `curl.exe`）。
 - 让浏览器走 rurge 的代理，按浏览器分三种写法（前两种不改系统设置）：
   - **Edge、Chrome 与 Chromium**：带参数另起一个实例，把 `--user-data-dir=<一个新的空目录>` 与 `--proxy-server="http://127.0.0.1:6152"`（HTTP 代理那一次）或 `--proxy-server="socks5://127.0.0.1:6153"`（SOCKS5 那一次）一起给；这样主机名由 rurge 解析。Chromium 带参数启动之前要退出正在运行的实例，新的数据目录就是另起一个实例；关掉窗口就没了。程序名：Windows 的 `msedge.exe` / `chrome.exe`，macOS 的 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`（路径带空格，要引号），Linux 的 `chromium` / `google-chrome`。
@@ -81,7 +81,7 @@ to trust it (rurge does not install it; run these where the files are):
 | 2 | 主流站点 MITM 解密成功且证书固定站点给出提示 | W2、W3 | M2、M3 | L2、L3 | P1（证书固定的提示）、P2 ～ P5 |
 | 3 | Body Rewrite 与 jq 用例通过 | — | — | — | Body Rewrite 的正则形式有了项（W7、M7、L7）；jq 等 M3c——这一构建里 jq 的行是 `W0042`、那一行跳过（P10 的一处） |
 | 4 | 大小限制行为与手册一致 | — | — | — | P9（32 MiB 与 10 MiB 的边界）；回环上的用例是 `the_request_limit_is_thirty_two_mib` 与 `the_response_limit_is_ten_mib` |
-| 5 | 抓包可通过 API 读取 | — | — | — | M4 之后才有项 |
+| 5 | 抓包可通过 API 读取 | W9、W10 | M9、M10 | L9、L10 | P11 ～ P13 与回环上的用例：API 的 `the_capture_status_says_the_limits_and_the_counts`、`a_capture_session_lists_its_entries_newest_first`、`an_entry_is_shown_whole_with_four_headers_masked`、`a_session_is_exported_as_har_oldest_first`，命令行的端到端 `a_capture_switched_on_over_the_api_is_exported_as_har` |
 
 ---
 
@@ -265,3 +265,65 @@ M3 的明文项在 `rurge run` 上就能做；解密的项（W7、M7、L7 与 P1
 | P8 | **Map Local 的两种失败。** (a) 把 `<conf>` 同目录的 `data/map-local.json` 改名，浏览器打开 `/m3-file`。(b) 把 URL 的那一条改成 `data="http://<服务器>:8080/missing.json"`（那个文件不存在），重载或重启，打开 `/m3-url`；再读 `GET /v1/external_resources` 里那一项的 `error`。做完改回去 | 两个都是 502 的错误页（`show-error-page` 缺省开着；关着时不答就关连接）：(a) 的标题是 `Connection failed`，页里写着 `The file a Map Local rule names cannot be read.`，记录里 `status` 是 `failed`、`error` 是 `Map Local: cannot read <路径>`，备注是 `Map Local failed: ^http://<明文站点>/m3-file: the file cannot be read`，`failed` 加一、`mapLocal` 不动；(b) 的页里写着 `The data a Map Local rule names has not been downloaded yet.`，记录是 `Map Local: the data from http://<服务器>:8080/… is not available yet`，备注的原因是 `the data is not available yet`，那一项在外部资源的列表里有 `error`（设计第 10.3 节；用例 `a_missing_file_answers_502`、`a_missing_map_local_file_answers_502`、`url_data_that_is_not_there_answers_502`、`map_local_url_data_that_never_came_answers_502`） | 浏览器的错误页；`recent` 的 `status`、`error`、`notes`；`rewrite.failed`；`/v1/external_resources` | | | |
 | P9 | **32 MiB 与 10 MiB 的边界。** 请求那一半：`curl -x http://127.0.0.1:6152 -H "Expect:" --data-binary @<40 MiB 的文件> http://<明文站点>/m3-upload`（curl 对大于 1 MB 的 POST 缺省带 `Expect: 100-continue`，而 rurge 对带它的请求不缓冲——一律一条 `Body Rewrite skipped: {式子}: the request expects 100-continue`、正文照原样转发，走不到 32 MiB 那一支，所以 `-H "Expect:"` 让它不发；不加时看到的正是那一条 `Skipped`、正文原样到源站、`failed` 不动，这一半也记下来）。应答那一半：`curl -x http://127.0.0.1:6152 -o <落盘的文件> http://<服务器>:8080/m3-big`。各读一次记录与计数 | 请求那一条：连接被关掉（`curl` 以错误结束、没有应答），记录里 `status` 是 `failed`、`error` 是 `Body Rewrite: the request body is over 32 MiB`，`failed` 加一。应答那一条：20 MiB 一个字节不少地到了客户端（落盘的字节数与内容一致），`statusCode` 是 `200`、`status` 是 `completed`，备注是 `Body Rewrite skipped: ^http://<服务器>:8080/m3-big: the body is over 10 MiB`，`failed` 不动（读到的先发、其余接着流过；设计第 9.3 节；用例 `the_request_limit_is_thirty_two_mib`、`the_response_limit_is_ten_mib`、`a_response_over_the_limit_streams_through`） | `curl` 的输出与退出码；落盘文件的大小；`recent`；`rewrite.failed` 与 `body` | | | |
 | P10 | **正文、数据与头的值不进备注与日志；jq 的行给 `W0042`。** 规则不动，照 W7 的 `--data` 那条 `curl` 发一个请求，正文里放规则不碰的一段：`curl.exe -s -x http://127.0.0.1:6152 --data "value s3cr3t-m3" -H "X-M3-Secret: h3ad3r-m3" "https://<回显站点>/anything?q=qu3ry-m3"`（信 CA 的写法照 W7），回显里是 `rurge s3cr3t-m3`。跑完在 `rurge run` 的日志里搜 `s3cr3t-m3`、`h3ad3r-m3` 与 `qu3ry-m3`（标准输出、标准错误与 `--log-file` 那一份都搜）；再读那一条记录的 `notes`；做过 W8 的话再在日志里搜一次 `mapped`。最后在 `[Body Rewrite]` 加一行 `http-response-jq ^https://<站点 1>/ .`，`rurge check -c <conf>` | 日志里一个也搜不到 `s3cr3t-m3`、`h3ad3r-m3` 与 `qu3ry-m3`，`notes` 里只有规则的式子与原因，没有正文、头的值、Map Local 的数据与 URL 的查询串；`mapped` 也搜不到。`check` 给一条 ``warning[W0042] <conf>:<那一行>: [Body Rewrite]: jq body rewrite is not available in this build of rurge; the line is ignored``（警告不是错误，`check` 以 0 退出，那一行跳过；设计第 13 节、第 8.5 与 14 节；用例 `no_body_or_data_reaches_the_notes_or_the_log`、`notes_never_carry_bodies`、`jq_lines_are_ignored_with_w0042`） | `rurge run` 的日志（两个流与 `--log-file`）；`recent` 的 `notes`；`rurge check` 的输出与退出码 | | | |
+
+## M4　抓包与请求记录的完整
+
+M4a（抓包）的行为已经有用例：开关的读、切与 `state.json`、`always-capture` 在开关关着时与 `FINAL` 上的、直连模式不读规则、被拒绝的请求、监听器的口令与上游代理的凭据不进条目、`[MITM]` 解密的请求记成 `https`、重载之后条目还在、抓到的内容不进任何日志、两个上限的写法与降低的那一行 WARN、六个端点（含 `?decode` 与清除）、HAR 的映射与 `timings` 各项相加等于 `time`，以及一次量内存。那些用例的客户端是测试自己写的 HTTP 客户端与 rustls 客户端，源站是回环上的测试服务器，导出的 HAR 没有被任何浏览器读过。下面是它们验不了的：真浏览器经代理发出去的请求在抓包里长什么样、真站点的大正文与压缩、Chrome 与 Firefox 能不能导入导出的 HAR 以及耗时的瀑布图画得对不对、`_` 开头的键与 `comment` 在两个浏览器的开发者工具里怎么显示、真实的大下载上截断与挤掉的先后、开关跨一次真的重启。**一项也没有做过。**
+
+M4 的明文项在 `rurge run` 上就能做；解密的项（W9、M9、L9 里那个 `[MITM]` 的站点）要先装 M2 那份 CA（做完照 M2 一节卸掉）。这一节现在只有 M4a 的项，M4b（请求记录的完整）的项随它收尾加在这里。
+
+### 前置条件
+
+- M1 的 `[General]`、`[Rule]` 与日志、记录的命令；解密的项要 M2 的 `[MITM]`、`<CA 目录>` 与装 CA 的三条（`[MITM] hostname` 里要有那个 `<站点 1>`）。
+- **不要 M3 的四个节**（`[URL Rewrite]`、`[Header Rewrite]`、`[Body Rewrite]` 与 `[Map Local]`）：它们会改流量，抓到的就不是站点本来的样子。做 M4 的项之前把它们从 `<conf>` 里去掉，重启 `rurge run`。
+- 两个上限的写法（`docs/api/phase4.md` 的「两个上限与命令行」）：十进制字节数，可跟不分大小写的 `k`、`m`、`g`；缺省总量 100 MiB、单条 5 MiB。P12 用 `--capture-size 20m` 起。
+- 打开开关（Windows 的 `cmd` 不认单引号，JSON 里的双引号要转义；macOS 与 Linux 用下一行）：
+
+  ```
+  curl.exe -s -X POST -H "X-Key: testkey" -d "{\"enabled\":true}" http://127.0.0.1:6171/v1/features/capture
+  curl -s -X POST -H "X-Key: testkey" -d '{"enabled":true}' http://127.0.0.1:6171/v1/features/capture
+  ```
+
+  读回来：`curl.exe -s -H "X-Key: testkey" http://127.0.0.1:6171/v1/features/capture` 应当是 `{"enabled":true}`。
+- 看抓包（Windows 的 `cmd`；macOS 与 Linux 把 `curl.exe` 换成 `curl`）：
+
+  ```
+  curl.exe -s -H "X-Key: testkey" http://127.0.0.1:6171/v1/rurge/capture
+  curl.exe -s -H "X-Key: testkey" http://127.0.0.1:6171/v1/rurge/capture/sessions
+  curl.exe -s -H "X-Key: testkey" "http://127.0.0.1:6171/v1/rurge/capture/sessions/default?limit=20"
+  curl.exe -s -H "X-Key: testkey" "http://127.0.0.1:6171/v1/rurge/capture/entries/42?decode=true"
+  ```
+
+  `42` 换成摘要里的 `id`。有 `jq` 时可以把 `sessions/default` 的输出拆开看，`id` 用 `.id`。
+- 每一项执行后填「结果」「日期」「系统版本」三栏；做完把 `<conf>` 的四个节、`[MITM]`、开关与 `--capture-size` 恢复（开关关回去、M2 的 CA 卸掉）。
+
+---
+
+### Windows
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| W9 | **真实浏览器的流量开着抓包。** 打开开关（见前置条件），照「共用的前置条件」带 `--proxy-server="http://127.0.0.1:6152"` 另起一个 Edge 或 Chrome 实例：先打开一个 `<明文站点>` 并翻几页，再打开解密的那一个 `<站点 1>`（`[MITM] hostname` 里有它、装了 CA）并翻几页。读 `GET /v1/rurge/capture`、`/sessions`、`/sessions/default`，再取其中一条明文与一条解密的 `/entries/{id}`，两条各带一次 `?decode=true`；把这几个 id 拿到 `/v1/requests/recent?limit=1000` 里找同一个请求 | 状态里 `used` 与 `entries` 随浏览增长（`entries` 不超过 `limit` 能放下的条数），`stored` 跟着涨；`/sessions` 里有 `default`。摘要与详情的 `url`、`method`、`status` 与浏览器真的发出、真的收到的一致；`headers` 里有浏览器发的头（`user-agent`、`accept` 一类），四个凭据头（`authorization`、`proxy-authorization`、`cookie`、`set-cookie`）的**值都是 `***`**；`requestBodySize` 与 `responseBodySize` 是见过的字节数，`truncated` 在这一步应当是 `false`（单条上限 5 MiB 还没有碰到）；`timings` 的三段相加与 `totalMs` 对得上（`connectMs` 有值、`waitMs` 与 `receiveMs` 都有值），`remoteAddr` 是站点那一个地址；`?decode=true` 时 `gzip` 的应答 `decoded` 是 `true`、`base64` 是解开之后的字节、`notDecoded` 是 `null`，`br` 或 `zstd` 的应答 `decoded` 是 `false`、`notDecoded` 是 `content-encoding br is not supported` 一类（登记的不同，不是不通过）。解密那条的 `url` 以 `https://` 开头、`version` 是浏览器看到的那个（HTTP/2 的站点的多路复用请求在抓包里是各自一条）。**同一个请求在抓包里与 `recent` 里的 `id` 相同**。设计第 6、7 节；用例 `the_switch_captures_into_default`、`an_entry_is_shown_whole_with_four_headers_masked`、`decode_undoes_gzip_and_says_why_it_cannot`、`a_decrypted_request_is_captured_as_https` | 状态、会话列表、摘要与详情的 JSON；`recent` 里同一个 `id` 那一条；浏览器的开发者工具与抓包对照 | | | |
+| W10 | **导出的 HAR 能被 Chrome 与 Firefox 的开发者工具导入。** 先把 `/sessions/default/har` 存成文件：`curl.exe -s -H "X-Key: testkey" -o capture.har http://127.0.0.1:6171/v1/rurge/capture/sessions/default/har`。再分别导入 Chrome（或 Edge、Chromium）与 Firefox 的开发者工具：Chrome 的 Network 面板里在请求列表上右键 →「Import HAR…」（或 Network 面板左上角的导入箭头），选那个文件；Firefox 的 Network 面板右上角的齿轮 →「Import HAR…」，选同一个文件。两边的条目个数与 `GET /v1/rurge/capture/sessions/default` 的条数、URL、状态码、头、正文都对一遍 | 两个浏览器都导入成功、没有报格式错误；条目**由旧到新**、个数与摘要的条数相同；每条的方法、URL、状态码与摘要一致，头里四个凭据头的值是 `***`；正文显示得出来（`text` 原样的直接显示，Base64 的显示成二进制或让你下载），`_rurgeId`、`_session`、`_outcome`、`_notes` 这些 `_` 开头的键两个浏览器都各自有一种显示法（**照你看到的写下来**：Chrome 可能只在一处列出自定义键，Firefox 可能把它们放在「响应头」或一个单独的区块）；截断过或解不开的正文在 `comment` 里，两个浏览器显示 `comment` 的方式也照看到的写。**耗时的瀑布图**：新拨了连接的条目有 `connect` 那一段（`blocked` 是空的），借了连接的条目有 `blocked`、没有 `connect`，`ssl` 一段都不显示（HAR 里是 `-1`），各段之和等于 `time`（设计第 8.3 节；用例 `a_session_is_exported_as_har_oldest_first`、`har_timings_add_up_to_the_total`、`har_bodies_are_text_or_base64_and_say_what_was_left_out`） | 两个浏览器的 Network 面板；`capture.har` 的大小与 `GET /v1/rurge/capture/sessions/default` 的条数 | | | |
+
+### macOS
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| M9 | **真实浏览器的流量开着抓包。** 照 W9 做：Chrome 照前置条件带 `--proxy-server=…`，Safari 只能用系统代理（见「改系统设置的项与恢复」，做完把三栏改回去）；装 CA 照 M2 一节的 M1；`curl.exe` 换成 `curl` | 同 W9 | 同 W9；Safari 的系统代理原值与恢复 | | | |
+| M10 | **导出的 HAR 能被 Chrome 与 Firefox 的开发者工具导入。** 照 W10 做（`curl.exe` 换成 `curl`）；macOS 上两个都用惯用的那两个浏览器（Safari 没有导入 HAR 的入口，照 M2 一节用的是 Safari 与 Chrome，这一项用 Chrome 与 Firefox） | 同 W10 | 同 W10 | | | |
+
+### Linux
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| L9 | **真实浏览器的流量开着抓包。** 照 W9 做，浏览器用 Firefox 与 Chromium（Firefox 在它自己的设置里，Chromium 带 `--proxy-server=…`）；装 CA 照 M2 一节的 L1；`curl.exe` 换成 `curl` | 同 W9 | 同 W9；Firefox 改过的代理选项要改回「使用系统代理设置」 | | | |
+| L10 | **导出的 HAR 能被 Chrome 与 Firefox 的开发者工具导入。** 照 W10 做（`curl.exe` 换成 `curl`），两个浏览器用 Firefox 与 Chromium | 同 W10 | 同 W10 | | | |
+
+### 与平台无关
+
+| # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
+| --- | --- | --- | --- | --- | --- | --- |
+| P11 | **`always-capture` 在开关关着时。** 关掉开关（`{"enabled":false}`）。在 `[Rule]` 的 `FINAL,DIRECT` 之前加一行 `DOMAIN,example.test,DIRECT,always-capture=debug-1`（`example.test` 换成你真会打开的一个域名），重启 `rurge run`。先打开那个域名的一个页面，再打开另一个域名的一个页面；读 `/v1/rurge/capture/sessions` 与两个会话的内容。然后把开关打开，两个域名各再打开一次，再读一次 | 开关关着时：命中的那个域名进 `debug-1` 这个会话（`sessions` 里有 `debug-1`，这一次的请求没有进 `default`），另一个域名的请求**一个也没有存**（`used` 与 `entries` 不动）；开关开着时：命中的仍进 `debug-1`，另一个域名进 `default`（设计第 5.2、5.3、4.6 节；用例 `always_capture_captures_with_the_switch_off`、`the_session_a_rule_names_comes_before_default`、`always_capture_on_final_captures_too`）。把 `always-capture=debug-1` 写在 `FINAL,DIRECT` 那一行上也试一次：同样进 `debug-1` | `/v1/rurge/capture/sessions` 与 `/sessions/debug-1`、`/sessions/default`；`/v1/rurge/capture` 的 `used` 与 `entries` | | | |
+| P12 | **截断与挤掉在真实的大下载上。** 用 `rurge run -c <conf> --capture-size 20m` 起（单条上限仍是缺省的 5m，总量 20 MiB），打开开关。经代理下载一个几十 MB 的文件（明文的站点就行）：`curl.exe -x http://127.0.0.1:6152 -o big.bin http://<明文站点>/<大文件>`，再浏览几页别的页面。读 `GET /v1/rurge/capture`、那个大文件那一条的详情与 `/sessions` | 客户端收到的文件**完整**（`big.bin` 的字节数与 `Content-Length` 一致，校验和与服务器上的相同）；那一条的 `responseBodySize` 是见过的全部字节、`truncated` 是 `"limit"`（超过单条 5 MiB）或 `"budget"`（总量挤不出地方）——照实写看到的是哪一个，`stored` 是存下的字节（不超过 5 MiB）；更早的条目被挤掉（`evicted` 增加，`/sessions` 里先前的条目少了一些）；`used` 从不超过 `limits.total`（20 MiB）。设计第 4.3、4.4 节；用例 `a_body_over_its_limit_keeps_its_beginning`、`a_chunk_evicts_older_entries_to_find_room`、`the_oldest_entries_go_first_whatever_their_session`，命令行的 `the_capture_limits_come_from_the_options_or_the_variables` | `big.bin` 的大小与校验和；那一条的详情；`/v1/rurge/capture` 的 `used`、`limits`、`evicted` | | | |
+| P13 | **清除与开关的持久化。** 先读一次 `/v1/rurge/capture` 的四个数与 `/sessions`。只清一个会话：`curl.exe -s -X POST -H "X-Key: testkey" -d "{\"session\":\"default\"}" http://127.0.0.1:6171/v1/rurge/capture/clear`；再清全部：同一个地址、body 给 `{}`（或不给 body）。每次之后读四个数与 `/sessions`。然后开着开关停掉 `rurge run`、再起一次（同一份 `<conf>` 与数据目录），读 `GET /v1/features/capture`、`/v1/rurge/capture` 与 `state.json` 的 `features.capture` | 只清一个会话时那一句的应答是 `{"cleared":N}`（N 是那个会话的条数），别的会话还在；清全部时每个会话都没了、`entries` 是 0、`used` 是 0；**四个数（`stored`、`evicted`、`dropped`、`truncated`）不清零**（它们是同一个进程里的累计）。重启之后开关仍是开着的（`GET` 给 `{"enabled":true}`，`state.json` 的 `features.capture` 是 `true`），条目**一条也没有**（存储只在内存里）。设计第 4.1、7.6、5.1 节；用例 `clearing_takes_one_session_or_all`、`the_capture_switch_is_kept_in_state_json_and_restored`、`entries_outlive_a_reload`（重载不清条目，与重启不同） | 两次清除的应答；每次的四个数与 `/sessions`；重启前后的开关状态；`state.json` | | | |
