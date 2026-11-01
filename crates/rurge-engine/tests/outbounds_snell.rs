@@ -396,6 +396,8 @@ async fn udp_goes_through_snell() {
     for r in udp_records(&h) {
         assert_eq!(r.policy, ["S"], "{r:?}");
         assert_eq!(r.status, RecordStatus::Completed, "{r:?}");
+        // the flows leave rurge by the snell server
+        assert_eq!(r.remote_addr, Some(fake.addr()), "{r:?}");
     }
     assert_eq!(
         fake.datagrams(),

@@ -2606,6 +2606,27 @@ async fn a_doq_carrier_follows_the_rules_through_a_socks5_proxy() {
     );
 }
 
+/// A DoQ carrier that goes straight to its server records the server as the
+/// far end of its session (`phase 4 M4 design 10.3`): the internal UDP
+/// session's record reads the trail as any other session's does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_direct_doq_carrier_records_its_server() {
+    let dns = MockDns::spawn().await;
+    dns.set("target.test", &["127.0.0.1"], &[], 60);
+    let doq = FakeDoq::spawn(&dns, DoqScript::default());
+    let dir = tempfile::tempdir().unwrap();
+    let profile = follow_profile(&format!("quic://{}", doq.addr()), "", "");
+    let engine = engine_from_profile(dir.path(), &profile).await;
+    let res = lookup_target(&engine).await;
+    assert_eq!(res.v4, [Ipv4Addr::LOCALHOST]);
+    let carriers = carrier_sessions(&engine);
+    let carrier = carriers
+        .iter()
+        .find(|r| r.protocol == Some(ProtocolKind::Doq))
+        .unwrap_or_else(|| panic!("no DoQ carrier in {carriers:?}"));
+    assert_eq!(carrier.remote_addr, Some(doq.addr()), "{carrier:?}");
+}
+
 /// The same for a DoH3 server, sent by an IP rule. Its carrier is called
 /// `DOH3` although a loopback server here is not on port 443.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3864,10 +3885,11 @@ async fn an_internal_dns_session_records_the_server_it_connected_to() {
     assert_eq!((session.listen_port, session.dns_ms), (0, None));
 }
 
-/// A QUIC carrier is UDP: the control connection of the SOCKS5 association
-/// it rides on is no address of its record.
+/// A QUIC carrier is UDP: its record tells where it leaves rurge — the
+/// relay of the SOCKS5 association it rides on, not the control connection
+/// that opened it (`phase 4 M4 design 10.3`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_carrier_over_a_socks5_association_has_no_remote_address() {
+async fn a_carrier_over_a_socks5_association_records_the_relay() {
     let dns = MockDns::spawn().await;
     dns.set("target.test", &["127.0.0.1"], &[], 60);
     let doq = FakeDoq::spawn(&dns, DoqScript::default());
@@ -3893,7 +3915,19 @@ async fn a_carrier_over_a_socks5_association_has_no_remote_address() {
         carriers.iter().any(|r| r.policy == ["Socks"]),
         "{carriers:?}"
     );
+    let relays = proxy.relays();
+    assert!(!relays.is_empty(), "the association had a relay");
     for carrier in &carriers {
-        assert_eq!(carrier.remote_addr, None, "{carrier:?}");
+        assert!(
+            carrier
+                .remote_addr
+                .is_some_and(|addr| relays.contains(&addr)),
+            "{carrier:?}"
+        );
+        assert_ne!(
+            carrier.remote_addr,
+            Some(proxy.addr()),
+            "not the proxy itself"
+        );
     }
 }

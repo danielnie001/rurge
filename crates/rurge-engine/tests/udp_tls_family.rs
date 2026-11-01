@@ -27,7 +27,7 @@ async fn through(policy: &str) -> Harness {
 
 /// Two echoes, asked three times through `policy` (a `P = …` line); the
 /// flows leave through `P` and end with the association.
-async fn two_echoes_through(policy: &str) {
+async fn two_echoes_through(policy: &str) -> Harness {
     let h = through(policy).await;
     let ((one, _), (two, _)) = (udp_echo().await, udp_echo().await);
     let association = udp_associate(h.socks()).await;
@@ -41,6 +41,7 @@ async fn two_echoes_through(policy: &str) {
         assert_eq!(r.policy, ["P"], "{r:?}");
         assert_eq!(r.status, RecordStatus::Completed, "{r:?}");
     }
+    h
 }
 
 /// After one exchange through `policy`, a stranger writes to the server's
@@ -71,11 +72,15 @@ async fn a_stranger_writes(
 async fn udp_goes_through_trojan() {
     let origin = TestServer::spawn().await;
     let (upstream, params) = trojan_upstream(false, origin_addr(&origin)).await;
-    two_echoes_through(&format!(
+    let h = two_echoes_through(&format!(
         "P = trojan, 127.0.0.1, {}, {params}",
         upstream.addr().port()
     ))
     .await;
+    // the flows leave rurge by the trojan server, which carries them
+    for r in udp_records(&h) {
+        assert_eq!(r.remote_addr, Some(upstream.addr()), "{r:?}");
+    }
     let seen = upstream.requests();
     assert_eq!(
         (seen.len(), seen[0].command),
@@ -106,11 +111,15 @@ async fn anyone_may_answer_through_trojan() {
 async fn udp_goes_through_anytls() {
     let origin = TestServer::spawn().await;
     let (upstream, params) = anytls_upstream(origin_addr(&origin)).await;
-    two_echoes_through(&format!(
+    let h = two_echoes_through(&format!(
         "P = anytls, 127.0.0.1, {}, {params}",
         upstream.addr().port()
     ))
     .await;
+    // the flows leave rurge by the anytls server, which carries them
+    for r in udp_records(&h) {
+        assert_eq!(r.remote_addr, Some(upstream.addr()), "{r:?}");
+    }
     assert_eq!(
         upstream.uot_requests().len(),
         1,

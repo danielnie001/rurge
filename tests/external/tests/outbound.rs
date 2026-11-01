@@ -130,6 +130,14 @@ async fn udp_goes_through_the_program() {
         }
     });
     let carrier = o.open_udp(&ConnectOpts::default()).await.unwrap();
+    // The program's own UDP relay carries the flow (`phase 4 M4 design
+    // 10.3`): the far end is the relay on loopback, not the target (the phase
+    // 4 / M4b plan's P8 ②).
+    let far = carrier
+        .far_end(&target(echo_addr))
+        .unwrap_or_else(|| panic!("the program's relay is known"));
+    assert!(far.ip().is_loopback(), "{far}");
+    assert_ne!(far, echo_addr, "the relay, not the target");
     carrier.send_to(b"ping", &target(echo_addr)).await.unwrap();
     let mut buf = [0u8; 256];
     let (n, from) = tokio::time::timeout(Duration::from_secs(5), carrier.recv_from(&mut buf))

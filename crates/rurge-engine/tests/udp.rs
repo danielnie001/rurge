@@ -580,11 +580,12 @@ async fn udp_goes_through_a_socks5_proxy() {
     );
 }
 
-/// A UDP flow has no single far end. The control connection of the proxy's
-/// association is a TCP socket of the flow that happened to open the
-/// carrier, and it is no address of the flow's record.
+/// A flow's record tells where its datagrams leave rurge (`phase 4 M4 design
+/// 10.3`): the proxy's UDP relay, not the control connection of the
+/// association, which is a TCP socket of the flow that happened to open the
+/// carrier.
 #[tokio::test]
-async fn a_flow_through_a_socks5_proxy_has_no_remote_address() {
+async fn a_flow_through_a_socks5_proxy_records_the_relay() {
     let up = FakeSocks5::spawn(Socks5Script::default()).await;
     let proxies = format!(
         "Up = socks5, 127.0.0.1, {}, udp-relay=true",
@@ -611,8 +612,46 @@ async fn a_flow_through_a_socks5_proxy_has_no_remote_address() {
     drop(association);
     let records = finished(&h, 1).await;
     assert_eq!(records[0].policy, ["Up"]);
-    assert_eq!(records[0].remote_addr, None, "{:?}", records[0]);
+    assert_eq!(
+        records[0].remote_addr,
+        Some(up.relays()[0]),
+        "{:?}",
+        records[0]
+    );
+    assert_ne!(
+        records[0].remote_addr,
+        Some(up.addr()),
+        "not the proxy itself"
+    );
     assert_eq!(records[0].listen_port, h.socks().port());
+}
+
+/// A flow's record tells where its datagrams leave rurge (`phase 4 M4 design
+/// 10.3`): the echo's address, whether the client wrote it or a name DIRECT
+/// looked up.
+#[tokio::test]
+async fn a_direct_flow_records_where_its_datagrams_go() {
+    let h = harness(Profile::default()).await;
+    let (echo, _) = udp_echo().await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("127.0.0.1", echo.port(), b"by address")
+        .await;
+    association
+        .send("target.test", echo.port(), b"by name")
+        .await;
+    let mut answers = vec![association.recv().await.1, association.recv().await.1];
+    answers.sort();
+    assert_eq!(answers, [b"by address".to_vec(), b"by name".to_vec()]);
+    drop(association);
+    let records = finished(&h, 2).await;
+    assert!(
+        records.iter().any(|r| r.dst.starts_with("target.test")),
+        "{records:?}"
+    );
+    for record in &records {
+        assert_eq!(record.remote_addr, Some(echo), "{record:?}");
+    }
 }
 
 /// The lookup DIRECT makes of the name a flow is addressed to counts, as a

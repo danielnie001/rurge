@@ -326,6 +326,8 @@ async fn udp_through(fake: &FakeShadowsocks, params: &str) {
     for r in udp_records(&h) {
         assert_eq!(r.policy, ["S"], "{r:?}");
         assert_eq!(r.status, RecordStatus::Completed, "{r:?}");
+        // the flows leave rurge by the server's UDP port
+        assert_eq!(r.remote_addr, Some(fake.udp_addr()), "{r:?}");
     }
     assert_eq!(fake.datagrams().len(), 3, "{params}");
     assert_eq!(fake.connections(), 0, "{params}: no TCP");
