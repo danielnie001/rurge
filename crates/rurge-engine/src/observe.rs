@@ -456,6 +456,9 @@ impl TrafficStats {
 }
 
 #[cfg(test)]
+mod memory;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rurge_config::HostName;
