@@ -1062,3 +1062,111 @@ cargo test -j 8 --workspace --lib -- observe::memory::<名字> --ignored --exact
 - 开头那一句（“这一份写的是本地提交的行为：……CI 没有见过。”）、各节开头“这一节写的是本地提交的行为：……”那一句，与各节「没有覆盖的」里说提交在本地、CI 没有见过的那一条，都不再成立：各节引的用例 CI 在三个平台上都跑过、没有失败（带 `#[cfg(unix)]` 的只在 Linux 与 macOS 上，见本节第二条；带 `#[ignore]` 的 CI 不跑，见第三条）。
 - 「M2c」一节带 `#[cfg(unix)]` 的 `0600`（`restrict` 与 `mitm_ca_generate_keeps_the_secrets_private`）在 CI 的 Linux 与 macOS 上第一次被编译，那条用例在两个平台上通过。
 - 照旧成立的：全部证据是回环上的用例；没有手工验收（`docs/acceptance/phase4-manual.md` 六十二项）；没有经真浏览器、没有对真实的站点试过，也没有把 CA 装进任何信任库。量抓包内存与记录大小的两份 `memory.rs` 里，Linux 与其余平台的两支在 CI 上只编译、没有运行：调用它们的只有带 `#[ignore]` 的用例。以上由测试一步的结论与失败摘要推出，逐条的结果在要登录才能读的任务日志里。
+
+## M5a　QUIC 里的 SNI 与 `auto-quic-block`
+
+M5a 让 QUIC 流在求规则之前有 SNI，并让 `[MITM]` 的 `auto-quic-block` 生效（设计第 4 ～ 6 节，计划 P3 ～ P10）。一条 UDP 流的第一个数据报是客户端的 QUIC Initial 时，rurge 从它与后面几个数据报里的 Initial 包读出 CRYPTO 帧、按偏移拼出 ClientHello（设计第 4 节）；拼齐之前持住这条流，至多 300 毫秒、16 个数据报（第 5 节）；读出的 SNI 在求规则之前写进会话，所以带 `extended-matching` 的域名规则从此按 SNI 命中 QUIC 流，请求记录里的 `sni` 也有了值。`GET /v1/rurge/http` 因此多一个 `quic`。这一节写 API、记录与日志里看得见的部分；读不成与凑不齐时的几件、以及没有做的事，见下面「没有覆盖的」。
+
+**这一节写的是本地提交的行为：M5a 的提交在本地，CI 没有见过。**
+
+### `GET /v1/rurge/http` 的 `quic`
+
+应答在 `rewrite` 之后多一个对象，键的次序固定（设计第 5.4、7 节，计划 P11）：
+
+```json
+"quic":{"hello":0,"incomplete":0,"unreadable":0,"blocked":0}
+```
+
+一条认出是 QUIC、走到建句柄的流在下面三个里**恰好计一次**，另有第四个（设计第 5.4 节的表）：
+
+- `hello`：ClientHello 拼齐了，而且 `rurge_http::tls::parse_client_hello` 读得出——**有没有 SNI 都算**（客户端按地址连的也算）。被 `auto-quic-block` 阻断的流都在这里。
+- `incomplete`：300 毫秒到了，或持着的数据报到了 16 个，还没有拼齐。
+- `unreadable`：读者放弃了，或拼齐了而 `parse_client_hello` 读不出。
+- `blocked`：被 `auto-quic-block` 阻断的流（都是 `hello` 里的）。
+
+关联在持住时结束的流一个也不计（见「等多久、持几个」）。四个数自进程启动起累计，**重载不清零**：计数器是 `crates/rurge-engine/src/serve.rs` 的 `QuicCounts`（四个 `AtomicU64`，与 `SniffCounts` 并排），在引擎里紧跟着 `sniff_counts`。用例 `the_quic_counts_go_out_under_their_names`（`crates/rurge-api/src/routes/rurge_http.rs` 的测试模块：四个键的名字与次序逐字节）与 `rurge_http_counts_start_at_zero`（`crates/rurge-api/tests/api.rs`：`rewrite` 之后紧跟这一串）。
+
+### 记录：`sni` 与两种备注
+
+**形状不变**（设计第 5.3、7 节）：`/v1/requests/recent` 与 `/v1/requests/active` 的键一个也没有增减。变的只有两处：
+
+- **`sni`**：QUIC 流读到了 ClientHello 时是它连的名字（`parse_client_hello` 答的那个，小写）；没有 SNI、或没有读到时照旧是 `null`。
+- **`notes`**：没有读到时多一句，一条流至多一句。
+
+两种备注照 `crates/rurge-engine/src/udp.rs` 的原文逐字（`add_note`；第 5.4 节的表）：
+
+```text
+No SNI: the QUIC ClientHello did not arrive whole
+No SNI: the QUIC ClientHello could not be read
+```
+
+第一句是 `incomplete` 那一类（300 毫秒到了、或 16 个数据报还没有拼齐），第二句是 `unreadable` 那一类（读者放弃了、或拼齐了而读不出）。**读成了的不写备注**（M5-D10）：没有 SNI 的 ClientHello 也读得成、也计进 `hello`，那时记录里只有 `sni: null`，没有备注。备注在建句柄之前就定了、建句柄时写；之后被规则拒绝的照样带着它。
+
+### 被 `auto-quic-block` 阻断的流
+
+被阻断的流的记录（设计第 6.2 节，M5-D12）：
+
+- `status` 是 `rejected`、`rejectKind` 是 `REJECT`（结局 `Rejected(RejectKind::Reject)`）；
+- `error` 是 `QUIC blocked by auto-quic-block`（常数 `AUTO_QUIC_BLOCKED`，`crates/rurge-engine/src/udp.rs`）；
+- 规则文字与策略链照旧：阻断放在规则与 `REJECT` 之后，使用者看得到这条流命中了哪一行、本来要走哪条策略；
+- `notes` 里没有这一句：说明在 `error` 里，与备注是两个字段。
+
+这一句与 `block-quic` 的 `QUIC blocked` 不同，两者一读就分得开。虚拟网卡上每次丢掉的数据报各回一个 ICMP「管理上禁止」，SOCKS5 上只能丢（同 `block-quic`）。
+
+**阻断的条件**（设计第 6.1 节，M5-D11）：下面三条都成立才阻断，实现在 `crates/rurge-engine/src/serve.rs` 的 `auto_quic_blocks`：
+
+1. 这条流的 ClientHello 读到了（上面 `hello` 那一类）；
+2. 这一代配置的 `[MITM] auto-quic-block` 为真（缺省真）；
+3. **回落之后的 TCP 会被嗅探并解密**——同一个目标、同一个端口上的一条 TCP 会话，带着同一个 ClientHello 去掉 ALPN，会被 `sniffable_session` 嗅探、被 `Engine::decrypting` 解密。两步都是 TCP 一侧今天的那段代码（入口、名字、`always-raw-tcp-hosts`、`always-raw-tcp-keywords` 与端口那几步抽成 `sniffable_target`，两侧共用，条件不会分叉），所以名单、`mitm` 开关、可用的 CA、`client-source-address`、`always-raw-tcp-hosts` 与 `always-raw-tcp-keywords`、以及端口（80、443、`force-http-engine-hosts` 与 `[MITM]` 放宽到的）都对 QUIC 流同样算数。ALPN 不看：QUIC 的是 `h3`，回落到 TCP 之后客户端给的是 `h2` 与 `http/1.1`，那时由 TCP 一侧照常判断。
+
+两处因此与手册不同（登记在兼容性清单的 `auto-quic-block` 一行）：名单里同时写了 `always-raw-tcp-hosts` 的主机**不阻断**（回落之后的 TCP 反正不解开，阻断只让客户端慢）；名单里**不带端口**的项只在这个端口本来就嗅探时算数——例如 HTTP/3 在 8443、名单写 `example.com` 而不带端口，不阻断。要阻断就写明 `:8443` 或 `:0`，两侧一起生效。
+
+**没有 SNI 的 ClientHello**（设计第 6.4 节，M5-D14）：名单按目标比，不带端口的项只对 443——同 TCP 上没有 SNI 的 TLS。
+
+**与 `block-quic` 的关系**（设计第 6.3 节，M5-D13）：两者各自独立，任一个要阻断就阻断；`auto-quic-block` 先判，两者都要阻断时 `error` 写它。全局的 `block-quic = always-allow` **不放过** `auto-quic-block` 要阻断的流（`always-allow` 说的是各策略的 `block-quic` 参数，手册没有说 `[MITM]` 的这个键）；不想阻断名单里主机的 QUIC，写 `auto-quic-block = false`。被 `auto-quic-block` 阻断的流不碰自适应的表（它每一次都阻断，不是试探）；`block-quic` 那一段本身没有改。
+
+用例：`crates/rurge-engine/tests/mitm.rs`（经 SOCKS5）的 `auto_quic_block_blocks_quic_to_a_listed_host`、`auto_quic_block_off_lets_quic_through`、`with_mitm_off_quic_goes_through`、`without_a_usable_ca_quic_goes_through`、`a_source_mitm_does_not_take_lets_quic_through`、`a_negated_entry_lets_quic_through`、`a_raw_tcp_host_is_not_blocked`、`a_bare_entry_does_not_block_quic_on_8443`、`a_port_entry_blocks_only_its_port`、`an_incomplete_hello_is_not_blocked`、`a_hello_without_sni_is_judged_by_its_target`、`always_allow_does_not_stop_auto_quic_block`、`with_block_quic_too_the_record_names_auto_quic_block`、`a_reject_rule_comes_before_auto_quic_block`，与 `crates/rurge-engine/tests/tun.rs`（经内存设备上的虚拟网卡）的 `auto_quic_block_answers_each_held_datagram_with_icmp`。
+
+### 等多久、持几个
+
+两个常数在 `crates/rurge-engine/src/udp.rs`，**没有旋钮**（M5-D7）：
+
+- `HELLO_WAIT`：300 毫秒，**从第一个数据报起**；
+- `HELLO_DATAGRAMS`：16，第一个算在内。
+
+拼齐了立刻放，所以 ClientHello 装得进第一个数据报的流一点也不多等；跨两个数据报的只多等两个数据报到达的间隔。300 毫秒与 16 个只管凑不齐的：300 毫秒同 sing-box 的缺省、在 Xray 的 200 毫秒与 mihomo 的 3 秒之间，远小于客户端 1 秒的 PTO；16 个装得下 16 KiB 的 ClientHello，也挡住一个只发别的包的客户端让持着的队列一直长（每个关联 1 MiB 的 `QUEUED_BYTES` 照旧管着全部）。
+
+持着的时候**没有句柄、没有记录**，同 TCP 的嗅探；满了 16 个之后的与别的数据报照旧排在流的队列里，放了之后按原来的次序发出去（`forward` 先发持着的，再收队列）。关联在持住时结束的，这条流**不留记录、不计数**。
+
+### 日志
+
+只多两行 DEBUG，一条流至多一行（设计第 5.4 节；`destination` 是这条流的目标，`why` 是读者放弃的原因）：
+
+```rust
+tracing::debug!(host = %destination.host, port = destination.port, "udp: the QUIC ClientHello did not come whole within 300 ms or 16 datagrams; the rules see no SNI");
+tracing::debug!(host = %destination.host, port = destination.port, why, "udp: the QUIC ClientHello could not be read; the rules see no SNI");
+```
+
+读不成的原因**只进 DEBUG**（`why`），不进备注、记录与 API。九种：
+
+```text
+the client closed the connection
+a frame an Initial may not carry
+a frame cut short
+CRYPTO data beyond 64 KiB
+CRYPTO data that changed when it came again
+CRYPTO data in more than 32 pieces
+the first handshake message is no ClientHello
+a ClientHello longer than 64 KiB
+a ClientHello that does not parse
+```
+
+前八种是 `rurge-net/src/quic/initial.rs` 里那几个常数的原文，最后一种是拼齐了而 `parse_client_hello` 读不出的（`udp.rs` 自己写的）。名字与地址只进 DEBUG：INFO 与以上的会话日志行不变。
+
+### 没有覆盖的
+
+- **M5a 的提交都在本地，CI 没有见过**；**没有手工验收**：`docs/acceptance/phase4-manual.md` 的 M5 一节（W13、W14、M13、M14、L13、L14）2026-11-02 加在那里，一项也没有做过。
+- **全部证据是回环上的用例**：QUIC 的数据报是用例自己造的或 quinn 的客户端在回环上真发出的，没有一个 QUIC 握手完成过；没有经真浏览器、没有对真实的 HTTP/3 站点试过。
+- **设计第 4.7 节的四件没有做**（M5-D15）：从没有拼齐的 ClientHello 里取 SNI（Surge iOS 5.17.0 说有）、gQUIC 的 SNI（Surge iOS 5.14.6 说有）、Retry 之后的第二把密钥（持住时还没有到服务端，放出去之后不再读）、ECH（读到的是外层的 SNI）。前两件要不要做归项目所有者（设计第 15 节）。
+- **放行的 QUIC 流发往没有人收的回环端口**，用例因此**不断言说明为空**（计划 P12、设计第 16 节第 2 条）：Windows 上可能写上一个「连接被重置」一类的说明。被阻断的流断言的是 `error` 恰好那一句。
+- **没有观察过 Surge 在这些地方的实际行为**，照设计与手册写：`quic` 四个数的口径、两种备注与那一句说明的文字、持住的两个上限、阻断跟着 TCP 一侧的读法。
