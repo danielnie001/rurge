@@ -1266,6 +1266,7 @@ mod tests {
     /// A carrier whose sends never finish: a stream stuck behind a peer that
     /// reads no more.
     struct Stuck;
+
     impl PacketSocket for Stuck {
         fn send_to<'a>(&'a self, _: &'a [u8], _: &'a Target) -> BoxFuture<'a, io::Result<()>> {
             Box::pin(std::future::pending())
