@@ -103,10 +103,10 @@ async fn queued_bytes_are_given_back_when_the_reader_runs_ahead_of_the_shard() {
 /// of SYNs go in before that. The budget holds 128 more than that, so whichever
 /// order the tasks run in, SYNs are still waiting once the shard is held up. A
 /// budget of 8 KiB, which holds 128 of them, was not enough: the reader drops
-/// what does not fit and counts it `queue_full`, so a shard that lags behind it
-/// may take all of it in one turn, send one batch that the writer and the
-/// device take without holding it up, and leave nothing waiting (the phase 4 /
-/// M4b plan's execution record row 75).
+/// what does not fit and counts it `queue_full`, so a shard that lags behind
+/// the reader may take the 128 that fit in one turn, send one batch, which
+/// waits in the writer's hands without holding the shard up, and leave nothing
+/// waiting (the phase 4 / M4b plan's execution record row 75).
 async fn queued_bytes_come_back() {
     let (gate, end) = GatedDevice::pair();
     let app = app4(40_000);
