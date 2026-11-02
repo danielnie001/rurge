@@ -509,3 +509,48 @@ async fn a_reload_keeps_an_unchanged_policy_and_its_connection() {
         previous = now;
     }
 }
+
+/// Every stream on the policy's one QUIC connection leaves rurge by that
+/// connection: each of their records has the server's address as its remote
+/// (`phase 4 M4 design 10.3`).
+#[tokio::test]
+async fn every_stream_on_a_tuic_connection_records_the_servers_address() {
+    let echo = echo_server().await;
+    for version in [Version::V5, Version::V4] {
+        let fake = FakeTuic::spawn(TuicScript {
+            connect_to: Some(echo),
+            ..version.script()
+        });
+        let h = through(&fake, &plain_line(version, &fake)).await;
+        let mut first = connect_via_http(h.http(), "target.test:7").await;
+        echo_through(&mut first, b"the one that dialled").await;
+        let mut second = connect_via_http(h.http(), "target.test:7").await;
+        echo_through(&mut second, b"the one that borrowed").await;
+        assert_eq!(fake.connections(), 1, "one QUIC connection, {version:?}");
+        drop((first, second));
+        for record in the_records(&h, 2).await {
+            assert_eq!(record.remote_addr, Some(fake.addr()), "{record:?}");
+        }
+    }
+}
+
+/// A UDP flow through the policy's connection leaves rurge by it too: its
+/// record has the server's address (`phase 4 M4 design 10.3`).
+#[tokio::test]
+async fn a_tuic_udp_flow_records_the_server() {
+    let fake = FakeTuic::spawn(Version::V5.script());
+    let h = through(&fake, &plain_line(Version::V5, &fake)).await;
+    let echo = udp_echo_server().await;
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", echo.port(), b"one").await;
+    assert_eq!(association.recv().await, (echo, b"one".to_vec()));
+    drop(association);
+    wait_until("the flow to finish", || !udp_records(&h).is_empty()).await;
+    let records = udp_records(&h);
+    assert_eq!(
+        records[0].remote_addr,
+        Some(fake.addr()),
+        "{:?}",
+        records[0]
+    );
+}

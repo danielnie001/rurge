@@ -502,3 +502,97 @@ peer = (public-key = {}, allowed-ips = 10.8.0.3/32)\n",
     );
     assert!(h.dns.queries().is_empty(), "the name is not looked up");
 }
+
+/// A session through the tunnel leaves rurge by the carrier of the peer its
+/// destination routes to: its record has the peer's endpoint
+/// (`phase 4 M4 design 10.3`).
+#[tokio::test]
+async fn a_session_through_wireguard_records_its_peers_endpoint() {
+    let (peer, section) = peer().await;
+    let h = harness(Profile {
+        proxies: WG,
+        rules: TO_WG,
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let mut tunnel = connect_via_http(h.http(), "10.0.0.1:7").await;
+    echo_through(&mut tunnel, b"through the tunnel").await;
+    assert_eq!(peer.core().connected_to, [echo_addr()]);
+    drop(tunnel);
+    let log = h.engine.request_log();
+    wait_until("the session to finish", || !log.recent(10).is_empty()).await;
+    let record = log.recent(10)[0].clone();
+    assert_eq!(record.remote_addr, Some(peer.addr()), "{record:?}");
+}
+
+/// A UDP flow through the tunnel leaves rurge by the same carrier: its
+/// record has the peer's endpoint (`phase 4 M4 design 10.3`).
+#[tokio::test]
+async fn a_udp_flow_through_wireguard_records_its_peers_endpoint() {
+    let (peer, section) = peer().await;
+    let h = harness(Profile {
+        proxies: WG,
+        rules: TO_WG,
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association.send("10.0.0.1", ECHO_PORT, b"through").await;
+    assert_eq!(association.recv().await, (echo_addr(), b"through".to_vec()));
+    drop(association);
+    wait_until("the flow to finish", || !udp_records(&h).is_empty()).await;
+    let records = udp_records(&h);
+    assert_eq!(
+        records[0].remote_addr,
+        Some(peer.addr()),
+        "{:?}",
+        records[0]
+    );
+}
+
+/// A section with two peers, each taking a range of the tunnel: the session
+/// notes the carrier of the peer its destination routes to, so two
+/// destinations, one peer each, record one endpoint each
+/// (`phase 4 M4 design 10.3`, `Routes::lookup`).
+#[tokio::test]
+async fn a_session_records_the_peer_its_destination_routes_to() {
+    let ((private, public), _) = (keypair(), ());
+    let one = FakeWgPeer::start(public, PeerOpts::default()).await;
+    let two = FakeWgPeer::start(public, PeerOpts::default()).await;
+    let mut section = format!(
+        "[WireGuard w]\nprivate-key = {}\nself-ip = 10.9.0.2\n",
+        hex(&private)
+    );
+    for (peer, allowed) in [(&one, "10.1.0.0/16"), (&two, "10.2.0.0/16")] {
+        section.push_str(&format!(
+            "peer = (public-key = {}, allowed-ips = {allowed}, endpoint = {})\n",
+            hex(&peer.public_key()),
+            peer.addr()
+        ));
+    }
+    let h = harness(Profile {
+        proxies: WG,
+        rules: TO_WG,
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    let mut first = connect_via_http(h.http(), "10.1.0.1:7").await;
+    echo_through(&mut first, b"to one").await;
+    let mut second = connect_via_http(h.http(), "10.2.0.1:7").await;
+    echo_through(&mut second, b"to two").await;
+    drop((first, second));
+    let records = the_records(&h, 2).await;
+    assert_eq!(records[0].remote_addr, Some(one.addr()), "{:?}", records[0]);
+    assert_eq!(records[1].remote_addr, Some(two.addr()), "{:?}", records[1]);
+    assert_eq!(
+        one.core().connected_to,
+        [SocketAddr::from(([10, 1, 0, 1], ECHO_PORT))]
+    );
+    assert_eq!(
+        two.core().connected_to,
+        [SocketAddr::from(([10, 2, 0, 1], ECHO_PORT))]
+    );
+}

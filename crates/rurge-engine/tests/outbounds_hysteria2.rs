@@ -487,3 +487,82 @@ async fn a_reload_keeps_an_unchanged_policy_and_its_connection() {
         previous = now;
     }
 }
+
+/// Every stream on the policy's one QUIC connection leaves rurge by that
+/// connection: each of their records has the server's address as its remote,
+/// not just the one that dialled it (`phase 4 M4 design 10.3`).
+#[tokio::test]
+async fn every_stream_on_a_quic_connection_records_the_servers_address() {
+    let echo = echo_server().await;
+    let fake = FakeHysteria2::spawn(Hysteria2Script {
+        connect_to: Some(echo),
+        ..script()
+    });
+    let h = through(&fake, &plain_line(&fake)).await;
+    let mut first = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut first, b"the one that dialled").await;
+    let mut second = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut second, b"the one that borrowed").await;
+    assert_eq!(fake.connections(), 1, "one QUIC connection");
+    drop((first, second));
+    for record in the_records(&h, 2).await {
+        assert_eq!(record.remote_addr, Some(fake.addr()), "{record:?}");
+    }
+}
+
+/// A UDP flow through the policy's connection leaves rurge by it too: its
+/// record has the server's address (`phase 4 M4 design 10.3`).
+#[tokio::test]
+async fn a_hysteria2_udp_flow_records_the_server() {
+    let fake = FakeHysteria2::spawn(script());
+    let h = through(&fake, &plain_line(&fake)).await;
+    let echo = udp_echo_server().await;
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", echo.port(), b"one").await;
+    assert_eq!(association.recv().await, (echo, b"one".to_vec()));
+    drop(association);
+    wait_until("the flow to finish", || !udp_records(&h).is_empty()).await;
+    let records = udp_records(&h);
+    assert_eq!(
+        records[0].remote_addr,
+        Some(fake.addr()),
+        "{:?}",
+        records[0]
+    );
+}
+
+/// Through an `underlying-proxy`, the session leaves rurge by the proxy's
+/// UDP relay: its record has the relay's address — not the stand-in quinn
+/// knows the server by, and not the proxy's TCP address (`phase 4 M4 design
+/// 10.3`).
+#[tokio::test]
+async fn hysteria2_through_a_socks5_relay_records_the_relay() {
+    let echo = echo_server().await;
+    let fake = FakeHysteria2::spawn(Hysteria2Script {
+        connect_to: Some(echo),
+        ..script()
+    });
+    let socks5 = FakeSocks5::spawn(Socks5Script::default()).await;
+    let proxies = format!(
+        "Entry = socks5, 127.0.0.1, {}, udp-relay=true\n{}",
+        socks5.addr().port(),
+        line(
+            &fake,
+            &format!("password={PASSWORD}, underlying-proxy=Entry")
+        )
+    );
+    let h = through(&fake, &proxies).await;
+    let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+    echo_through(&mut tunnel, b"through the relay").await;
+    drop(tunnel);
+    let record = the_records(&h, 1).await[0].clone();
+    let relays = socks5.relays();
+    assert_eq!(relays.len(), 1, "{relays:?}");
+    assert_eq!(record.remote_addr, Some(relays[0]), "{record:?}");
+    assert_ne!(
+        record.remote_addr,
+        Some("192.0.2.1:443".parse().unwrap()),
+        "the stand-in is no far end"
+    );
+    assert_ne!(record.remote_addr, Some(socks5.addr()));
+}
