@@ -2628,6 +2628,17 @@ async fn expect_100_continue_is_answered() {
 /// reads the next request and goes without answering it, and answers every
 /// request of its later connections; it counts the connections it accepted.
 async fn cut_off_origin() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    slow_cut_off_origin(Duration::ZERO, Duration::ZERO).await
+}
+
+/// As `cut_off_origin`, with `hold` slept by the first connection after it
+/// reads its second request and before it goes, and `delay` slept by every
+/// later connection after it reads a request and before it answers `two`.
+/// Both are skipped when zero.
+async fn slow_cut_off_origin(
+    hold: Duration,
+    delay: Duration,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -2656,11 +2667,17 @@ async fn cut_off_origin() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
                     if n == 1 && heads == 2 {
                         // the request was read and no answer comes: the
                         // connection goes
+                        if !hold.is_zero() {
+                            tokio::time::sleep(hold).await;
+                        }
                         return;
                     }
                     let answer = if n == 1 {
                         "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none"
                     } else {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
                         "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo"
                     };
                     if s.write_all(answer.as_bytes()).await.is_err() {
@@ -2717,6 +2734,67 @@ async fn an_idempotent_request_cut_off_is_sent_again_through_the_engine() {
         accepted.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "the cut-off request was sent again on a connection of its own"
+    );
+}
+
+/// A `GET` sent again on a new connection gets its whole idle from that
+/// connection (`phase 4 M1 design 8.6`, the phase 4 / M1b plan's deferred row
+/// 4): the origin holds the first connection 1.5 s after reading the second
+/// request before it goes, and holds the connection the request is sent again
+/// on 1.5 s before it answers; the engine's idle is 2.5 s. The answer at about
+/// 3.0 s is inside the 4.0 s that request's clock reaches and 1.0 s past the
+/// 2.5 s it would have without `Progress::restart` in `retry`, which would
+/// answer 504.
+#[tokio::test]
+async fn a_request_sent_again_waits_its_whole_idle_on_the_new_connection() {
+    const IDLE: Duration = Duration::from_millis(2_500);
+    const HOLD: Duration = Duration::from_millis(1_500);
+    const DELAY: Duration = Duration::from_millis(1_500);
+    let (origin, accepted) = slow_cut_off_origin(HOLD, DELAY).await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_timed(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+        IDLE,
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    let first = request(&mut tunnel, "target.test", "/a").await;
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    assert!(first.ends_with("one"), "{first}");
+
+    // the borrowed connection is held and then goes; the request goes out
+    // again on a connection of its own, where the clock starts over
+    let sent = Instant::now();
+    let second = request(&mut tunnel, "target.test", "/b").await;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    assert!(second.ends_with("two"), "{second}");
+    assert!(
+        sent.elapsed() > IDLE,
+        "send to answer outlasts the whole idle: only a clock restarted on the new connection answers"
+    );
+    drop(tunnel);
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    for record in &records {
+        assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+        assert_eq!(record.status_code, Some(200), "{record:?}");
+    }
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the held request was sent again on a connection of its own"
     );
 }
 
