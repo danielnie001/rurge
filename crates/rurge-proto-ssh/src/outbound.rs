@@ -17,6 +17,7 @@ use russh::{Channel, ChannelOpenFailure, ChannelStream, Disconnect, Error, Prefe
 use rustls::RootCertStore;
 use std::borrow::Cow;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -221,6 +222,10 @@ fn session_config(pins: &[HostKeyPin]) -> client::Config {
 
 struct Session {
     handle: Handle<Client>,
+    /// Where the session's connection goes, noted by the dial that made it:
+    /// a channel opened on a session reused from another request leaves rurge
+    /// by it too (`the phase 4 / M4b plan's P9 ⑤`).
+    peer: Option<SocketAddr>,
     /// Channels being opened or handed out, and not yet dropped.
     open: Arc<AtomicUsize>,
     /// Woken when a channel opens or closes, and when the session goes.
@@ -632,11 +637,17 @@ impl SshOutbound {
         // never dial for a target whose name cannot be sent
         let host = channel_host(target)?;
         let session = self.session(opts).await?;
+        if let Some(peer) = session.peer {
+            rurge_net::trail::connected(peer);
+        }
         match open_channel(&session, &host, target.port).await {
             Err(ChannelError::Gone) => {
                 // the session ended since it was last used: one new one
                 self.forget(&session).await;
                 let session = self.session(opts).await?;
+                if let Some(peer) = session.peer {
+                    rurge_net::trail::connected(peer);
+                }
                 open_channel(&session, &host, target.port)
                     .await
                     .map_err(ChannelError::into_outbound)
@@ -691,6 +702,8 @@ impl SshOutbound {
 
     async fn establish(&self, opts: &ConnectOpts) -> Result<Session, OutboundError> {
         let (stream, armed) = abandonable(self.stack.open(opts).await?);
+        // where the dial sent it, before the login is written
+        let peer = rurge_net::trail::current().and_then(|trail| trail.peer());
         let client = Client {
             pins: self.pins.clone(),
         };
@@ -717,6 +730,7 @@ impl SshOutbound {
         }
         Ok(Session {
             handle,
+            peer,
             open: Arc::new(AtomicUsize::new(0)),
             activity: Arc::new(Notify::new()),
         })

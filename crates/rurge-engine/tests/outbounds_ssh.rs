@@ -50,6 +50,42 @@ async fn a_connect_leaves_through_ssh_with_the_name_unresolved() {
     assert_eq!(log.recent(10)[0].policy, ["S"]);
 }
 
+/// Two channels on one SSH session: each record names the server, not only the
+/// session that logged in (`the phase 4 / M4b plan's P9 ⑤`).
+#[tokio::test]
+async fn every_channel_on_an_ssh_session_records_its_address() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let server = ssh_server(
+        &origin,
+        FakeSshOpts {
+            password: Some("pw".into()),
+            ..FakeSshOpts::default()
+        },
+    )
+    .await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "S = ssh, 127.0.0.1, {}, username=u, password=pw",
+            server.addr.port()
+        ),
+        rules: "DOMAIN,target.test,S",
+        ..Profile::default()
+    })
+    .await;
+    let log = h.engine.request_log();
+    for round in 1..=2 {
+        let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+        let response = get(&mut tunnel, "target.test", "/hello").await;
+        assert!(response.ends_with("hi there"), "{response}");
+        drop(tunnel);
+        wait_until("the session to finish", || log.recent(10).len() == round).await;
+        let record = log.recent(10)[0].clone();
+        assert_eq!(record.remote_addr, Some(server.addr), "{record:?}");
+    }
+    assert_eq!(server.logins(), 1, "one SSH session carried both");
+}
+
 /// A key from `[Keystore]`, and a server pinned by `server-fingerprint`.
 #[tokio::test]
 async fn a_keystore_key_logs_in_to_a_pinned_server() {
