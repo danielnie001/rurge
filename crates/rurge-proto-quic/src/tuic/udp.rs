@@ -60,6 +60,7 @@ use rurge_net::connector::{ConnectOpts, PacketSocket, Target};
 use rurge_proto::OutboundError;
 use std::collections::{HashMap, VecDeque, hash_map};
 use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -824,6 +825,15 @@ impl PacketSocket for TuicUdp {
     /// A packet longer than `buf` is dropped: give it 64 KiB.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
         Box::pin(self.inbox.recv_from(buf))
+    }
+
+    /// The far end of the hop this carrier's datagrams leave rurge by: the
+    /// bound lease's connection (`phase 4 M4 design 10.3`), or none while
+    /// nothing is bound. Read off `bound` rather than by `current`, which
+    /// compares the route and may unbind.
+    fn far_end(&self, _to: &Target) -> Option<SocketAddr> {
+        let bound = self.bound.lock().expect("bound");
+        bound.as_ref()?.lease.far_end()
     }
 }
 

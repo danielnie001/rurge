@@ -54,11 +54,12 @@ use rurge_config::KeystoreItem;
 use rurge_config::spec::{PortHopping, QuicOpts, TlsOpts, Tristate};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{ConnectOpts, Connector, Route, Target};
-use rurge_net::quic::{self, Path, Transport};
+use rurge_net::quic::{self, FarEnd, Path, Transport};
 use rurge_proto::build::quic_tls;
 use rurge_proto::{BuildError, OutboundError};
 use rustls::RootCertStore;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -160,10 +161,14 @@ impl Dialer {
     }
 
     /// A new connection to the server: nothing bounds it here but quinn's
-    /// idle timer.
-    async fn connect(&self, opts: &ConnectOpts) -> io::Result<Connection> {
+    /// idle timer. Its far end comes with it, read before the path is
+    /// handed over (`phase 4 M4 design 10.3`): the protocol may put its own
+    /// socket over the path's, but not over where the packets go.
+    async fn connect(&self, opts: &ConnectOpts) -> io::Result<(Connection, FarEnd)> {
         let (path, config) = self.path(opts).await?;
-        quic::connect(path, config, &self.server_name).await
+        let far_end = path.far_end();
+        let quic = quic::connect(path, config, &self.server_name).await?;
+        Ok((quic, far_end))
     }
 
     /// The path of a new connection, under what the protocol lays over it,
@@ -252,6 +257,12 @@ impl<S> Lease<S> {
     /// What the protocol's handshake left for the connection's requests.
     pub fn state(&self) -> &S {
         &self.conn.state
+    }
+
+    /// The far end of the hop this connection's traffic leaves rurge by,
+    /// read now (`phase 4 M4 design 10.3`): a path that hops moves its port.
+    pub fn far_end(&self) -> Option<SocketAddr> {
+        self.conn.far_end.now()
     }
 }
 
@@ -471,6 +482,11 @@ impl<P: Protocol> Session<P> {
                 let came = *first_look.get_or_insert(slot.dials);
                 if let Some(lease) = self.shared.pick(&mut slot, route.as_ref(), self.cap, after) {
                     let was_up = lease.conn.dialed < came;
+                    // a borrowed connection notes the far end of the hop it
+                    // leaves rurge by, as the session that dialled it did
+                    if let Some(far) = lease.far_end() {
+                        rurge_net::trail::connected(far);
+                    }
                     return Ok((lease, was_up));
                 }
                 if let Some(since) = waited_since
@@ -490,7 +506,11 @@ impl<P: Protocol> Session<P> {
             let _waiting = Waiting(&self.shared);
             dialed.await;
         }
-        self.dial(opts).await.map(|lease| (lease, false))
+        let lease = self.dial(opts).await?;
+        if let Some(far) = lease.far_end() {
+            rurge_net::trail::connected(far);
+        }
+        Ok((lease, false))
     }
 
     /// Whether a request that found no room dials, rather than waits for
@@ -517,13 +537,14 @@ impl<P: Protocol> Session<P> {
             let dialed = slot.dials;
             slot.dials += 1;
             match result {
-                Ok((quic, state, route)) => {
+                Ok((quic, state, route, far_end)) => {
                     slot.failure = None;
                     let conn = Arc::new(Conn {
                         dialed,
                         quic,
                         state,
                         route,
+                        far_end,
                         rerouted: AtomicBool::new(false),
                         usage: Mutex::new(Usage {
                             leases: 0,
@@ -546,19 +567,19 @@ impl<P: Protocol> Session<P> {
     }
 
     /// QUIC's handshake over the path to the server, then the protocol's:
-    /// the connection, what the protocol's handshake left, and where the
-    /// connector led.
+    /// the connection, what the protocol's handshake left, where the
+    /// connector led, and the far end the path leaves rurge by.
     async fn connect(
         &self,
         opts: &ConnectOpts,
-    ) -> Result<(Connection, P::State, Option<Route>), OutboundError> {
+    ) -> Result<(Connection, P::State, Option<Route>, FarEnd), OutboundError> {
         // asked before the dial: should the connector lead elsewhere while
         // it goes on, the next request finds the connection off the way,
         // never the other way round
         let route = self.dialer.route();
-        let quic = self.dialer.connect(opts).await?;
+        let (quic, far_end) = self.dialer.connect(opts).await?;
         match self.shared.protocol.handshake(&quic).await {
-            Ok(state) => Ok((quic, state, route)),
+            Ok(state) => Ok((quic, state, route, far_end)),
             Err(e) => {
                 close(&quic, P::NO_ERROR);
                 Err(e)
@@ -711,6 +732,9 @@ struct Conn<S> {
     state: S,
     /// Where the connector led when the connection was dialled.
     route: Option<Route>,
+    /// The far end of the hop its packets leave rurge by (`phase 4 M4 design
+    /// 10.3`): what a lease hands to the session that borrows it.
+    far_end: FarEnd,
     /// The connector has led elsewhere since: nothing new goes to it.
     rerouted: AtomicBool,
     usage: Mutex<Usage>,
