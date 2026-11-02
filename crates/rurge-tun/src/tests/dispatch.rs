@@ -8,7 +8,7 @@ use super::support::{GatedDevice, WITHIN, addr, eventually, rig_with, sock, syn_
 use crate::bytes::QueuedBytes;
 use crate::dispatch::{route, shard_of};
 use crate::stats::Stats;
-use crate::tcp::Tuple;
+use crate::tcp::{INGRESS_PER_WAKE, Tuple};
 use crate::{Counters, TunOptions};
 use rurge_config::IpRewrite;
 use std::hash::RandomState;
@@ -84,8 +84,34 @@ fn a_shard_queue_beyond_queue_bytes_drops_and_counts_queue_full() {
 /// them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn queued_bytes_are_given_back_when_the_shard_takes_the_packets() {
-    const BUDGET: usize = 8 * 1024;
+    queued_bytes_come_back().await;
+}
+
+/// The same on the current-thread runtime, where the reader runs ahead of the
+/// shard before the shard's first turn: the order in which a budget of 8 KiB
+/// had the shard left with nothing waiting.
+#[tokio::test]
+async fn queued_bytes_are_given_back_when_the_reader_runs_ahead_of_the_shard() {
+    queued_bytes_come_back().await;
+}
+
+/// The body of the two tests above. The budget holds more SYNs than a shard
+/// takes before the writer's queue and the device hold it up: a turn takes at
+/// most `INGRESS_PER_WAKE` of them, and the shard is held up at the latest at
+/// the third turn whose segments it sends — one batch is in the writer's hands
+/// and one in the writer's queue of length one — so at most three turns' worth
+/// of SYNs go in before that. The budget holds 128 more than that, so whichever
+/// order the tasks run in, SYNs are still waiting once the shard is held up. A
+/// budget of 8 KiB, which holds 128 of them, was not enough: the reader drops
+/// what does not fit and counts it `queue_full`, so a shard that lags behind it
+/// may take all of it in one turn, send one batch that the writer and the
+/// device take without holding it up, and leave nothing waiting (the phase 4 /
+/// M4b plan's execution record row 75).
+async fn queued_bytes_come_back() {
     let (gate, end) = GatedDevice::pair();
+    let app = app4(40_000);
+    let syn = |port: u16| syn_v4(app, addr(format!("192.0.2.1:{port}").as_str()));
+    let budget = (3 * INGRESS_PER_WAKE + 128) * syn(1_000).capacity();
     let rig = rig_with(
         gate.clone(),
         end,
@@ -93,14 +119,13 @@ async fn queued_bytes_are_given_back_when_the_shard_takes_the_packets() {
             shards: 1,
             shard_queue: 4_096,
             writer_queue: 1,
-            queue_bytes: BUDGET,
+            queue_bytes: budget,
             ..TunOptions::default()
         },
     );
-    let app = app4(40_000);
-    let syn = |port: u16| syn_v4(app, addr(format!("192.0.2.1:{port}").as_str()));
-    // far more SYNs than the shard takes before the writer's queue is full and
-    // the device, which writes nothing until `gate` is opened, holds it up
+    // more SYNs than the shard takes in the three turns it may have before the
+    // writer's queue is full and the device, which writes nothing until `gate`
+    // is opened, holds it up
     for port in 0..1_024u16 {
         rig.app.inject(syn(1_000 + port));
     }
@@ -109,8 +134,8 @@ async fn queued_bytes_are_given_back_when_the_shard_takes_the_packets() {
     })
     .await;
     assert!(
-        rig.tun.queue_bytes_queued() <= BUDGET,
-        "{} bytes wait, and the budget is {BUDGET}",
+        rig.tun.queue_bytes_queued() <= budget,
+        "{} bytes wait, and the budget is {budget}",
         rig.tun.queue_bytes_queued()
     );
     gate.open();
