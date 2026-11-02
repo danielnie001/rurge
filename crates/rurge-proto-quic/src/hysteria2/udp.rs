@@ -519,7 +519,9 @@ impl PacketSocket for Hysteria2Udp {
     /// The far end of the hop this carrier's datagrams leave rurge by: the
     /// bound lease's connection (`phase 4 M4 design 10.3`), or none while
     /// nothing is bound. Read off `bound` rather than by `current`, which
-    /// compares the route and moves the carrier.
+    /// compares the route: it answers `None` once the policy leads elsewhere,
+    /// while the datagrams go on over the connection bound until the next
+    /// send binds anew.
     fn far_end(&self, _to: &Target) -> Option<SocketAddr> {
         let bound = self.bound.lock().expect("bound");
         bound.as_ref()?.lease.far_end()

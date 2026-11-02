@@ -558,7 +558,7 @@ async fn a_udp_flow_through_wireguard_records_its_peers_endpoint() {
 /// (`phase 4 M4 design 10.3`, `Routes::lookup`).
 #[tokio::test]
 async fn a_session_records_the_peer_its_destination_routes_to() {
-    let ((private, public), _) = (keypair(), ());
+    let (private, public) = keypair();
     let one = FakeWgPeer::start(public, PeerOpts::default()).await;
     let two = FakeWgPeer::start(public, PeerOpts::default()).await;
     let mut section = format!(
@@ -584,9 +584,19 @@ async fn a_session_records_the_peer_its_destination_routes_to() {
     let mut second = connect_via_http(h.http(), "10.2.0.1:7").await;
     echo_through(&mut second, b"to two").await;
     drop((first, second));
+    // the order records come in is the order the sessions ended, not the
+    // order they began: each is found by its own destination
     let records = the_records(&h, 2).await;
-    assert_eq!(records[0].remote_addr, Some(one.addr()), "{:?}", records[0]);
-    assert_eq!(records[1].remote_addr, Some(two.addr()), "{:?}", records[1]);
+    let to_one = records
+        .iter()
+        .find(|r| r.dst == "10.1.0.1:7")
+        .unwrap_or_else(|| panic!("the session to the first peer: {records:?}"));
+    let to_two = records
+        .iter()
+        .find(|r| r.dst == "10.2.0.1:7")
+        .unwrap_or_else(|| panic!("the session to the second peer: {records:?}"));
+    assert_eq!(to_one.remote_addr, Some(one.addr()), "{to_one:?}");
+    assert_eq!(to_two.remote_addr, Some(two.addr()), "{to_two:?}");
     assert_eq!(
         one.core().connected_to,
         [SocketAddr::from(([10, 1, 0, 1], ECHO_PORT))]
