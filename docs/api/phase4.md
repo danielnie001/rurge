@@ -955,13 +955,14 @@ not decoded: {NotDecoded 的 Display}
 
 **在哪里数的**（M4-D30）：记录在句柄 `finish` 的那一刻拍下，之后句柄上的计数进不了记录。所以两个正文在引擎把每一帧交出去时、记录结束之前数：请求正文在 `Idle` 交出每一帧时数（两种版本都数）；应答正文在 `Tail` 与 `LocalFile` 交出每一帧时、`complete()` 之前数；rurge 自己的答复在建好应答、`finish` 之前按应答正文的长度记下。这不在 M4a 包住应答正文的那一层：那里总漏掉最后一帧、自己的答复总是 0。
 
-三种不普通的情形：
+四种不普通的情形：
 
 - **`HEAD`**：hyper 1.11.1 的 HTTP/1.1 服务端不写 `HEAD` 应答的正文，HTTP/2 服务端照样发出去。所以 rurge 自己的页答 `HEAD` 时，HTTP/1.1 上 `responseBodyBytes` 是 0、HTTP/2 上是页的长度（照实数，不改 hyper 的行为，没有用例，登记）；上游与 `[Map Local]` 对 `HEAD` 的应答本来没有正文，两种版本都是 0。用例 `a_head_answer_counts_no_body_on_http1`。
 - **升级之后**（应答是 `101`，或嗅探到的连接上的 `CONNECT` 得到 2xx）：之后的字节不算正文，算在 `up` / `down`；`responseBodyBytes` 只是升级之前那一小段应答的正文（通常没有）。用例 `an_upgrade_counts_no_body`。
-- **源站提前作答、请求正文还在上传**：`requestBodyBytes` 只到记录结束的那一刻，之后接着上传的进不了记录（设计第 11 节第 11 条）。用例 `a_client_that_leaves_mid_body_counts_what_was_handed_over`。
+- **源站提前作答、请求正文还在上传**：`requestBodyBytes` 只到记录结束的那一刻，之后接着上传的进不了记录（设计第 11 节第 11 条）；没有用例（登记）。
+- **客户端在应答正文中途走掉**：`responseBodyBytes` 是到那一刻交给它的字节数，不多于源站写的。用例 `a_client_that_leaves_mid_body_counts_what_was_handed_over`。
 
-两个数是 `u64`，加法不回绕。用例：`the_body_counters_add_up_apart_from_the_bytes`、`first_byte_at_is_counted_from_the_start`（`crates/rurge-inbound/src/session.rs`）、`a_finished_record_has_its_receive_time_and_its_body_bytes`、`a_session_that_is_no_http_request_has_no_body_bytes`、`the_receive_time_is_none_without_a_first_byte`（`crates/rurge-engine/src/observe.rs`）、`the_new_keys_sit_where_the_design_puts_them`（`crates/rurge-api/src/routes/requests.rs`，键序），引擎里的 `the_request_body_sent_upstream_is_counted_before_the_record_ends`、`a_one_frame_answer_is_counted_before_the_record_ends`、`a_chunked_answer_counts_every_frame`、`rurges_own_answers_count_their_length`、`map_local_answers_count_their_length`、`an_h2_connect_501_counts_its_page`、`an_h2_client_counts_its_bodies_too`，与经 API 的端到端 `the_request_records_carry_the_three_new_keys`（`crates/rurge-api/tests/api.rs`：一个 9 字节的 `POST` 与一个不可嗅探端口上的 `CONNECT`，后者两个正文是 `null`）。
+两个数是 `u64`（`AtomicU64::fetch_add` 累加；要 2^64 字节才会溢出回绕，实际到不了）。用例：`the_body_counters_add_up_apart_from_the_bytes`、`first_byte_at_is_counted_from_the_start`（`crates/rurge-inbound/src/session.rs`）、`a_finished_record_has_its_receive_time_and_its_body_bytes`、`a_session_that_is_no_http_request_has_no_body_bytes`、`the_receive_time_is_none_without_a_first_byte`（`crates/rurge-engine/src/observe.rs`）、`the_new_keys_sit_where_the_design_puts_them`（`crates/rurge-api/src/routes/requests.rs`，键序），引擎里的 `the_request_body_sent_upstream_is_counted_before_the_record_ends`、`a_one_frame_answer_is_counted_before_the_record_ends`、`a_chunked_answer_counts_every_frame`、`rurges_own_answers_count_their_length`、`map_local_answers_count_their_length`、`an_h2_connect_501_counts_its_page`、`an_h2_client_counts_its_bodies_too`，与经 API 的端到端 `the_request_records_carry_the_three_new_keys`（`crates/rurge-api/tests/api.rs`：一个 9 字节的 `POST` 与一个不可嗅探端口上的 `CONNECT`，后者两个正文是 `null`）。
 
 ### 直通的原因
 
@@ -981,7 +982,7 @@ not decoded: {NotDecoded 的 Display}
 
 **判断的次序**是名单 → 开关 → CA → 来源 → 名字 → ALPN（设计第 10.2 节，计划 P6 ③）：名单没有命中的 TLS 原样转发是 TLS 的常态，不写，来源不允许而名单也没有命中的同样不写。`Mitm::decides` 的次序是名单 → 来源 → 名字 → ALPN，交回五种（`Decrypt`、`NotListed`、`SourceBlocked`、`NoCertificate`、`AlpnMismatch`）；解不解密与 M4b 之前相同，只有标签变了。
 
-**什么时候写**：在拨号、建好这条会话的句柄时写（`crates/rurge-engine/src/engine.rs` 的 `dial_noted` 与 `PassedBy`），一条会话至多一句；之后被任何规则拒绝的照样带着它。客户端在嗅探时关掉的（`Sniffed::Closed`）没有表示任何协议，不写；暂停的引擎、fake 地址背后没有名字的不写；嗅探等到时限的照写（`force-http-engine-hosts` 命中也照旧拨号）。预匹配排在名单之后：名单没有命中、最先成立的是预匹配的才不写，命中 `always-raw-tcp-*` 而又被预匹配的规则拒绝的照写那一句（M4-D31，修正记录第 22 行）。不可嗅探的端口上命中名单的照写（名单在端口之前）。备注里没有名字、地址、凭据，也没有别的变量。
+**什么时候写**：在拨号、建好这条会话的句柄时写（`crates/rurge-engine/src/engine.rs` 的 `dial_noted` 与 `PassedBy`），一条会话至多一句；之后被任何规则拒绝的照样带着它。客户端在嗅探时关掉的（`Sniffed::Closed`）没有表示任何协议，不写；暂停的引擎、fake 地址背后没有名字的不写；嗅探等到时限的照写（`force-http-engine-hosts` 命中也照旧拨号）。预匹配排在名单之后：名单没有命中、最先成立的是预匹配的才不写，命中 `always-raw-tcp-*` 而又被预匹配的规则拒绝的照写那一句（M4-D31，设计第 18 节第 11 条，计划 P6 ⑤ 的登记）。不可嗅探的端口上命中名单的照写（名单在端口之前）。备注里没有名字、地址、凭据，也没有别的变量。
 
 用例：`crates/rurge-engine/tests/sniff.rs` 的 `always_raw_tcp_hosts_and_keywords_are_noted`、`a_listed_raw_host_on_a_port_that_is_never_sniffed_is_noted_still`、`a_listed_raw_host_that_the_rules_reject_keeps_its_note`、`neither_http_nor_tls_is_noted`、`a_sniff_that_waits_out_its_time_is_noted`、`a_client_that_closes_during_the_wait_has_no_note`、`a_paused_engine_writes_no_reason`、`pre_matching_writes_no_reason_unless_a_list_came_first`、`an_unlisted_tls_session_has_no_note`，与 `crates/rurge-engine/tests/mitm.rs` 的 `a_listed_session_with_mitm_off_is_noted`、`a_listed_session_without_a_usable_ca_is_noted`、`a_listed_session_from_a_source_not_allowed_is_noted`、`a_listed_session_whose_alpn_rurge_does_not_decrypt_is_noted`、`a_listed_name_no_certificate_can_be_made_for_is_noted`、`a_decrypted_session_has_no_reason`。
 
@@ -1000,10 +1001,10 @@ not decoded: {NotDecoded 的 Display}
 | `anytls` 池里的会话 | 同上，会话带着对端。 |
 | `h2-connect` 与 HTTP/2 的 `trust-tunnel` 共用的连接 | 连接带着对端，借用的每个流写进自己的会话。 |
 | `ssh` 的会话 | 会话带着对端，每条通道都写。 |
-| QUIC 一族（`hysteria2`、`tuic` / `tuic-v5`、MASQUE 的 TCP、`trust-tunnel` 的 `h3=true`） | 借出时写那条连接此刻的远端：直连的是服务端的地址，跳端口的是取出那一刻的端口，经底层代理的是承载的远端（例如 socks5 的 UDP 中继）。**从不是替身 `192.0.2.1:443`**，也不用 quinn 的 `remote_address()`（它在跳端口时是第一个端口、经承载时是替身；修正记录第 52、53、60 行）。 |
+| QUIC 一族（`hysteria2`、`tuic` / `tuic-v5`、MASQUE 的 TCP、`trust-tunnel` 的 `h3=true`） | 借出时写那条连接此刻的远端：直连的是服务端的地址，跳端口的是取出那一刻的端口，经底层代理的是承载的远端（例如 socks5 的 UDP 中继）。**从不是替身 `192.0.2.1:443`**，也不用 quinn 的 `remote_address()`（它在跳端口时是第一个端口、经承载时是替身；设计第 18 节第 14 条、计划 P10 ①，做法见修正记录第 52、53 行）。 |
 | `hysteria2`、`tuic` 的 UDP | 读此刻绑定的那条连接的远端；没有绑定时是 `null`（修正记录第 54 行）。 |
 | `wireguard` | 覆盖这个目标的那个对端的载体的远端：直连是它的端点，经底层代理的是承载的远端（修正记录第 55 行）。 |
-| UDP 流 | 载体只有一个远端的（`ss`、socks5 的中继、`trojan`、`snell`、`anytls`、QUIC 一族、`wireguard`）是那个远端；DIRECT 的是这条流第一个数据报发往的地址；`external` 是本机的中继 `127.0.0.1:<端口>`。 |
+| UDP 流 | 载体只有一个远端的（`ss`、socks5 的中继、`trojan`、`snell`、`anytls`）是那个载体的远端；QUIC 一族与 `wireguard` 见上面两格。DIRECT 的是这条流第一个数据报发往的地址；`external` 是本机的中继 `127.0.0.1:<端口>`。 |
 | 内部的 UDP 会话（DoQ、DoH3 的载体） | 同上：直连的是服务端的地址，经 socks5 的是中继（计划 P8 ④，修正记录第 36 行）。 |
 | 没开成载体的 UDP 流与内部 UDP 会话 | `null`：两处 `clear_peer` 把载体的拨号所经的第一跳（socks5 的控制连接）清掉——那不是这条会话的远端（修正记录第 36 行）。 |
 
@@ -1011,11 +1012,11 @@ not decoded: {NotDecoded 的 Display}
 
 **照旧是 `null` 的**（登记，P8 ②）：`vmess`、`h2-connect` 与 MASQUE 的 **UDP**——它们按目标在第一次发送时才在另一个任务里开连接，那时会话的 `Trail` 不在；被拒绝的会话；rurge 不实现的协议。
 
-记录读 `Trail` 的对端时不再分 TCP 与 UDP。用例：`crates/rurge-engine/src/observe.rs` 的 `a_udp_record_reads_the_trail_as_a_tcp_record_does`（原来是 `the_record_of_a_udp_session_has_no_remote_address`）、`tests/udp.rs` 的 `a_direct_flow_records_where_its_datagrams_go`、`tests/outbounds_snell.rs` 的 `a_pooled_snell_connection_gives_its_record_the_servers_address`、`a_pooled_snell_connection_through_a_socks5_proxy_records_the_first_hop` 与 `a_redialled_snell_session_records_the_new_connection`、`tests/outbounds_http2.rs` 的 `every_stream_on_a_shared_h2_connection_records_its_address`、`tests/outbounds_ssh.rs` 的 `every_channel_on_an_ssh_session_records_its_address`、`tests/outbounds_hysteria2.rs` 的 `every_stream_on_a_quic_connection_records_the_servers_address`、`a_hysteria2_udp_flow_records_the_server` 与 `hysteria2_through_a_socks5_relay_records_the_relay`、`tests/outbounds_tuic.rs` 的 `every_stream_on_a_tuic_connection_records_the_servers_address` 与 `a_tuic_udp_flow_records_the_server`、`tests/outbounds_masque.rs` 的 `every_stream_on_a_masque_connection_records_the_servers_address` 与 `a_masque_udp_flow_records_no_far_end`、`tests/outbounds_wireguard.rs` 的 `a_session_through_wireguard_records_its_peers_endpoint`、`a_udp_flow_through_wireguard_records_its_peers_endpoint` 与 `a_session_records_the_peer_its_destination_routes_to`，以及 `crates/rurge-net` 的 `quic/mod.rs` 的 `a_carried_path_far_end_is_its_carriers_not_the_stand_in`、`quic/hop.rs` 的 `the_current_port_follows_the_hops`。引擎与协议那几层断言的地址都是回环上夹具的地址；单元那一层（`Trail` 的用例）用文档地址当哨兵，不拨号。
+记录读 `Trail` 的对端时不再分 TCP 与 UDP。用例：`crates/rurge-engine/src/observe.rs` 的 `a_udp_record_reads_the_trail_as_a_tcp_record_does`（原来是 `the_record_of_a_udp_session_has_no_remote_address`）、`tests/udp.rs` 的 `a_direct_flow_records_where_its_datagrams_go`、`tests/pipeline.rs` 的 `a_carrier_over_a_socks5_association_records_the_relay`、`tests/outbounds_snell.rs` 的 `a_pooled_snell_connection_gives_its_record_the_servers_address`、`a_pooled_snell_connection_through_a_socks5_proxy_records_the_first_hop` 与 `a_redialled_snell_session_records_the_new_connection`、`tests/outbounds_tls_family.rs` 的 `a_pooled_anytls_session_gives_its_record_the_servers_address`、`tests/outbounds_http2.rs` 的 `every_stream_on_a_shared_h2_connection_records_its_address`、`tests/outbounds_ssh.rs` 的 `every_channel_on_an_ssh_session_records_its_address`、`tests/outbounds_hysteria2.rs` 的 `every_stream_on_a_quic_connection_records_the_servers_address`、`a_hysteria2_udp_flow_records_the_server` 与 `hysteria2_through_a_socks5_relay_records_the_relay`、`tests/outbounds_tuic.rs` 的 `every_stream_on_a_tuic_connection_records_the_servers_address` 与 `a_tuic_udp_flow_records_the_server`、`tests/outbounds_masque.rs` 的 `every_stream_on_a_masque_connection_records_the_servers_address` 与 `a_masque_udp_flow_records_no_far_end`、`tests/outbounds_wireguard.rs` 的 `a_session_through_wireguard_records_its_peers_endpoint`、`a_udp_flow_through_wireguard_records_its_peers_endpoint` 与 `a_session_records_the_peer_its_destination_routes_to`，以及 `crates/rurge-net` 的 `quic/mod.rs` 的 `a_carried_path_far_end_is_its_carriers_not_the_stand_in`、`quic/hop.rs` 的 `the_current_port_follows_the_hops`。引擎与协议那几层断言的地址都是回环上夹具的地址；单元那一层（`Trail` 的用例）用文档地址当哨兵，不拨号。
 
 ### `dnsMs` 在解析途中
 
-`dnsMs`（紧跟 `firstByteMs`）：规则与出站花在名字查找上的时间，两者合在一起；一次还没有结束的查找也计到读记录的此刻，所以进行中的会话的 `dnsMs` 随时间增长，结束之后是合计（设计第 10.4 节，M4-D24）。被打断的查找记它已经花的时间。没有做过查找（目标是地址、或代理自己解析名字）时是 `null`。它是 `connectMs` 里的一段，不另外相加。
+`dnsMs`（紧跟 `firstByteMs`）：规则与出站花在名字查找上的时间，两者合在一起；一次还没有结束的查找也计到读记录的此刻，所以进行中的会话的 `dnsMs` 随时间增长，结束之后是合计（设计第 10.4 节，M4-D24）。被打断的查找记它已经花的时间。没有做过查找（目标是地址、或代理自己解析名字）时是 `null`。规则与拨号里的查找在出站就绪之前，落在 `connectMs` 那一段里；出站就绪之前 `connectMs` 是 `null`、`dnsMs` 可以已经有数；出站就绪之后的查找也算进 `dnsMs`（例如 snell 的池连接失效、拨号返回之后才换新连接重发时，重拨在会话的 `trail` 下跑，设计第 18 节第 16 条、计划 P9 ②），所以 `dnsMs` 不一定不大于 `connectMs`。
 
 `Trail` 的 `dns()` 含在途的查找；新的查找用 `Lookup::begin()`，它在开始时登记、被丢下时加上花的时间并注销。`trail::current()` 只在 `follow` 里有。用例：`crates/rurge-net/src/trail.rs` 的 `a_lookup_under_way_counts_up_to_now`、`current_is_the_trail_followed_now`、`a_lookup_begun_outside_a_follow_notes_nothing` 与 `a_lookup_ends_on_the_trail_it_began_on`，`crates/rurge-dns/src/resolver.rs` 的 `a_lookup_under_way_shows_on_the_trail_while_it_waits`，`crates/rurge-engine/tests/pipeline.rs` 的 `an_active_session_shows_the_time_its_lookup_has_taken_so_far`，与现有的 `a_lookup_cut_short_is_noted_for_the_time_it_took`（`crates/rurge-dns/src/resolver.rs`）。
 
@@ -1028,7 +1029,7 @@ cargo test -j 8 --workspace --lib -- observe::memory::<名字> --ignored --exact
 ```
 
 - `observe::memory::an_empty_request_log_is_the_baseline`：只建一份空的 `RequestLog::new(100_000)`，作基线。空表的 `VecDeque::with_capacity` 只分配、不写，没写过的页不进工作集。
-- `observe::memory::a_full_request_log_of_http_requests`：容量 100 000 条，造 110 000 个像真实的 HTTP 请求的句柄（`dst` 是约 30 字节的名字加端口、`url` 约 80 字节、`sni` 约 20 字节、规则文字约 40 字节、两项的策略链、一条约 40 字节的备注，设了方法与状态、记了连接与第一个字节、两个正文的计数），照引擎的路 `mark_active` → `finish` → `record_finished`，装满之后再进 10 000 条、挤掉最早的；先读峰值、再打印 `records held`（`log.len()`，不复制记录）。
+- `observe::memory::a_full_request_log_of_http_requests`：容量 100 000 条，造 110 000 个像真实的 HTTP 请求的句柄（`dst` 连 `:443` 是 32 字节、`url` 87 ～ 92 字节、`sni` 23 字节、规则文字 42 字节、两项的策略链、一条 53 字节的备注，设了方法与状态、记了连接与第一个字节、两个正文的计数），照引擎的路 `mark_active` → `finish` → `record_finished`，装满之后再进 10 000 条、挤掉最早的；先读峰值、再打印 `records held`（`log.len()`，不复制记录）。
 
 两次运行的数（`memory-task-8.log` 与协调者评审时的那一次——那一次没有日志文件，数记在修正记录第 67 行；**一台机器上的一次运行，不是 CI**）：
 
@@ -1037,7 +1038,7 @@ cargo test -j 8 --workspace --lib -- observe::memory::<名字> --ignored --exact
 | 任务 8 | 17,702,912 | 126,230,528（`records held: 100000`） | 108,527,616 | 1085.3 |
 | 协调者评审时 | 17,649,664 | 125,829,120（`records held: 100000`） | 108,179,456 | 1081.8 |
 
-由多出的直接算：1 000 条（`--request-log-size` 的缺省）约 1.03 MiB、10 000 条约 10.3 MiB、100 000 条约 103 MiB；两次运行到这个精度相同（协调者那一次为约 103.2 MiB）。这个数里含着环里那一格 `RequestRecord` 本身与它在堆上的字符串和向量（修正记录第 67 行）。**1088 字节一条不是精确的数**：那是任务 8 那一次向上取整到 8 的倍数（取最近的是 1080，修正记录第 62、67 行）。
+由多出的直接算：1 000 条（`--request-log-size` 的缺省）约 1.03 MiB、10 000 条约 10.3 MiB、100 000 条约 103 MiB；两次运行到这个精度相同（协调者那一次为约 103.2 MiB）。这个数里含着环里那一格 `RequestRecord` 本身与它在堆上的字符串和向量（修正记录第 67 行）。**1088 字节一条不是量到的数**：计划 P12 让把一条的字节数取整到 8 的倍数，任务 8 的 1085.3 取整是 1088（修正记录第 62 行）；协调者那一次的 1081.8 向上取整也是 1088、取最近是 1080（第 67 行）。
 
 **缺省（`--request-log-size` 1 000）不因此改**（M4-D25）：要不要改归项目所有者（设计第 17 节）。
 
@@ -1048,6 +1049,7 @@ cargo test -j 8 --workspace --lib -- observe::memory::<名字> --ignored --exact
 - **照旧 `null` 的三种**（P8 ②）：MASQUE、`h2`（`h2-connect`）与 `vmess` 的 UDP——按目标在另一个任务里懒开，登记（设计第 10.3 节）。
 - **HTTP/2 上 `HEAD` 的应答、rurge 自己的页数页的长度**：没有用例（P5 ③，登记，设计第 18 节第 15 条）。
 - **三处 `bad_request` 没有用例**：第 5 步 `absolute_form` / `origin_form` 失败、`fit` 失败、重发时 `fit` 失败（修正记录第 18 行）。
+- **源站提前作答、请求正文还在上传的那一种没有用例**（设计第 11 节第 11 条，登记）。
 - **跳端口的 hysteria2 在引擎那一层没有用例**：只有 `rurge-net` 的 `the_current_port_follows_the_hops` 钉住单元那一层（修正记录第 60 行）。
 - **WireGuard 的 `far_end_for` 在 `connect` 之后读、不与换载体在同一把锁里**：碰上正在换载体的会话可能记下前一个载体的远端；这仍是「记下时的那一跳」（M4-D23），不改（修正记录第 60 行）。
 - **`external` 的 UDP 只断言到「回环上、不是目标」**：中继的端口是那个程序自己绑的，用例不知道（修正记录第 39 行）。
