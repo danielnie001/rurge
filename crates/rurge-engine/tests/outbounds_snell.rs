@@ -144,6 +144,98 @@ async fn reuse_carries_sessions_one_after_another_on_one_connection() {
     }
 }
 
+/// The second session goes out on the pooled connection, which it did not
+/// dial: its record names the server all the same (`the phase 4 / M4b
+/// plan's P9 ②`).
+#[tokio::test]
+async fn a_pooled_snell_connection_gives_its_record_the_servers_address() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let fake = FakeSnell::spawn(SnellScript {
+        connect_to: Some(echo),
+        ..SnellScript::new("s3same")
+    })
+    .await;
+    let h = through(&snell_line(&fake, "psk=s3same, version=4, reuse=true")).await;
+    for (n, payload) in [(1, &b"first"[..]), (2, b"second")] {
+        let record = one_session(&h, n, payload).await;
+        assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+        assert_eq!(record.remote_addr, Some(fake.addr()), "{record:?}");
+        // the connection is back in the pool before the next dial
+        wait_until("the connection to be pooled", || idle_now(&h) == Some(1)).await;
+    }
+    assert_eq!(fake.connections(), 1, "both went over one connection");
+}
+
+/// A pooled connection behind a SOCKS5 `underlying-proxy`: what the session
+/// leaves rurge by is the first hop, the entry, on both sessions (`the phase
+/// 4 / M4b plan's P9 ②`).
+#[tokio::test]
+async fn a_pooled_snell_connection_through_a_socks5_proxy_records_the_first_hop() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let fake = FakeSnell::spawn(SnellScript {
+        connect_to: Some(echo),
+        ..SnellScript::new("s3same")
+    })
+    .await;
+    let entry = FakeSocks5::spawn(Socks5Script::default()).await;
+    let h = through(&format!(
+        "Entry = socks5, 127.0.0.1, {}\n{}",
+        entry.addr().port(),
+        snell_line(
+            &fake,
+            "psk=s3same, version=4, reuse=true, underlying-proxy=Entry"
+        )
+    ))
+    .await;
+    for (n, payload) in [(1, &b"first"[..]), (2, b"second")] {
+        let record = one_session(&h, n, payload).await;
+        assert_eq!(record.status, RecordStatus::Completed, "{record:?}");
+        assert_eq!(record.remote_addr, Some(entry.addr()), "{record:?}");
+        wait_until("the connection to be pooled", || idle_now(&h) == Some(1)).await;
+    }
+    assert_eq!(fake.connections(), 1, "both went over one connection");
+}
+
+/// A pooled connection the server retired is dialled again for this session:
+/// the record names the new connection, and the lookup that dial made is the
+/// session's (`the phase 4 / M4b plan's P9 ②`).
+#[tokio::test]
+async fn a_redialled_snell_session_records_the_new_connection() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let fake = FakeSnell::spawn(SnellScript {
+        connect_to: Some(echo),
+        tunnels_per_connection: Some(1),
+        ..SnellScript::new("s3same")
+    })
+    .await;
+    // the name has to be looked up, which `[Host]` cannot answer — it never
+    // applies to a proxy server's own name —: the fixture's DNS does (`the
+    // phase 4 / M4b plan's P9 ②`)
+    let h = harness(Profile {
+        proxies: &format!(
+            "S = snell, snell.test, {}, psk=s3same, version=4, reuse=true",
+            fake.addr().port()
+        ),
+        rules: "DOMAIN,target.test,S\nIP-CIDR,127.0.0.1/32,S,no-resolve",
+        ..Profile::default()
+    })
+    .await;
+    h.dns.set("snell.test", &["127.0.0.1"], &[], 60);
+    let first = one_session(&h, 1, b"first").await;
+    assert_eq!(first.status, RecordStatus::Completed, "{first:?}");
+    assert_eq!(first.remote_addr, Some(fake.addr()), "{first:?}");
+    // the connection is back in the pool before the next session takes it
+    wait_until("the connection to be pooled", || idle_now(&h) == Some(1)).await;
+    let second = one_session(&h, 2, b"second").await;
+    assert_eq!(second.status, RecordStatus::Completed, "{second:?}");
+    assert_eq!(second.remote_addr, Some(fake.addr()), "{second:?}");
+    assert!(
+        second.dns_ms.is_some(),
+        "the redial looked the name up: {second:?}"
+    );
+    assert_eq!(fake.connections(), 2, "the retired one was redialled");
+}
+
 #[tokio::test]
 async fn obfs_http_carries_the_session() {
     let echo = rurge_proto::testing::echo_server().await;
