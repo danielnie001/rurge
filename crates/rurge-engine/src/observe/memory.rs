@@ -1,4 +1,5 @@
-//! What a request log costs in memory at its default capacity. A measurement,
+//! What a request log costs in memory at the 100 000 records this measures (a
+//! request log of the default 1 000 costs a thousandth of it). A measurement,
 //! not a gate: the two tests that measure are ignored, and the one that reads
 //! the peak is the guard of the reading itself. Each of the two prints what
 //! its log holds and the peak working set of the process, taken from the
@@ -100,8 +101,9 @@ fn parse_vm_hwm(status: &str) -> Option<u64> {
     Some(kib * 1024)
 }
 
-/// A log at the default capacity, filled with more than it holds so the
-/// oldest records are evicted, and the peak this process reached.
+/// A log of 100 000 records — the capacity this measures, a hundred times the
+/// default 1 000 — filled with more than it holds so the oldest records are
+/// evicted, and the peak this process reached.
 ///
 /// What to read: this test's peak less `an_empty_request_log_is_the_baseline`'
 /// peak, divided by the capacity — one record's bytes (`the phase 4 / M4b
