@@ -32,8 +32,9 @@ pub struct HttpJson {
 
 /// The outcomes of the QUIC ClientHellos (`phase 4 M5 design 5.4`): the flows
 /// whose ClientHello came whole and parsed, the ones it did not come whole for
-/// within the wait, the ones it came whole for but could not be read, and the
-/// ones `auto-quic-block` blocked, which are also counted as read.
+/// within the wait or the datagram count, the ones it came whole for but could
+/// not be read or which the reader gave up on, and the ones
+/// `auto-quic-block` blocked, which are also counted as read.
 #[derive(Serialize)]
 pub struct QuicJson {
     pub hello: u64,
