@@ -17,6 +17,9 @@ use hyper::{Method, Request, StatusCode, header};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rurge_config::rule::ProtocolKind;
 use rurge_engine::MitmCounts;
+use rurge_net::quic::testing::{
+    RFC_DCID, big_client_hello, client_hello as testing_client_hello, hello_initial, hello_initials,
+};
 use std::sync::Arc;
 
 /// The `[MITM]` section of a profile: the hosts to decrypt, and the CA rurge
@@ -3116,4 +3119,346 @@ async fn a_decrypted_session_has_no_reason() {
     let record = the_records(&h, 1).await.remove(0);
     assert_eq!(record.protocol, Some(ProtocolKind::Https), "{record:?}");
     assert_reason(&record, None);
+}
+
+/// What a QUIC flow `auto-quic-block` refused says on its record (the phase 4
+/// / M5a plan's P10).
+const AUTO_QUIC_BLOCKED: &str = "QUIC blocked by auto-quic-block";
+
+/// The one Initial a QUIC client's ClientHello for `name` travels in.
+fn quic_hello(name: Option<&str>) -> Vec<u8> {
+    hello_initial(RFC_DCID, &testing_client_hello(name, &[b"h3"]))
+}
+
+/// The profile the `auto-quic-block` tests start from: `origin.test` pinned to
+/// loopback, the `[MITM]` section that lists it, and no rule of its own.
+fn quic_profile<'a>(section: &'a str) -> Profile<'a> {
+    Profile {
+        hosts: "origin.test = 127.0.0.1",
+        sections: section,
+        ..Profile::default()
+    }
+}
+
+/// The finished record of the UDP flow to `dst`.
+async fn ended(h: &Harness, dst: &str) -> rurge_engine::RequestRecord {
+    wait_until("the UDP flow to finish", || {
+        udp_records(h).iter().any(|r| r.dst == dst)
+    })
+    .await;
+    udp_records(h)
+        .into_iter()
+        .find(|r| r.dst == dst)
+        .expect("the flow's record")
+}
+
+/// A flow `auto-quic-block` blocked, as the plan's P12 has it asserted.
+fn assert_blocked(record: &rurge_engine::RequestRecord) {
+    assert_eq!(record.status, RecordStatus::Rejected("REJECT".into()));
+    assert_eq!(record.error.as_deref(), Some(AUTO_QUIC_BLOCKED));
+    assert!(!record.policy.is_empty(), "{record:?}");
+}
+
+/// A flow `auto-quic-block` let through: its first datagram went out, which
+/// the one that waited for it saw, and it does not say it was blocked.
+fn assert_let_through(record: &rurge_engine::RequestRecord) {
+    assert_ne!(record.error.as_deref(), Some(AUTO_QUIC_BLOCKED));
+    assert_ne!(record.status, RecordStatus::Rejected("REJECT".into()));
+}
+
+/// A QUIC flow to a name `[MITM]` lists is blocked: its ClientHello names
+/// `origin.test`, the rules and the policy are on its record, and it says why
+/// (`phase 4 M5 design 6.1`, 6.2).
+#[tokio::test]
+async fn auto_quic_block_blocks_quic_to_a_listed_host() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw"))),
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = ended(&h, "origin.test:443").await;
+    assert_blocked(&record);
+    assert_eq!(record.sni.as_deref(), Some("origin.test"));
+    let quic = h.engine.http_counts().quic;
+    assert_eq!((quic.blocked, quic.hello), (1, 1));
+}
+
+/// `auto-quic-block = false` turns it off: the flow goes out.
+#[tokio::test]
+async fn auto_quic_block_off_lets_quic_through() {
+    let ca = mitm_ca();
+    let section = format!(
+        "{}\nauto-quic-block = false",
+        mitm_section("origin.test", &ca.ca_p12_base64("pw"))
+    );
+    let h = harness_mitm(quic_profile(&section), ca.roots()).await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = flowing(&h, "origin.test:443").await;
+    assert_let_through(&record);
+    assert_eq!(h.engine.http_counts().quic.blocked, 0);
+}
+
+/// MITM off is not decrypted, so nothing is blocked either.
+#[tokio::test]
+async fn with_mitm_off_quic_goes_through() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw"))),
+        ca.roots(),
+    )
+    .await;
+    h.engine.set_mitm(false).await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = flowing(&h, "origin.test:443").await;
+    assert_let_through(&record);
+    assert_eq!(h.engine.http_counts().quic.blocked, 0);
+}
+
+/// A listed name with no usable CA is passed through, not blocked.
+#[tokio::test]
+async fn without_a_usable_ca_quic_goes_through() {
+    let h = harness_mitm(
+        quic_profile("[MITM]\nhostname = origin.test"),
+        Arc::new(rustls::RootCertStore::empty()),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = flowing(&h, "origin.test:443").await;
+    assert_let_through(&record);
+    assert_eq!(h.engine.http_counts().quic.blocked, 0);
+}
+
+/// A listed name from a source `client-source-address` does not take is
+/// passed through, not blocked.
+#[tokio::test]
+async fn a_source_mitm_does_not_take_lets_quic_through() {
+    let ca = mitm_ca();
+    let section = format!(
+        "{}\nclient-source-address = 10.0.0.0/8",
+        mitm_section("origin.test", &ca.ca_p12_base64("pw"))
+    );
+    let h = harness_mitm(quic_profile(&section), ca.roots()).await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = flowing(&h, "origin.test:443").await;
+    assert_let_through(&record);
+    assert_eq!(h.engine.http_counts().quic.blocked, 0);
+}
+
+/// `origin.test` excluded from a set is not listed, so it is not blocked.
+#[tokio::test]
+async fn a_negated_entry_lets_quic_through() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        quic_profile(&mitm_section(
+            "-origin.test, *.test",
+            &ca.ca_p12_base64("pw"),
+        )),
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = flowing(&h, "origin.test:443").await;
+    assert_let_through(&record);
+    assert_eq!(h.engine.http_counts().quic.blocked, 0);
+}
+
+/// A host in `always-raw-tcp-hosts` is not sniffed on the TCP side, so a QUIC
+/// flow to it is not blocked either.
+#[tokio::test]
+async fn a_raw_tcp_host_is_not_blocked() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        Profile {
+            general: "always-raw-tcp-hosts = origin.test",
+            ..quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw")))
+        },
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = flowing(&h, "origin.test:443").await;
+    assert_let_through(&record);
+    assert_eq!(h.engine.http_counts().quic.blocked, 0);
+}
+
+/// An entry without a port does not widen sniffing to 8443, so QUIC there is
+/// not blocked (`phase 4 M2 design 7.6`).
+#[tokio::test]
+async fn a_bare_entry_does_not_block_quic_on_8443() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw"))),
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 8443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = flowing(&h, "origin.test:8443").await;
+    assert_let_through(&record);
+    assert_eq!(h.engine.http_counts().quic.blocked, 0);
+}
+
+/// A ClientHello that does not arrive whole is not blocked: the rules see no
+/// SNI, and the record says so (`phase 4 M5 design 5.2`).
+#[tokio::test]
+async fn an_incomplete_hello_is_not_blocked() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw"))),
+        ca.roots(),
+    )
+    .await;
+    let hello = big_client_hello(Some("origin.test"));
+    let [first, _] = hello_initials(RFC_DCID, &hello, 600);
+    let association = udp_associate(h.socks()).await;
+    association.send("origin.test", 443, &first).await;
+    let record = flowing(&h, "origin.test:443").await;
+    assert_let_through(&record);
+    assert!(
+        record
+            .notes
+            .iter()
+            .any(|note| note == "No SNI: the QUIC ClientHello did not arrive whole"),
+        "{record:?}"
+    );
+    let quic = h.engine.http_counts().quic;
+    assert_eq!((quic.blocked, quic.hello, quic.incomplete), (0, 0, 1));
+}
+
+/// An entry with a port blocks that port only, not another one of the same
+/// name.
+#[tokio::test]
+async fn a_port_entry_blocks_only_its_port() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        quic_profile(&mitm_section("origin.test:8443", &ca.ca_p12_base64("pw"))),
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    let hello = quic_hello(Some("origin.test"));
+    association.send("origin.test", 8443, &hello).await;
+    association.send("origin.test", 443, &hello).await;
+    let blocked = ended(&h, "origin.test:8443").await;
+    assert_blocked(&blocked);
+    let through = flowing(&h, "origin.test:443").await;
+    assert_let_through(&through);
+    let quic = h.engine.http_counts().quic;
+    assert_eq!((quic.blocked, quic.hello), (1, 2));
+}
+
+/// `block-quic = always-allow` does not pass a flow `auto-quic-block` blocks
+/// (M5-D13).
+#[tokio::test]
+async fn always_allow_does_not_stop_auto_quic_block() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        Profile {
+            general: "block-quic = always-allow",
+            ..quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw")))
+        },
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = ended(&h, "origin.test:443").await;
+    assert_blocked(&record);
+    assert_eq!(h.engine.http_counts().quic.blocked, 1);
+}
+
+/// With `block-quic = all` too, the record names `auto-quic-block`: it is
+/// asked first (`phase 4 M5 design 6.3`).
+#[tokio::test]
+async fn with_block_quic_too_the_record_names_auto_quic_block() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        Profile {
+            general: "block-quic = all",
+            ..quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw")))
+        },
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = ended(&h, "origin.test:443").await;
+    assert_blocked(&record);
+    assert_eq!(h.engine.http_counts().quic.blocked, 1);
+}
+
+/// A `REJECT` rule of the target has the first word: its record is a plain
+/// rejection, not `auto-quic-block`'s.
+#[tokio::test]
+async fn a_reject_rule_comes_before_auto_quic_block() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        Profile {
+            rules: "DOMAIN,origin.test,REJECT",
+            ..quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw")))
+        },
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = ended(&h, "origin.test:443").await;
+    assert_eq!(record.status, RecordStatus::Rejected("REJECT".into()));
+    assert_ne!(record.error.as_deref(), Some(AUTO_QUIC_BLOCKED));
+    let quic = h.engine.http_counts().quic;
+    assert_eq!((quic.blocked, quic.hello), (0, 1));
+}
+
+/// Without an SNI the target decides (`phase 4 M5 design 6.4`): blocked at
+/// 443 where the list takes it, not at 8443 where sniffing is not widened.
+#[tokio::test]
+async fn a_hello_without_sni_is_judged_by_its_target() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw"))),
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    let hello = quic_hello(None);
+    association.send("origin.test", 443, &hello).await;
+    association.send("origin.test", 8443, &hello).await;
+    let blocked = ended(&h, "origin.test:443").await;
+    assert_blocked(&blocked);
+    assert_eq!(blocked.sni, None);
+    let through = flowing(&h, "origin.test:8443").await;
+    assert_let_through(&through);
+    let quic = h.engine.http_counts().quic;
+    assert_eq!((quic.blocked, quic.hello), (1, 2));
 }

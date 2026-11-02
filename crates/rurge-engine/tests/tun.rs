@@ -31,6 +31,7 @@ use rurge_engine::{OwnerLookup, OwnerQuery};
 use rurge_inbound::{Dialer, UdpClient};
 use rurge_net::BoxFuture;
 use rurge_net::connector::Target;
+use rurge_net::quic::testing::{RFC_DCID, big_client_hello, hello_initials};
 use rurge_proto::RejectKind;
 use rurge_proto::testing::{echo_server, udp_echo_server};
 use rurge_tun::device::MemoryDevice;
@@ -254,6 +255,50 @@ async fn a_blocked_quic_flow_answers_with_icmp() {
         record.protocol,
         Some(rurge_config::rule::ProtocolKind::Quic)
     );
+}
+
+/// `auto-quic-block`: a QUIC flow to a name `[MITM]` lists is refused, and
+/// every datagram that was held while its ClientHello was put together is
+/// answered with one ICMP "administratively prohibited" (`phase 4 M5 design
+/// 6.1`, 6.2): the two halves of one ClientHello are two datagrams.
+#[tokio::test]
+async fn auto_quic_block_answers_each_held_datagram_with_icmp() {
+    let ca = TlsFixture::with_ca_name("rurge test MITM CA", &[]);
+    let section = format!(
+        "[MITM]\nhostname = origin.test\nca-p12 = {}\nca-passphrase = pw",
+        ca.ca_p12_base64("pw")
+    );
+    let rules = guarded("DOMAIN,origin.test,DIRECT");
+    let rig = Rig::on(
+        harness_trusting(
+            Profile {
+                hosts: "origin.test = 127.0.0.1",
+                sections: &section,
+                ..profile(&rules)
+            },
+            ca.roots(),
+        )
+        .await,
+    )
+    .await;
+    let mut icmp = rig.app.divert_icmp();
+    let (fake, _) = rig.fakes("origin.test");
+    let hello = big_client_hello(Some("origin.test"));
+    let [d1, d2] = hello_initials(RFC_DCID, &hello, 600);
+    rig.app
+        .inject(packets::udp(app_udp(), SocketAddr::new(fake, 443), &d1));
+    rig.app
+        .inject(packets::udp(app_udp(), SocketAddr::new(fake, 443), &d2));
+    prohibited_from(&mut icmp, fake).await;
+    prohibited_from(&mut icmp, fake).await;
+    wait_until("the record of the flow", || !udp_records(&rig.h).is_empty()).await;
+    let record = udp_records(&rig.h).remove(0);
+    assert_eq!(
+        record.error.as_deref(),
+        Some("QUIC blocked by auto-quic-block")
+    );
+    assert_eq!(record.status, RecordStatus::Rejected("REJECT".to_string()));
+    assert_eq!(rig.h.engine.http_counts().quic.blocked, 1);
 }
 
 // ---- ICMP

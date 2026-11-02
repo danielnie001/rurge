@@ -461,6 +461,25 @@ pub fn udp_records(h: &Harness) -> Vec<rurge_engine::RequestRecord> {
         .collect()
 }
 
+/// The record of the UDP flow to `dst` once a datagram of it has gone out:
+/// `open` has read the rules and the flow goes through, running or finished.
+pub async fn flowing(h: &Harness, dst: &str) -> rurge_engine::RequestRecord {
+    wait_until("the flow's first datagram to go out", || {
+        let log = h.engine.request_log();
+        log.active()
+            .into_iter()
+            .chain(log.recent(4096))
+            .any(|r| r.dst == dst && r.up > 0)
+    })
+    .await;
+    let log = h.engine.request_log();
+    log.active()
+        .into_iter()
+        .chain(log.recent(4096))
+        .find(|r| r.dst == dst)
+        .expect("the flow's record")
+}
+
 /// One session to the echo through `h`: a round trip, then the client
 /// goes and the session finishes.
 pub async fn one_session(h: &Harness, n: usize, payload: &[u8]) -> rurge_engine::RequestRecord {

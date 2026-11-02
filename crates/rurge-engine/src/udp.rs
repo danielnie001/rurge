@@ -55,6 +55,10 @@ const SEND_TIMEOUT: Duration = CONNECT_TIMEOUT.saturating_add(Duration::from_sec
 /// Room for the largest datagram.
 const DATAGRAM: usize = 65536;
 
+/// What a QUIC flow `auto-quic-block` refused says on its record
+/// (`phase 4 M5 design 6.2`, the phase 4 / M5a plan's P10).
+const AUTO_QUIC_BLOCKED: &str = "QUIC blocked by auto-quic-block";
+
 /// What `block-quic` says of one QUIC flow (phase 3 M5 design 6.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QuicVerdict {
@@ -676,7 +680,7 @@ async fn run_flow(
         tokio::select! {
             _ = association.ended.cancelled() => Err(SessionOutcome::Completed),
             _ = handle.token().cancelled() => Err(SessionOutcome::Completed),
-            opened = trail.follow(open(&engine, &association, &handle, &destination, &asked)) => opened,
+            opened = trail.follow(open(&engine, &association, &handle, &destination, &asked, read == Some(HelloRead::Read))) => opened,
         }
     };
     match opened {
@@ -742,6 +746,7 @@ async fn open(
     handle: &Arc<SessionHandle>,
     destination: &Target,
     asked: &Target,
+    hello_read: bool,
 ) -> Result<(Arc<Flow>, Arc<Carrier>, Target), SessionOutcome> {
     // Refused before anything is asked of the rules, a name lookup or a `smart`
     // group, and as a failure, not a rejection: a failed flow is tried again
@@ -774,6 +779,17 @@ async fn open(
     }
     if resolution.terminal == TerminalKind::Reject {
         return Err(SessionOutcome::Rejected(reject_kind(&resolution.chain)));
+    }
+    // a QUIC flow whose ClientHello was read, to a name `[MITM]` would
+    // decrypt, is blocked here: after a `REJECT` rule of its own, which has
+    // the first word, and before `block-quic`, which it does not consult —
+    // `always-allow` does not pass it (`phase 4 M5 design 6.1` ～ 6.3,
+    // M5-D13). The rules and the policy stay on its record as they were
+    // found (design 6.2).
+    if hello_read && engine.auto_quic_blocks(handle.session()) {
+        handle.set_error(AUTO_QUIC_BLOCKED);
+        engine.quic_counts.count_blocked();
+        return Err(SessionOutcome::Rejected(RejectKind::Reject));
     }
     let direct = resolution.terminal == TerminalKind::Direct;
     // what the terminal outbound can carry, before

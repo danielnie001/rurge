@@ -138,6 +138,11 @@ impl QuicCounts {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts one QUIC flow that `auto-quic-block` blocked.
+    pub(crate) fn count_blocked(&self) {
+        self.blocked.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn snapshot(&self) -> QuicSniffed {
         QuicSniffed {
             hello: self.hello.load(Ordering::Relaxed),
@@ -311,6 +316,32 @@ impl Engine {
             return None;
         }
         Some(probed)
+    }
+
+    /// Whether a UDP flow of `session` that carries QUIC is to be blocked
+    /// (`auto-quic-block`, `phase 4 M5 design 6.1`): the switch in `[MITM]` is
+    /// on, the target is one sniffing would take, and the name is one this
+    /// generation's `[MITM]` would decrypt — the same `sniffable_target` and
+    /// `decrypting` the TCP side asks through, so the two cannot come to
+    /// different answers about one name.
+    ///
+    /// The ALPN is empty: QUIC's is `h3`, and once a flow is blocked the
+    /// client falls back to TCP, where `decrypting` judges the `h2` and
+    /// `http/1.1` it is offered as usual. Neither the pause nor pre-matching
+    /// is asked — a QUIC flow was never answered first (design 6.1).
+    pub(crate) fn auto_quic_blocks(&self, session: &SessionInfo) -> bool {
+        let runtime = self.runtime();
+        runtime.config.mitm.auto_quic_block
+            && self.sniffable_target(session, &runtime).is_some()
+            && self
+                .decrypting(
+                    session,
+                    &ClientHello {
+                        sni: session.sni.clone(),
+                        alpn: Vec::new(),
+                    },
+                )
+                .is_ok()
     }
 
     /// The session with the name behind a fake address it names at a proxy

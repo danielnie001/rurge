@@ -1471,25 +1471,6 @@ impl Sink {
     }
 }
 
-/// The record of the UDP flow to `dst` once a datagram of it has gone out:
-/// `open` has read the rules and the flow goes through, running or finished.
-async fn flowing(h: &Harness, dst: &str) -> RequestRecord {
-    wait_until("the flow's first datagram to go out", || {
-        let log = h.engine.request_log();
-        log.active()
-            .into_iter()
-            .chain(log.recent(4096))
-            .any(|r| r.dst == dst && r.up > 0)
-    })
-    .await;
-    let log = h.engine.request_log();
-    log.active()
-        .into_iter()
-        .chain(log.recent(4096))
-        .find(|r| r.dst == dst)
-        .expect("the flow's record")
-}
-
 /// The ClientHello of `held.test` over two datagrams, `at` bytes in the first,
 /// and the last datagram of a flow that closes the connection in packet 1.
 fn a_hello_over_two(at: usize) -> ([Vec<u8>; 2], Vec<u8>) {
