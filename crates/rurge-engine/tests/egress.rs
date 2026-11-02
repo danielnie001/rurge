@@ -10,6 +10,7 @@ mod common;
 use common::*;
 
 use rurge_dns::LookupOpts;
+use rurge_dns::testing::tcp_and_udp_on_one_port;
 use rurge_engine::stack::{Stack, build_stack};
 use rurge_net::socket::Family;
 use std::net::{IpAddr, Ipv4Addr};
@@ -127,10 +128,9 @@ fn took(seen: &Seen) -> usize {
     seen.lock().expect("what the server took").len()
 }
 
-/// A loopback listener that takes every connection and answers none of them.
-async fn silent_tcp() -> (SocketAddr, Seen) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+/// Takes every connection on `listener` and answers none of them, noting each
+/// peer.
+fn serve_silently(listener: tokio::net::TcpListener) -> Seen {
     let seen = taken();
     let log = seen.clone();
     tokio::spawn(async move {
@@ -140,7 +140,14 @@ async fn silent_tcp() -> (SocketAddr, Seen) {
             held.push(stream);
         }
     });
-    (addr, seen)
+    seen
+}
+
+/// A loopback listener that takes every connection and answers none of them.
+async fn silent_tcp() -> (SocketAddr, Seen) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    (addr, serve_silently(listener))
 }
 
 /// A loopback socket that receives every datagram and answers none of them.
@@ -162,8 +169,9 @@ async fn silent_udp() -> (SocketAddr, Seen) {
 /// listener on the same port that takes the retry and answers it not: what
 /// the listener took, which is the stream of the second step.
 async fn truncated() -> (SocketAddr, Seen) {
-    let (addr, seen) = silent_tcp().await;
-    let socket = tokio::net::UdpSocket::bind(addr).await.unwrap();
+    let (listener, socket) = tcp_and_udp_on_one_port().await;
+    let addr = listener.local_addr().unwrap();
+    let seen = serve_silently(listener);
     tokio::spawn(async move {
         let mut buf = [0u8; 4096];
         loop {
@@ -432,11 +440,17 @@ async fn an_egress_error_stops_each_kind_before_anything_is_sent() {
         let dir = tempfile::tempdir().unwrap();
         // the server, held by the test: nothing is ever answered, and nothing
         // is expected to arrive
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let datagrams = match reach {
-            Reach::Tcp => None,
-            Reach::Udp | Reach::Truncated => Some(tokio::net::UdpSocket::bind(addr).await.unwrap()),
+        let (listener, addr, datagrams) = match reach {
+            Reach::Tcp => {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                (listener, addr, None)
+            }
+            Reach::Udp | Reach::Truncated => {
+                let (listener, socket) = tcp_and_udp_on_one_port().await;
+                let addr = listener.local_addr().unwrap();
+                (listener, addr, Some(socket))
+            }
         };
         let stack = stack_over(dir.path(), &profile(&line(addr)), hook(&log)).await;
 

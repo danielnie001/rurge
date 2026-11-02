@@ -294,12 +294,12 @@ impl Upstream for UdpUpstream {
 mod tests {
     use super::*;
     use crate::message::parse_response;
-    use crate::testing::{MockDns, direct, query_wire};
+    use crate::testing::{MockDns, direct, query_wire, tcp_and_udp_on_one_port};
     use rurge_net::connector::{
         BoxedDatagram, BoxedStream, ConnectOpts, Connector, DirectConnector, SystemResolve, Target,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::net::UdpSocket;
 
     /// A direct connector that records what it was asked to connect to: the
     /// datagram of a question, the stream of a retry over TCP.
@@ -442,8 +442,8 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_answer_is_retried_over_tcp() {
-        // TCP echo bound first so the UDP server can share the port number.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // The TCP echo and the UDP server share one port, found as a pair.
+        let (listener, socket) = tcp_and_udp_on_one_port().await;
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             loop {
@@ -461,7 +461,6 @@ mod tests {
                 });
             }
         });
-        let socket = UdpSocket::bind(("127.0.0.1", port)).await.unwrap();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             loop {
@@ -568,8 +567,8 @@ mod tests {
     /// came: under its own ID, and the answer is handed back under it.
     #[tokio::test]
     async fn a_truncated_answer_to_a_query_sent_under_another_id_is_retried_as_it_came() {
-        // TCP echo bound first so the UDP server can share the port number.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // The TCP echo and the UDP server share one port, found as a pair.
+        let (listener, socket) = tcp_and_udp_on_one_port().await;
         let port = listener.local_addr().unwrap().port();
         let asked_over_tcp = Arc::new(Mutex::new(Vec::new()));
         let asked = Arc::clone(&asked_over_tcp);
@@ -593,7 +592,7 @@ mod tests {
         });
         // every question is answered, a while after, with the TC bit: the
         // second is asked while the first is in flight
-        let socket = Arc::new(UdpSocket::bind(("127.0.0.1", port)).await.unwrap());
+        let socket = Arc::new(socket);
         let asked_over_udp = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&asked_over_udp);
         tokio::spawn(async move {

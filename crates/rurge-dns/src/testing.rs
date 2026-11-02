@@ -238,6 +238,62 @@ fn no_port(tcp: Option<&io::Error>, udp: Option<&io::Error>) -> String {
     )
 }
 
+/// A TCP listener and a UDP socket on one port of `127.0.0.1`, or a panic that
+/// says why no port was found.
+///
+/// The ephemeral port the OS hands out to a socket of one kind may not be free
+/// for one of the other kind: an unrelated socket may hold it, and on a Windows
+/// CI runner every try of one order failed, without the reason being recorded.
+/// It is not free even for a socket of the other kind bound right after it:
+/// on Windows in CI run 41411445901, binding UDP on the port a TCP listener
+/// had just been given got `WSAEACCES` (the phase 4 / M4b plan's execution
+/// record row 82). So the whole pair is tried again, the two kinds taking
+/// turns at being bound first, and when no try gets a port the last error of
+/// each kind is told.
+pub async fn tcp_and_udp_on_one_port() -> (TcpListener, UdpSocket) {
+    let mut found = None;
+    let mut last_tcp: Option<io::Error> = None;
+    let mut last_udp: Option<io::Error> = None;
+    for round in 1..=64 {
+        if round % 2 == 1 {
+            // TCP first, then UDP on the same port
+            let listener = match TcpListener::bind("127.0.0.1:0").await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    last_tcp = Some(e);
+                    continue;
+                }
+            };
+            let addr = listener.local_addr().expect("addr");
+            match UdpSocket::bind(addr).await {
+                Ok(udp) => {
+                    found = Some((listener, udp));
+                    break;
+                }
+                Err(e) => last_udp = Some(e),
+            }
+        } else {
+            // UDP first, then TCP on the same port
+            let udp = match UdpSocket::bind("127.0.0.1:0").await {
+                Ok(udp) => udp,
+                Err(e) => {
+                    last_udp = Some(e);
+                    continue;
+                }
+            };
+            let addr = udp.local_addr().expect("addr");
+            match TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    found = Some((listener, udp));
+                    break;
+                }
+                Err(e) => last_tcp = Some(e),
+            }
+        }
+    }
+    found.unwrap_or_else(|| panic!("{}", no_port(last_tcp.as_ref(), last_udp.as_ref())))
+}
+
 impl MockDns {
     pub async fn spawn() -> MockDns {
         Self::start(false).await
@@ -248,55 +304,9 @@ impl MockDns {
     }
 
     async fn start(tls: bool) -> MockDns {
-        // The ephemeral port the OS hands out to a socket of one kind may not
-        // be free for one of the other kind: an unrelated socket may hold it,
-        // and on a Windows CI runner every try of one order failed, without
-        // the reason being recorded. So the whole pair is tried again, the two
-        // kinds taking turns at being bound first, and when no try gets a
-        // port the last error of each kind is told.
-        let (listener, addr, udp) = {
-            let mut found = None;
-            let mut last_tcp: Option<io::Error> = None;
-            let mut last_udp: Option<io::Error> = None;
-            for round in 1..=64 {
-                if round % 2 == 1 {
-                    // TCP first, then UDP on the same port
-                    let listener = match TcpListener::bind("127.0.0.1:0").await {
-                        Ok(listener) => listener,
-                        Err(e) => {
-                            last_tcp = Some(e);
-                            continue;
-                        }
-                    };
-                    let addr = listener.local_addr().expect("addr");
-                    match UdpSocket::bind(addr).await {
-                        Ok(udp) => {
-                            found = Some((listener, addr, Arc::new(udp)));
-                            break;
-                        }
-                        Err(e) => last_udp = Some(e),
-                    }
-                } else {
-                    // UDP first, then TCP on the same port
-                    let udp = match UdpSocket::bind("127.0.0.1:0").await {
-                        Ok(udp) => udp,
-                        Err(e) => {
-                            last_udp = Some(e);
-                            continue;
-                        }
-                    };
-                    let addr = udp.local_addr().expect("addr");
-                    match TcpListener::bind(addr).await {
-                        Ok(listener) => {
-                            found = Some((listener, addr, Arc::new(udp)));
-                            break;
-                        }
-                        Err(e) => last_tcp = Some(e),
-                    }
-                }
-            }
-            found.unwrap_or_else(|| panic!("{}", no_port(last_tcp.as_ref(), last_udp.as_ref())))
-        };
+        let (listener, udp) = tcp_and_udp_on_one_port().await;
+        let addr = listener.local_addr().expect("addr");
+        let udp = Arc::new(udp);
         let state = Arc::new(Mutex::new(State::default()));
         let acceptor = if tls { Some(tls_acceptor()) } else { None };
 
