@@ -17,7 +17,8 @@
 //!
 //! `-p` and `--release` are the exception `docs/testing.md` already records
 //! for `relay_throughput`: only the engine and its dependencies are built a
-//! second time, in release. Check that D: has more than 20 GiB free first.
+//! second time, in release. Check first that the disk holding `target/` has
+//! more than 20 GiB free.
 //! `HTTP_BENCH_QUICK=1` shrinks every measurement in a debug build, to see
 //! that it runs, not to read a number.
 
@@ -41,7 +42,7 @@ use std::time::Instant;
 /// `USER-AGENT` rule can be matched on (phase 4 M5 design 8.4).
 const USER_AGENT: &str = "rurge-bench/1";
 
-/// One frame's worth of `Repeat`, and of the rules that miss.
+/// One frame's worth of `Repeat`.
 const BLOCK: usize = 64 * 1024;
 
 /// The sizes the benchmarks run at (phase 4 M5 design 8.1 -- 8.7). The
@@ -308,8 +309,7 @@ async fn origin(tls: Option<tokio_rustls::TlsAcceptor>, down: u64) -> Arc<Origin
 }
 
 /// A client connection to `addr` (or to rurge, or through a tunnel), handshook
-/// as HTTP/1.1 or HTTP/2. The HTTP/2 half is used by B2 and B4 in this file.
-#[allow(dead_code)]
+/// as HTTP/1.1 or HTTP/2. The HTTP/2 half is used by B2 in this file.
 enum Client {
     H1(http1::SendRequest<Repeat>),
     H2(http2::SendRequest<Repeat>),
@@ -326,7 +326,6 @@ where
     Client::H1(sender)
 }
 
-#[allow(dead_code)]
 async fn h2_client<I>(io: I) -> Client
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -370,24 +369,26 @@ async fn send(client: &mut Client, req: Request<Repeat>) -> Response<Incoming> {
     send_request(client, req).await
 }
 
-fn get(uri: &str, host: &str) -> Request<Repeat> {
-    Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header(header::HOST, host)
-        .header(header::USER_AGENT, USER_AGENT)
-        .body(Repeat::new(0))
-        .unwrap()
+/// `host` is the `Host` header; `None` leaves it out, for the HTTP/2 requests
+/// whose `:authority` comes from an absolute URI (phase 4 M5 design 8.3).
+fn get(uri: &str, host: Option<&str>) -> Request<Repeat> {
+    request("GET", uri, host, 0)
 }
 
-fn post(uri: &str, host: &str, len: u64) -> Request<Repeat> {
-    Request::builder()
-        .method("POST")
+/// As `get`, for a `POST` of `len` bytes.
+fn post(uri: &str, host: Option<&str>, len: u64) -> Request<Repeat> {
+    request("POST", uri, host, len)
+}
+
+fn request(method: &str, uri: &str, host: Option<&str>, len: u64) -> Request<Repeat> {
+    let mut builder = Request::builder()
+        .method(method)
         .uri(uri)
-        .header(header::HOST, host)
-        .header(header::USER_AGENT, USER_AGENT)
-        .body(Repeat::new(len))
-        .unwrap()
+        .header(header::USER_AGENT, USER_AGENT);
+    if let Some(host) = host {
+        builder = builder.header(header::HOST, host);
+    }
+    builder.body(Repeat::new(len)).unwrap()
 }
 
 /// Sends `req` and reads the answer frame by frame, counting the body and
@@ -407,7 +408,7 @@ async fn fetch(client: &mut Client, req: Request<Repeat>) -> (StatusCode, u64) {
 }
 
 /// Sends a `POST` and reads the origin's short answer line, which is the only
-/// body anything here accumulates. Used by B2 and B4 in this file.
+/// body anything here accumulates. Used by B5 in this file.
 #[allow(dead_code)]
 async fn upload(client: &mut Client, req: Request<Repeat>) -> String {
     let response = send(client, req).await;
@@ -449,7 +450,7 @@ async fn timed_upload(client: &mut Client, req: Request<Repeat>) -> (String, Dur
 async fn timed_gets(
     client: &mut Client,
     uri: &str,
-    host: &str,
+    host: Option<&str>,
     warm_up: usize,
     count: usize,
 ) -> Vec<Duration> {
@@ -498,7 +499,7 @@ async fn b1_connection(addr: SocketAddr, absolute: bool, host: &str, body: u64) 
     } else {
         "/down".to_owned()
     };
-    let (status, got, took) = timed_fetch(&mut client, get(&down_uri, host)).await;
+    let (status, got, took) = timed_fetch(&mut client, get(&down_uri, Some(host))).await;
     assert_eq!(status, StatusCode::OK, "the download's answer");
     assert_eq!(got, body, "the downloaded bytes");
     let down = gbit_per_s(got, took);
@@ -508,7 +509,7 @@ async fn b1_connection(addr: SocketAddr, absolute: bool, host: &str, body: u64) 
     } else {
         "/up".to_owned()
     };
-    let (line, took) = timed_upload(&mut client, post(&up_uri, host, body)).await;
+    let (line, took) = timed_upload(&mut client, post(&up_uri, Some(host), body)).await;
     assert_eq!(
         line,
         format!("{body} 97"),
@@ -532,7 +533,234 @@ async fn b1_latency_pass(
     } else {
         "/small".to_owned()
     };
-    timed_gets(&mut client, &uri, host, warm_up, requests).await
+    timed_gets(&mut client, &uri, Some(host), warm_up, requests).await
+}
+
+/// The `[MITM]` section of a profile: the hosts to decrypt, and the CA rurge
+/// signs with, as `tests/mitm.rs` writes it (phase 4 M5 design 8.3).
+fn mitm_section(hostname: &str, ca_p12: &str) -> String {
+    format!("[MITM]\nhostname = {hostname}\nca-p12 = {ca_p12}\nca-passphrase = pw")
+}
+
+/// A rustls client trusting only `roots` and nothing else; `alpn` is what it
+/// offers, and `resume` false disables session resumption (`tests/mitm.rs`
+/// builds the same configuration for its handshakes). The server name
+/// extension is sent, as the default lets it be.
+fn client_tls(
+    roots: Arc<rustls::RootCertStore>,
+    alpn: &[&[u8]],
+    resume: bool,
+) -> Arc<rustls::ClientConfig> {
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("the protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    if !resume {
+        config.resumption = rustls::client::Resumption::disabled();
+    }
+    Arc::new(config)
+}
+
+/// The client side of a TLS handshake to `name` over `tcp`. A benchmark puts
+/// no timeout here: the command that runs one bounds it (the phase 4 / M5b
+/// plan's execution record row 13's coordinator's ruling).
+async fn tls_stream(
+    tcp: TcpStream,
+    config: Arc<rustls::ClientConfig>,
+    name: &str,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let server_name = rustls::pki_types::ServerName::try_from(name.to_string())
+        .unwrap_or_else(|_| panic!("{name} as a server name"));
+    tokio_rustls::TlsConnector::from(config)
+        .connect(server_name, tcp)
+        .await
+        .unwrap_or_else(|e| panic!("the TLS handshake with {name}: {e}"))
+}
+
+/// The `(uri, Host)` a B2 request takes: HTTP/2 writes the absolute form (h2
+/// reads `:scheme` and `:authority` from it), HTTP/1.1 the origin form with a
+/// `Host` (phase 4 M5 design 8.3, and the phase 4 / M5b plan's row 3).
+fn b2_request(h2: bool, host: &str, path: &str) -> (String, Option<String>) {
+    if h2 {
+        (format!("https://{host}{path}"), None)
+    } else {
+        (path.to_owned(), Some(host.to_owned()))
+    }
+}
+
+/// A TLS client for one B2 path: `tcp` is already connected, `roots` are the
+/// side it talks to, `alpn` is what it offers, and the HTTP version follows
+/// it. The negotiated ALPN is asserted to be `alpn`.
+async fn b2_tls_client(
+    tcp: TcpStream,
+    roots: Arc<rustls::RootCertStore>,
+    alpn: &[u8],
+    h2: bool,
+    name: &str,
+) -> Client {
+    let tls = tls_stream(
+        tcp,
+        client_tls(roots, std::slice::from_ref(&alpn), true),
+        name,
+    )
+    .await;
+    assert_eq!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(alpn),
+        "the ALPN the {name} client negotiated"
+    );
+    if h2 {
+        h2_client(tls).await
+    } else {
+        h1_client(tls).await
+    }
+}
+
+/// A B2 client through rurge's SOCKS5 listener to `origin.test:{port}`, the
+/// TLS handshake done and `alpn` negotiated.
+async fn b2_via_client(
+    h: &Harness,
+    roots: Arc<rustls::RootCertStore>,
+    alpn: &[u8],
+    h2: bool,
+    port: u16,
+) -> Client {
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", port).await;
+    tunnel.set_nodelay(true).unwrap();
+    b2_tls_client(tunnel, roots, alpn, h2, "origin.test").await
+}
+
+/// A B2 client straight to the origin, the TLS handshake done and `alpn`
+/// negotiated.
+async fn b2_direct_client(
+    addr: SocketAddr,
+    roots: Arc<rustls::RootCertStore>,
+    alpn: &[u8],
+    h2: bool,
+) -> Client {
+    b2_tls_client(plain_stream(addr).await, roots, alpn, h2, "origin.test").await
+}
+
+/// One B2 download and upload, timed as B1's are, on an already-handshook
+/// `client`; the origin's answers are asserted.
+async fn b2_connection(client: &mut Client, h2: bool, host: &str, body: u64) -> (f64, f64) {
+    let (down_uri, down_host) = b2_request(h2, host, "/down");
+    let (status, got, took) = timed_fetch(client, get(&down_uri, down_host.as_deref())).await;
+    assert_eq!(status, StatusCode::OK, "the download's answer");
+    assert_eq!(got, body, "the downloaded bytes");
+    let down = gbit_per_s(got, took);
+
+    let (up_uri, up_host) = b2_request(h2, host, "/up");
+    let (line, took) = timed_upload(client, post(&up_uri, up_host.as_deref(), body)).await;
+    assert_eq!(
+        line,
+        format!("{body} 97"),
+        "the origin's answer to the upload"
+    );
+    (down, gbit_per_s(body, took))
+}
+
+/// One B2 latency pass on an already-handshook `client`.
+async fn b2_latency_pass(
+    client: &mut Client,
+    h2: bool,
+    host: &str,
+    warm_up: usize,
+    requests: usize,
+) -> Vec<Duration> {
+    let (uri, req_host) = b2_request(h2, host, "/small");
+    timed_gets(client, &uri, req_host.as_deref(), warm_up, requests).await
+}
+
+/// One B2 via connection through rurge (a download and an upload).
+async fn b2_via_connection(
+    h: &Harness,
+    ca: &TlsFixture,
+    alpn: &[u8],
+    h2: bool,
+    port: u16,
+    host: &str,
+    body: u64,
+) -> (f64, f64) {
+    let mut client = b2_via_client(h, ca.roots(), alpn, h2, port).await;
+    b2_connection(&mut client, h2, host, body).await
+}
+
+/// One B2 direct connection to the origin (a download and an upload).
+async fn b2_direct_connection(
+    addr: SocketAddr,
+    cert: &TlsFixture,
+    alpn: &[u8],
+    h2: bool,
+    host: &str,
+    body: u64,
+) -> (f64, f64) {
+    let mut client = b2_direct_client(addr, cert.roots(), alpn, h2).await;
+    b2_connection(&mut client, h2, host, body).await
+}
+
+/// One B2 via latency pass.
+async fn b2_via_latency(
+    h: &Harness,
+    ca: &TlsFixture,
+    alpn: &[u8],
+    h2: bool,
+    port: u16,
+    host: &str,
+    s: &Scale,
+) -> Vec<Duration> {
+    let mut client = b2_via_client(h, ca.roots(), alpn, h2, port).await;
+    b2_latency_pass(&mut client, h2, host, s.warm_up, s.requests).await
+}
+
+/// One B2 direct latency pass.
+async fn b2_direct_latency(
+    addr: SocketAddr,
+    cert: &TlsFixture,
+    alpn: &[u8],
+    h2: bool,
+    host: &str,
+    s: &Scale,
+) -> Vec<Duration> {
+    let mut client = b2_direct_client(addr, cert.roots(), alpn, h2).await;
+    b2_latency_pass(&mut client, h2, host, s.warm_up, s.requests).await
+}
+
+/// One B4 handshake to `name` through rurge's SOCKS5 listener, timed from
+/// before the tunnel is connected to the end of the handshake; `pass` is only
+/// for the messages. The handshake is asserted to be a full one, and the leaf
+/// certificate of `name` is returned (`phase 4 M5 design 8.5`).
+async fn b4_handshake(
+    h: &Harness,
+    client: &Arc<rustls::ClientConfig>,
+    name: &str,
+    pass: usize,
+) -> (Duration, Vec<u8>) {
+    let started = Instant::now();
+    let tunnel = connect_via_socks5(h.socks(), name, 443).await;
+    tunnel.set_nodelay(true).unwrap();
+    let tls = tls_stream(tunnel, client.clone(), name).await;
+    let took = started.elapsed();
+    let der = {
+        let (_, conn) = tls.get_ref();
+        assert_eq!(
+            conn.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "the handshake for {name} in pass {pass} is a full one"
+        );
+        conn.peer_certificates()
+            .expect("the leaf certificate")
+            .first()
+            .expect("one certificate")
+            .as_ref()
+            .to_vec()
+    };
+    drop(tls);
+    (took, der)
 }
 
 #[tokio::test]
@@ -820,5 +1048,347 @@ async fn b3_a_thousand_rules_latency() {
     );
     println!(
         "NFR-01 line: 100,000 rules p99 < 50 us is rurge-rules' single match; here it is what one request pays"
+    );
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b2_decrypted_throughput() {
+    let s = scale();
+    let cert = TlsFixture::new(&["origin.test"]);
+    let origin = origin(Some(cert.acceptor(false)), s.body).await;
+    let ca = TlsFixture::with_ca_name("rurge test MITM CA", &[]);
+    let ca_p12 = ca.ca_p12_base64("pw");
+    let port = origin.addr.port();
+    let host = format!("origin.test:{port}");
+    println!("b2_decrypted_throughput [{}]", s.label());
+
+    for h2 in [false, true] {
+        let alpn: &[u8] = if h2 { b"h2" } else { b"http/1.1" };
+        let tag = if h2 { "h2" } else { "h1" };
+        let section = if h2 {
+            format!("{}\nh2 = true", mitm_section(&host, &ca_p12))
+        } else {
+            mitm_section(&host, &ca_p12)
+        };
+        let h = harness_with(
+            Profile {
+                hosts: "origin.test = 127.0.0.1",
+                sections: &section,
+                ..Profile::default()
+            },
+            EngineShared {
+                roots: Some(cert.roots()),
+                sniff_wait: Duration::from_millis(300),
+                ..EngineShared::default()
+            },
+        )
+        .await;
+        let (h1_before, h2_before) = origin.counts();
+        let decrypted_before = h.engine.http_counts().mitm.decrypted;
+        let requests_before = h.engine.http_counts().requests;
+        let mut via_down = Vec::new();
+        let mut via_up = Vec::new();
+        let mut direct_down = Vec::new();
+        let mut direct_up = Vec::new();
+        for round in 0..s.rounds {
+            let (via, direct) = if round % 2 == 0 {
+                let via = b2_via_connection(&h, &ca, alpn, h2, port, &host, s.body).await;
+                let direct =
+                    b2_direct_connection(origin.addr, &cert, alpn, h2, &host, s.body).await;
+                (via, direct)
+            } else {
+                let direct =
+                    b2_direct_connection(origin.addr, &cert, alpn, h2, &host, s.body).await;
+                let via = b2_via_connection(&h, &ca, alpn, h2, port, &host, s.body).await;
+                (via, direct)
+            };
+            println!(
+                "{tag} round {:>2}: via down {:.2} Gbit/s, via up {:.2}, direct down {:.2}, direct up {:.2}",
+                round + 1,
+                via.0,
+                via.1,
+                direct.0,
+                direct.1
+            );
+            via_down.push(via.0);
+            via_up.push(via.1);
+            direct_down.push(direct.0);
+            direct_up.push(direct.1);
+        }
+
+        let (h1_after, h2_after) = origin.counts();
+        let served = (4 * s.rounds) as u64;
+        let seen = (h1_after - h1_before, h2_after - h2_before);
+        if h2 {
+            assert_eq!(
+                seen,
+                (0, served),
+                "the origin's requests in the h2 row, by version"
+            );
+        } else {
+            assert_eq!(
+                seen,
+                (served, 0),
+                "the origin's requests in the h1 row, by version"
+            );
+        }
+        wait_until("this row's decrypted connections", || {
+            h.engine.http_counts().mitm.decrypted - decrypted_before >= s.rounds as u64
+        })
+        .await;
+        assert_eq!(
+            h.engine.http_counts().mitm.decrypted - decrypted_before,
+            s.rounds as u64,
+            "the decrypted connections of this row"
+        );
+        let requests = h.engine.http_counts().requests - requests_before;
+        assert_eq!(
+            requests,
+            (2 * s.rounds) as u64,
+            "the requests that reached the rules in this row: expected {}, got {requests}",
+            2 * s.rounds
+        );
+
+        let vd = median(&via_down);
+        let vu = median(&via_up);
+        let dd = median(&direct_down);
+        let du = median(&direct_up);
+        println!("{tag} via: down {vd:.2} Gbit/s, up {vu:.2} Gbit/s");
+        println!("{tag} direct: down {dd:.2} Gbit/s, up {du:.2} Gbit/s");
+        println!("{tag} direct/via: down {:.2}x, up {:.2}x", dd / vd, du / vu);
+    }
+    println!("NFR-01 line: 1.00 Gbit/s (single-core loopback TCP)");
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b2_decrypted_latency() {
+    let s = scale();
+    let cert = TlsFixture::new(&["origin.test"]);
+    let origin = origin(Some(cert.acceptor(false)), s.body).await;
+    let ca = TlsFixture::with_ca_name("rurge test MITM CA", &[]);
+    let ca_p12 = ca.ca_p12_base64("pw");
+    let port = origin.addr.port();
+    let host = format!("origin.test:{port}");
+    println!("b2_decrypted_latency [{}]", s.label());
+
+    for h2 in [false, true] {
+        let alpn: &[u8] = if h2 { b"h2" } else { b"http/1.1" };
+        let tag = if h2 { "h2" } else { "h1" };
+        let section = if h2 {
+            format!("{}\nh2 = true", mitm_section(&host, &ca_p12))
+        } else {
+            mitm_section(&host, &ca_p12)
+        };
+        let h = harness_with(
+            Profile {
+                hosts: "origin.test = 127.0.0.1",
+                sections: &section,
+                ..Profile::default()
+            },
+            EngineShared {
+                roots: Some(cert.roots()),
+                sniff_wait: Duration::from_millis(300),
+                ..EngineShared::default()
+            },
+        )
+        .await;
+        let (h1_before, h2_before) = origin.counts();
+        let decrypted_before = h.engine.http_counts().mitm.decrypted;
+        let requests_before = h.engine.http_counts().requests;
+        let mut via = Vec::new();
+        let mut direct = Vec::new();
+        for round in 0..s.rounds {
+            let (v, d) = if round % 2 == 0 {
+                let v = b2_via_latency(&h, &ca, alpn, h2, port, &host, &s).await;
+                let d = b2_direct_latency(origin.addr, &cert, alpn, h2, &host, &s).await;
+                (v, d)
+            } else {
+                let d = b2_direct_latency(origin.addr, &cert, alpn, h2, &host, &s).await;
+                let v = b2_via_latency(&h, &ca, alpn, h2, port, &host, &s).await;
+                (v, d)
+            };
+            let mut v_copy = v.clone();
+            let mut d_copy = d.clone();
+            println!(
+                "{tag} round {:>2}: via median {:.1} us, direct median {:.1} us",
+                round + 1,
+                micros(latency(&mut v_copy).median),
+                micros(latency(&mut d_copy).median)
+            );
+            via.extend(v);
+            direct.extend(d);
+        }
+
+        let (h1_after, h2_after) = origin.counts();
+        let per_round = (s.warm_up + s.requests) as u64;
+        let served = (2 * s.rounds) as u64 * per_round;
+        let seen = (h1_after - h1_before, h2_after - h2_before);
+        if h2 {
+            assert_eq!(
+                seen,
+                (0, served),
+                "the origin's requests in the h2 row, by version"
+            );
+        } else {
+            assert_eq!(
+                seen,
+                (served, 0),
+                "the origin's requests in the h1 row, by version"
+            );
+        }
+        wait_until("this row's decrypted connections", || {
+            h.engine.http_counts().mitm.decrypted - decrypted_before >= s.rounds as u64
+        })
+        .await;
+        assert_eq!(
+            h.engine.http_counts().mitm.decrypted - decrypted_before,
+            s.rounds as u64,
+            "the decrypted connections of this row"
+        );
+        let requests = h.engine.http_counts().requests - requests_before;
+        assert_eq!(
+            requests,
+            s.rounds as u64 * per_round,
+            "the requests that reached the rules in this row: expected {}, got {requests}",
+            s.rounds as u64 * per_round
+        );
+
+        assert!(!via.is_empty(), "the via latency samples are empty");
+        let v = latency(&mut via);
+        assert!(!direct.is_empty(), "the direct latency samples are empty");
+        let d = latency(&mut direct);
+        println!(
+            "{tag} via: median {:.1} us, p99 {:.1} us, max {:.1} us",
+            micros(v.median),
+            micros(v.p99),
+            micros(v.max)
+        );
+        println!(
+            "{tag} direct: median {:.1} us, p99 {:.1} us, max {:.1} us",
+            micros(d.median),
+            micros(d.p99),
+            micros(d.max)
+        );
+        println!(
+            "{tag} decryption overhead: median {:.1} us, p99 {:.1} us",
+            micros(v.median) - micros(d.median),
+            micros(v.p99) - micros(d.p99)
+        );
+    }
+    println!(
+        "NFR-01 lines: 1.00 Gbit/s (single-core loopback TCP); 100,000 rules p99 < 50 us (a rule match)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b4_leaf_certificates() {
+    let s = scale();
+    let ca = TlsFixture::with_ca_name("rurge test MITM CA", &[]);
+    let ca_p12 = ca.ca_p12_base64("pw");
+    let roots = TlsFixture::new(&[]).roots();
+    let client = client_tls(ca.roots(), &[], false);
+    let section = mitm_section("*.bench.test", &ca_p12);
+    let names: Vec<String> = (0..s.names)
+        .map(|i| format!("n{i:04}.bench.test"))
+        .collect();
+    println!("b4_leaf_certificates [{}]", s.label());
+
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for round in 0..s.rounds {
+        let h = harness_with(
+            Profile {
+                hosts: "*.bench.test = 127.0.0.1",
+                sections: &section,
+                ..Profile::default()
+            },
+            EngineShared {
+                roots: Some(roots.clone()),
+                sniff_wait: Duration::from_millis(300),
+                ..EngineShared::default()
+            },
+        )
+        .await;
+
+        let mut leaves = Vec::with_capacity(s.names);
+        let mut round_first = Vec::with_capacity(s.names);
+        for name in &names {
+            let (took, der) = b4_handshake(&h, &client, name, 1).await;
+            leaves.push(der);
+            round_first.push(took);
+        }
+        let mut distinct = leaves.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            s.names,
+            "the leaves of the first pass are all different"
+        );
+
+        let mut round_second = Vec::with_capacity(s.names);
+        for (i, name) in names.iter().enumerate() {
+            let (took, der) = b4_handshake(&h, &client, name, 2).await;
+            assert_eq!(
+                der, leaves[i],
+                "the leaf for {name} in the second pass is the cached one"
+            );
+            round_second.push(took);
+        }
+
+        let mut r1 = round_first.clone();
+        let l1 = latency(&mut r1);
+        println!(
+            "round {:>2}: first pass median {:.1} us, p99 {:.1} us, max {:.1} us",
+            round + 1,
+            micros(l1.median),
+            micros(l1.p99),
+            micros(l1.max)
+        );
+        let mut r2 = round_second.clone();
+        let l2 = latency(&mut r2);
+        println!(
+            "round {:>2}: second pass median {:.1} us, p99 {:.1} us, max {:.1} us",
+            round + 1,
+            micros(l2.median),
+            micros(l2.p99),
+            micros(l2.max)
+        );
+        first.extend(round_first);
+        second.extend(round_second);
+
+        wait_until("the two passes' decrypted connections", || {
+            h.engine.http_counts().mitm.decrypted >= (2 * s.names) as u64
+        })
+        .await;
+        assert_eq!(
+            h.engine.http_counts().mitm.decrypted,
+            (2 * s.names) as u64,
+            "the decrypted connections of both passes"
+        );
+    }
+
+    assert!(!first.is_empty(), "the first pass samples are empty");
+    let f = latency(&mut first);
+    assert!(!second.is_empty(), "the second pass samples are empty");
+    let cached = latency(&mut second);
+    println!(
+        "first pass: median {:.1} us, p99 {:.1} us, max {:.1} us",
+        micros(f.median),
+        micros(f.p99),
+        micros(f.max)
+    );
+    println!(
+        "second pass: median {:.1} us, p99 {:.1} us, max {:.1} us",
+        micros(cached.median),
+        micros(cached.p99),
+        micros(cached.max)
+    );
+    println!(
+        "signing a leaf certificate: median {:.1} us (rurge signs on a blocking thread -- phase 4 M5 design 8.5)",
+        micros(f.median) - micros(cached.median)
     );
 }
