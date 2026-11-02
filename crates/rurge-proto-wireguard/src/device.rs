@@ -2,6 +2,7 @@
 //! and the task that drives it. Only the task touches the peers' carriers,
 //! and nothing sends, receives or waits with the lock held.
 
+use crate::routes::Routes;
 use crate::stack::{Outgoing, Stack};
 use crate::stream::TunnelStream;
 use crate::wire;
@@ -12,7 +13,7 @@ use smoltcp::iface::SocketHandle;
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
@@ -156,6 +157,14 @@ pub(crate) struct Shared {
     /// Taken through `stack` and `running` alone: they know what a poisoned
     /// lock means.
     stack: Mutex<Stack>,
+    /// What routes a destination to a peer, as the stack's own has it: read
+    /// to name the peer whose carrier a session left by (`phase 4 M4 design
+    /// 10.3`).
+    routes: Routes,
+    /// Each peer's carrier's far end, in peer order; `None` for a peer
+    /// without a carrier. Written by the task as it takes carriers away and
+    /// lands new ones, read by whoever records a session.
+    far_ends: Mutex<Vec<Option<SocketAddr>>>,
     /// Wakes the task: a stream read, wrote or closed, a connection opened.
     kick: Notify,
     /// Set by `Device::network_changed`, taken by the task.
@@ -322,8 +331,20 @@ impl Device {
         let mut stack = Stack::new(section);
         let mut out = Vec::new();
         stack.initiate(&mut out);
+        // the carriers just dialled, as whoever records a session reads
+        // them (`phase 4 M4 design 10.3`)
+        let far_ends = carriers
+            .iter()
+            .map(|carrier| {
+                carrier
+                    .as_ref()
+                    .and_then(|carrier| carrier.datagram.far_end())
+            })
+            .collect();
         let shared = Arc::new(Shared {
             stack: Mutex::new(stack),
+            routes: Routes::new(section.peers.iter().map(|p| p.allowed_ips.as_slice())),
+            far_ends: Mutex::new(far_ends),
             kick: Notify::new(),
             network_changed: AtomicBool::new(false),
             greet: AtomicBool::new(false),
@@ -392,6 +413,19 @@ impl Device {
     /// is left of S′ does not take over the tunnel S shares again.
     fn share(&self, generation: u64) {
         self.generation.fetch_max(generation, Ordering::SeqCst);
+    }
+
+    /// The far end of the carrier of the peer `ip` routes to (`phase 4 M4
+    /// design 10.3`), read now: a carrier dialled again moves it. `None` for
+    /// an address no peer takes, and for a peer whose carrier is gone.
+    pub(crate) fn far_end_for(&self, ip: IpAddr) -> Option<SocketAddr> {
+        let peer = self.shared.routes.lookup(ip)?;
+        let far_ends = self
+            .shared
+            .far_ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        far_ends.get(peer).copied().flatten()
     }
 
     /// A tunnel of a later configuration took over: nothing more goes out,
@@ -753,6 +787,20 @@ impl Driver {
             .min()
     }
 
+    /// The far end of the carrier of `peer`, for whoever records a session
+    /// through it (`phase 4 M4 design 10.3`): every place that sets the
+    /// carrier sets this with it.
+    fn note_far_end(&self, peer: usize, far: Option<SocketAddr>) {
+        let mut far_ends = self
+            .shared
+            .far_ends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = far_ends.get_mut(peer) {
+            *slot = far;
+        }
+    }
+
     /// A dialled carrier of `peer` takes the place of the one there when
     /// there is none, when it goes to another address, or when `anew`
     /// says so; the peer is greeted on it at once.
@@ -778,6 +826,7 @@ impl Driver {
             }
             tracing::info!(policy = %self.policy, peer = peer + 1, "wireguard: the peer's endpoint moved");
         }
+        self.note_far_end(peer, datagram.far_end());
         self.carriers[peer] = Some(Carrier {
             datagram,
             marks: true,
@@ -907,6 +956,7 @@ impl Driver {
                             Err(e) if ended_for_good(&e) => {
                                 // dropped now, so the batch below skips it
                                 self.carriers[peer] = None;
+                                self.note_far_end(peer, None);
                                 if !ended.contains(&peer) {
                                     ended.push(peer);
                                 }

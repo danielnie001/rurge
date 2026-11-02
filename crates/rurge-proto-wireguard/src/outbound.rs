@@ -147,6 +147,11 @@ impl WireGuardOutbound {
         let device = self.device(opts).await?;
         let ip = self.names.address(target, &device).await?;
         let stream = device.connect(SocketAddr::new(ip, target.port)).await?;
+        // the carrier of the peer the session leaves rurge by (`phase 4 M4
+        // design 10.3`)
+        if let Some(far) = device.far_end_for(ip) {
+            rurge_net::trail::connected(far);
+        }
         Ok(Box::new(stream))
     }
 

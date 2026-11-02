@@ -120,6 +120,15 @@ impl PacketSocket for TunnelUdp {
         })
     }
 
+    /// The far end of the carrier of the peer `to` routes to (`phase 4 M4
+    /// design 10.3`): a name is not routed before it is looked up.
+    fn far_end(&self, to: &Target) -> Option<SocketAddr> {
+        match &to.host {
+            HostName::Ip(ip) => self.device.far_end_for(*ip),
+            HostName::Domain(_) => None,
+        }
+    }
+
     /// A datagram longer than `buf` is cut to it: give it 64 KiB.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, Target)>> {
         Box::pin(async move {
