@@ -22,6 +22,7 @@
 
 use rustls::Side;
 use rustls::quic::{DirectionalKeys, Version};
+use std::collections::VecDeque;
 use std::fmt;
 
 /// The smallest datagram a client's Initial comes in (RFC 9000 §14.1):
@@ -224,11 +225,12 @@ impl HelloReader {
         } = self;
         match pieces.whole {
             Some(whole) => {
-                let (_, mut bytes) = pieces
+                let (_, kept) = pieces
                     .pieces
                     .into_iter()
                     .next()
                     .expect("the whole ClientHello starts at offset zero");
+                let mut bytes: Vec<u8> = kept.into();
                 bytes.truncate(whole);
                 Hello::Whole(bytes)
             }
@@ -337,15 +339,55 @@ fn next_varint(buf: &[u8], at: &mut usize) -> Result<u64, &'static str> {
     Ok(value)
 }
 
+/// Copy the part of `bytes` (which starts at `start`) that falls in
+/// `[from, to)` into `into`, which holds `[from, to)`.
+fn fill_from<'a>(
+    into: &mut [u8],
+    from: u64,
+    to: u64,
+    start: u64,
+    len: u64,
+    bytes: impl Iterator<Item = &'a u8>,
+) {
+    let lo = from.max(start);
+    let hi = to.min(start + len);
+    if lo >= hi {
+        return;
+    }
+    let dst = (lo - from) as usize;
+    let skip = (lo - start) as usize;
+    let take = (hi - lo) as usize;
+    for (slot, byte) in into[dst..dst + take]
+        .iter_mut()
+        .zip(bytes.skip(skip).take(take))
+    {
+        *slot = *byte;
+    }
+}
+
 /// The CRYPTO bytes that have arrived, as the fewest pieces that hold them
 /// (phase 4 M5 design 4.5): sorted by start, disjoint and not touching.
 /// Only the bytes that came are stored, so a piece's cost is its bytes.
+///
+/// A piece's bytes are a `VecDeque`, because new bytes join at either end:
+/// the longest piece the new bytes touch keeps its buffer, and only what
+/// the others leave around it is written in. One `add` writes at most the
+/// bytes that arrive plus the bytes of the shorter pieces it merges, and a
+/// piece at least doubles each time it is merged into another, so within
+/// 64 KiB one byte moves about a dozen times at most: the cost follows
+/// what arrived, not what the pieces span (the phase 4 / M5a plan's
+/// execution record row 13).
 #[derive(Default)]
 struct Pieces {
-    pieces: Vec<(u64, Vec<u8>)>,
+    pieces: Vec<(u64, VecDeque<u8>)>,
     /// The length of the ClientHello once its head says how long it is and
     /// all of it has arrived.
     whole: Option<usize>,
+    /// How many bytes `add` has written into piece buffers: for the one
+    /// test that pins the cost (the phase 4 / M5a plan's execution record
+    /// row 13).
+    #[cfg(test)]
+    written: usize,
 }
 
 impl Pieces {
@@ -360,47 +402,85 @@ impl Pieces {
         if data.is_empty() {
             return Ok(());
         }
-        // the pieces this one overlaps or abuts have to agree where the two
-        // overlap, and all of them become one
-        let mut first = None;
-        let mut start = offset;
-        let mut merged_end = end;
-        let mut touched = 0usize;
-        for (at, (piece_start, bytes)) in self.pieces.iter().enumerate() {
-            let piece_end = piece_start + bytes.len() as u64;
-            if *piece_start > end || offset > piece_end {
-                continue;
-            }
-            if first.is_none() {
-                first = Some(at);
-            }
-            touched += 1;
-            let from = offset.max(*piece_start);
-            let to = end.min(piece_end);
+        // the pieces the new bytes overlap or abut: `a` is the first whose
+        // end reaches `offset`, `b` the first that starts past `end`
+        let a = self
+            .pieces
+            .partition_point(|(start, bytes)| start + (bytes.len() as u64) < offset);
+        let b = self.pieces.partition_point(|(start, _)| *start <= end);
+        // where two pieces overlap, the bytes must be the same
+        for (start, bytes) in &self.pieces[a..b] {
+            let from = offset.max(*start);
+            let to = end.min(start + bytes.len() as u64);
             if from < to {
                 let ours = &data[(from - offset) as usize..(to - offset) as usize];
-                let theirs = &bytes[(from - *piece_start) as usize..(to - *piece_start) as usize];
-                if ours != theirs {
+                let theirs = bytes.range((from - *start) as usize..(to - *start) as usize);
+                if ours.iter().copied().ne(theirs.copied()) {
                     return Err(CHANGED);
                 }
             }
-            start = start.min(*piece_start);
-            merged_end = merged_end.max(piece_end);
         }
-        let at = first.unwrap_or_else(|| {
+        // inside one piece: compared, and nothing new to store
+        if b - a == 1
+            && self.pieces[a].0 <= offset
+            && end <= self.pieces[a].0 + self.pieces[a].1.len() as u64
+        {
+            return Ok(());
+        }
+        if a == b {
             self.pieces
-                .partition_point(|(piece_start, _)| *piece_start < offset)
-        });
-        let mut merged = vec![0u8; (merged_end - start) as usize];
-        merged[(offset - start) as usize..(end - start) as usize].copy_from_slice(data);
-        for (piece_start, bytes) in self.pieces.drain(at..at + touched) {
-            let from = (piece_start - start) as usize;
-            merged[from..from + bytes.len()].copy_from_slice(&bytes);
+                .insert(a, (offset, VecDeque::from(data.to_vec())));
+            #[cfg(test)]
+            {
+                self.written += data.len();
+            }
+            if self.pieces.len() > 32 {
+                return Err(TOO_MANY);
+            }
+            return self.see_head();
         }
-        self.pieces.insert(at, (start, merged));
-        if self.pieces.len() > 32 {
-            return Err(TOO_MANY);
+        // keep the longest piece's buffer and write what the others leave
+        // before and after it in: the bytes come in from both ends without
+        // moving the buffer that is kept
+        let start = offset.min(self.pieces[a].0);
+        let end = end.max(self.pieces[b - 1].0 + self.pieces[b - 1].1.len() as u64);
+        let keep = (a..b)
+            .max_by_key(|&at| self.pieces[at].1.len())
+            .expect("a piece the new bytes touch");
+        let keep_start = self.pieces[keep].0;
+        let mut kept = std::mem::take(&mut self.pieces[keep].1);
+        let keep_end = keep_start + kept.len() as u64;
+        let mut before = vec![0u8; (keep_start - start) as usize];
+        fill_from(&mut before, start, keep_start, offset, len, data.iter());
+        let mut after = vec![0u8; (end - keep_end) as usize];
+        fill_from(&mut after, keep_end, end, offset, len, data.iter());
+        for at in a..b {
+            if at == keep {
+                continue;
+            }
+            let (piece_start, bytes) = &self.pieces[at];
+            let len = bytes.len() as u64;
+            fill_from(
+                &mut before,
+                start,
+                keep_start,
+                *piece_start,
+                len,
+                bytes.iter(),
+            );
+            fill_from(&mut after, keep_end, end, *piece_start, len, bytes.iter());
         }
+        for byte in after {
+            kept.push_back(byte);
+        }
+        for byte in before.into_iter().rev() {
+            kept.push_front(byte);
+        }
+        #[cfg(test)]
+        {
+            self.written += (keep_start - start) as usize + (end - keep_end) as usize;
+        }
+        self.pieces.splice(a..b, std::iter::once((start, kept)));
         self.see_head()
     }
 
@@ -457,11 +537,13 @@ impl Pieces {
         if *start != 0 {
             return Ok(());
         }
-        if bytes[0] != 0x01 {
-            return Err(NO_CLIENT_HELLO);
-        }
+        // the type and the 24-bit length are read once the four bytes from
+        // offset zero are here (phase 4 M5 design 4.5)
         if bytes.len() < 4 {
             return Ok(());
+        }
+        if bytes[0] != 0x01 {
+            return Err(NO_CLIENT_HELLO);
         }
         let length = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]) as usize;
         let whole = 4 + length;
@@ -835,7 +917,10 @@ mod tests {
             Some(Hello::Whole(message)) => message,
             _ => panic!("a sample Initial did not come whole"),
         };
-        assert_eq!(whole(RFC9369_CLIENT_INITIAL), whole(RFC9001_CLIENT_INITIAL));
+        assert!(
+            whole(RFC9369_CLIENT_INITIAL) == whole(RFC9001_CLIENT_INITIAL),
+            "the two samples carry the same CRYPTO frame"
+        );
     }
 
     #[test]
@@ -843,7 +928,12 @@ mod tests {
         let (hello, d1, d2) = two_datagrams();
         let reader = partial(&d1);
         match reader.read(&d2) {
-            Hello::Whole(message) => assert_eq!(message, hello),
+            Hello::Whole(message) => assert!(
+                message == hello,
+                "{} bytes, not {}",
+                message.len(),
+                hello.len()
+            ),
             _ => panic!("the second datagram did not finish the ClientHello"),
         }
     }
@@ -873,7 +963,12 @@ mod tests {
         .seal(Some(1200));
         let reader = partial(&first);
         match reader.read(&second) {
-            Hello::Whole(message) => assert_eq!(message, hello),
+            Hello::Whole(message) => assert!(
+                message == hello,
+                "{} bytes, not {}",
+                message.len(),
+                hello.len()
+            ),
             _ => panic!("the halves did not come together"),
         }
     }
@@ -887,7 +982,12 @@ mod tests {
             let d2 = Initial::new(1, RFC_DCID, 1, second).seal(Some(1200));
             let reader = partial(&d1);
             match reader.read(&d2) {
-                Hello::Whole(message) => assert_eq!(message, hello, "seed {seed}"),
+                Hello::Whole(message) => assert!(
+                    message == hello,
+                    "seed {seed}: {} bytes, not {}",
+                    message.len(),
+                    hello.len()
+                ),
                 _ => panic!("seed {seed}: Chrome's arrangement did not come whole"),
             }
         }
@@ -900,7 +1000,12 @@ mod tests {
             let frames = chaos_frames(&[(0, &small)], seed);
             let datagram = Initial::new(1, RFC_DCID, 0, frames).seal(Some(1200));
             match read_first(&datagram) {
-                Some(Hello::Whole(message)) => assert_eq!(message, small, "seed {seed}"),
+                Some(Hello::Whole(message)) => assert!(
+                    message == small,
+                    "seed {seed}: {} bytes, not {}",
+                    message.len(),
+                    small.len()
+                ),
                 _ => panic!("seed {seed}: the chaos frames did not come whole"),
             }
         }
@@ -931,7 +1036,12 @@ mod tests {
         .seal(None);
         let datagram = crate::quic::testing::datagram(&[first, second], 1200);
         match read_first(&datagram) {
-            Some(Hello::Whole(message)) => assert_eq!(message, small),
+            Some(Hello::Whole(message)) => assert!(
+                message == small,
+                "{} bytes, not {}",
+                message.len(),
+                small.len()
+            ),
             _ => panic!("two Initials in one datagram did not come whole"),
         }
     }
@@ -952,7 +1062,12 @@ mod tests {
         let datagram =
             crate::quic::testing::datagram(&[whole, long_packet(1, 0b01, RFC_DCID, 100)], 1200);
         match read_first(&datagram) {
-            Some(Hello::Whole(message)) => assert_eq!(message, small),
+            Some(Hello::Whole(message)) => assert!(
+                message == small,
+                "{} bytes, not {}",
+                message.len(),
+                small.len()
+            ),
             _ => panic!("the Initial before the 0-RTT packet did not come whole"),
         }
 
@@ -981,7 +1096,12 @@ mod tests {
             1200,
         );
         match read_first(&datagram) {
-            Some(Hello::Whole(message)) => assert_eq!(message, small),
+            Some(Hello::Whole(message)) => assert!(
+                message == small,
+                "{} bytes, not {}",
+                message.len(),
+                small.len()
+            ),
             _ => panic!("the walk past the 0-RTT packet did not come whole"),
         }
     }
@@ -1002,7 +1122,12 @@ mod tests {
         let d1 = crate::quic::testing::datagram(&[first], 1300);
         let reader = partial(&d1);
         match reader.read(&d2) {
-            Hello::Whole(message) => assert_eq!(message, hello),
+            Hello::Whole(message) => assert!(
+                message == hello,
+                "{} bytes, not {}",
+                message.len(),
+                hello.len()
+            ),
             _ => panic!("the zeros after the packet ended the ClientHello"),
         }
     }
@@ -1025,7 +1150,12 @@ mod tests {
         .seal(Some(1200));
         let reader = partial(&d1);
         match reader.read(&second) {
-            Hello::Whole(message) => assert_eq!(message, hello),
+            Hello::Whole(message) => assert!(
+                message == hello,
+                "{} bytes, not {}",
+                message.len(),
+                hello.len()
+            ),
             _ => panic!("another Destination Connection ID stopped the read"),
         }
     }
@@ -1039,7 +1169,12 @@ mod tests {
             _ => panic!("the same datagram again was not taken"),
         };
         match reader.read(&d2) {
-            Hello::Whole(message) => assert_eq!(message, hello),
+            Hello::Whole(message) => assert!(
+                message == hello,
+                "{} bytes, not {}",
+                message.len(),
+                hello.len()
+            ),
             _ => panic!("the retransmission kept the ClientHello from coming whole"),
         }
     }
@@ -1069,7 +1204,12 @@ mod tests {
         .seal(Some(1200));
         let reader = partial(&first);
         match reader.read(&second) {
-            Hello::Whole(message) => assert_eq!(message, hello),
+            Hello::Whole(message) => assert!(
+                message == hello,
+                "{} bytes, not {}",
+                message.len(),
+                hello.len()
+            ),
             _ => panic!("the overlapping pieces did not merge"),
         }
     }
@@ -1215,7 +1355,12 @@ mod tests {
             _ => panic!("a packet sealed with other keys ended the read"),
         };
         match reader.read(&d2) {
-            Hello::Whole(message) => assert_eq!(message, hello),
+            Hello::Whole(message) => assert!(
+                message == hello,
+                "{} bytes, not {}",
+                message.len(),
+                hello.len()
+            ),
             _ => panic!("the skipped packet kept the ClientHello from coming whole"),
         }
     }
@@ -1278,7 +1423,12 @@ mod tests {
         .seal(Some(1200));
         let reader = partial(&first);
         match reader.read(&second) {
-            Hello::Whole(message) => assert_eq!(message, hello),
+            Hello::Whole(message) => assert!(
+                message == hello,
+                "{} bytes, not {}",
+                message.len(),
+                hello.len()
+            ),
             _ => panic!("the one-byte packet number did not open"),
         }
     }
@@ -1385,10 +1535,13 @@ mod tests {
     fn pieces_that_touch_merge_and_the_whole_hello_is_seen() {
         let mut pieces = Pieces::default();
         assert_eq!(pieces.add(4, &TINY[4..]), Ok(()));
-        assert_eq!(pieces.pieces, vec![(4u64, TINY[4..].to_vec())]);
+        assert_eq!(
+            pieces.pieces,
+            vec![(4u64, VecDeque::from(TINY[4..].to_vec()))]
+        );
         assert_eq!(pieces.whole, None);
         assert_eq!(pieces.add(0, &TINY[..4]), Ok(()));
-        assert_eq!(pieces.pieces, vec![(0u64, TINY.to_vec())]);
+        assert_eq!(pieces.pieces, vec![(0u64, VecDeque::from(TINY.to_vec()))]);
         assert_eq!(pieces.whole, Some(TINY.len()));
     }
 
@@ -1397,7 +1550,10 @@ mod tests {
         let mut pieces = Pieces::default();
         assert_eq!(pieces.add(2, &[1, 2, 3]), Ok(()));
         assert_eq!(pieces.add(1, &[0, 1, 2]), Ok(()));
-        assert_eq!(pieces.pieces, vec![(1u64, vec![0, 1, 2, 3])]);
+        assert_eq!(
+            pieces.pieces,
+            vec![(1u64, VecDeque::from(vec![0, 1, 2, 3]))]
+        );
 
         let mut pieces = Pieces::default();
         assert_eq!(pieces.add(0, TINY), Ok(()));
@@ -1446,7 +1602,7 @@ mod tests {
         let mut pieces = Pieces::default();
         assert_eq!(pieces.read_frames(&plaintext), Ok(()));
         assert_eq!(pieces.whole, Some(TINY.len()));
-        assert_eq!(pieces.pieces, vec![(0u64, TINY.to_vec())]);
+        assert_eq!(pieces.pieces, vec![(0u64, VecDeque::from(TINY.to_vec()))]);
     }
 
     /// A CONNECTION_CLOSE, a frame an Initial may not carry, and a frame
@@ -1475,6 +1631,49 @@ mod tests {
             let mut pieces = Pieces::default();
             assert_eq!(pieces.read_frames(&cut), Err(CUT_SHORT), "{cut:?}");
         }
+    }
+
+    /// The cost of adding a piece is what arrives, not what the piece it
+    /// joins spans: one big CRYPTO frame, then tens of thousands of
+    /// one-byte frames that repeat it or extend its ends. A client can send
+    /// a 64 KiB datagram, so a cost that is the span each time is a cost a
+    /// client chooses (the phase 4 / M5a plan's execution record row 13).
+    #[test]
+    fn adding_costs_what_arrives() {
+        let mut pieces = Pieces::default();
+        assert_eq!(pieces.add(20_000, &[0x5a; 20_000]), Ok(()));
+        for at in 20_000..40_000u64 {
+            assert_eq!(pieces.add(at, &[0x5a]), Ok(()));
+        }
+        for at in (10_000..20_000u64).rev() {
+            assert_eq!(pieces.add(at, &[0x5a]), Ok(()));
+        }
+        for at in 40_000..50_000u64 {
+            assert_eq!(pieces.add(at, &[0x5a]), Ok(()));
+        }
+        assert_eq!(pieces.add(55_000, &[0x5a; 10]), Ok(()));
+        assert_eq!(pieces.add(50_000, &[0x5a; 5_000]), Ok(()));
+        assert_eq!(pieces.pieces.len(), 1);
+        let (start, bytes) = &pieces.pieces[0];
+        assert_eq!(*start, 10_000);
+        assert_eq!(bytes.len(), 45_010);
+        assert!(bytes.iter().all(|byte| *byte == 0x5a));
+        // 65_010 bytes went in; the piece buffers are written 45_020 of them
+        assert!(
+            pieces.written <= 65_010,
+            "{} bytes written for 65_010 that came",
+            pieces.written
+        );
+    }
+
+    #[test]
+    fn the_head_is_read_once_four_bytes_are_here() {
+        // one or two bytes of a head say nothing yet: the type alone is not
+        // enough (phase 4 M5 design 4.5)
+        let mut pieces = Pieces::default();
+        assert_eq!(pieces.add(0, &[0x02]), Ok(()));
+        assert_eq!(pieces.whole, None);
+        assert_eq!(pieces.add(1, &[0, 0, 1]), Err(NO_CLIENT_HELLO));
     }
 
     #[test]
