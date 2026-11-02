@@ -772,9 +772,14 @@ impl Initial {
 /// A long-header packet that is not sealed: `kind` in bits 4 and 5 of the
 /// first byte (the caller gives the version's numbering), no token, a
 /// two-byte Length of `payload`, then `payload` bytes of 0x5a. A reader
-/// skips it by its Length.
+/// skips it by its Length. Panics where `payload` is 16384 bytes or more:
+/// two bytes of Length cannot hold that much.
 pub fn long_packet(version: u32, kind: u8, dcid: &[u8], payload: usize) -> Vec<u8> {
-    let length = u16::try_from(payload).expect("a payload of at most 65535 bytes");
+    assert!(
+        payload < 0x4000,
+        "a {payload}-byte payload does not fit two bytes of Length"
+    );
+    let length = u16::try_from(payload).expect("a payload under 16384 bytes");
     let mut packet = Vec::with_capacity(payload + 16);
     packet.push(0x80 | 0x40 | ((kind & 0b11) << 4));
     packet.extend_from_slice(&version.to_be_bytes());
@@ -1475,7 +1480,7 @@ mod tests {
     }
 
     /// `chaos_frames` covers its pieces byte for byte, in more CRYPTO frames
-    /// than there were pieces, with several PINGs. The asserion messages
+    /// than there were pieces, with several PINGs. The assertion messages
     /// carry the seed.
     #[test]
     fn chaos_frames_cover_their_pieces() {
