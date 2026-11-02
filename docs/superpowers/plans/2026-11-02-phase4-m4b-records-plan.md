@@ -841,7 +841,7 @@ relay, a carrier's far end read after its dial.
 | 46 | 6 | anytls：`Session` 多 `peer: Option<SocketAddr>`（`start` 里是 `None`）、`with_peer(self, peer)` 与 `peer(&self)`；`new_session` 在 `stack.open` 之后读远端、`.with_peer(peer)`（`mod.rs:107`）；`open` 从池里取出的会话在 `open` 成功之后 `connected`（`mod.rs:139`）。用例 `a_pooled_anytls_session_gives_its_record_the_servers_address`；RED 是第二条记录的 `remote_addr` 为 `None`。 | `ca87b0b` |
 | 47 | 6 | `h2pool`：`Conn` 多 `peer`，`connect` 在 `self.dial.dial(opts)` 之后读远端（`mod.rs:306`），`open` 在 `lease` 之后 `connected`（`mod.rs:188`）。用例 `every_stream_on_a_shared_h2_connection_records_its_address`；RED 是第二条流的记录为 `None`。 | `e783ccd` |
 | 48 | 6 | ssh：`Session` 多 `peer`，`establish` 在建好底下的连接之后读远端（`outbound.rs:706`），`dial` 在每次 `session()` 之后 `connected`（`outbound.rs:641`、`:649`）。用例 `every_channel_on_an_ssh_session_records_its_address`；RED 是第二条通道的记录为 `None`。 | `0ec7cd9` |
-| 49 | 6 | 门禁两次（一台机器上的一次运行，不是 CI）：第一次在 `0ec7cd9` 的树上，第二次在加完这几行（本提交）的树上。两次都是 `cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 退出码 0、`cargo test -j 8 --workspace --no-fail-fast` 93 个结果行、5361 通过、0 失败、15 忽略、退出码 0（基线的 5354 加本任务新加的 7 条）；两次都没有死掉的测试二进制，也没有留下 `rurge.exe`。新加的 6 条带等待的用例各自单独跑二十次（`--exact`），全过。计划文件的尾仍是 `i/lf w/lf`，弯引号 0 个。 | 本提交 |
+| 49 | 6 | 门禁三次（一台 Windows 11 开发机上的一次运行，不是 CI）：第一次在 `0ec7cd9` 的树上；第二次在同一棵树加完这几行之前；第三次就是加完本提交的树之后的再一次全量（细节与第三次的数记在 `task-6-report.md` 里）。前两次里 `cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 的退出码都是 0；`cargo test -j 8 --workspace --no-fail-fast` 三次都是 93 个结果行、5361 通过、0 失败、15 忽略（第二次的两次运行分别以 `STATUS_HEAP_CORRUPTION` 退出：`rurge_inbound` 与 `smart`，各按约定单独重跑那一个二进制、都 80 条与 22 条全过，补齐之后就是 5361；第三次退出码 0）。没有留下 `rurge.exe`。新加的 6 条带等待的用例各自单独跑二十次（`--exact`），全过。计划文件的尾仍是 `i/lf w/lf`，弯引号 0 个。 | 本提交 |
 
 ## 延后事项
 
