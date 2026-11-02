@@ -219,6 +219,10 @@ pub struct Engine {
     /// How the sniffs of this engine ended (phase 4 M1 design 7.5), what
     /// `http_counts` reads. As `fake_pool`, it outlives a reload.
     pub(crate) sniff_counts: crate::serve::SniffCounts,
+    /// How the QUIC ClientHellos of this engine were read (`phase 4 M5 design
+    /// 5.4`), what `http_counts` reads as `quic`: as `sniff_counts`, a reload
+    /// does not clear them.
+    pub(crate) quic_counts: crate::serve::QuicCounts,
     /// How the decrypted connections of this engine ended (`phase 4 M2 design
     /// 8.5`), what `http_counts` reads as `mitm`: as `sniff_counts`, a reload
     /// does not clear them, so they live here and not in a generation.
@@ -299,6 +303,7 @@ impl Engine {
             capture_on: AtomicBool::new(false),
             fake_pool: ArcSwapOption::empty(),
             sniff_counts: crate::serve::SniffCounts::default(),
+            quic_counts: crate::serve::QuicCounts::default(),
             mitm_counts: crate::mitm::MitmCounters::default(),
             request_count: AtomicU64::new(0),
             state: OnceLock::new(),
@@ -1579,6 +1584,7 @@ impl Engine {
             requests: self.request_count.load(Ordering::Relaxed),
             mitm: self.mitm_counts.snapshot(),
             rewrite: self.shared.rewrite.snapshot(),
+            quic: self.quic_counts.snapshot(),
         }
     }
     /// Kills an in-flight session by id (M4 `POST /v1/requests/{id}/kill`).

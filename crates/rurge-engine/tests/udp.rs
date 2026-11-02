@@ -6,10 +6,14 @@ mod common;
 use common::*;
 use rurge_config::HostName;
 use rurge_config::session::{SessionInfo, Transport};
-use rurge_engine::{REFUSED_STRICT, RequestRecord};
+use rurge_engine::{QuicSniffed, REFUSED_STRICT, RequestRecord};
 use rurge_inbound::{Dialer, UdpClient};
 use rurge_net::BoxFuture;
 use rurge_net::connector::Target;
+use rurge_net::quic::testing::{
+    Frame, Initial, RFC_DCID, RFC9001_CLIENT_INITIAL, big_client_hello, hello_initial,
+    hello_initials, unhex,
+};
 use rurge_proto::RejectKind;
 use std::io;
 use std::sync::Mutex;
@@ -1415,4 +1419,316 @@ IP-CIDR6,::1/128,V4,no-resolve",
     // than it takes
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(association.client.refused.lock().unwrap().len(), 7);
+}
+
+/// A UDP server on the loopback that answers nothing: it hands every datagram
+/// it receives, with the moment it came, to the test (the phase 4 / M5a
+/// plan's P12).
+struct Sink {
+    port: u16,
+    heard: mpsc::UnboundedReceiver<(Vec<u8>, tokio::time::Instant)>,
+    _task: AbortOnDropHandle<()>,
+}
+
+async fn udp_sink() -> Sink {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let (heard, waiting) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        // room for the largest datagram a client may send
+        let mut buf = vec![0; 65536];
+        loop {
+            let Ok((len, _)) = socket.recv_from(&mut buf).await else {
+                break;
+            };
+            if heard
+                .send((buf[..len].to_vec(), tokio::time::Instant::now()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    Sink {
+        port,
+        heard: waiting,
+        _task: AbortOnDropHandle::new(task),
+    }
+}
+
+impl Sink {
+    /// The next datagram, within five seconds.
+    async fn next(&mut self) -> (Vec<u8>, tokio::time::Instant) {
+        tokio::time::timeout(Duration::from_secs(5), self.heard.recv())
+            .await
+            .expect("the datagram arrives within five seconds")
+            .expect("the sink still runs")
+    }
+
+    /// Nothing has come, as of now.
+    fn silent(&mut self) -> bool {
+        self.heard.try_recv().is_err()
+    }
+}
+
+/// The record of the UDP flow to `dst` once a datagram of it has gone out:
+/// `open` has read the rules and the flow goes through, running or finished.
+async fn flowing(h: &Harness, dst: &str) -> RequestRecord {
+    wait_until("the flow's first datagram to go out", || {
+        let log = h.engine.request_log();
+        log.active()
+            .into_iter()
+            .chain(log.recent(4096))
+            .any(|r| r.dst == dst && r.up > 0)
+    })
+    .await;
+    let log = h.engine.request_log();
+    log.active()
+        .into_iter()
+        .chain(log.recent(4096))
+        .find(|r| r.dst == dst)
+        .expect("the flow's record")
+}
+
+/// The ClientHello of `held.test` over two datagrams, `at` bytes in the first,
+/// and the last datagram of a flow that closes the connection in packet 1.
+fn a_hello_over_two(at: usize) -> ([Vec<u8>; 2], Vec<u8>) {
+    let hello = big_client_hello(Some("held.test"));
+    let datagrams = hello_initials(RFC_DCID, &hello, at);
+    let frames = vec![Frame::ConnectionClose {
+        error: 0,
+        frame_type: 0,
+        reason: Vec::new(),
+    }];
+    let closed = Initial::new(1, RFC_DCID, 1, frames).seal(Some(1200));
+    (datagrams, closed)
+}
+
+/// A QUIC flow whose whole ClientHello arrives, in two datagrams, is routed by
+/// its SNI: the rule of `held.test` rejects it, both held datagrams are told
+/// of the refusal, and nothing goes to the target (design 5.1).
+#[tokio::test]
+async fn a_hello_across_two_datagrams_is_routed_by_its_sni() {
+    let h = harness(Profile {
+        hosts: "held.test = 127.0.0.1",
+        rules: "DOMAIN,held.test,REJECT,extended-matching",
+        ..Profile::default()
+    })
+    .await;
+    let mut sink = udp_sink().await;
+    let ([d1, d2], _) = a_hello_over_two(600);
+    let association = own_association(&h);
+    association.write("127.0.0.1", sink.port, &d1);
+    association.write("127.0.0.1", sink.port, &d2);
+
+    let dst = format!("127.0.0.1:{}", sink.port);
+    let record = flow_record(&h, &dst).await;
+    assert_eq!(record.status, RecordStatus::Rejected("REJECT".into()));
+    assert_eq!(record.sni.as_deref(), Some("held.test"));
+    assert_eq!(
+        record.protocol,
+        Some(rurge_config::rule::ProtocolKind::Quic)
+    );
+    assert!(record.notes.is_empty(), "{:?}", record.notes);
+    // one refusal for each datagram the flow held
+    assert_eq!(association.refused(2).await.len(), 2);
+    assert_eq!(
+        h.engine.http_counts().quic,
+        QuicSniffed {
+            hello: 1,
+            ..QuicSniffed::default()
+        }
+    );
+    // a refused flow is never sent, so there is nothing to wait for
+    assert!(sink.silent());
+}
+
+/// The same hello without `extended-matching`: the rule does not look at the
+/// SNI, so the flow goes to its target, datagram for datagram as it came
+/// (design 5.1).
+#[tokio::test]
+async fn without_extended_matching_the_sni_does_not_match() {
+    let h = harness(Profile {
+        hosts: "held.test = 127.0.0.1",
+        rules: "DOMAIN,held.test,REJECT",
+        ..Profile::default()
+    })
+    .await;
+    let mut sink = udp_sink().await;
+    let ([d1, d2], _) = a_hello_over_two(600);
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", sink.port, &d1).await;
+    association.send("127.0.0.1", sink.port, &d2).await;
+
+    assert_eq!(sink.next().await.0, d1);
+    assert_eq!(sink.next().await.0, d2);
+    let dst = format!("127.0.0.1:{}", sink.port);
+    let record = flowing(&h, &dst).await;
+    assert_eq!(record.sni.as_deref(), Some("held.test"));
+    assert_ne!(record.status, RecordStatus::Rejected("REJECT".into()));
+    assert_eq!(
+        h.engine.http_counts().quic,
+        QuicSniffed {
+            hello: 1,
+            ..QuicSniffed::default()
+        }
+    );
+}
+
+/// A client that sends one datagram of its hello waits 300 ms for the rest,
+/// and its flow then goes out as it came, with no SNI (design 5.2).
+#[tokio::test]
+async fn a_hello_that_never_completes_goes_out_after_300_ms() {
+    let h = harness(Profile {
+        hosts: "held.test = 127.0.0.1",
+        ..Profile::default()
+    })
+    .await;
+    let mut sink = udp_sink().await;
+    let ([d1, _], _) = a_hello_over_two(600);
+    let association = udp_associate(h.socks()).await;
+    let sent = tokio::time::Instant::now();
+    association.send("127.0.0.1", sink.port, &d1).await;
+
+    let (payload, at) = sink.next().await;
+    assert_eq!(payload, d1);
+    assert!(
+        at.duration_since(sent) >= Duration::from_millis(300),
+        "the flow went out after {:?}",
+        at.duration_since(sent)
+    );
+    let dst = format!("127.0.0.1:{}", sink.port);
+    let record = flowing(&h, &dst).await;
+    assert_eq!(record.sni, None);
+    assert_eq!(
+        record.notes,
+        ["No SNI: the QUIC ClientHello did not arrive whole"]
+    );
+    let quic = h.engine.http_counts().quic;
+    assert_eq!(
+        quic,
+        QuicSniffed {
+            incomplete: 1,
+            ..QuicSniffed::default()
+        }
+    );
+}
+
+/// A hello the reader gives up on and one that comes whole but does not parse
+/// are both noted as unread, either way; only DEBUG says which way (design
+/// 5.4).
+#[tokio::test]
+async fn an_unreadable_hello_is_noted() {
+    let log = LogCapture::start();
+    let h = harness(Profile {
+        hosts: "held.test = 127.0.0.1",
+        ..Profile::default()
+    })
+    .await;
+    let mut closed = udp_sink().await;
+    let broken = udp_sink().await;
+    let ([d1, _], closing) = a_hello_over_two(600);
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", closed.port, &d1).await;
+    association.send("127.0.0.1", closed.port, &closing).await;
+    // a handshake message that claims a length of 4 and carries 4 bytes
+    let claims = [1, 0, 0, 4, 0xff, 0xff, 0xff, 0xff];
+    association
+        .send("127.0.0.1", broken.port, &hello_initial(RFC_DCID, &claims))
+        .await;
+
+    // the datagrams held for the closed connection go out in the order they
+    // came
+    assert_eq!(closed.next().await.0, d1);
+    assert_eq!(closed.next().await.0, closing);
+    let note = ["No SNI: the QUIC ClientHello could not be read"];
+    for port in [closed.port, broken.port] {
+        let dst = format!("127.0.0.1:{port}");
+        let record = flowing(&h, &dst).await;
+        assert_eq!(record.sni, None, "{record:?}");
+        assert_eq!(record.notes, note, "{record:?}");
+    }
+    assert_eq!(
+        h.engine.http_counts().quic,
+        QuicSniffed {
+            unreadable: 2,
+            ..QuicSniffed::default()
+        }
+    );
+
+    let lines = log.lines();
+    for why in [
+        "the client closed the connection",
+        "a ClientHello that does not parse",
+    ] {
+        assert!(
+            lines.iter().any(|line| line.starts_with("DEBUG")
+                && line.contains("the QUIC ClientHello could not be read")
+                && line.contains(why)),
+            "no DEBUG line says {why}: {lines:?}"
+        );
+    }
+}
+
+/// An association that ends while a flow is held leaves nothing of that flow:
+/// no record, no count (design 5.1).
+#[tokio::test]
+async fn a_flow_whose_association_ends_while_held_leaves_no_record() {
+    let h = harness(Profile {
+        hosts: "held.test = 127.0.0.1",
+        ..Profile::default()
+    })
+    .await;
+    let mut held_by = udp_sink().await;
+    let other = udp_sink().await;
+    let ([d1, _], _) = a_hello_over_two(600);
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", held_by.port, &d1).await;
+    association.send("127.0.0.1", other.port, b"plain").await;
+    // the other flow has its policy: it went past the rules while the first
+    // one is held
+    let other_dst = format!("127.0.0.1:{}", other.port);
+    wait_until("the other flow to be routed", || {
+        let log = h.engine.request_log();
+        log.active()
+            .into_iter()
+            .chain(log.recent(4096))
+            .any(|r| r.dst == other_dst && !r.policy.is_empty())
+    })
+    .await;
+    drop(association);
+    // what is held leaves nothing behind: 600 ms is the 300 ms the wait would
+    // have run for, and as much again to spare
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let held_dst = format!("127.0.0.1:{}", held_by.port);
+    let log = h.engine.request_log();
+    assert!(
+        !log.active()
+            .into_iter()
+            .chain(log.recent(4096))
+            .any(|r| r.dst == held_dst),
+        "the held flow left a record"
+    );
+    assert_eq!(h.engine.http_counts().quic, QuicSniffed::default());
+    assert!(held_by.silent());
+}
+
+/// A real client's first datagram, read from the RFC 9001 sample, gives the
+/// flow its SNI.
+#[tokio::test]
+async fn the_rfc_sample_flow_has_its_sni() {
+    let h = harness(Profile {
+        hosts: "example.com = 127.0.0.1",
+        ..Profile::default()
+    })
+    .await;
+    let sink = udp_sink().await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("127.0.0.1", sink.port, &unhex(RFC9001_CLIENT_INITIAL))
+        .await;
+    let dst = format!("127.0.0.1:{}", sink.port);
+    let record = flowing(&h, &dst).await;
+    assert_eq!(record.sni.as_deref(), Some("example.com"));
 }

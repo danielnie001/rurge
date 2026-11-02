@@ -115,6 +115,65 @@ impl SniffCounts {
     }
 }
 
+/// How the QUIC ClientHellos of an engine were read, and how many of its
+/// flows `auto-quic-block` blocked (`phase 4 M5 design 5.4`), as
+/// `GET /v1/rurge/http` reads them once they are a `QuicSniffed`.
+#[derive(Default)]
+pub(crate) struct QuicCounts {
+    hello: AtomicU64,
+    incomplete: AtomicU64,
+    unreadable: AtomicU64,
+    blocked: AtomicU64,
+}
+
+impl QuicCounts {
+    /// Counts one QUIC flow by how its ClientHello was read.
+    pub(crate) fn count(&self, read: HelloRead) {
+        let counter = match read {
+            HelloRead::Read => &self.hello,
+            HelloRead::Incomplete => &self.incomplete,
+            HelloRead::Unreadable => &self.unreadable,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> QuicSniffed {
+        QuicSniffed {
+            hello: self.hello.load(Ordering::Relaxed),
+            incomplete: self.incomplete.load(Ordering::Relaxed),
+            unreadable: self.unreadable.load(Ordering::Relaxed),
+            blocked: self.blocked.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// How one QUIC flow's ClientHello was read (the phase 4 / M5a plan's P8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HelloRead {
+    /// Whole and parsed: the flow's session has an SNI.
+    Read,
+    /// The rest did not come within the wait or the datagram count.
+    Incomplete,
+    /// It came whole but could not be read, or the reader gave up.
+    Unreadable,
+}
+
+/// How the QUIC ClientHellos of an engine were read and how many of its flows
+/// `auto-quic-block` blocked (`phase 4 M5 design 5.4`): what
+/// `GET /v1/rurge/http` reads as `quic`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuicSniffed {
+    /// The flows whose ClientHello came whole and parsed.
+    pub hello: u64,
+    /// The flows whose ClientHello did not arrive whole in time.
+    pub incomplete: u64,
+    /// The flows whose ClientHello came whole but could not be read, or which
+    /// the reader gave up on.
+    pub unreadable: u64,
+    /// The flows `auto-quic-block` blocked.
+    pub blocked: u64,
+}
+
 /// How the sniffs of an engine ended (phase 4 M1 design 7.5): what
 /// `GET /v1/rurge/http` reads (the phase 4 / M1a plan's P16).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -141,6 +200,9 @@ pub struct HttpCounts {
     /// The rewrite counts of the engine (`phase 4 M3 design 12`): the
     /// generation in use counts into them, and a reload keeps them.
     pub rewrite: rurge_http::RewriteCounts,
+    /// The QUIC ClientHellos that were read, and the flows `auto-quic-block`
+    /// blocked (`phase 4 M5 design 5.4`).
+    pub quic: QuicSniffed,
 }
 
 /// The parts of one client connection that `serve_http` and `serve_mitm` set

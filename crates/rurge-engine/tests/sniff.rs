@@ -14,7 +14,7 @@ use common::*;
 use rurge_config::HostName;
 use rurge_config::rule::ProtocolKind;
 use rurge_config::session::{SessionInfo, Transport};
-use rurge_engine::{HttpCounts, MitmCounts, Mode, SniffedCounts};
+use rurge_engine::{HttpCounts, MitmCounts, Mode, QuicSniffed, SniffedCounts};
 use rurge_inbound::Dialer;
 use std::net::IpAddr;
 
@@ -966,6 +966,7 @@ async fn the_sniffs_are_counted() {
             requests: 1,
             mitm: MitmCounts::default(),
             rewrite: rurge_http::RewriteCounts::default(),
+            quic: QuicSniffed::default(),
         }
     );
 }

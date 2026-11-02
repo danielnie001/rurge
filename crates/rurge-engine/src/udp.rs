@@ -6,6 +6,7 @@
 use crate::auto::{EVALUATION_FAILED, resolve_ready};
 use crate::engine::{CONNECT_TIMEOUT, Chosen, Engine, FAKE_ADDRESS_NOT_KNOWN, REFUSED_STRICT};
 use crate::fake_address::Turned;
+use crate::serve::HelloRead;
 use rurge_config::HostName;
 use rurge_config::general::{BlockQuicGlobal, UdpFallback};
 use rurge_config::policy::Builtin;
@@ -14,10 +15,11 @@ use rurge_config::session::SessionInfo;
 use rurge_config::spec::BlockQuic;
 use rurge_inbound::{ProcessSlot, SessionHandle, SessionOutcome, UdpClient};
 use rurge_net::connector::{ConnectOpts, PacketSocket, Target, lost_alone};
+use rurge_net::quic::initial::{Hello, HelloReader, read_first};
 use rurge_policy::TerminalKind;
 use rurge_policy::auto::SelectCtx;
 use rurge_proto::{OutboundRef, RejectKind, UdpSupport};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -43,6 +45,7 @@ pub const ASSOCIATIONS: usize = 4096;
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Datagrams waiting for their flow to get going; more are dropped.
 const QUEUE: usize = 64;
+
 /// What the flows of one association may hold in all, waiting for their
 /// carrier or their turn to go out; more is dropped.
 const QUEUED_BYTES: usize = 1 << 20;
@@ -314,11 +317,12 @@ struct Carriers(Mutex<HashMap<usize, Arc<Slot>>>);
 struct Slot {
     /// How many openings have failed.
     failures: AtomicU64,
-    held: tokio::sync::Mutex<Held>,
+    held: tokio::sync::Mutex<Opening>,
 }
 
+/// The carrier a slot opened, or why the last opening failed.
 #[derive(Default)]
-struct Held {
+struct Opening {
     carrier: Weak<Carrier>,
     /// Why the last opening failed.
     why: String,
@@ -410,6 +414,69 @@ impl Queued {
 impl Drop for Queued {
     fn drop(&mut self) {
         self.queued.fetch_sub(self.datagram.len(), Ordering::AcqRel);
+    }
+}
+
+/// How long a QUIC flow is held for the rest of its ClientHello (`phase 4 M5
+/// design 5.2`): long enough for the second datagram of a hello of 1500 to
+/// 1900 bytes, short enough that a client that sent one datagram waits no
+/// longer than a third of a second. There is no knob (M5-D7).
+const HELLO_WAIT: Duration = Duration::from_millis(300);
+
+/// How many datagrams, the first included, a QUIC flow holds while its
+/// ClientHello is incomplete (`phase 4 M5 design 5.2`): the rest stay in the
+/// flow's queue, and the flow goes as it always did.
+const HELLO_DATAGRAMS: usize = 16;
+
+/// What holding a QUIC flow for its ClientHello came to.
+enum Held {
+    /// The hello came whole, as 4 + the length its header gives, bytes.
+    Whole(Vec<u8>),
+    /// The rest did not come within `HELLO_WAIT` or `HELLO_DATAGRAMS`.
+    Incomplete,
+    /// The reader's reason, for DEBUG only.
+    GaveUp(&'static str),
+    /// The association ended while the flow was held.
+    Ended,
+}
+
+/// Holds a QUIC flow's datagrams until its ClientHello is whole, its reader
+/// gives up, the wait is over or the association ends (`phase 4 M5 design
+/// 5.2`). `held` comes in holding the flow's first datagram, and keeps every
+/// datagram this takes from `waiting`: they go out in that order once the
+/// flow lets go.
+async fn hold(
+    association: &Association,
+    mut reader: HelloReader,
+    held: &mut VecDeque<Queued>,
+    waiting: &mut mpsc::Receiver<Queued>,
+) -> Held {
+    let until = now() + HELLO_WAIT;
+    let sleep = tokio::time::sleep_until(until.into());
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = association.ended.cancelled() => return Held::Ended,
+            _ = &mut sleep => return Held::Incomplete,
+            got = waiting.recv() => match got {
+                // the association's queue is closed: nothing more comes
+                None => return Held::Ended,
+                Some(datagram) => {
+                    let hello = reader.read(&datagram.datagram);
+                    held.push_back(datagram);
+                    match hello {
+                        Hello::Whole(hello) => return Held::Whole(hello),
+                        Hello::GaveUp(why) => return Held::GaveUp(why),
+                        Hello::Partial(next) => {
+                            reader = next;
+                            if held.len() >= HELLO_DATAGRAMS {
+                                return Held::Incomplete;
+                            }
+                        }
+                    }
+                }
+            },
+        }
     }
 }
 
@@ -508,25 +575,85 @@ async fn run_flow(
     mut waiting: mpsc::Receiver<Queued>,
     id: u64,
 ) {
-    let mut session = association.template.clone();
+    let mut session: SessionInfo = association.template.clone();
     session.dst_host = asked.host.clone();
     session.dst_port = asked.port;
     // A fake address the client wrote is the name behind it (phase 3 M3 design
     // 13): the rules see the name, and the flow goes to it.
     let turned = engine.turn_back(&mut session);
     let destination = Target::new(session.dst_host.clone(), session.dst_port);
+    // the flow's first datagram, and whatever else it holds while its
+    // ClientHello is not whole
+    let mut held = VecDeque::from([first]);
     // the rules see what the first datagram is (`PROTOCOL,QUIC`,
-    // `PROTOCOL,STUN`), on any port
-    session.protocol = Some(
-        if rurge_net::quic::initial::is_client_initial(&first.datagram) {
-            ProtocolKind::Quic
-        } else if crate::sniff::is_stun(&first.datagram) {
-            ProtocolKind::Stun
-        } else {
-            ProtocolKind::Udp
+    // `PROTOCOL,STUN`), on any port, and a QUIC flow is held for the rest of
+    // its ClientHello before they do (`phase 4 M5 design 4.4, 5.1`)
+    let first_is = read_first(&held[0].datagram);
+    let hello = match first_is {
+        None => {
+            session.protocol = Some(if crate::sniff::is_stun(&held[0].datagram) {
+                ProtocolKind::Stun
+            } else {
+                ProtocolKind::Udp
+            });
+            None
+        }
+        Some(Hello::Whole(hello)) => {
+            session.protocol = Some(ProtocolKind::Quic);
+            Some(Held::Whole(hello))
+        }
+        Some(Hello::GaveUp(why)) => {
+            session.protocol = Some(ProtocolKind::Quic);
+            Some(Held::GaveUp(why))
+        }
+        Some(Hello::Partial(reader)) => {
+            session.protocol = Some(ProtocolKind::Quic);
+            Some(hold(&association, reader, &mut held, &mut waiting).await)
+        }
+    };
+    // the association ended while the flow was held: nothing is left of it,
+    // no record and no count (`phase 4 M5 design 5.1`)
+    if matches!(hello, Some(Held::Ended)) {
+        let _ = association.done.send((asked, id));
+        return;
+    }
+    // what became of the hello, for the count and the note: the session's SNI
+    // is set now, before the handle reads the session
+    let (read, why) = match hello {
+        None => (None, None),
+        Some(Held::Whole(message)) => match rurge_http::tls::parse_client_hello(&message) {
+            Some(hello) => {
+                session.sni = hello.sni;
+                (Some(HelloRead::Read), None)
+            }
+            None => (
+                Some(HelloRead::Unreadable),
+                Some("a ClientHello that does not parse"),
+            ),
         },
-    );
+        Some(Held::GaveUp(why)) => (Some(HelloRead::Unreadable), Some(why)),
+        Some(Held::Incomplete) => (Some(HelloRead::Incomplete), None),
+        Some(Held::Ended) => unreachable!("an ended flow did not go on"),
+    };
     let handle = engine.new_handle_with(session, association.process.clone());
+    // one QUIC flow counts once, however it came of reading its hello; a flow
+    // whose hello was not read whole or at all says so on its record, and
+    // nowhere but DEBUG says why (`phase 4 M5 design 5.4`)
+    if let Some(read) = read {
+        engine.quic_counts.count(read);
+        match read {
+            HelloRead::Read => {}
+            HelloRead::Incomplete => {
+                handle.add_note("No SNI: the QUIC ClientHello did not arrive whole");
+                tracing::debug!(host = %destination.host, port = destination.port, "udp: the QUIC ClientHello did not come whole within 300 ms or 16 datagrams; the rules see no SNI");
+            }
+            HelloRead::Unreadable => {
+                handle.add_note("No SNI: the QUIC ClientHello could not be read");
+                let why = why.expect("a hello that could not be read says why");
+                tracing::debug!(host = %destination.host, port = destination.port, why, "udp: the QUIC ClientHello could not be read; the rules see no SNI");
+            }
+        }
+    }
     let unknown = match turned {
         Turned::Unchanged => false,
         // the address stays the name's as long as the flow lasts
@@ -549,7 +676,7 @@ async fn run_flow(
     match opened {
         Ok((flow, carrier, send_to)) => {
             let outcome =
-                forward(&association, &flow, &carrier, &send_to, first, &mut waiting).await;
+                forward(&association, &flow, &carrier, &send_to, held, &mut waiting).await;
             carrier.routes.remove(&flow);
             // a flow whose datagrams stopped going out is tried again after
             // `RETRY_AFTER`, as one that could not open
@@ -566,18 +693,22 @@ async fn run_flow(
             // far end of it (the phase 4 / M4b plan's P8 ③)
             trail.clear_peer();
             // it holds no room while the flow stays
-            drop(first);
+            let held_datagrams = held.len();
+            drop(held);
             // a refused flow stays until it is idle, and its client is told of
-            // each datagram it drops, this first one too; a failed one is tried
-            // again after `RETRY_AFTER`, and its client is told nothing: it
-            // would give up on a destination that may be reachable by then
+            // each datagram it drops, the ones held for its ClientHello too;
+            // a failed one is tried again after `RETRY_AFTER`, and its client
+            // is told nothing: it would give up on a destination that may be
+            // reachable by then
             let retry = matches!(outcome, SessionOutcome::Failed(_)).then(|| now() + RETRY_AFTER);
             let refused = match &outcome {
                 SessionOutcome::Rejected(kind) => Some((&asked, *kind)),
                 _ => None,
             };
             if let Some((target, kind)) = refused {
-                association.client.refused(target, kind);
+                for _ in 0..held_datagrams {
+                    association.client.refused(target, kind);
+                }
             }
             handle.finish(outcome);
             drain(&association, &handle, &mut waiting, retry, refused).await;
@@ -772,12 +903,11 @@ async fn forward(
     flow: &Flow,
     carrier: &Carrier,
     send_to: &Target,
-    first: Queued,
+    mut held: VecDeque<Queued>,
     waiting: &mut mpsc::Receiver<Queued>,
 ) -> SessionOutcome {
-    let mut next = Some(first);
     loop {
-        if let Some(datagram) = next.take() {
+        if let Some(datagram) = held.pop_front() {
             // the end of the association cuts a send short (its carriers go
             // with it), a kill waits for it: one cut short may leave half a
             // datagram on a stream the other flows share
@@ -806,6 +936,8 @@ async fn forward(
                     return upstream_failed(&flow.handle, "sending to the outbound timed out");
                 }
             }
+            // what is held goes first, in the order it came
+            continue;
         }
         tokio::select! {
             _ = association.ended.cancelled() => return SessionOutcome::Completed,
@@ -814,7 +946,7 @@ async fn forward(
                 return upstream_failed(&flow.handle, "the outbound's UDP socket has closed");
             }
             got = waiting.recv() => match got {
-                Some(datagram) => next = Some(datagram),
+                Some(datagram) => held.push_back(datagram),
                 None => return SessionOutcome::Completed,
             },
             _ = flow.idle() => return SessionOutcome::Completed,
@@ -866,6 +998,8 @@ async fn drain(
 mod tests {
     use super::*;
     use rurge_net::BoxFuture;
+    use rurge_net::quic::initial::{Hello, read_first};
+    use rurge_net::quic::testing::{Frame, Initial, RFC_DCID, big_client_hello, hello_initials};
     use rurge_proto::OutboundError;
     use std::net::SocketAddr;
 
@@ -1375,7 +1509,7 @@ mod tests {
             &flow,
             &carrier,
             &to,
-            queued(b"x"),
+            VecDeque::from([queued(b"x")]),
             &mut waiting,
         );
         let outcome = tokio::time::timeout(Duration::from_secs(60), sending)
@@ -1397,7 +1531,7 @@ mod tests {
             &flow,
             &carrier,
             &to,
-            queued(b"x"),
+            VecDeque::from([queued(b"x")]),
             &mut waiting,
         );
         let outcome = tokio::time::timeout(Duration::from_secs(1), sending)
@@ -1530,5 +1664,171 @@ mod tests {
         assert!(silence_tells(&target("10.0.0.1", 53)));
         assert!(!silence_tells(&target("10.0.0.1", 9)));
         assert!(!silence_tells(&target("quic.test", 443)));
+    }
+
+    /// The ClientHello of `held.test`, `at` bytes of it in each datagram, and
+    /// the reader the first datagram leaves.
+    fn hello_over_two(at: usize) -> ([Vec<u8>; 2], Vec<u8>, HelloReader) {
+        let hello = big_client_hello(Some("held.test"));
+        let datagrams = hello_initials(RFC_DCID, &hello, at);
+        let Some(Hello::Partial(reader)) = read_first(&datagrams[0]) else {
+            panic!("the first datagram opens as half a ClientHello");
+        };
+        (datagrams, hello, reader)
+    }
+
+    /// A datagram of the flow that closes the connection in packet 1.
+    fn closes() -> Vec<u8> {
+        let frames = vec![Frame::ConnectionClose {
+            error: 0,
+            frame_type: 0,
+            reason: Vec::new(),
+        }];
+        Initial::new(1, RFC_DCID, 1, frames).seal(Some(1200))
+    }
+
+    /// The second datagram carries the rest: the hello comes whole, and the
+    /// flow holds both datagrams until it does.
+    #[tokio::test(start_paused = true)]
+    async fn holding_lets_go_once_the_hello_is_whole() {
+        let (association, ..) = stuck();
+        let ([d1, d2], hello, reader) = hello_over_two(600);
+        let mut held = VecDeque::from([queued(&d1)]);
+        let (queue, mut waiting) = mpsc::channel(QUEUE);
+        queue.send(queued(&d2)).await.expect("room");
+        let let_go = {
+            let fut = hold(&association, reader, &mut held, &mut waiting);
+            tokio::pin!(fut);
+            tokio::time::timeout(Duration::from_secs(1), &mut fut)
+                .await
+                .expect("the second datagram lets go at once")
+        };
+        match let_go {
+            Held::Whole(read) => assert_eq!(read, hello, "the hello as it was sent"),
+            Held::Incomplete => panic!("the hello did not come whole"),
+            Held::GaveUp(why) => panic!("the hello was given up on: {why}"),
+            Held::Ended => panic!("the association ended while the hello was held"),
+        }
+        assert_eq!(held.len(), 2);
+    }
+
+    /// Nothing more comes: the flow lets go at 300 ms, not before.
+    #[tokio::test(start_paused = true)]
+    async fn holding_lets_go_at_300_ms() {
+        let (association, ..) = stuck();
+        let ([d1, _], _, reader) = hello_over_two(600);
+        let mut held = VecDeque::from([queued(&d1)]);
+        let (_queue, mut waiting) = mpsc::channel(QUEUE);
+        let late = {
+            let fut = hold(&association, reader, &mut held, &mut waiting);
+            tokio::pin!(fut);
+            let early = tokio::time::timeout(Duration::from_millis(299), &mut fut).await;
+            assert!(early.is_err(), "the flow does not let go before 300 ms");
+            tokio::time::timeout(Duration::from_millis(2), &mut fut)
+                .await
+                .expect("the flow lets go at 300 ms")
+        };
+        assert!(
+            matches!(late, Held::Incomplete),
+            "the flow did not let go at 300 ms"
+        );
+        assert_eq!(held.len(), 1);
+    }
+
+    /// Sixteen datagrams without progress are as far as a flow holds: the
+    /// seventeenth stays in the flow's queue, and the wait's clock has not run.
+    #[tokio::test(start_paused = true)]
+    async fn holding_lets_go_at_16_datagrams() {
+        let (association, ..) = stuck();
+        let ([d1, _], _, reader) = hello_over_two(600);
+        let mut held = VecDeque::from([queued(&d1)]);
+        let (queue, mut waiting) = mpsc::channel(QUEUE);
+        for _ in 0..HELLO_DATAGRAMS {
+            queue.send(queued(&d1)).await.expect("room");
+        }
+        let begun = tokio::time::Instant::now();
+        let let_go = {
+            let fut = hold(&association, reader, &mut held, &mut waiting);
+            tokio::pin!(fut);
+            tokio::time::timeout(Duration::from_secs(1), &mut fut)
+                .await
+                .expect("sixteen datagrams let go at once")
+        };
+        assert!(
+            matches!(let_go, Held::Incomplete),
+            "sixteen datagrams did not let go at once"
+        );
+        assert_eq!(held.len(), HELLO_DATAGRAMS);
+        assert!(waiting.try_recv().is_ok(), "the seventeenth stays queued");
+        assert!(begun.elapsed() < HELLO_WAIT, "the clock did not run");
+    }
+
+    /// The association ends: the flow lets go at once, whether the wait is
+    /// still on or its queue has closed.
+    #[tokio::test(start_paused = true)]
+    async fn holding_ends_with_the_association() {
+        let (association, ..) = stuck();
+        let ([d1, _], _, reader) = hello_over_two(600);
+        let mut held = VecDeque::from([queued(&d1)]);
+        let (_queue, mut waiting) = mpsc::channel(QUEUE);
+        association.ended.cancel();
+        let let_go = {
+            let fut = hold(&association, reader, &mut held, &mut waiting);
+            tokio::pin!(fut);
+            tokio::time::timeout(Duration::from_millis(1), &mut fut)
+                .await
+                .expect("the end of the association lets go at once")
+        };
+        assert!(
+            matches!(let_go, Held::Ended),
+            "the flow did not let go with the association"
+        );
+    }
+
+    /// The association's queue is closed while the flow holds: the flow lets
+    /// go at once.
+    #[tokio::test(start_paused = true)]
+    async fn holding_ends_when_the_queue_closes() {
+        let (association, ..) = stuck();
+        let ([d1, _], _, reader) = hello_over_two(600);
+        let mut held = VecDeque::from([queued(&d1)]);
+        let (queue, mut waiting) = mpsc::channel(QUEUE);
+        drop(queue);
+        let let_go = {
+            let fut = hold(&association, reader, &mut held, &mut waiting);
+            tokio::pin!(fut);
+            tokio::time::timeout(Duration::from_millis(1), &mut fut)
+                .await
+                .expect("a closed queue lets go at once")
+        };
+        assert!(
+            matches!(let_go, Held::Ended),
+            "the flow did not let go with the association"
+        );
+    }
+
+    /// The reader's own reason is the flow's: what it could not read goes no
+    /// further, and the datagram that told it is held like the rest.
+    #[tokio::test(start_paused = true)]
+    async fn holding_gives_up_with_the_reader() {
+        let (association, ..) = stuck();
+        let ([d1, _], _, reader) = hello_over_two(600);
+        let mut held = VecDeque::from([queued(&d1)]);
+        let (queue, mut waiting) = mpsc::channel(QUEUE);
+        queue.send(queued(&closes())).await.expect("room");
+        let let_go = {
+            let fut = hold(&association, reader, &mut held, &mut waiting);
+            tokio::pin!(fut);
+            tokio::time::timeout(Duration::from_secs(1), &mut fut)
+                .await
+                .expect("a closed connection lets go at once")
+        };
+        match let_go {
+            Held::GaveUp(why) => assert_eq!(why, "the client closed the connection"),
+            Held::Whole(..) => panic!("a closed connection came whole"),
+            Held::Incomplete => panic!("a closed connection was held to the end"),
+            Held::Ended => panic!("the association ended while the hello was held"),
+        }
+        assert_eq!(held.len(), 2);
     }
 }

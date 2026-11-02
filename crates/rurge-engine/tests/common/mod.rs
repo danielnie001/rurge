@@ -599,10 +599,11 @@ impl UdpAssociation {
     }
 }
 
-/// A QUIC client Initial: one that opens with the Initial keys of QUIC v1
-/// and the connection ID below (RFC 9001 §5).
+/// A QUIC client Initial: the whole ClientHello of a client that sends no
+/// Server Name, in one datagram that holds it (the phase 4 / M5a plan's P14).
 pub fn quic_initial() -> Vec<u8> {
-    rurge_net::quic::testing::client_initial(1, &[0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08])
+    let hello = rurge_net::quic::testing::client_hello(None, &[b"h3"]);
+    rurge_net::quic::testing::hello_initial(rurge_net::quic::testing::RFC_DCID, &hello)
 }
 
 /// A datagram that looks like an Initial to a glance at its header; no key

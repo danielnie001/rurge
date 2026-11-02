@@ -49,7 +49,7 @@ pub use rurge_inbound::{ProcessSlot, Running};
 pub use rurge_policy::EmptyGroup;
 pub use rurge_policy::testbook::TestResult;
 pub use rurge_tun::Counters as TunCounters;
-pub use serve::{HttpCounts, SniffedCounts};
+pub use serve::{HttpCounts, QuicSniffed, SniffedCounts};
 pub use shared::{EngineShared, ExternalPrograms, ResolverCell};
 pub use subscriptions::check_profile;
 pub use views::{GeoIpView, GroupView, MemberView, SelectError};
