@@ -552,10 +552,55 @@ impl Reference {
     }
 }
 
+/// How many of its log's last lines a failure tells: with the sentence that
+/// panicked, they fit in one note of `.github/scripts/report-test-failures.py`
+/// (sixty lines).
+const TAIL_LINES: usize = 20;
+
+/// How many characters of those lines a failure tells at most: with the
+/// sentence that panicked, they fit in one note of
+/// `.github/scripts/report-test-failures.py` (3000 characters).
+const TAIL_CHARS: usize = 2000;
+
+/// What a test's failure says about the reference beside it: whether it was
+/// still running, and the end of its log — the last `TAIL_LINES` lines, cut to
+/// the last `TAIL_CHARS` characters, or that the log is empty.
+///
+/// A log may hold anything, so the cut is on a character boundary: one made on
+/// a byte would panic.
+fn post_mortem(what: &str, state: &str, log: &str) -> String {
+    let log = log.trim();
+    if log.is_empty() {
+        return format!("{what} {state}; its log is empty");
+    }
+    let lines: Vec<&str> = log.lines().collect();
+    let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
+    let skip = tail.chars().count().saturating_sub(TAIL_CHARS);
+    let tail: String = tail.chars().skip(skip).collect();
+    format!("{what} {state}; the last lines of its log:\n{tail}")
+}
+
 impl Drop for Reference {
     fn drop(&mut self) {
+        // Asked before the kill: once killed and reaped it has always exited,
+        // and the answer would say nothing about why the test failed. The log
+        // is read after both, when everything the child wrote is in it. Only a
+        // failing test tells: what a reference that may have exited on its
+        // own, with a log no note held, leaves is undecidable from the note
+        // alone (the phase 4 / M4b plan's execution record row 82).
+        let state = std::thread::panicking().then(|| match self.child.try_wait() {
+            Ok(Some(status)) => format!("had exited by itself before the test failed ({status})"),
+            Ok(None) => "was still running when the test failed".to_string(),
+            Err(e) => format!("could not be asked whether it had exited ({e})"),
+        });
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(state) = state {
+            // `eprintln!`, not `writeln!(std::io::stderr(), …)`: a test's
+            // output holds what a macro printed, and only that reaches the
+            // note.
+            eprintln!("{}", post_mortem(self.what, &state, &self.log_text()));
+        }
     }
 }
 
@@ -1185,5 +1230,47 @@ mod tests {
     fn windows_paths_are_escaped() {
         assert_eq!(toml_path(Path::new(r"C:\t\x.pem")), r#""C:\\t\\x.pem""#);
         assert_eq!(toml_string("p\"w"), r#""p\"w""#);
+    }
+
+    /// A failure's post-mortem names the child's state and the last lines of
+    /// its log: the last twenty of thirty, joined by a newline.
+    #[test]
+    fn post_mortem_tells_the_last_lines_of_the_log() {
+        let log = (1..=30).map(|n| format!("<{n}>\n")).collect::<String>();
+        let tail = (11..=30)
+            .map(|n| format!("<{n}>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            post_mortem("sing-box", "was still running when the test failed", &log),
+            format!(
+                "sing-box was still running when the test failed; the last lines of its log:\n{tail}"
+            )
+        );
+    }
+
+    /// A line longer than the limit is cut at the end, on a character boundary:
+    /// `é` is two bytes, so a cut on a byte would panic.
+    #[test]
+    fn post_mortem_keeps_the_end_of_a_long_line() {
+        let log = format!("{}END", "é".repeat(3000));
+        let said = post_mortem("sing-box", "was still running when the test failed", &log);
+        let opening =
+            "sing-box was still running when the test failed; the last lines of its log:\n";
+        let tail = said.strip_prefix(opening).expect("the same opening");
+        assert_eq!(tail.chars().count(), TAIL_CHARS);
+        assert!(tail.ends_with("END"));
+    }
+
+    /// A log of nothing but whitespace says that it is empty.
+    #[test]
+    fn post_mortem_of_an_empty_log() {
+        let state = "had exited by itself before the test failed (exit status: 1)";
+        for log in ["", "\n \n"] {
+            assert_eq!(
+                post_mortem("sing-box", state, log),
+                "sing-box had exited by itself before the test failed (exit status: 1); its log is empty"
+            );
+        }
     }
 }
