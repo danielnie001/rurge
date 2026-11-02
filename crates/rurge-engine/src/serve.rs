@@ -150,7 +150,8 @@ impl QuicCounts {
 /// How one QUIC flow's ClientHello was read (the phase 4 / M5a plan's P8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HelloRead {
-    /// Whole and parsed: the flow's session has an SNI.
+    /// Whole and parsed: the flow's session has the SNI it named, if it named
+    /// one.
     Read,
     /// The rest did not come within the wait or the datagram count.
     Incomplete,

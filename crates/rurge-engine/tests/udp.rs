@@ -1560,8 +1560,20 @@ async fn without_extended_matching_the_sni_does_not_match() {
     association.send("127.0.0.1", sink.port, &d1).await;
     association.send("127.0.0.1", sink.port, &d2).await;
 
-    assert_eq!(sink.next().await.0, d1);
-    assert_eq!(sink.next().await.0, d2);
+    let (got, _) = sink.next().await;
+    assert!(
+        got == d1,
+        "the first datagram as it was sent: {} bytes, not {}",
+        d1.len(),
+        got.len()
+    );
+    let (got, _) = sink.next().await;
+    assert!(
+        got == d2,
+        "the second datagram as it was sent: {} bytes, not {}",
+        d2.len(),
+        got.len()
+    );
     let dst = format!("127.0.0.1:{}", sink.port);
     let record = flowing(&h, &dst).await;
     assert_eq!(record.sni.as_deref(), Some("held.test"));
@@ -1591,7 +1603,12 @@ async fn a_hello_that_never_completes_goes_out_after_300_ms() {
     association.send("127.0.0.1", sink.port, &d1).await;
 
     let (payload, at) = sink.next().await;
-    assert_eq!(payload, d1);
+    assert!(
+        payload == d1,
+        "the datagram as it was sent: {} bytes, not {}",
+        d1.len(),
+        payload.len()
+    );
     assert!(
         at.duration_since(sent) >= Duration::from_millis(300),
         "the flow went out after {:?}",
@@ -1639,8 +1656,20 @@ async fn an_unreadable_hello_is_noted() {
 
     // the datagrams held for the closed connection go out in the order they
     // came
-    assert_eq!(closed.next().await.0, d1);
-    assert_eq!(closed.next().await.0, closing);
+    let (got, _) = closed.next().await;
+    assert!(
+        got == d1,
+        "the first datagram as it was sent: {} bytes, not {}",
+        d1.len(),
+        got.len()
+    );
+    let (got, _) = closed.next().await;
+    assert!(
+        got == closing,
+        "the closing datagram as it was sent: {} bytes, not {}",
+        closing.len(),
+        got.len()
+    );
     let note = ["No SNI: the QUIC ClientHello could not be read"];
     for port in [closed.port, broken.port] {
         let dst = format!("127.0.0.1:{port}");

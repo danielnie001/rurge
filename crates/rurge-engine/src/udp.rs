@@ -45,7 +45,6 @@ pub const ASSOCIATIONS: usize = 4096;
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Datagrams waiting for their flow to get going; more are dropped.
 const QUEUE: usize = 64;
-
 /// What the flows of one association may hold in all, waiting for their
 /// carrier or their turn to go out; more is dropped.
 const QUEUED_BYTES: usize = 1 << 20;
@@ -418,14 +417,21 @@ impl Drop for Queued {
 }
 
 /// How long a QUIC flow is held for the rest of its ClientHello (`phase 4 M5
-/// design 5.2`): long enough for the second datagram of a hello of 1500 to
-/// 1900 bytes, short enough that a client that sent one datagram waits no
-/// longer than a third of a second. There is no knob (M5-D7).
+/// design 5.2`). A hello that is whole lets go at once, so a flow whose hello
+/// fits one datagram waits not at all; one whose hello comes over two waits
+/// for the gap between them, and no longer. The wait is for the hellos that
+/// never come whole: 300 ms is sing-box's default, between Xray's 200 ms and
+/// mihomo's 3 s, and well under the client's 1 s PTO. There is no knob
+/// (M5-D7).
 const HELLO_WAIT: Duration = Duration::from_millis(300);
 
 /// How many datagrams, the first included, a QUIC flow holds while its
-/// ClientHello is incomplete (`phase 4 M5 design 5.2`): the rest stay in the
-/// flow's queue, and the flow goes as it always did.
+/// ClientHello is incomplete (`phase 4 M5 design 5.2`): sixteen carry a hello
+/// of 16 KiB, the size quic-go and BoringSSL take, at about 1158 bytes each
+/// (fifteen). They also stop a client that sends other packets from growing
+/// the held queue without end — the association's `QUEUED_BYTES` still caps it
+/// all. The rest stay in the flow's queue, and the flow goes as it always
+/// did.
 const HELLO_DATAGRAMS: usize = 16;
 
 /// What holding a QUIC flow for its ClientHello came to.
@@ -575,7 +581,7 @@ async fn run_flow(
     mut waiting: mpsc::Receiver<Queued>,
     id: u64,
 ) {
-    let mut session: SessionInfo = association.template.clone();
+    let mut session = association.template.clone();
     session.dst_host = asked.host.clone();
     session.dst_port = asked.port;
     // A fake address the client wrote is the name behind it (phase 3 M3 design
@@ -1704,12 +1710,21 @@ mod tests {
                 .expect("the second datagram lets go at once")
         };
         match let_go {
-            Held::Whole(read) => assert_eq!(read, hello, "the hello as it was sent"),
+            Held::Whole(read) => assert!(
+                read == hello,
+                "the hello as it was sent: {} bytes, not {}",
+                hello.len(),
+                read.len()
+            ),
             Held::Incomplete => panic!("the hello did not come whole"),
             Held::GaveUp(why) => panic!("the hello was given up on: {why}"),
             Held::Ended => panic!("the association ended while the hello was held"),
         }
-        assert_eq!(held.len(), 2);
+        assert_eq!(held.len(), 2, "both datagrams are held");
+        assert!(
+            held[0].datagram == d1 && held[1].datagram == d2,
+            "the datagrams held in the order they came"
+        );
     }
 
     /// Nothing more comes: the flow lets go at 300 ms, not before.
@@ -1803,7 +1818,7 @@ mod tests {
         };
         assert!(
             matches!(let_go, Held::Ended),
-            "the flow did not let go with the association"
+            "the flow did not let go when its queue closed"
         );
     }
 
