@@ -29,6 +29,7 @@ cargo test -p rurge-proto-wireguard             # wireguard：路由表、client
 cargo test -p rurge-engine --test outbounds_wireguard   # 经 wireguard 出站的端到端用例：回显、[Host] 解析、经 underlying-proxy（socks5）的隧道与底层不载 UDP 时的失败、重载沿用与替换、握手测速与经隧道的 URL / UDP 测速、经隧道的 UDP
 cargo test -p rurge-proto-wireguard --release throughput -- --ignored --nocapture   # WireGuard 吞吐基准（经回环假对端双向回显 64 MiB；不作门禁）
 cargo test -p rurge-engine --release --lib relay_throughput -- --ignored --nocapture   # 转发循环吞吐基准（四个栈 × 四种缓冲 × 8 轮，上行再下行在同一条会话上；不作门禁；整张表约 26 ～ 27 分钟，RELAY_BENCH_MIB=<n> 缩小每轮的字节数）
+cargo test -p rurge-engine --release --test bench -- --ignored --exact <name> --nocapture --test-threads=1   # 阶段 4 / M5b 的基准（B1 ～ B5 与 Q1，十六个忽略的用例；`--test bench` 是引擎的第二处 `-p` 例外，同 `relay_throughput`；不作门禁；每个单独一个进程（B5 读进程的峰值，一个进程只量一项）；跑之前看放 `target/` 的盘剩 20 GiB 以上；`HTTP_BENCH_QUICK=1` 在调试构建里缩小规模、只看跑不跑得通；读数在 `docs/status.md` 的阶段 4 / M5b 一节）
 cargo test -p rurge-engine --lib relay          # 转发循环：每次写后恰好一次 flush、半关闭前先 flush、停着的写不被别的事插队、flush 永不完成时 stop 仍能打断、空闲超时、一个方向出错时另一个随之结束
 cargo test -p rurge-engine --test udp          # UDP 流水线：SOCKS5 UDP ASSOCIATE → DIRECT / REJECT / socks5（含链）、全锥、QUIC 阻断、不支持 UDP 的策略、关联结束与流数上限
 cargo test -p rurge-engine --test udp_tls_family   # 经 trojan / anytls（全锥）与 vmess（每个目标一条连接、对称）的 UDP 端到端用例（回环假服务端）
@@ -611,3 +612,18 @@ CI 运行 41411445901（第 17 次）起另有两条（M4b 计划 `docs/superpow
 五、**失败信息只写情形与长度，从不打印数据报与 ClientHello 的字节**（M5a 记录第 13、17 行）：比整个数据报或整个 ClientHello 的断言写成 `assert!(a == b, "…{} bytes, not {}", …)`，信息里只有情形、两边的长度与（随机的构造）种子。`HelloReader` 的 `Debug` 手写，只写版本、最大包号、段数与字节数，不写密钥（计划 P4 ⑦）。数据报的字节、ClientHello 的字节与密钥不进日志、错误文本或 `Debug`；打印长度、段数、包号与种子可以。
 
 六、**任务 3 的六条端到端一起并行跑，在这台机器上会偶发 `STATUS_HEAP_CORRUPTION`**（M5a 记录第 18 行）：`crates/rurge-engine/tests/udp.rs` 的 `a_hello_across_two_datagrams_is_routed_by_its_sni`、`without_extended_matching_the_sni_does_not_match`、`a_hello_that_never_completes_goes_out_after_300_ms`、`an_unreadable_hello_is_noted`、`a_flow_whose_association_ends_while_held_leaves_no_record`、`the_rfc_sample_flow_has_its_sni` 一起（并行）跑 100 次，有 4 次以 `STATUS_HEAP_CORRUPTION`（0xC0000374）退出、没有失败的用例，都停在刚开跑时；每条单独各跑 50 次（共 300 次）与六条一起加 `--test-threads=1` 跑 60 次都是 0 次。这与 `CLAUDE.md`「这台开发机」第一条、阶段 2 / M8 设计第 3.5 节查明的征状相同（注入的网络钩子在几个线程同时开始用套接字时出错），记作环境，不为它改代码；撞上时单独重跑那一个测试二进制。
+
+
+### 阶段 4 / M5b 起：基准与遗留
+
+阶段 4 / M5b 起另有几条（计划 `docs/superpowers/plans/2026-11-03-phase4-m5b-bench-legacy-plan.md`，下面写“M5b 记录第 N 行”指它末尾的「执行期修正记录」；M5b 的提交都在本地，CI 都没有见过）：
+
+一、**基准是量、不是门**：B1 ～ B5 与 Q1 十六个都是 `#[ignore]` 的用例，CI 的 `cargo test` 与门禁编译它们、不跑；没有“先红”，`HTTP_BENCH_QUICK=1` 在调试构建里缩小规模、只看跑不跑得通；守护读数解析的 `the_readings_are_parsed_from_what_the_system_prints` 不忽略，照常先红（先写、看它红、再实现到绿）。
+
+二、**`-p` 的例外现在有三处**：`rurge-tun` 的三个基准（命令一节的那三行）、`relay_throughput`、`--test bench`。别的用例一律经整个工作区、不用 `-p`。
+
+三、**内存的读数一个进程一个**：每个 B5 一开头查 `static MEASURED: AtomicBool`，同一个进程里跑到第二个 B5 就 panic（`one B5 measurement per process: run it alone with --exact`），所以每个基准单独跑（`--exact`、`--test-threads=1`）；峰值只涨不落，差用有符号的数（Windows 会修剪工作集，`now` 会变小）。
+
+四、**遗留的端到端用例用真实的时钟**：`a_request_sent_again_waits_its_whole_idle_on_the_new_connection` 约 3 秒，常数是 `IDLE` 2,500 毫秒、`HOLD`/`DELAY` 1,500 毫秒，绿的一侧每处至少 1 秒余量，提交前单独循环 25 次全过（M5b 记录第 11、12 行）；它的能力靠 `Idle` 第一次 `poll_frame` 才起表与重发之前那一处 `restart`，去掉任一处就红。两条单元用例（`idle_starts_its_clock_at_the_first_poll`、`restart_gives_the_resent_request_its_whole_wait`）用暂停的时钟，`rurge-http` 的开发依赖因此给 tokio 开了 `test-util`。
+
+五、**测 TLS 会话恢复的用例，票据在握手之后才到，客户端要读一下才收得进**（M5b 记录第 16 行）：rustls 服务端在 TLS 1.3 上照样发票据（没有 `ticketer` 时走有状态的一支，把会话放进 `session_storage`），但票据在客户端处理服务端 Finished 之后才发，客户端握完不读就收不进；rustls 客户端缺省的存储至多留 31 个服务器、挤掉最早的，名字多于它而依次握两遍时第二遍一个也恢复不了。这一条是协调者加的（P13 ① 没有）。
