@@ -620,10 +620,10 @@ CI 运行 41411445901（第 17 次）起另有两条（M4b 计划 `docs/superpow
 
 一、**基准是量、不是门**：B1 ～ B5 与 Q1 十六个都是 `#[ignore]` 的用例，CI 的 `cargo test` 与门禁编译它们、不跑；没有“先红”，`HTTP_BENCH_QUICK=1` 在调试构建里缩小规模、只看跑不跑得通；守护读数解析的 `the_readings_are_parsed_from_what_the_system_prints` 不忽略，照常先红（先写、看它红、再实现到绿）。
 
-二、**`-p` 的例外现在有三处**：`rurge-tun` 的三个基准（命令一节的那三行）、`relay_throughput`、`--test bench`。别的用例一律经整个工作区、不用 `-p`。
+二、**`--test bench` 是引擎里第二处用 `-p` 跑的**（第一处是 `relay_throughput`）：同 `rurge-tun` 的三个基准（命令一节的那三行）与命令一节里另几条带 `--release` 的基准（WireGuard 与 Hysteria 2 的吞吐、`rurge-rules` 的内存），只另编这个 crate 与它的依赖的一份 release。门禁照旧经整个工作区跑、不用 `-p`。
 
 三、**内存的读数一个进程一个**：每个 B5 一开头查 `static MEASURED: AtomicBool`，同一个进程里跑到第二个 B5 就 panic（`one B5 measurement per process: run it alone with --exact`），所以每个基准单独跑（`--exact`、`--test-threads=1`）；峰值只涨不落，差用有符号的数（Windows 会修剪工作集，`now` 会变小）。
 
-四、**遗留的端到端用例用真实的时钟**：`a_request_sent_again_waits_its_whole_idle_on_the_new_connection` 约 3 秒，常数是 `IDLE` 2,500 毫秒、`HOLD`/`DELAY` 1,500 毫秒，绿的一侧每处至少 1 秒余量，提交前单独循环 25 次全过（M5b 记录第 11、12 行）；它的能力靠 `Idle` 第一次 `poll_frame` 才起表与重发之前那一处 `restart`，去掉任一处就红。两条单元用例（`idle_starts_its_clock_at_the_first_poll`、`restart_gives_the_resent_request_its_whole_wait`）用暂停的时钟，`rurge-http` 的开发依赖因此给 tokio 开了 `test-util`。
+四、**遗留的端到端用例用真实的时钟**：`a_request_sent_again_waits_its_whole_idle_on_the_new_connection` 约 3 秒，常数是 `IDLE` 2,500 毫秒、`HOLD`/`DELAY` 1,500 毫秒，绿的一侧每处至少 1 秒余量，提交前单独循环 25 次全过（M5b 记录第 11、12 行）；它钉住重发之前那一处 `restart`：删掉它，第二个请求答 504（M5b 记录第 11 行的变异 ③）；`Idle` 第一次 `poll_frame` 才起表与 `Progress::restart` 本身由两条单元用例钉住（变异 ①、②）。两条单元用例（`idle_starts_its_clock_at_the_first_poll`、`restart_gives_the_resent_request_its_whole_wait`）用暂停的时钟，`rurge-http` 的开发依赖因此给 tokio 开了 `test-util`。
 
-五、**测 TLS 会话恢复的用例，票据在握手之后才到，客户端要读一下才收得进**（M5b 记录第 16 行）：rustls 服务端在 TLS 1.3 上照样发票据（没有 `ticketer` 时走有状态的一支，把会话放进 `session_storage`），但票据在客户端处理服务端 Finished 之后才发，客户端握完不读就收不进；rustls 客户端缺省的存储至多留 31 个服务器、挤掉最早的，名字多于它而依次握两遍时第二遍一个也恢复不了。这一条是协调者加的（P13 ① 没有）。
+五、**测 TLS 会话恢复的用例，票据在握手之后才到，客户端要读一下才收得进**（M5b 记录第 16 行）：rustls 服务端在 TLS 1.3 上照样发票据（没有 `ticketer` 时走有状态的一支，把会话放进 `session_storage`），但票据在服务端收到客户端的 Finished 之后才发，客户端握完不读就收不进；rustls 客户端缺省的存储至多留 31 个服务器、挤掉最早的，名字多于它而依次握两遍时第二遍一个也恢复不了。这一条是协调者加的（P13 ① 没有）。
