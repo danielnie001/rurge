@@ -1051,7 +1051,7 @@ M4b 做完了（2026-11-02；计划 `docs/superpowers/plans/2026-11-02-phase4-m4
 
 做了什么：
 
-- **记录多三个键**（`rurge-inbound`、`rurge-engine`、`rurge-api`）：`SessionHandle` 多两个 `AtomicU64`（`request_body`、`response_body`，`new_with_slot` 里初始化为 0）与 `add_request_body`、`add_response_body`、`body_bytes`、`first_byte_at` 四个方法；`RequestRecord` 与 `RequestJson` 多 `receiveMs`（紧跟 `dns_ms`）、`requestBodyBytes` 与 `responseBodyBytes`（紧跟 `status_code`；`RequestJson` 的字段次序就是 JSON 里键的次序）。`receive_ms` 由 `outcome.and(h.first_byte_at())` 从会话开始的那一刻减出来，进行中的会话与从没有收到上游字节的是 `null`；不是 HTTP 请求的会话（`method` 是 `null`）两个正文也是 `null`（记录第 7、8 行）。
+- **记录多三个键**（`rurge-inbound`、`rurge-engine`、`rurge-api`）：`SessionHandle` 多两个 `AtomicU64`（`request_body`、`response_body`，`new_with_slot` 里初始化为 0）与 `add_request_body`、`add_response_body`、`body_bytes`、`first_byte_at` 四个方法；`RequestRecord` 与 `RequestJson` 多 `receiveMs`（紧跟 `dns_ms`）、`requestBodyBytes` 与 `responseBodyBytes`（紧跟 `status_code`；`RequestJson` 的字段次序就是 JSON 里键的次序）。`receive_ms` 是会话的时长（`h.elapsed()`）减去 `first_byte_at()`（从会话开始到上游的第一个字节，`crates/rurge-inbound/src/session.rs` 的 `first_byte_at`），即从上游的第一个字节到会话结束（`crates/rurge-engine/src/observe.rs` 的 `record_of`：`outcome.and(h.first_byte_at()).map(|f| elapsed.saturating_sub(f) ..)`）；进行中的会话与从没有收到上游字节的是 `null`；不是 HTTP 请求的会话（`method` 是 `null`）两个正文也是 `null`（记录第 7、8 行）。
 - **两个正文在哪里数**（`rurge-http` 的引擎，M4-D30）：请求正文在 `Idle` 交出每一帧时数（两种版本都数，与 `Meter` 各记各的）；应答正文在 `Tail` 与 `LocalFile` 交出每一帧时、`complete()` 之前数（不看 `counted`）；rurge 自己的答复由私有的 `own_body` 按应答正文的长度记，它在这十处 `finish` 之前调（`TinyGif`、HTTP/2 上 `CONNECT` 的 501、三处 `bad_request` 与 `map_local` 的 `(None, data)` 是换了次序的——原来是先 `finish` 再建应答）（记录第 12、17 行）。
 - **九种直通的原因**（`rurge-engine` 的 `serve.rs` 与 `engine.rs`、`rurge-http` 的 `mitm/decrypt.rs`）：九句是 `serve.rs` 的私有常量；`Mitm::decides` 交回五种（`Decrypt`、`NotListed`、`SourceBlocked`、`NoCertificate`、`AlpnMismatch`），次序是名单 → 来源 → 名字 → ALPN；`decrypting` 的次序是名单 → 开关 → CA → 来源 → 名字 → ALPN，解不解密与 M4b 之前相同；原因在拨号、建句柄时由 `dial_noted` 写（`PassedBy::Sniff(..)` 与 `PassedBy::Lists`），`Dialer::dial` 只是 `PassedBy::Lists` 那一条路（记录第 22 行）。没有加日志行。
 - **`remoteAddr` 的新口径**（M4-D23；`rurge-net` 的 `connector.rs`、`packet_datagram.rs` 与 `quic/`、`rurge-proto` 与 `rurge-proto-quic` 的各个载体、`rurge-proto-wireguard`）：`Datagram::far_end` 与 `PacketSocket::far_end` 两个有缺省的新方法；UDP 流与内部的 UDP 会话由 `note_far_end` 与 `wrap_internal_udp` 写（开不成载体的两处 `clear_peer`）；复用、共用的 TCP 载体拨号时记着远端、借出时 `trail::connected`（snell 连同失效重拨、anytls、`h2pool`、ssh）；QUIC 一族的远端在 `Path::far_end`（`rurge_net::quic::FarEnd`，跳端口的是 `hop::Current`、经承载的是承载的远端，不用 quinn 的 `remote_address()`）；WireGuard 的 `Shared.far_ends` 随载体更新、`Device::far_end_for` 按协议栈给这个目标选中的那个对端答；`record_of` 读 `h.trail().peer()`，不再分 TCP 与 UDP（记录第 36 ～ 39、44 ～ 48、52 ～ 55 行）。
@@ -1067,18 +1067,18 @@ M4b 做完了（2026-11-02；计划 `docs/superpowers/plans/2026-11-02-phase4-m4
 - **任务 3**（`51e5886`、`30eeed7`、`40f31be`，修正轮 1 `0af3451`，协调者 `1e8143a`）：九种原因；+15 条（93 / 5340）。
 - **任务 4**（`793f371`、`3c6ccdb`、`448a4e2`、`9457f8a`，协调者 `ba4a686`）：`Lookup`、`trail::current()` 与 `dnsMs` 在途；+7 条（93 / 5347）。
 - **任务 5**（`95a4abc`、`e85d60d`、`4323335`、`73e3552`、`1e6cc8a`、`d129367`，协调者 `7d06251`）：两个 `far_end`、UDP 流与内部 UDP 会话的远端；+7 条（93 / 5354）。
-- **任务 6**（`43fcb45`、`b7f9a53`、`8a11377`、`ca87b0b`、`e783ccd`、`0ec7cd9`、`8360a13`、`3845ad0`，协调者 `339e141`）：复用、共用的 TCP 载体（snell 连同失效重拨、anytls、`h2pool`、ssh）；+6 条（93 / 5361）。
+- **任务 6**（`43fcb45`、`b7f9a53`、`8a11377`、`ca87b0b`、`e783ccd`、`0ec7cd9`、`8360a13`、`3845ad0`，协调者 `339e141`）：复用、共用的 TCP 载体（snell 连同失效重拨、anytls、`h2pool`、ssh）；+7 条（93 / 5361）。
 - **任务 7**（`e9b99d4`、`9235156`、`4cd3e86`、`7fe4998`、`f0aa553`、`e960894`，修正轮 1 `c5689c1`，协调者 `97f02a8`）：QUIC 一族与 WireGuard；+13 条（93 / 5374）。
 - **任务 8**（`91ec9f1`、`97b5fe4`、`005daa1`、`2e6abfe`，修正轮 1 `af84a16`、修正轮 2 `f5723fd`，协调者 `fcb6aa1`）：经 API 的端到端（`the_request_records_carry_the_three_new_keys`）与量一条记录的大小；+2 条，另加 2 条带 `#[ignore]` 的（93 / 5376，忽略的从 15 变成 17）。
 - **任务 9a**（`223a83c`，修正轮 1 `11fbd9d`，协调者 `032a187`）：API、手工清单与测试的文档，只改文档，0 条用例（记录第 68 ～ 70 行）。
 - **任务 9b**（本节的提交）：M4b 的收尾文档，只改文档，0 条用例。
 
-门禁：任务 0 ～ 8 各跑了一次全量（`cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test -j 8 --workspace --no-fail-fast`），任务 9a 与 9b 只改文档、没有跑。M4b 最后一棵代码树（`f5723fd`）上的全量是 93 / 5376 / 0 / 17、退出码 0（记录第 67 行；一台机器上的一次运行，不是 CI）。五次撞上开发机已知的 `STATUS_HEAP_CORRUPTION`（任务 2、4、6 的两次、8，记录第 13、34、51、67 行），每次单独重跑那一个二进制、全过；`LNK1102: out of memory` 两次、rustc 一次 `0xc0000409`、`LNK1104` 一次（记录第 40、57 行，换并行度或等几秒重跑即过）；`cli` 的 `give_up` 超时一次也没有见到。带等待或并发的用例各自单独循环跑了二十次以上、全过（任务 2 ～ 8；记录第 13、23、28、49、56、59、60、67 行）。日志在工作区（git 忽略）。
+门禁：任务 0 ～ 8 都跑了全量（`cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test -j 8 --workspace --no-fail-fast`），有几个不止一次（任务 4、5 各两次，任务 6 五次，任务 7 三次，任务 8 五次；记录第 35、41、51、60、67 行），任务 9a 与 9b 只改文档、没有跑。M4b 最后一棵代码树（`f5723fd`）上的全量是 93 / 5376 / 0 / 17、退出码 0（记录第 67 行；一台机器上的一次运行，不是 CI）。五次撞上开发机已知的 `STATUS_HEAP_CORRUPTION`（任务 2、4、6 的两次、8，记录第 13、34 与 35、51、67 行），每次单独重跑那一个二进制、全过；`LNK1102: out of memory` 两次、rustc 一次 `0xc0000409`、`LNK1104` 一次（记录第 40、57 行，换并行度或等几秒重跑即过）；`cli` 的 `give_up` 超时一次也没有见到。带等待或并发的用例各自单独循环跑了二十次以上、全过（任务 2 ～ 8；记录第 13、23、28、40、41、49、56、59、60、67 行；任务 4 的那一次只记在它的报告里，修正记录没有写）。日志在工作区（git 忽略）。
 
 没做的，与不要当成已经有的：
 
 - **没有手工验收**：`docs/acceptance/phase4-manual.md` 现在六十二项，M4b 的十项（W11、W12、M11、M12、L11、L12 与 P14 ～ P17）一项也没有做；M4b 的全部证据是回环上的用例与假的对端。
-- **M4b 的提交 CI 都没有见过**：三个平台一次也没有编译、运行过它们；这台 Windows 开发机编译、运行过全部改动（M4b 没有平台代码，也没有只在 CI 上编译的代码）。
+- **M4b 的提交 CI 都没有见过**：三个平台一次也没有编译、运行过它们；这台 Windows 开发机编译、运行过其余的全部改动——M4b 的生产代码没有平台代码，只在 CI 上编译的是两份量内存的 `memory.rs` 里 Linux 与其余平台的两支：M4b 的 `crates/rurge-engine/src/observe/memory.rs`（挂在 `crates/rurge-engine/src/observe.rs` 的 `#[cfg(test)] mod memory;` 下）的 `peak_resident_bytes` 有 `#[cfg(windows)]`、`#[cfg(target_os = "linux")]` 与 `#[cfg(not(any(windows, target_os = "linux")))]` 三支，后两支本机没有编译过；M4a 那一份（`crates/rurge-http/src/capture/memory.rs`）照抄自同一个写法，也一样。**M4a 一节那一句（第 1008 行）不对**：`capture/memory.rs` 同样有这三支，Linux 与其余平台的两支只有 CI 编译（历史段落不改，由这一句订正）。
 - **照旧是 `null` 的三种 UDP**（P8 ②，设计第 10.3 节）：`vmess`、`h2-connect` 与 MASQUE 的 UDP 按目标在另一个任务里懒开，记录里仍是 `null`；被拒绝的会话与 rurge 不实现的协议照旧。
 - **几处没有用例**：三处 `bad_request`（记录第 18 行）；HTTP/2 上 rurge 自己的页答 `HEAD` 时的页长（P5 ③，设计第 18 节第 15 条）；源站提前作答、请求正文还在上传（设计第 11 节第 11 条）；跳端口的 hysteria2 在引擎那一层（记录第 60 行）；`external` 的 UDP 只断言到「回环上、不是目标」（记录第 39 行）。
 - **没有真的代理服务端与浏览器**：snell / anytls / hysteria2 / tuic / MASQUE / WireGuard 的对端都是测试自己的假服务端与 `FakeWgPeer`，没有连过真的；没有经真浏览器看过三个新键与 `remoteAddr`。
@@ -1090,7 +1090,7 @@ M4b 做完了（2026-11-02；计划 `docs/superpowers/plans/2026-11-02-phase4-m4
 
 以后的会话必须知道的事（改那一块之前读设计第 10、11 节与本计划的两张表）：
 
-- **直通的原因在建句柄时写**（`crates/rurge-engine/src/serve.rs` 的 `dial_noted` 与 `PassedBy`，记录第 22 行）：新的入口要么经 `Dialer::dial`（`PassedBy::Lists`），要么自己给 `PassedBy`；原因在 `match turned` 之后、`quic_adaptive.on_tcp` 之前写，`judged_at_the_entry` 管的是 `PassedBy::Lists` 只判哪些会话（`Transport::Tcp`、监听器是 `Http` / `Socks5` / `Tun`、引擎没有暂停）。
+- **直通的原因在建句柄时写**（`crates/rurge-engine/src/engine.rs` 的 `dial_noted` 与 `PassedBy`，记录第 22 行；`serve.rs` 里是九句备注的常量与嗅探那一条路的 `PassedBy::Sniff(..)`）：新的入口要么经 `Dialer::dial`（`PassedBy::Lists`），要么自己给 `PassedBy`；原因在 `match turned` 之后、`quic_adaptive.on_tcp` 之前写，`judged_at_the_entry` 管的是 `PassedBy::Lists` 只判哪些会话（`Transport::Tcp`、监听器是 `Http` / `Socks5` / `Tun`、引擎没有暂停）。
 - **`Decision` 的五种，名单先看**（`crates/rurge-http/src/mitm/decrypt.rs`）：`Decrypt`、`NotListed`、`SourceBlocked`、`NoCertificate`、`AlpnMismatch`；`decides` 的次序是名单 → 来源 → 名字 → ALPN，`decrypting` 的是名单 → 开关 → CA → 来源 → 名字 → ALPN。加判定时要同时改这两处的次序与 `decrypting` 的两行 DEBUG（这两行的文字不变）。
 - **rurge 自己的答复先 `own_body` 再 `finish`**（`crates/rurge-http/src/engine.rs` 的 `own_body`，记录第 12 行）：新加的自答要在 `finish` 之前调它；新的应答正文类型要在交出每一帧时、`complete()` 之前数——不能靠 M4a 包住应答正文的那一层（那里总漏掉最后一帧、自己的答复总是 0）；两个正文的计数是 `u64`、`fetch_add` 累加，记录在 `finish` 那一刻拍下，之后加的进不了记录。
 - **新的复用或共用的载体要记着自己的远端**（记录第 44 ～ 48、52 ～ 55 行）：拨号之后读 `trail::current().and_then(|t| t.peer())` 记在连接上，借出时在会话的 `follow` 里 `trail::connected`；新的 UDP 载体要答 `far_end`（`Datagram` 与 `PacketSocket` 各一个，缺省是 `None`），开不成时清 `trail`（`clear_peer`）。
@@ -1100,12 +1100,12 @@ M4b 做完了（2026-11-02；计划 `docs/superpowers/plans/2026-11-02-phase4-m4
 
 去向写着项目所有者的（后来的会话不要自己定）：
 
-- **推送与读回那次 CI**：M1、M2、M3、M4a 与 M4b 的提交都在本地，由所有者一起推送（M1 ～ M4），推送之后先读那次运行的注解与任务摘要；`#[cfg(unix)]` 的两处（M2c 的）第一次在那里编译与运行。
-- **设计第 17 节的两行（M4b 的）**：`remoteAddr` 的新口径（M4-D23：从「会话自己开的那条 TCP 连接」改成「所经的连接或载体的远端」，`docs/api/phase1.md` 的说法随之订正，照旧 `null` 的几种登记）与 `--request-log-size` 的缺省（M4-D25：1 000 不改，量到的一条记录的大小供所有者决定）。
+- **推送与读回那次 CI**：M1、M2、M3、M4a 与 M4b 的提交都在本地，由所有者一起推送（M1 ～ M4），推送之后先读那次运行的注解与任务摘要；`#[cfg(unix)]` 的两处（M2c 的）第一次在那里编译与运行；两份量内存的 `memory.rs`（M4a 的 `crates/rurge-http/src/capture/memory.rs`、M4b 的 `crates/rurge-engine/src/observe/memory.rs`）里 Linux 与其余平台的两支，也是第一次在那里编译（见上面「M4b 的提交 CI 都没有见过」那一条）。
+- **设计第 17 节的两行（M4b 的）**：`remoteAddr` 的新口径（M4-D23：从「会话自己开的那条 TCP 连接」改成「所经的连接或载体的远端」，`docs/api/phase1.md` 的说法随之订正（照计划，`docs/api/phase1.md` 的历史段落不改，订正写在 `docs/api/phase4.md` 的「M4b」一节），照旧 `null` 的几种登记）与 `--request-log-size` 的缺省（M4-D25：1 000 不改，量到的一条记录的大小供所有者决定）。
 - **手工验收**：`docs/acceptance/phase4-manual.md`（六十二项），连 M4b 的十项一项也没有做。
 - **修正记录与延后事项里去向写着项目所有者的行**：延后事项一行也没有（空表）；修正记录里只有第 62 行（量到的数交给所有者，M4-D25）。第 41 行提到的「所有者让先合并到 `main`」是所有者已经下过的指示，不是留给所有者的事。
 
-依赖附录：M4b 没有加生产代码里 crate 之间的边，也没有改任何 `Cargo.toml`（`Cargo.lock` 仍是 520 个包）；`rurge_net::trail` 用到的 crate（`rurge-proto`、`rurge-proto-quic`、`rurge-proto-ssh`、`rurge-proto-wireguard`、`rurge-dns`、`rurge-policy`、`rurge-http`、`rurge-engine`、`rurge-inbound`）本来就正式依赖 `rurge-net`；`unsafe_code` 的名单仍是 23 项，`crates/rurge/tests/sockets.rs` 的 `LISTED` 仍是 26 行。
+依赖附录：M4b 没有加生产代码里 crate 之间的边，也没有改任何 `Cargo.toml`（`Cargo.lock` 仍是 520 个包）；用 `rurge_net::trail` 的是 `rurge-proto`、`rurge-proto-quic`、`rurge-proto-ssh`、`rurge-proto-wireguard`、`rurge-dns`、`rurge-engine` 与 `rurge-inbound`，它们本来就正式依赖 `rurge-net`；`rurge-policy` 不用那个模块、只是给 `Relayed` 实现 `Datagram::far_end`，`rurge-http` 也不 `use` 它、经句柄读会话的 `Trail`（`handle.trail()`），两者也本来就正式依赖 `rurge-net`；`unsafe_code` 的名单仍是 23 项，`crates/rurge/tests/sockets.rs` 的 `LISTED` 仍是 26 行。
 
 M4b 做完，M4 至此做完，下一步是项目所有者推送（M1 ～ M4 一起），推送之后读回那次 CI；再往后是 M5（`auto-quic-block`、基准与遗留）的细化设计。
 
