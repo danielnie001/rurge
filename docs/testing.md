@@ -587,3 +587,11 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 二十、**量内存的两条各自单独跑**（`--exact`），读的是**整个进程**的峰值（M4a 记录第 76、81 行）：两条并在一起跑时，基线读到的会是装过满的那个进程的峰值。
 
 二十一、**带等待与并发的 M4a 用例提交前各自单独循环跑二十次以上**（全过才算数）：任务 1 的 `when_finished_and_finish_race_without_losing_or_repeating`（第 21 行）；任务 3 的五条——`a_client_that_leaves_mid_body_is_captured_as_failed`、`a_killed_request_leaves_no_reservation_behind`、`an_upgrade_is_captured_at_its_101`、`a_dropped_request_is_captured_before_its_hold_ends`、`an_http2_stream_reset_before_its_answer_is_captured_with_no_response`——各二十次（第 36 行），修正轮 1 补的 `an_http2_stream_reset_mid_body_is_captured_with_what_went_by` 二十次（第 40 行）；任务 4 的九条各二十次（第 43 行）；任务 7 的四条 `cli` 用例各二十次（第 62 行），修正轮 1 之后改过的两条再各二十次（第 70 行）；任务 8 的六条端到端用例各二十次（第 75 行）。结论凭**每一次的 `test result:` 那一行**，那一次记的退出码不作数（第 80 行订正 ①）。日志在工作区（git 忽略）：`loop-task-1.log`、`loop-task-3.log`、`loop-task-3-fix-1.log`、`loop-task-4.log`、`loop-task-7.log`、`loop-task-7-fix-1.log`、`loop-task-8.log`。
+
+### 第 17 次 CI 运行起：同一个号上的 TCP 与 UDP、互操作用例失败时的说明
+
+CI 运行 41411445901（第 17 次）起另有两条（M4b 计划 `docs/superpowers/plans/2026-11-02-phase4-m4b-records-plan.md` 的任务 11，下面写“M4b 记录第 N 行”指它末尾的「执行期修正记录」）：
+
+一、**同一个号上要 TCP 监听器与 UDP 套接字都有的测试服务端，用 `rurge_dns::testing::tcp_and_udp_on_one_port()` 拿这一对**（`crates/rurge-dns/src/testing.rs`，M4b 记录第 82、83 行）：它至多试 64 轮、两种次序轮流（单数轮先 TCP 后 UDP，双数轮先 UDP 后 TCP），都不成时 panic 的文本说出两种各自最后的错误。不要 bind TCP 的 0 号、再在同一个号上 bind UDP 并 `unwrap`：系统给一种套接字的临时端口，同一个号在另一种上不保证能用——第 17 次运行的 Windows 上，`crates/rurge-engine/tests/egress.rs` 的两条在这一步得到了 `WSAEACCES`（10013），它们在第 13 ～ 16 次都通过。现在用它的有 `MockDns::start`、`crates/rurge-dns/src/upstream/udp.rs` 的两条单元测试与 `egress.rs` 的两处。参照服务端要的号照旧用 `tests/interop/src/lib.rs` 的 `free_tcp_and_udp_port()`（「M8c 起的通用约定」）。
+
+二、**互操作用例失败时，读注解先找参照服务端的那一段**（M4b 记录第 82、84 行）：`tests/interop/src/lib.rs` 的 `Reference` 在用例失败时（`std::thread::panicking()`）由 `Drop` 先问子进程是不是自己退出了，杀、收之后用 `eprintln!` 说出这一点与它日志的最后至多 20 行（2000 个字符以内，`TAIL_LINES`、`TAIL_CHARS`），连同 panic 的那一句放得进 `.github/scripts/report-test-failures.py` 的一条注解（60 行、3000 字）；不在 panic 时什么也不多说。新的参照服务端都经 `Reference` 起，不另写；要在 `Drop` 里多说什么，写进 `post_mortem` 并给它用例（`Drop` 在展开途中再 panic 会中止进程，所以那里不 `unwrap`、不 `expect`、不按字节切）。`wait_ready` 与 `wait_for_output` 的 panic 本来带着整份日志，那时注解装不下后面这一段。这几行本机运行不到（这台机器上没有参照服务端），到 2026-11-02 只编译过。
