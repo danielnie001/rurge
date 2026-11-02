@@ -6,7 +6,7 @@
 
 ## 怎么用
 
-**先做哪一节。** 建议的次序是 M1 → M2：M1 不需要 CA，先把三种入口与明文 HTTP 的记录认下来；M2 先做「生成与安装 CA」那一条，其余都是拿着这份 CA 做。每一节里先做不改系统设置的项，再做装 CA、开增强模式、改系统代理的项；做完一项就恢复一次（卸 CA、关增强模式、把系统代理改回去），别把几项叠在一起做。M3 一节接在 M2 之后：先做它明文的项（W6 与 W8，其余平台同号）与 P7 ～ P9，再做要 CA 的 W7、M7、L7 与 P10；CA 照样做完就卸。M4 一节接在 M3 之后：先做明文的项与 P11 ～ P13，再做要 CA 的 W9、M9、L9 里解密的那个站点（明文的那一半不用 CA）。M5 一节接在 M4 之后，它的两项都要增强模式：13 号还要 M2 那份 CA，做完照 M2 一节卸掉；14 号先做 `auto-quic-block = false` 那一半（不要 CA），再做按 SNI 拒绝的那一半。
+**先做哪一节。** 建议的次序是 M1 → M2：M1 不需要 CA，先把三种入口与明文 HTTP 的记录认下来；M2 先做「生成与安装 CA」那一条，其余都是拿着这份 CA 做。每一节里先做不改系统设置的项，再做装 CA、开增强模式、改系统代理的项；做完一项就恢复一次（卸 CA、关增强模式、把系统代理改回去），别把几项叠在一起做。M3 一节接在 M2 之后：先做它明文的项（W6 与 W8，其余平台同号）与 P7 ～ P9，再做要 CA 的 W7、M7、L7 与 P10；CA 照样做完就卸。M4 一节接在 M3 之后：先做明文的项与 P11 ～ P13，再做要 CA 的 W9、M9、L9 里解密的那个站点（明文的那一半不用 CA）。M5 一节接在 M4 之后，它的两项都要增强模式：13 号还要 M2 那份 CA，做完照 M2 一节卸掉；14 号先做 `auto-quic-block = false` 那一半（CA 照样装着），再做按 SNI 拒绝的那一半。
 
 **共用的前置条件。**
 - `cargo build --release`，用得到的二进制（`target/release/rurge`，Windows 下是 `target\release\rurge.exe`）。下文按平台写作 `rurge.exe`（Windows）或 `./rurge`（macOS / Linux）。
@@ -347,10 +347,10 @@ M5a（QUIC 里的 ClientHello 与 `auto-quic-block`）的行为已经有用例�
 - M1 那一份 `[General]`、`[Rule]` 与日志、记录的命令（照「共用的前置条件」）。
 - **两项都要增强模式**：浏览器自己的 QUIC 只经虚拟网卡才到 rurge（HTTP 监听器上 rurge 只有 TCP；浏览器不用 SOCKS5 的 UDP 关联）。照 W2 的前置条件以管理员（macOS 与 Linux 上是 root / `sudo`）运行 `--enhanced-mode`，系统代理与浏览器的代理都关着，浏览器自己的「安全 DNS」（DoH）也关掉：开着的话浏览器绕过 rurge 的 DNS，rurge 认不出地址背后是哪个名字。
 - 13 号还要 M2 一节的前置条件：`[MITM]` 节、`<CA 目录>` 与装 CA 的三条，`hostname` 里要有 `<站点 H3>`（一个讲 HTTP/3 的站点）；`auto-quic-block` 不用写（缺省就是开的）。
-- 14 号不要 CA。它的第二半要把这一行加在 `[Rule]` 的 `FINAL,DIRECT` 之前：`DOMAIN,<站点 H3>,REJECT,extended-matching`。
+- 14 号照 13 号的前置条件：CA 装着、`hostname` 里有 `<站点 H3>`，只在 `[MITM]` 里多一行 `auto-quic-block = false`——开关是它与 13 号唯一的不同（没有可用的 CA 时 `auto-quic-block` 本来就不阻断，不装 CA 就验不了开关）。它的第二半要把这一行加在 `[Rule]` 的 `FINAL,DIRECT` 之前：`DOMAIN,<站点 H3>,REJECT,extended-matching`。
 - 看引擎的计数：`GET /v1/rurge/http` 在 `rewrite` 之后多一个 `quic` 对象，四个数是 `hello`（ClientHello 读成了，有没有 SNI 都算）、`incomplete`（300 毫秒到了或 16 个数据报还没有拼齐）、`unreadable`（读不成）与 `blocked`（被 `auto-quic-block` 阻断的，都在 `hello` 里）。其余三个对象照旧。
-- 看记录：QUIC 流是 `transport` 为 `udp` 的那些，`protocol` 是 `quic`；看 `dst`、`sni`、`status`、`error`、`notes` 与规则、策略那几栁。
-- 每一项执行后填「结果」「日期」「系统版本」三栁；做完把 `[MITM]` 里的 `auto-quic-block = false` 与 14 号加的那一行 `[Rule]` 删掉、把 M2 的 CA 卸掉、关掉增强模式并核对恢复。
+- 看记录：QUIC 流是 `transport` 为 `udp` 的那些，`protocol` 是 `quic`；看 `dst`、`sni`、`status`、`error`、`notes` 与规则、策略那几栏。
+- 每一项执行后填「结果」「日期」「系统版本」三栏；做完把 `[MITM]` 里的 `auto-quic-block = false` 与 14 号加的那一行 `[Rule]` 删掉、把 M2 的 CA 卸掉、关掉增强模式并核对恢复。
 
 ---
 
@@ -358,19 +358,19 @@ M5a（QUIC 里的 ClientHello 与 `auto-quic-block`）的行为已经有用例�
 
 | # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
 | --- | --- | --- | --- | --- | --- | --- |
-| W13 | **HTTP/3 发往 MITM 名单里的站点被阻断，回落到 TCP 之后被解密。** 照 W2 的前置条件以管理员运行 `rurge.exe run -c <conf> --enhanced-mode --log-level debug`；装好 M2 那份 CA 并让浏览器信任它，`[MITM]` 的 `hostname` 里有 `<站点 H3>`。先读一次 `GET /v1/rurge/http` 的 `quic`。用 Chrome 打开 `https://<站点 H3>/` 并翻几页，再用 Firefox 打开同一个站点翻几页；读完再读一次 `quic` 与 `recent` 里那个站点的记录。做完照 M2 一节卸掉 CA、关掉增强模式并核对恢复 | 那个站点有 `transport` 为 `udp` 的 QUIC 流记录：`protocol` 是 `quic`、`dst` 是站点的名字、`sni` 是它、**`status` 是 `rejected`、`rejectKind` 是 `REJECT`、`error` 恰好是 `QUIC blocked by auto-quic-block`**，规则文字与策略链都在（看得出命中了哪一行、本来要走哪条策略）；页面照样打开（浏览器回落到了 TCP），同一个站点的 TCP 会话被解密：`protocol` 是 `https`、`url` 以 `https://` 开头、有 `method` 与 `statusCode`。`quic.hello` 与 `quic.blocked` 都涨了，`blocked` 不多于 `hello`；`mitm.decrypted` 涨了。设计第 5.4、6.1 ～ 6.3 节；用例 `auto_quic_block_blocks_quic_to_a_listed_host`、`with_block_quic_too_the_record_names_auto_quic_block`、`auto_quic_block_answers_each_held_datagram_with_icmp` | `recent` 与 `active` 里那个站点的记录；`GET /v1/rurge/http` 的 `quic`、`mitm`、`sniffed` 前后两次；浏览器开发者工具的 Network 面板里那个站点的请求（先是 `h3`、之后是 `h2` 或 `http/1.1`） | | | |
-| W14 | **`auto-quic-block = false` 时 HTTP/3 照通；带 `extended-matching` 的规则按 SNI 拒绝它。** (a) 在 `[MITM]` 里加一行 `auto-quic-block = false`，重启 `rurge run`（增强模式照 W13 的前置条件，这一半不要 CA），读一次 `quic`；用 Chrome 与 Firefox 各打开一次 `https://<站点 H3>/` 并翻几页，读那个站点的 QUIC 记录，再读一次 `quic`。(b) 让 `auto-quic-block = false` 留着，把 `DOMAIN,<站点 H3>,REJECT,extended-matching` 加在 `[Rule]` 的 `FINAL,DIRECT` 之前，重启 `rurge run`，再打开一次那个站点，读它的 QUIC 记录 | (a) 那个站点的 QUIC 流照通：`transport` 是 `udp`、`dst` 是站点的名字、**`sni` 是 `<站点 H3>`**，`status` 不是 `rejected`、`error` 里没有 `QUIC blocked by auto-quic-block`，`quic.blocked` 不变（`quic.hello` 涨）；浏览器真的用上了 HTTP/3（开发者工具的 Protocol 是 `h3`）。(b) 那个站点的 QUIC 流的 `status` 是 `rejected`、`rejectKind` 是 `REJECT`、命中的规则文字是那一行，`error` 与 `notes` 里都**不是** `QUIC blocked by auto-quic-block`（是那一行 `REJECT` 规则先判，不是 `auto-quic-block`），`quic.blocked` 照旧不变；浏览器回落到 TCP，那个站点的 TCP 会话走 `FINAL,DIRECT`。**`dst` 是名字还是地址照实记下来**：`dst` 是名字时，不带 `extended-matching` 的 `DOMAIN` 规则也命中；`dst` 是地址（rurge 认不出这个地址背后是谁）时，只有带 `extended-matching` 的才按 SNI 命中——两种都算通过，但要在「结果」里写明是哪一种。设计第 4.7、5.3、6.4 节；用例 `auto_quic_block_off_lets_quic_through`、`a_hello_across_two_datagrams_is_routed_by_its_sni`、`without_extended_matching_the_sni_does_not_match` | 那个站点的记录与 `GET /v1/rurge/http` 的 `quic`；浏览器开发者工具的 Protocol 一栁；`recent` 里同一个站点的 `tcp` 记录 | | | |
+| W13 | **HTTP/3 发往 MITM 名单里的站点被阻断，回落到 TCP 之后被解密。** 照 W2 的前置条件以管理员运行 `rurge.exe run -c <conf> --enhanced-mode --log-level debug`；装好 M2 那份 CA 并让浏览器信任它，`[MITM]` 的 `hostname` 里有 `<站点 H3>`；rurge 起来之后把浏览器完全退出再打开（浏览器会留着增强模式之前建好的连接，同 W5）。先读一次 `GET /v1/rurge/http` 的 `quic`。用 Chrome 打开 `https://<站点 H3>/` 并翻几页，再用 Firefox 打开同一个站点翻几页；读完再读一次 `quic` 与 `recent` 里那个站点的记录。做完照 M2 一节卸掉 CA、关掉增强模式并核对恢复 | 那个站点有 `transport` 为 `udp` 的 QUIC 流记录：`protocol` 是 `quic`、`dst` 是站点的名字、`sni` 是它、**`status` 是 `rejected`、`rejectKind` 是 `REJECT`、`error` 恰好是 `QUIC blocked by auto-quic-block`**，规则文字与策略链都在（看得出命中了哪一行、本来要走哪条策略）；页面照样打开（浏览器回落到了 TCP），同一个站点的 TCP 会话被解密：`protocol` 是 `https`、`url` 以 `https://` 开头、有 `method` 与 `statusCode`。`quic.hello` 与 `quic.blocked` 都涨了，`blocked` 不多于 `hello`；`mitm.decrypted` 涨了；那个站点的请求在开发者工具里 Protocol 是 `h2` 或 `http/1.1`，没有 `h3`。设计第 5.4、6.1 ～ 6.3 节；用例 `auto_quic_block_blocks_quic_to_a_listed_host`、`with_block_quic_too_the_record_names_auto_quic_block`、`auto_quic_block_answers_each_held_datagram_with_icmp` | `recent` 与 `active` 里那个站点的记录；`GET /v1/rurge/http` 的 `quic`、`mitm`、`sniffed` 前后两次；浏览器开发者工具的 Network 面板里那个站点的请求的 Protocol 一栏 | | | |
+| W14 | **`auto-quic-block = false` 时 HTTP/3 照通；带 `extended-matching` 的规则按 SNI 拒绝它。** (a) 照 W13 的前置条件（CA 装着、`hostname` 里有 `<站点 H3>`），只在 `[MITM]` 里多一行 `auto-quic-block = false`，重启 `rurge run`，读一次 `quic`；用 Chrome 与 Firefox 各打开一次 `https://<站点 H3>/` 并翻几页，读那个站点的 QUIC 记录，再读一次 `quic`。开关是这一半与 W13 唯一的不同。(b) 接着 (a) 的设置（`auto-quic-block = false` 与 CA 都留着），把 `DOMAIN,<站点 H3>,REJECT,extended-matching` 加在 `[Rule]` 的 `FINAL,DIRECT` 之前，重启 `rurge run`；在浏览器的「安全 DNS」里选一个固定的提供者（例如 Cloudflare）并打开，让浏览器自己解析，再打开一次那个站点，读它的 QUIC 记录；做完把「安全 DNS」关回去 | (a) 那个站点的 QUIC 流照通：`transport` 是 `udp`、`dst` 是站点的名字、**`sni` 是 `<站点 H3>`**，`status` 不是 `rejected`、`error` 里没有 `QUIC blocked by auto-quic-block`，`quic.blocked` 不变（`quic.hello` 涨）；浏览器真的用上了 HTTP/3（开发者工具的 Protocol 是 `h3`）。(b) 那个站点的 QUIC 流的 `dst` 是**地址**、`sni` 是 `<站点 H3>`；`status` 是 `rejected`、`rejectKind` 是 `REJECT`、命中的规则文字是那一行——也就是按 SNI 命中（目标是地址，规则靠 `extended-matching` 比的是 SNI）；`error` 与 `notes` 里都**不是** `QUIC blocked by auto-quic-block`，`quic.blocked` 照旧不变。同一个站点的 TCP 会话同样被这一行拒绝（443 上嗅探出的 SNI 一样命中）、页面打不开，这是期望的结局。**`dst` 若是名字**（说明浏览器没有用它自己的 DoH），规则是按名字命中的、不是这一项要看的：照实记下来，这一项写「没有验到」。设计第 4.7、5.3、6.4 节；用例 `auto_quic_block_off_lets_quic_through`、`a_hello_across_two_datagrams_is_routed_by_its_sni`、`without_extended_matching_the_sni_does_not_match` | 那个站点的记录与 `GET /v1/rurge/http` 的 `quic`；浏览器开发者工具的 Protocol 一栏；同样的 `tcp` 记录的 `status`（`rejected`） | | | |
 
 ### macOS
 
 | # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
 | --- | --- | --- | --- | --- | --- | --- |
-| M13 | **HTTP/3 发往 MITM 名单里的站点被阻断，回落到 TCP 之后被解密。** 照 W13 做（root 运行 `--enhanced-mode`；装 CA 照 M2 一节的 M1；浏览器用 Chrome 与 Safari，Safari 只能用系统代理，见「改系统设置的项与恢复」，做完把三栁改回去；`curl.exe` 换成 `curl`） | 同 W13；Safari 的系统代理原值与恢复照实写下来 | 同 W13 | | | |
-| M14 | **`auto-quic-block = false` 时 HTTP/3 照通；带 `extended-matching` 的规则按 SNI 拒绝它。** 照 W14 做（root 运行 `--enhanced-mode`；浏览器用 Chrome 与 Safari，`curl.exe` 换成 `curl`） | 同 W14 | 同 W14 | | | |
+| M13 | **HTTP/3 发往 MITM 名单里的站点被阻断，回落到 TCP 之后被解密。** 照 W13 做（root 运行 `--enhanced-mode`，系统代理与浏览器的代理都关着；装 CA 照 M2 一节的 M1；浏览器用 Chrome 与 Firefox；`curl.exe` 换成 `curl`） | 同 W13 | 同 W13 | | | |
+| M14 | **`auto-quic-block = false` 时 HTTP/3 照通；带 `extended-matching` 的规则按 SNI 拒绝它。** 照 W14 做（root 运行 `--enhanced-mode`，系统代理与浏览器的代理都关着；浏览器用 Chrome 与 Firefox；`curl.exe` 换成 `curl`） | 同 W14 | 同 W14 | | | |
 
 ### Linux
 
 | # | 操作 | 期望 | 怎么看 | 结果 | 日期 | 系统版本 |
 | --- | --- | --- | --- | --- | --- | --- |
-| L13 | **HTTP/3 发往 MITM 名单里的站点被阻断，回落到 TCP 之后被解密。** 照 W13 做（root 运行 `--enhanced-mode`；装 CA 照 M2 一节的 L1；浏览器用 Firefox 与 Chromium，Firefox 在它自己的设置里，Chromium 带 `--proxy-server=…`——增强模式那一次两者的代理都要关掉；`curl.exe` 换成 `curl`） | 同 W13；Firefox 改过的代理选项要改回「使用系统代理设置」 | 同 W13 | | | |
-| L14 | **`auto-quic-block = false` 时 HTTP/3 照通；带 `extended-matching` 的规则按 SNI 拒绝它。** 照 W14 做（root 运行 `--enhanced-mode`；浏览器用 Firefox 与 Chromium；`curl.exe` 换成 `curl`） | 同 W14 | 同 W14 | | | |
+| L13 | **HTTP/3 发往 MITM 名单里的站点被阻断，回落到 TCP 之后被解密。** 照 W13 做（root 运行 `--enhanced-mode`，系统代理与浏览器的代理都关着；装 CA 照 M2 一节的 L1；浏览器用 Firefox 与 Chromium；`curl.exe` 换成 `curl`） | 同 W13 | 同 W13 | | | |
+| L14 | **`auto-quic-block = false` 时 HTTP/3 照通；带 `extended-matching` 的规则按 SNI 拒绝它。** 照 W14 做（root 运行 `--enhanced-mode`，系统代理与浏览器的代理都关着；浏览器用 Firefox 与 Chromium；`curl.exe` 换成 `curl`） | 同 W14 | 同 W14 | | | |
