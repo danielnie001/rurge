@@ -50,6 +50,7 @@ use http::{Request, Response};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedStream, ConnectOpts};
 use std::io;
+use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -180,6 +181,12 @@ impl H2Pool {
     ) -> Result<Response<H2Stream>, OutboundError> {
         self.reaper.get_or_init(|| spawn_reaper(&self.state));
         let lease = self.lease(opts).await?;
+        // the connection was dialled by this request or by another's: either
+        // way this session leaves rurge by it (`the phase 4 / M4b plan's
+        // P9 ④`)
+        if let Some(peer) = lease.0.peer {
+            rurge_net::trail::connected(peer);
+        }
         let conn = lease.0.clone();
         if request.extensions().get::<Protocol>().is_some() {
             conn.settled().await;
@@ -295,6 +302,8 @@ impl H2Pool {
 
     async fn connect(&self, opts: &ConnectOpts) -> Result<Conn, OutboundError> {
         let io = self.dial.dial(opts).await?;
+        // where the dial sent it, before the handshake is written
+        let peer = rurge_net::trail::current().and_then(|trail| trail.peer());
         let mut builder = client::Builder::new();
         builder
             .initial_window_size(STREAM_WINDOW)
@@ -330,6 +339,7 @@ impl H2Pool {
             ended,
             dead,
             check,
+            peer,
             usage: Mutex::new(Usage {
                 open: 0,
                 idle_since: Instant::now(),
@@ -417,6 +427,9 @@ struct Conn {
     /// Asks the connection's task for a liveness check; flags that come
     /// while one runs are merged into a single permit.
     check: Arc<Notify>,
+    /// Where the connection goes, noted by the dial that made it: every
+    /// stream it carries leaves rurge by it, not only the one that dialled.
+    peer: Option<SocketAddr>,
     usage: Mutex<Usage>,
     /// Dropped with the connection: tells its task to close it.
     _closing: oneshot::Sender<()>,

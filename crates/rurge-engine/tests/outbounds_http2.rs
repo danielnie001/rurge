@@ -114,6 +114,33 @@ async fn max_streams_bounds_the_sessions_on_one_connection() {
     assert_eq!(places, [0, 0, 1]);
 }
 
+/// Two streams open at once on one shared H2 connection: each record names the
+/// server, not only the session that dialled it (`the phase 4 / M4b plan's
+/// P9 ④`).
+#[tokio::test]
+async fn every_stream_on_a_shared_h2_connection_records_its_address() {
+    let echo = rurge_proto::testing::echo_server().await;
+    let (fake, pin) = h2_upstream(H2ProxyScript {
+        connect_to: Some(echo),
+        ..H2ProxyScript::default()
+    })
+    .await;
+    let h = through(&line("h2-connect", &fake, &pin)).await;
+    let mut tunnels = Vec::new();
+    for n in 0..2u8 {
+        let mut tunnel = connect_via_http(h.http(), "target.test:7").await;
+        echo_through(&mut tunnel, &[n; 16]).await;
+        // both are open at once, so the second stream leases the first's
+        // connection
+        tunnels.push(tunnel);
+    }
+    drop(tunnels);
+    for record in the_records(&h, 2).await {
+        assert_eq!(record.remote_addr, Some(fake.addr()), "{record:?}");
+    }
+    assert_eq!(fake.connections(), 1, "both streams shared one connection");
+}
+
 /// Credentials the proxy refuses fail the session with the text that says
 /// so, and the password is nowhere in the record.
 #[tokio::test]
