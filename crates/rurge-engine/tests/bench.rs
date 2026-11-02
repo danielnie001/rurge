@@ -34,7 +34,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -409,7 +409,6 @@ async fn fetch(client: &mut Client, req: Request<Repeat>) -> (StatusCode, u64) {
 
 /// Sends a `POST` and reads the origin's short answer line, which is the only
 /// body anything here accumulates. Used by B5 in this file.
-#[allow(dead_code)]
 async fn upload(client: &mut Client, req: Request<Repeat>) -> String {
     let response = send(client, req).await;
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -1388,7 +1387,620 @@ async fn b4_leaf_certificates() {
         micros(cached.max)
     );
     println!(
-        "signing a leaf certificate: median {:.1} us (rurge signs on a blocking thread -- phase 4 M5 design 8.5)",
+        "signing a leaf certificate: median {:.1} us (first pass less second: signing on a blocking thread plus two hand-offs -- phase 4 M5 design 16.6)",
         micros(f.median) - micros(cached.median)
     );
+}
+
+/// What this process costs in memory: the peak it reached and what it holds
+/// now, in bytes (phase 4 / M5b plan's P10 ①).
+struct Resident {
+    peak: u64,
+    now: u64,
+}
+
+/// The peak and the current working set of this process, in bytes, from the
+/// operating system; `None` where this platform's reading is not made.
+/// Copied from `crates/rurge-engine/src/observe/memory.rs`'s
+/// `peak_resident_bytes`, which reads only the peak, and reads the current
+/// working set as well (phase 4 / M5b plan's P10 ①).
+fn resident() -> Option<Resident> {
+    #[cfg(windows)]
+    {
+        // a read-only system tool, started by the test itself
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command"])
+            .arg(format!(
+                r#"$p = Get-Process -Id {}; "$($p.PeakWorkingSet64) $($p.WorkingSet64)""#,
+                std::process::id()
+            ))
+            .output()
+            .ok()?;
+        let (peak, now) = parse_pair(&String::from_utf8_lossy(&output.stdout))?;
+        Some(Resident { peak, now })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let (peak, now) = parse_status(&std::fs::read_to_string("/proc/self/status").ok()?)?;
+        Some(Resident { peak, now })
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// The two numbers a command printed on its last non-empty line, split on
+/// whitespace; `None` unless there are exactly two. The shape is copied from
+/// `crates/rurge-engine/src/observe/memory.rs`'s `parse_count`.
+fn parse_pair(output: &str) -> Option<(u64, u64)> {
+    let line = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()?;
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?.parse().ok()?;
+    let second = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((first, second))
+}
+
+/// `VmHWM` and `VmRSS` of a `/proc/<pid>/status` text, in bytes. Copied from
+/// `crates/rurge-engine/src/observe/memory.rs`'s `parse_vm_hwm`, which reads
+/// `VmHWM`; `VmRSS` is read the same way (phase 4 / M5b plan's P10 ①).
+fn parse_status(status: &str) -> Option<(u64, u64)> {
+    let peak = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?;
+    let peak: u64 = peak.trim().strip_suffix("kB")?.trim().parse().ok()?;
+    let rss = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?;
+    let rss: u64 = rss.trim().strip_suffix("kB")?.trim().parse().ok()?;
+    Some((peak * 1024, rss * 1024))
+}
+
+/// Whether a B5 measurement already ran in this process (phase 4 / M5b plan's
+/// P10 ③): the peak only grows, so each B5 benchmark has to be the only one in
+/// its process.
+static MEASURED: AtomicBool = AtomicBool::new(false);
+
+/// The two readings are parsed from what the system prints (phase 4 / M5b
+/// plan's P10 ②). The shape is copied from
+/// `crates/rurge-engine/src/observe/memory.rs`'s
+/// `the_peak_is_read_from_what_the_system_prints`.
+#[test]
+fn the_readings_are_parsed_from_what_the_system_prints() {
+    assert_eq!(parse_pair("\r\n123 456\r\n"), Some((123, 456)));
+    assert_eq!(parse_pair("x"), None);
+    assert_eq!(parse_pair("1"), None);
+    let status = "Name:\trurge\nVmPeak:\t  900000 kB\nVmHWM:\t    2048 kB\nVmRSS:\t    1024 kB\n";
+    assert_eq!(parse_status(status), Some((2_097_152, 1_048_576)));
+    let without_rss = "Name:\trurge\nVmHWM:\t    2048 kB\n";
+    assert_eq!(parse_status(without_rss), None);
+}
+
+/// The size of B5's body: one byte under the 32 MiB a request rewrite declines
+/// to touch (`rewrite/body.rs`'s `REQUEST` is 33 554 432, and only a body
+/// larger than that is left alone; phase 4 / M5b plan's P10 ⑤). It does not
+/// follow `Scale` (the plan's P5 ③).
+const BIG: u64 = 32 * 1024 * 1024 - 1;
+
+/// Opens a connection with `open` and sends it one `GET /small`, asserted to
+/// be the 16 bytes; the `Client` comes back still connected, for the caller to
+/// keep open (phase 4 / M5b plan's P10 ④).
+async fn b5_small<F, Fut>(open: &mut F, uri: &str, host: &str) -> Client
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Client>,
+{
+    let mut client = open().await;
+    let (status, bytes) = fetch(&mut client, get(uri, Some(host))).await;
+    assert_eq!(status, StatusCode::OK, "an idle connection's answer");
+    assert_eq!(bytes, 16, "an idle connection's body");
+    client
+}
+
+/// B5's idle-connection measurement: one warm-up connection, dropped; the
+/// reading before; `count` connections each sending one `GET /small` and kept
+/// open; the reading after (phase 4 / M5b plan's P10 ④). A connection's task
+/// runs in the runtime, and dropping its `Client` would close it, so the
+/// connections are returned for the caller to hold until the end of its test.
+async fn b5_idle<F, Fut>(
+    count: usize,
+    uri: &str,
+    host: &str,
+    mut open: F,
+) -> (Resident, Resident, Vec<Client>)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Client>,
+{
+    drop(b5_small(&mut open, uri, host).await);
+    let before = resident().expect("a reading");
+    let mut kept = Vec::with_capacity(count);
+    for _ in 0..count {
+        kept.push(b5_small(&mut open, uri, host).await);
+    }
+    let after = resident().expect("a reading");
+    (before, after, kept)
+}
+
+/// B5's before and after lines and its per-unit increment in KiB with one
+/// decimal (phase 4 / M5b plan's P5 ⑧ and P10 ④, ⑥). The increments are
+/// computed on signed numbers: the current working set may shrink (`now` is
+/// not monotone).
+fn report_per(before: &Resident, after: &Resident, units: usize, what: &str) {
+    println!(
+        "before: peak {} bytes, now {} bytes",
+        before.peak, before.now
+    );
+    println!("after: peak {} bytes, now {} bytes", after.peak, after.now);
+    let peak = (after.peak as i64 - before.peak as i64) as f64 / units as f64;
+    let now = (after.now as i64 - before.now as i64) as f64 / units as f64;
+    println!(
+        "per {what}: peak {:.1} KiB, now {:.1} KiB",
+        peak / 1024.0,
+        now / 1024.0
+    );
+}
+
+/// B5's body-buffer lines: the increment in copies of `BIG`, with two decimals
+/// (phase 4 / M5b plan's P5 ⑧ and P10 ⑤). Signed like `report_per`.
+fn report_body(before: &Resident, after: &Resident, big: u64) {
+    println!(
+        "before: peak {} bytes, now {} bytes",
+        before.peak, before.now
+    );
+    println!("after: peak {} bytes, now {} bytes", after.peak, after.now);
+    let peak = (after.peak as i64 - before.peak as i64) as f64 / big as f64;
+    let now = (after.now as i64 - before.now as i64) as f64 / big as f64;
+    println!("body buffer: peak {peak:.2} copies, now {now:.2} copies");
+}
+
+/// One handshake to `name` through rurge's SOCKS5 listener, the connection
+/// dropped at once (phase 4 / M5b plan's P10 ⑥): B5's leaf cache reads a
+/// certificate per handshake and keeps none.
+async fn b5_handshake(h: &Harness, client: &Arc<rustls::ClientConfig>, name: &str) {
+    let tunnel = connect_via_socks5(h.socks(), name, 443).await;
+    tunnel.set_nodelay(true).unwrap();
+    drop(tls_stream(tunnel, client.clone(), name).await);
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b5_idle_connections_plain_direct() {
+    assert!(
+        !MEASURED.swap(true, Ordering::SeqCst),
+        "one B5 measurement per process: run it alone with --exact"
+    );
+    if resident().is_none() {
+        println!("no reading on this platform");
+        return;
+    }
+    let s = scale();
+    let origin = origin(None, 0).await;
+    let host = format!("origin.test:{}", origin.addr.port());
+    println!("b5_idle_connections_plain_direct [{}]", s.label());
+    let addr = origin.addr;
+    let open = move || async move { h1_client(plain_stream(addr).await).await };
+    let (before, after, kept) = b5_idle(s.connections, "/small", &host, open).await;
+    assert_eq!(
+        origin.counts(),
+        ((s.connections + 1) as u64, 0),
+        "the origin's requests, by version"
+    );
+    report_per(&before, &after, s.connections, "connection");
+    drop(kept);
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b5_idle_connections_plain() {
+    assert!(
+        !MEASURED.swap(true, Ordering::SeqCst),
+        "one B5 measurement per process: run it alone with --exact"
+    );
+    if resident().is_none() {
+        println!("no reading on this platform");
+        return;
+    }
+    let s = scale();
+    let origin = origin(None, 0).await;
+    let h = harness(Profile {
+        hosts: "origin.test = 127.0.0.1",
+        ..Profile::default()
+    })
+    .await;
+    let host = format!("origin.test:{}", origin.addr.port());
+    let uri = format!("http://{host}/small");
+    println!("b5_idle_connections_plain [{}]", s.label());
+    let requests_before = h.engine.http_counts().requests;
+    let http = h.http();
+    let open = move || async move { h1_client(plain_stream(http).await).await };
+    let (before, after, kept) = b5_idle(s.connections, &uri, &host, open).await;
+    let requests = h.engine.http_counts().requests - requests_before;
+    assert_eq!(
+        requests,
+        (s.connections + 1) as u64,
+        "the requests that reached the rules: expected {}, got {requests}",
+        s.connections + 1
+    );
+    assert_eq!(
+        origin.counts(),
+        ((s.connections + 1) as u64, 0),
+        "the origin's requests, by version"
+    );
+    report_per(&before, &after, s.connections, "connection");
+    drop(kept);
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b5_idle_connections_tls_direct() {
+    assert!(
+        !MEASURED.swap(true, Ordering::SeqCst),
+        "one B5 measurement per process: run it alone with --exact"
+    );
+    if resident().is_none() {
+        println!("no reading on this platform");
+        return;
+    }
+    let s = scale();
+    let cert = TlsFixture::new(&["origin.test"]);
+    let origin = origin(Some(cert.acceptor_with_alpn(false, &[b"http/1.1"])), 0).await;
+    let host = format!("origin.test:{}", origin.addr.port());
+    println!("b5_idle_connections_tls_direct [{}]", s.label());
+    let addr = origin.addr;
+    let config = client_tls(cert.roots(), &[b"http/1.1"], true);
+    let open = move || {
+        let config = config.clone();
+        async move { h1_client(tls_stream(plain_stream(addr).await, config, "origin.test").await).await }
+    };
+    let (before, after, kept) = b5_idle(s.connections, "/small", &host, open).await;
+    assert_eq!(
+        origin.counts(),
+        ((s.connections + 1) as u64, 0),
+        "the origin's requests, by version"
+    );
+    report_per(&before, &after, s.connections, "connection");
+    drop(kept);
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b5_idle_connections_relayed_tls() {
+    assert!(
+        !MEASURED.swap(true, Ordering::SeqCst),
+        "one B5 measurement per process: run it alone with --exact"
+    );
+    if resident().is_none() {
+        println!("no reading on this platform");
+        return;
+    }
+    let s = scale();
+    let cert = TlsFixture::new(&["origin.test"]);
+    let origin = origin(Some(cert.acceptor_with_alpn(false, &[b"http/1.1"])), 0).await;
+    let port = origin.addr.port();
+    let host = format!("origin.test:{port}");
+    let general = format!("force-http-engine-hosts = origin.test:{port}");
+    let h = harness_with(
+        Profile {
+            general: &general,
+            hosts: "origin.test = 127.0.0.1",
+            ..Profile::default()
+        },
+        EngineShared {
+            roots: Some(cert.roots()),
+            sniff_wait: Duration::from_millis(300),
+            ..EngineShared::default()
+        },
+    )
+    .await;
+    println!("b5_idle_connections_relayed_tls [{}]", s.label());
+    let sniffed_before = h.engine.http_counts().sniffed.tls;
+    let socks = h.socks();
+    let config = client_tls(cert.roots(), &[b"http/1.1"], true);
+    let open = move || {
+        let config = config.clone();
+        async move {
+            let tcp = connect_via_socks5(socks, "origin.test", port).await;
+            tcp.set_nodelay(true).unwrap();
+            h1_client(tls_stream(tcp, config, "origin.test").await).await
+        }
+    };
+    let (before, after, kept) = b5_idle(s.connections, "/small", &host, open).await;
+    let sniffed = h.engine.http_counts().sniffed.tls - sniffed_before;
+    assert_eq!(
+        sniffed,
+        (s.connections + 1) as u64,
+        "the TLS connections sniffed (the warm-up among them)"
+    );
+    assert_eq!(
+        h.engine.http_counts().mitm.decrypted,
+        0,
+        "a profile without [MITM] decrypts nothing"
+    );
+    report_per(&before, &after, s.connections, "connection");
+    drop(kept);
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b5_idle_connections_decrypted() {
+    assert!(
+        !MEASURED.swap(true, Ordering::SeqCst),
+        "one B5 measurement per process: run it alone with --exact"
+    );
+    if resident().is_none() {
+        println!("no reading on this platform");
+        return;
+    }
+    let s = scale();
+    let cert = TlsFixture::new(&["origin.test"]);
+    let origin = origin(Some(cert.acceptor(false)), 0).await;
+    let ca = TlsFixture::with_ca_name("rurge test MITM CA", &[]);
+    let ca_p12 = ca.ca_p12_base64("pw");
+    let port = origin.addr.port();
+    let host = format!("origin.test:{port}");
+    let section = mitm_section(&host, &ca_p12);
+    let h = harness_with(
+        Profile {
+            hosts: "origin.test = 127.0.0.1",
+            sections: &section,
+            ..Profile::default()
+        },
+        EngineShared {
+            roots: Some(cert.roots()),
+            sniff_wait: Duration::from_millis(300),
+            ..EngineShared::default()
+        },
+    )
+    .await;
+    println!("b5_idle_connections_decrypted [{}]", s.label());
+    let requests_before = h.engine.http_counts().requests;
+    let decrypted_before = h.engine.http_counts().mitm.decrypted;
+    let socks = h.socks();
+    let config = client_tls(ca.roots(), &[b"http/1.1"], true);
+    let open = move || {
+        let config = config.clone();
+        async move {
+            let tcp = connect_via_socks5(socks, "origin.test", port).await;
+            tcp.set_nodelay(true).unwrap();
+            h1_client(tls_stream(tcp, config, "origin.test").await).await
+        }
+    };
+    let (before, after, kept) = b5_idle(s.connections, "/small", &host, open).await;
+    wait_until("the decrypted connections", || {
+        h.engine.http_counts().mitm.decrypted - decrypted_before >= (s.connections + 1) as u64
+    })
+    .await;
+    let decrypted = h.engine.http_counts().mitm.decrypted - decrypted_before;
+    assert_eq!(
+        decrypted,
+        (s.connections + 1) as u64,
+        "the decrypted connections (the warm-up among them)"
+    );
+    let requests = h.engine.http_counts().requests - requests_before;
+    assert_eq!(
+        requests,
+        (s.connections + 1) as u64,
+        "the requests that reached the rules: expected {}, got {requests}",
+        s.connections + 1
+    );
+    report_per(&before, &after, s.connections, "connection");
+    drop(kept);
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b5_body_direct() {
+    assert!(
+        !MEASURED.swap(true, Ordering::SeqCst),
+        "one B5 measurement per process: run it alone with --exact"
+    );
+    if resident().is_none() {
+        println!("no reading on this platform");
+        return;
+    }
+    let s = scale();
+    let origin = origin(None, 0).await;
+    let host = format!("origin.test:{}", origin.addr.port());
+    println!("b5_body_direct [{}]", s.label());
+    let mut client = h1_client(plain_stream(origin.addr).await).await;
+    let before = resident().expect("a reading");
+    let line = upload(&mut client, post("/up", Some(host.as_str()), BIG)).await;
+    let after = resident().expect("a reading");
+    assert_eq!(
+        line,
+        format!("{BIG} 97"),
+        "the origin's answer to the upload"
+    );
+    report_body(&before, &after, BIG);
+    drop(client);
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b5_body_streamed() {
+    assert!(
+        !MEASURED.swap(true, Ordering::SeqCst),
+        "one B5 measurement per process: run it alone with --exact"
+    );
+    if resident().is_none() {
+        println!("no reading on this platform");
+        return;
+    }
+    let s = scale();
+    let origin = origin(None, 0).await;
+    let h = harness(Profile {
+        hosts: "origin.test = 127.0.0.1",
+        ..Profile::default()
+    })
+    .await;
+    let host = format!("origin.test:{}", origin.addr.port());
+    let uri = format!("http://{host}/up");
+    println!("b5_body_streamed [{}]", s.label());
+    let mut client = h1_client(plain_stream(h.http()).await).await;
+    let before = resident().expect("a reading");
+    let line = upload(&mut client, post(&uri, Some(host.as_str()), BIG)).await;
+    let after = resident().expect("a reading");
+    assert_eq!(
+        line,
+        format!("{BIG} 97"),
+        "the origin's answer to the upload"
+    );
+    report_body(&before, &after, BIG);
+    drop(client);
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b5_body_rewritten() {
+    assert!(
+        !MEASURED.swap(true, Ordering::SeqCst),
+        "one B5 measurement per process: run it alone with --exact"
+    );
+    if resident().is_none() {
+        println!("no reading on this platform");
+        return;
+    }
+    let s = scale();
+    let origin = origin(None, 0).await;
+    let port = origin.addr.port();
+    let host = format!("origin.test:{port}");
+    let uri = format!("http://{host}/up");
+    let section = format!("[Body Rewrite]\nhttp-request ^http://origin\\.test:{port}/up ^a b");
+    let h = harness(Profile {
+        hosts: "origin.test = 127.0.0.1",
+        sections: &section,
+        ..Profile::default()
+    })
+    .await;
+    println!("b5_body_rewritten [{}]", s.label());
+    let mut client = h1_client(plain_stream(h.http()).await).await;
+    let before = resident().expect("a reading");
+    let line = upload(&mut client, post(&uri, Some(host.as_str()), BIG)).await;
+    let after = resident().expect("a reading");
+    assert_eq!(
+        line,
+        format!("{BIG} 98"),
+        "the first byte the request rewrite left"
+    );
+    report_body(&before, &after, BIG);
+    drop(client);
+}
+
+#[tokio::test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+async fn b5_leaf_cache() {
+    assert!(
+        !MEASURED.swap(true, Ordering::SeqCst),
+        "one B5 measurement per process: run it alone with --exact"
+    );
+    if resident().is_none() {
+        println!("no reading on this platform");
+        return;
+    }
+    let s = scale();
+    let ca = TlsFixture::with_ca_name("rurge test MITM CA", &[]);
+    let ca_p12 = ca.ca_p12_base64("pw");
+    let roots = TlsFixture::new(&[]).roots();
+    let client = client_tls(ca.roots(), &[], false);
+    let section = mitm_section("*.bench.test", &ca_p12);
+    let h = harness_with(
+        Profile {
+            hosts: "*.bench.test = 127.0.0.1",
+            sections: &section,
+            ..Profile::default()
+        },
+        EngineShared {
+            roots: Some(roots),
+            sniff_wait: Duration::from_millis(300),
+            ..EngineShared::default()
+        },
+    )
+    .await;
+    println!("b5_leaf_cache [{}]", s.label());
+    let decrypted_before = h.engine.http_counts().mitm.decrypted;
+    // one name first: the request log fills to its capacity, and the cache
+    // holds one certificate
+    for _ in 0..s.names {
+        b5_handshake(&h, &client, "one.bench.test").await;
+    }
+    let before = resident().expect("a reading");
+    for i in 0..s.names {
+        let name = format!("n{i:04}.bench.test");
+        b5_handshake(&h, &client, &name).await;
+    }
+    let after = resident().expect("a reading");
+    report_per(&before, &after, s.names, "certificate");
+    wait_until("the two passes' decrypted connections", || {
+        h.engine.http_counts().mitm.decrypted - decrypted_before >= (2 * s.names) as u64
+    })
+    .await;
+    let decrypted = h.engine.http_counts().mitm.decrypted - decrypted_before;
+    assert_eq!(
+        decrypted,
+        (2 * s.names) as u64,
+        "the decrypted connections of both passes"
+    );
+}
+
+/// Q1: reading a ClientHello that came in two QUIC Initial datagrams, through
+/// the reader of M5a, timed with none of the engine in the way (phase 4 M5
+/// design 8.7, and the phase 4 / M5b plan's P11).
+#[test]
+#[ignore = "a measurement, not a gate: run it alone, in release, with --nocapture"]
+fn q1_reading_a_quic_client_hello() {
+    use rurge_net::quic::initial::{Hello, read_first};
+    use rurge_net::quic::testing::{Initial, RFC_DCID, big_client_hello, chrome_frames};
+
+    let s = scale();
+    let hello = big_client_hello(Some("held.test"));
+    let [first, second] = chrome_frames(&hello, 7);
+    let d1 = Initial::new(1, RFC_DCID, 0, first).seal(Some(1200));
+    let d2 = Initial::new(1, RFC_DCID, 1, second).seal(Some(1200));
+    println!("q1_reading_a_quic_client_hello [{}]", s.label());
+
+    // not timed: the same reading and the same assertions
+    for _ in 0..s.iterations / 100 {
+        let Some(Hello::Partial(reader)) = read_first(std::hint::black_box(&d1)) else {
+            panic!("the first datagram holds the start of a ClientHello");
+        };
+        let whole = reader.read(std::hint::black_box(&d2));
+        let Hello::Whole(message) = whole else {
+            panic!("the second datagram completes the ClientHello");
+        };
+        assert_eq!(message.len(), hello.len(), "the ClientHello's bytes");
+        let _ = std::hint::black_box(message);
+    }
+
+    let mut samples = Vec::with_capacity(s.iterations);
+    for _ in 0..s.iterations {
+        let started = Instant::now();
+        let Some(Hello::Partial(reader)) = read_first(std::hint::black_box(&d1)) else {
+            panic!("the first datagram holds the start of a ClientHello");
+        };
+        let whole = reader.read(std::hint::black_box(&d2));
+        let took = started.elapsed();
+        let Hello::Whole(message) = whole else {
+            panic!("the second datagram completes the ClientHello");
+        };
+        assert_eq!(message.len(), hello.len(), "the ClientHello's bytes");
+        let _ = std::hint::black_box(message);
+        samples.push(took);
+    }
+
+    let l = latency(&mut samples);
+    println!(
+        "median {:.1} us, p99 {:.1} us, max {:.1} us",
+        micros(l.median),
+        micros(l.p99),
+        micros(l.max)
+    );
+    println!("phase 3 M5 design 4.2's estimate: the order of ten microseconds");
 }
