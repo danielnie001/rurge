@@ -38,6 +38,7 @@ use rurge_config::spec::{ObfsMode, ShadowTlsOpts, SnellSpec, SnellVersion};
 use rurge_net::BoxFuture;
 use rurge_net::connector::{BoxedPacketSocket, BoxedStream, ConnectOpts, Connector, Target};
 use rustls::RootCertStore;
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use tunnel::SnellTunnel;
 use udp::SnellUdp;
@@ -57,9 +58,18 @@ pub(crate) struct Dialer {
 }
 
 impl Dialer {
-    pub(crate) async fn fresh(&self, opts: &ConnectOpts) -> Result<SnellStream, OutboundError> {
+    /// A new connection, with its far end as the dial just noted it: the
+    /// address the transport went to (`the phase 4 / M4b plan's P9 ②`).
+    pub(crate) async fn fresh(
+        &self,
+        opts: &ConnectOpts,
+    ) -> Result<(SnellStream, Option<SocketAddr>), OutboundError> {
         let transport = self.stack.open(opts).await?;
-        Ok(SnellStream::open(transport, self.psk.clone(), self.format).await?)
+        let peer = rurge_net::trail::current().and_then(|trail| trail.peer());
+        Ok((
+            SnellStream::open(transport, self.psk.clone(), self.format).await?,
+            peer,
+        ))
     }
 }
 
@@ -141,22 +151,28 @@ impl SnellOutbound {
 
     async fn open(&self, head: Vec<u8>, opts: &ConnectOpts) -> Result<BoxedStream, OutboundError> {
         let Some(pool) = &self.pool else {
-            let stream = self.dialer.fresh(opts).await?;
-            return Ok(Box::new(SnellTunnel::new(stream, head, None)));
+            let (stream, peer) = self.dialer.fresh(opts).await?;
+            return Ok(Box::new(SnellTunnel::new(stream, peer, head, None)));
         };
         self.reaper.get_or_init(|| pool::spawn_reaper(pool));
         let back = Arc::downgrade(pool);
-        if let Some(stream) = pool.take() {
+        if let Some((stream, peer)) = pool.take() {
+            // the connection was dialled under another session's trail: this
+            // session leaves rurge by it too (`the phase 4 / M4b plan's P9 ②`)
+            if let Some(peer) = peer {
+                rurge_net::trail::connected(peer);
+            }
             return Ok(Box::new(SnellTunnel::reused(
                 stream,
+                peer,
                 head,
                 back,
                 self.dialer.clone(),
                 opts.clone(),
             )));
         }
-        let stream = self.dialer.fresh(opts).await?;
-        Ok(Box::new(SnellTunnel::new(stream, head, Some(back))))
+        let (stream, peer) = self.dialer.fresh(opts).await?;
+        Ok(Box::new(SnellTunnel::new(stream, peer, head, Some(back))))
     }
 }
 
@@ -227,11 +243,7 @@ impl Outbound for SnellOutbound {
             // one budget for the connection, its layers, the key and the
             // server's answer, which comes at once
             let open = async {
-                let stream = self.dialer.fresh(opts).await?;
-                // where the connection went, read while the trail is still
-                // followed: a redial of the relay (phase 4 / M4b plan's P9 ②)
-                // will have it hand its own back instead
-                let far_end = rurge_net::trail::current().and_then(|trail| trail.peer());
+                let (stream, far_end) = self.dialer.fresh(opts).await?;
                 let udp = SnellUdp::open(stream, far_end).await?;
                 Ok(Box::new(udp) as BoxedPacketSocket)
             };
@@ -993,6 +1005,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&back, b"helloworld");
+    }
+
+    /// A stale pooled connection is redialled under the session's trail: the
+    /// new connection's far end replaces what a dial before it noted, so the
+    /// session's record names the server it left by (`the phase 4 / M4b
+    /// plan's P9 ②`).
+    #[tokio::test]
+    async fn a_redial_notes_the_new_connection_on_the_sessions_trail() {
+        let echo = echo_server().await;
+        let fake = FakeSnell::spawn(SnellScript {
+            tunnels_per_connection: Some(1),
+            ..SnellScript::new("secret")
+        })
+        .await;
+        let out = outbound_to(&fake, ", reuse=true");
+        // fills the pool; no trail follows this dial
+        request(&out, echo, b"first").await;
+        let trail = rurge_net::trail::Trail::new();
+        let mut stream = trail
+            .follow(async {
+                out.connect_tcp(&target(echo), &ConnectOpts::default())
+                    .await
+            })
+            .await
+            .unwrap();
+        // a sentinel from an earlier attempt: the redial has to replace it
+        trail.set_peer("192.0.2.9:9".parse().unwrap());
+        // the server closed the pooled connection while it idled
+        stream.write_all(b"hello").await.unwrap();
+        let mut back = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut back))
+            .await
+            .expect("the echo arrives within the bound")
+            .unwrap();
+        assert_eq!(&back, b"hello");
+        assert_eq!(trail.peer(), Some(fake.addr()), "the redial's far end");
+        assert_eq!(fake.connections(), 2, "the stale connection was redialled");
     }
 
     #[tokio::test]

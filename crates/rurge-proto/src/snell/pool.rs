@@ -9,6 +9,7 @@
 
 use super::record::SnellStream;
 use crate::task::AbortOnDrop;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
@@ -23,30 +24,33 @@ pub(crate) const MAX_IDLE: usize = 8;
 
 #[derive(Default)]
 pub(crate) struct Pool {
-    idle: Mutex<Vec<(SnellStream, Instant)>>,
+    /// Each idle connection with its far end, as the dial that made it noted
+    /// it (`the phase 4 / M4b plan's P9 ②`): a request that takes it back has
+    /// not dialled, so the address travels with the connection.
+    idle: Mutex<Vec<(SnellStream, Option<SocketAddr>, Instant)>>,
 }
 
 impl Pool {
     /// Only a stream that `is_reusable`; it is taken back ready for the next
-    /// request.
-    pub(crate) fn put(&self, mut stream: SnellStream) {
+    /// request. `peer` is where its connection goes.
+    pub(crate) fn put(&self, mut stream: SnellStream, peer: Option<SocketAddr>) {
         stream.next_tunnel();
         let mut idle = self.idle.lock().expect("pool");
         if idle.len() == MAX_IDLE {
             idle.remove(0);
         }
-        idle.push((stream, Instant::now()));
+        idle.push((stream, peer, Instant::now()));
     }
 
     /// The newest connection that has not idled too long and has heard
     /// nothing from the server since it was pooled; the others found on the
     /// way are dropped (the look happens outside the lock).
-    pub(crate) fn take(&self) -> Option<SnellStream> {
+    pub(crate) fn take(&self) -> Option<(SnellStream, Option<SocketAddr>)> {
         let now = Instant::now();
         loop {
-            let (mut stream, since) = self.idle.lock().expect("pool").pop()?;
+            let (mut stream, peer, since) = self.idle.lock().expect("pool").pop()?;
             if now.duration_since(since) < IDLE_TIMEOUT && is_quiet(&mut stream) {
-                return Some(stream);
+                return Some((stream, peer));
             }
         }
     }
@@ -55,7 +59,7 @@ impl Pool {
         self.idle
             .lock()
             .expect("pool")
-            .retain(|(_, since)| now.duration_since(*since) < IDLE_TIMEOUT);
+            .retain(|(_, _, since)| now.duration_since(*since) < IDLE_TIMEOUT);
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -136,16 +140,16 @@ mod tests {
     async fn an_idle_connection_expires_after_a_minute() {
         let pool = Pool::default();
         let (stream, _server) = ended().await;
-        pool.put(stream);
+        pool.put(stream, None);
         tokio::time::advance(IDLE_TIMEOUT - Duration::from_secs(1)).await;
         assert!(pool.take().is_some(), "still fresh");
         let (stream, _server) = ended().await;
-        pool.put(stream);
+        pool.put(stream, None);
         tokio::time::advance(IDLE_TIMEOUT).await;
         assert!(pool.take().is_none(), "expired");
         // the reaper's pass drops it too
         let (stream, _server) = ended().await;
-        pool.put(stream);
+        pool.put(stream, None);
         tokio::time::advance(IDLE_TIMEOUT).await;
         pool.reap(Instant::now());
         assert_eq!(pool.len(), 0);
@@ -156,8 +160,8 @@ mod tests {
         let pool = Pool::default();
         let (open, _server) = ended().await;
         let (closed, server) = ended().await;
-        pool.put(open);
-        pool.put(closed);
+        pool.put(open, None);
+        pool.put(closed, None);
         drop(server);
         // the newest is closed: skipped and dropped
         assert!(pool.take().is_some());
@@ -187,11 +191,11 @@ mod tests {
         let pool = Pool::default();
         let (open, mut server) = ended().await;
         let (closed, gone) = ended().await;
-        pool.put(open);
-        pool.put(closed);
+        pool.put(open, None);
+        pool.put(closed, None);
         drop(gone);
         // the newest is closed: skipped and dropped
-        let mut taken = pool.take().expect("the open one");
+        let (mut taken, _) = pool.take().expect("the open one");
         assert_eq!(pool.len(), 0);
         // and what was taken carries the next request
         server.next_tunnel();
@@ -210,7 +214,7 @@ mod tests {
         let mut servers = Vec::new();
         for _ in 0..MAX_IDLE + 2 {
             let (stream, server) = ended().await;
-            pool.put(stream);
+            pool.put(stream, None);
             servers.push(server);
         }
         assert_eq!(pool.len(), MAX_IDLE);

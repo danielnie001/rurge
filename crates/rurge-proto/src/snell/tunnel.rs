@@ -33,7 +33,9 @@ use crate::OutboundError;
 use crate::transport::lazy_head::LazyHead;
 use rurge_net::BoxFuture;
 use rurge_net::connector::ConnectOpts;
+use rurge_net::trail::Trail;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker, ready};
@@ -106,11 +108,11 @@ fn is_stale(error: &io::Error) -> bool {
 enum Conn {
     /// Boxed: the stream's buffers are large and a redial is rare.
     Open(Box<LazyHead<SnellStream>>),
-    /// The request going again on a fresh connection: the dial, what the
-    /// old one carried (the head and the payload written since), and the
-    /// tasks waiting for the dial.
+    /// The request going again on a fresh connection: the dial (with its
+    /// connection's far end), what the old one carried (the head and the
+    /// payload written since), and the tasks waiting for the dial.
     Redial(
-        BoxFuture<'static, io::Result<SnellStream>>,
+        BoxFuture<'static, io::Result<(SnellStream, Option<SocketAddr>)>>,
         Vec<u8>,
         Arc<Waiters>,
     ),
@@ -164,6 +166,10 @@ struct Retry {
     sent: Vec<u8>,
     dialer: Arc<Dialer>,
     opts: ConnectOpts,
+    /// The session's trail, taken while the request was opened on the pooled
+    /// connection: the redial shows its own connection on it (`the phase 4 /
+    /// M4b plan's P9 ②`).
+    trail: Option<Trail>,
 }
 
 /// No `Debug`: it holds the connection's keys.
@@ -178,13 +184,21 @@ pub(crate) struct SnellTunnel {
     end_owed: bool,
     /// The connection is not in a state to be reused.
     broken: bool,
+    /// Where the connection goes, as the dial that made it noted it; it
+    /// travels with the connection when it is pooled.
+    peer: Option<SocketAddr>,
     /// Where the connection goes after a clean end, when it is reused.
     pool: Option<Weak<Pool>>,
 }
 
 impl SnellTunnel {
     /// A request on a connection of its own, pooled afterwards with `pool`.
-    pub(crate) fn new(stream: SnellStream, head: Vec<u8>, pool: Option<Weak<Pool>>) -> SnellTunnel {
+    pub(crate) fn new(
+        stream: SnellStream,
+        peer: Option<SocketAddr>,
+        head: Vec<u8>,
+        pool: Option<Weak<Pool>>,
+    ) -> SnellTunnel {
         SnellTunnel {
             conn: Conn::Open(Box::new(LazyHead::new(stream, head))),
             reply: Reply::Waiting,
@@ -192,6 +206,7 @@ impl SnellTunnel {
             shut: false,
             end_owed: false,
             broken: false,
+            peer,
             pool,
         }
     }
@@ -200,6 +215,7 @@ impl SnellTunnel {
     /// connection from `dialer`.
     pub(crate) fn reused(
         stream: SnellStream,
+        peer: Option<SocketAddr>,
         head: Vec<u8>,
         pool: Weak<Pool>,
         dialer: Arc<Dialer>,
@@ -210,8 +226,9 @@ impl SnellTunnel {
             sent: head.clone(),
             dialer,
             opts,
+            trail: rurge_net::trail::current(),
         };
-        let mut tunnel = SnellTunnel::new(stream, head, Some(pool));
+        let mut tunnel = SnellTunnel::new(stream, peer, head, Some(pool));
         tunnel.retry = Some(retry);
         tunnel
     }
@@ -228,11 +245,30 @@ impl SnellTunnel {
             return Err(error);
         };
         let Retry {
-            sent, dialer, opts, ..
+            sent,
+            dialer,
+            opts,
+            trail,
+            ..
         } = retry;
         let dial = Box::pin(async move {
-            match tokio::time::timeout(opts.timeout, dialer.fresh(&opts)).await {
-                Ok(Ok(stream)) => Ok(stream),
+            // the redial's connection is this session's: it goes where the
+            // session leaves rurge, and the lookup it makes counts for the
+            // session (`the phase 4 / M4b plan's P9 ②`)
+            let attempt = async {
+                match trail {
+                    Some(trail) => {
+                        // whatever the stale connection noted is gone
+                        trail.clear_peer();
+                        trail
+                            .follow(tokio::time::timeout(opts.timeout, dialer.fresh(&opts)))
+                            .await
+                    }
+                    None => tokio::time::timeout(opts.timeout, dialer.fresh(&opts)).await,
+                }
+            };
+            match attempt.await {
+                Ok(Ok(pair)) => Ok(pair),
                 Ok(Err(OutboundError::Io(e))) => Err(e),
                 Ok(Err(e)) => Err(io::Error::other(e.to_string())),
                 Err(_) => Err(io::Error::new(
@@ -256,6 +292,8 @@ impl SnellTunnel {
                 Ok(stream) => {
                     // no grace: the application's bytes are already here
                     let sent = std::mem::take(sent);
+                    let (stream, peer) = stream;
+                    self.peer = peer;
                     self.conn =
                         Conn::Open(Box::new(LazyHead::with_grace(stream, sent, Duration::ZERO)));
                     self.end_owed = self.shut;
@@ -430,16 +468,16 @@ impl Drop for SnellTunnel {
         };
         let stream = (*lazy).into_inner();
         if stream.is_reusable() {
-            pool.put(stream);
+            pool.put(stream, self.peer);
         } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(finish(stream, Arc::downgrade(&pool)));
+            runtime.spawn(finish(stream, self.peer, Arc::downgrade(&pool)));
         }
     }
 }
 
 /// Ends our side (once more is harmless), then reads the server's side to
 /// its end; a connection that gets there cleanly goes back to `pool`.
-async fn finish(mut stream: SnellStream, pool: Weak<Pool>) {
+async fn finish(mut stream: SnellStream, peer: Option<SocketAddr>, pool: Weak<Pool>) {
     let ended = tokio::time::timeout(FINISH_TIMEOUT, async {
         std::future::poll_fn(|cx| stream.poll_end(cx)).await?;
         let mut sink = vec![0u8; 16 * 1024];
@@ -461,7 +499,7 @@ async fn finish(mut stream: SnellStream, pool: Weak<Pool>) {
         && stream.is_reusable()
         && let Some(pool) = pool.upgrade()
     {
-        pool.put(stream);
+        pool.put(stream, peer);
     }
 }
 
@@ -479,7 +517,10 @@ mod tests {
         let open = |end| SnellStream::open(Box::new(end), Psk::new("psk"), format);
         let client = open(near).await.unwrap();
         let server = open(far).await.unwrap();
-        (SnellTunnel::new(client, b"HEAD".to_vec(), pool), server)
+        (
+            SnellTunnel::new(client, None, b"HEAD".to_vec(), pool),
+            server,
+        )
     }
 
     /// `pair_in` v4's format.
