@@ -856,6 +856,7 @@ relay, a carrier's far end read after its dial.
 | 61 | 8 | P12 里的一处出入（执行者的裁定）：`a_full_request_log_of_http_requests` 照 P12 本来要打印"`recent` 能读到的条数"，而 `recent(100_000)` 会把十万条记录各复制一份、在例句行里活到打印之后，读峰值之前调它就把峰值抬高，量到的就不是记录表的开销；改成先读峰值、先打印峰值，再打印 `log.len()`（不复制），并断言它是 100_000。`observe/memory.rs` 的注释里写明了这一点。 | `91ec9f1` |
 | 62 | 8 | 量的结果（一台 Windows 11 开发机上的一次运行，不是 CI；两条各单独跑一次、调试构建，输出在 `memory-task-8.log`）：`an_empty_request_log_is_the_baseline` 的峰值是 17 702 912 字节，`a_full_request_log_of_http_requests` 是 126 230 528 字节（容量 100 000 条，装满之后再进 10 000 条、挤掉最早的，打印 `records held: 100000`）。差 108 527 616 字节，除以 100 000 是 1085.3 字节一条，取整到 8 字节是 **1088 字节**一条；1 000 条（`--request-log-size` 的缺省）约 1.04 MiB、10 000 条约 10.4 MiB、100 000 条约 103.8 MiB。缺省不改（M4-D25），这个数交给项目所有者，任务 9a 写进 `docs/api/phase4.md`。 | `91ec9f1` |
 | 63 | 8 | 门禁（同一台开发机上的一次运行，不是 CI）：在 `97b5fe4` 的树上（两个提交 `91ec9f1` 与 `97b5fe4`），`cargo fmt --all --check` 退出码 0、`cargo clippy --all-targets -- -D warnings` 退出码 0、`cargo test -j 8 --workspace --no-fail-fast` 退出码 0，93 个结果行、5376 通过、0 失败、17 忽略（基线 5374 / 0 / 15 加本任务两条通过的与两条忽略的），没有崩溃、没有重跑。`api.rs` 的新用例 `the_request_records_carry_the_three_new_keys` 直接跑测试二进制、`--exact`、二十次，0/20 失败；它测的是任务 1 ～ 7 已经做好的行为，第一次跑就是绿的，没有 RED。此后只加了本节第 61 ～ 63 行的文字，按规矩又跑了一次全量，那一次的数写在 `task-8-report.md` 里。 | 本提交 |
+| 64 | 8 | 订正第 61 行的一处手误（第 61 行不改）：那里写的"在例句行里活到打印之后"，说的是 `recent` 交回的那一份 `Vec` 活到 `println!` 那一句打印完，第 61 行取错了一个词。第 61 行说的其余不变。 | 本提交 |
 
 ## 延后事项
 
