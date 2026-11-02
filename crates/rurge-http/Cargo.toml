@@ -42,6 +42,7 @@ testing = []
 rurge-net = { workspace = true, features = ["testing"] }
 rurge-proto = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

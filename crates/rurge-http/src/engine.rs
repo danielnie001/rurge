@@ -11182,4 +11182,76 @@ mod tests {
         assert_eq!(entry.timings.connect, None);
         assert_eq!(entry.remote, None);
     }
+
+    /// A body that never hands a frame on and never ends. `Idle::poll_frame`
+    /// checks `is_end_stream` before it starts its clock, so a body that says
+    /// it is not ended is the one that reaches the timing code.
+    struct Never;
+
+    impl Body for Never {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    /// `Idle` starts its clock at the first poll, not when it was built
+    /// (`phase 4 M1 design 8.6`): a body that waited ten seconds before its
+    /// first poll, with a five second idle, is not late at that poll.
+    #[tokio::test(start_paused = true)]
+    async fn idle_starts_its_clock_at_the_first_poll() {
+        const IDLE: Duration = Duration::from_secs(5);
+        let handle = SessionHandle::new(1, SessionInfo::tcp(HostName::parse("origin.test"), 80));
+        let mut body = Idle::new(Never, IDLE, Progress::new(), Meter::new(), None, handle);
+        tokio::time::advance(IDLE * 2).await;
+        let first_poll = tokio::time::Instant::now();
+        let polled =
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_frame(cx))).await;
+        assert!(
+            polled.is_pending(),
+            "the clock starts at the first poll: a body built ten seconds ago is not late yet"
+        );
+        let stalled = body
+            .frame()
+            .await
+            .expect("a stalled body fails rather than ends")
+            .expect_err("the body stalls");
+        assert_eq!(stalled.to_string(), "request body stalled");
+        assert!(
+            first_poll.elapsed() >= IDLE,
+            "the first poll waits the whole idle before it stalls"
+        );
+    }
+
+    /// `Progress::restart` gives a request sent again on a new connection its
+    /// whole idle from scratch (`phase 4 M1 design 8.6`): twelve seconds after
+    /// the start, with a move at three, one second of ten is left; `restart`
+    /// makes it ten again and clears the wait on the source.
+    #[tokio::test(start_paused = true)]
+    async fn restart_gives_the_resent_request_its_whole_wait() {
+        const IDLE: Duration = Duration::from_secs(10);
+        let progress = Progress::new();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        progress.moved();
+        tokio::time::advance(Duration::from_secs(9)).await;
+        progress.waiting();
+        assert_eq!(
+            progress.remaining(IDLE),
+            Duration::from_secs(1),
+            "twelve seconds after the start, one second of ten is left"
+        );
+        assert!(progress.is_waiting(), "the source was found empty");
+        progress.restart();
+        assert_eq!(
+            progress.remaining(IDLE),
+            IDLE,
+            "the new connection starts the wait over"
+        );
+        assert!(!progress.is_waiting(), "the new attempt is not waiting");
+    }
 }
