@@ -4,6 +4,8 @@
 //! interfaces. M1a has the five ways a sniff can end; M1b adds `requests`;
 //! M2a adds `mitm`, the outcomes of the decrypted TLS sessions.
 //! M3a adds `rewrite`, what the rewrites did (`phase 4 M3 design 12`).
+//! M5a adds `quic`, how the QUIC ClientHellos were read and how many flows
+//! `auto-quic-block` blocked (`phase 4 M5 design 7`).
 
 use crate::App;
 use axum::Json;
@@ -22,6 +24,33 @@ pub struct HttpJson {
     /// `[Body Rewrite]` and `[Map Local]` did (`phase 4 M3 design 12`), since
     /// the engine started.
     pub rewrite: RewriteJson,
+    /// The QUIC ClientHellos of the flows through the engine, how they were
+    /// read, and the flows `auto-quic-block` blocked (`phase 4 M5 design 5.4`),
+    /// since the engine started.
+    pub quic: QuicJson,
+}
+
+/// The outcomes of the QUIC ClientHellos (`phase 4 M5 design 5.4`): the flows
+/// whose ClientHello came whole and parsed, the ones it did not come whole for
+/// within the wait, the ones it came whole for but could not be read, and the
+/// ones `auto-quic-block` blocked, which are also counted as read.
+#[derive(Serialize)]
+pub struct QuicJson {
+    pub hello: u64,
+    pub incomplete: u64,
+    pub unreadable: u64,
+    pub blocked: u64,
+}
+
+impl From<rurge_engine::QuicSniffed> for QuicJson {
+    fn from(counts: rurge_engine::QuicSniffed) -> Self {
+        Self {
+            hello: counts.hello,
+            incomplete: counts.incomplete,
+            unreadable: counts.unreadable,
+            blocked: counts.blocked,
+        }
+    }
 }
 
 /// The rewrite counts (`phase 4 M3 design 12`, `M3-D25`): `body` is the
@@ -92,5 +121,29 @@ pub async fn http(State(app): State<App>) -> Json<HttpJson> {
             skipped: counts.rewrite.skipped,
             failed: counts.rewrite.failed,
         },
+        quic: QuicJson::from(counts.quic),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QuicJson;
+    use rurge_engine::QuicSniffed;
+
+    /// The four QUIC counts go out under the names the design gives them, in
+    /// its order (`phase 4 M5 design 7`).
+    #[test]
+    fn the_quic_counts_go_out_under_their_names() {
+        let json = serde_json::to_string(&QuicJson::from(QuicSniffed {
+            hello: 1,
+            incomplete: 2,
+            unreadable: 3,
+            blocked: 4,
+        }))
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"hello":1,"incomplete":2,"unreadable":3,"blocked":4}"#
+        );
+    }
 }

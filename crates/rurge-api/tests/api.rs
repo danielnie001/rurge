@@ -1619,7 +1619,8 @@ async fn rurge_http_counts_start_at_zero() {
                 "sniffed": {"tls": 0, "http": 0, "other": 0, "timeout": 0, "closed": 0},
                 "requests": 0,
                 "mitm": {"decrypted": 0, "untrusted": 0, "failed": 0, "noRequest": 0},
-                "rewrite": {"url": 0, "header": 0, "body": 0, "mapLocal": 0, "skipped": 0, "failed": 0}
+                "rewrite": {"url": 0, "header": 0, "body": 0, "mapLocal": 0, "skipped": 0, "failed": 0},
+                "quic": {"hello": 0, "incomplete": 0, "unreadable": 0, "blocked": 0}
             })
         )
     );
@@ -1627,7 +1628,7 @@ async fn rurge_http_counts_start_at_zero() {
     assert_eq!(status, 200);
     assert_eq!(
         bytes.as_ref(),
-        br#"{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0},"requests":0,"mitm":{"decrypted":0,"untrusted":0,"failed":0,"noRequest":0},"rewrite":{"url":0,"header":0,"body":0,"mapLocal":0,"skipped":0,"failed":0}}"#
+        br#"{"sniffed":{"tls":0,"http":0,"other":0,"timeout":0,"closed":0},"requests":0,"mitm":{"decrypted":0,"untrusted":0,"failed":0,"noRequest":0},"rewrite":{"url":0,"header":0,"body":0,"mapLocal":0,"skipped":0,"failed":0},"quic":{"hello":0,"incomplete":0,"unreadable":0,"blocked":0}}"#
             .as_slice()
     );
     assert_eq!(
