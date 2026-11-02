@@ -1,5 +1,5 @@
 //! What a request log costs in memory at the 100 000 records this measures (a
-//! request log of the default 1 000 costs a thousandth of it). A measurement,
+//! request log of the default 1 000 costs a hundredth of it). A measurement,
 //! not a gate: the two tests that measure are ignored, and the one that reads
 //! the peak is the guard of the reading itself. Each of the two prints what
 //! its log holds and the peak working set of the process, taken from the
