@@ -153,6 +153,36 @@ async fn an_anytls_upstream_carries_two_requests_over_one_session() {
     assert!(h.dns.queries().is_empty(), "rurge never looked the name up");
 }
 
+/// The second request rides the pooled AnyTLS session, which it did not dial:
+/// its record names the server all the same (`the phase 4 / M4b plan's P9 ③`).
+#[tokio::test]
+async fn a_pooled_anytls_session_gives_its_record_the_servers_address() {
+    let origin = TestServer::spawn().await;
+    origin.set("/hello", "hi there");
+    let (upstream, params) = anytls_upstream(origin_addr(&origin)).await;
+    let h = harness(Profile {
+        proxies: &format!(
+            "A = anytls, 127.0.0.1, {}, {params}",
+            upstream.addr().port()
+        ),
+        rules: "DOMAIN,target.test,A",
+        ..Profile::default()
+    })
+    .await;
+    let log = h.engine.request_log();
+    for round in 1..=2 {
+        let mut tunnel = connect_via_http(h.http(), "target.test:8080").await;
+        let response = get(&mut tunnel, "target.test", "/hello").await;
+        assert!(response.ends_with("hi there"), "{response}");
+        drop(tunnel);
+        // by then the session is back in the pool
+        wait_until("the session to finish", || log.recent(10).len() == round).await;
+        let record = log.recent(10)[0].clone();
+        assert_eq!(record.remote_addr, Some(upstream.addr()), "{record:?}");
+    }
+    assert_eq!(upstream.sessions(), 1, "one session carried both");
+}
+
 /// A pooled AnyTLS session whose server has stopped answering — gone, and
 /// no reset came —: the request that reuses it fails when the three seconds
 /// a reused session gives a new stream are up, not at the relay's idle

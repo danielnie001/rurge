@@ -26,6 +26,7 @@ use crate::outbound::untrusted_text;
 use crate::task::AbortOnDrop;
 use rurge_net::connector::BoxedStream;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -289,6 +290,10 @@ pub(crate) struct Session {
     /// What the server gets to answer a stream opened on the session once
     /// it is reused.
     synack_timeout: Duration,
+    /// Where the connection goes, noted by the dial that made it: a session
+    /// lent from the pool gives it to the request that did not dial (`the
+    /// phase 4 / M4b plan's P9 ③`).
+    peer: Option<SocketAddr>,
     _task: AbortOnDrop,
 }
 
@@ -330,8 +335,19 @@ impl Session {
             next_sid: 0,
             fresh: true,
             synack_timeout: SYNACK_TIMEOUT,
+            peer: None,
             _task: AbortOnDrop(task),
         }
+    }
+
+    /// The session goes where `peer` says, as the dial that made it noted.
+    pub(crate) fn with_peer(self, peer: Option<SocketAddr>) -> Session {
+        Session { peer, ..self }
+    }
+
+    /// Where the session's connection goes, as its dial noted it.
+    pub(crate) fn peer(&self) -> Option<SocketAddr> {
+        self.peer
     }
 
     /// The session with another time than `SYNACK_TIMEOUT` for the server

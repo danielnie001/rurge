@@ -103,6 +103,8 @@ impl AnyTlsOutbound {
 
     async fn new_session(&self, opts: &ConnectOpts) -> Result<Session, OutboundError> {
         let mut io = self.stack.open(opts).await?;
+        // where the dial sent the session, before anything is written on it
+        let peer = rurge_net::trail::current().and_then(|trail| trail.peer());
         let scheme = self.scheme.lock().expect("scheme").clone();
         let padding = scheme.auth_padding(&mut pick);
         // one write, one TLS record: the reference server takes the whole
@@ -114,7 +116,9 @@ impl AnyTlsOutbound {
         io.write_all(&auth).await?;
         io.flush().await?;
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        Ok(Session::start(seq, io, self.scheme.clone()).with_synack_timeout(self.synack_timeout))
+        Ok(Session::start(seq, io, self.scheme.clone())
+            .with_synack_timeout(self.synack_timeout)
+            .with_peer(peer))
     }
 
     async fn open(&self, address: &[u8], opts: &ConnectOpts) -> Result<BoxedStream, OutboundError> {
@@ -127,7 +131,13 @@ impl AnyTlsOutbound {
         };
         // an idle session may have died since it was pooled: try the next one, then dial
         while let Some(session) = self.pool.as_ref().and_then(|p| p.take()) {
+            // the session was dialled under another request's trail: this one
+            // leaves rurge by it too (`the phase 4 / M4b plan's P9 ③`)
+            let peer = session.peer();
             if let Ok(stream) = session.open(address, pool.clone()).await {
+                if let Some(peer) = peer {
+                    rurge_net::trail::connected(peer);
+                }
                 return Ok(Box::new(stream));
             }
         }
