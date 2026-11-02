@@ -226,7 +226,7 @@ mod tests {
     use super::testing::{H3Server, ServerStream, response_section};
     use super::*;
     use crate::quic::testing::{TestCert, endpoint, loopback_socket};
-    use crate::quic::{Path, Transport, client_config, connect};
+    use crate::quic::{Far, FarEnd, Path, Transport, client_config, connect};
     use bytes::Bytes;
     use http::{HeaderValue, Method, Request, Response};
     use quinn::{Connection, ConnectionError, Endpoint, SendStream, TransportConfig};
@@ -263,9 +263,11 @@ mod tests {
         tune(&mut server_transport);
         config.transport_config(Arc::new(server_transport));
         let server = endpoint(config, loopback_socket());
+        let remote = server.local_addr().unwrap();
         let path = Path {
             socket: loopback_socket(),
-            remote: server.local_addr().unwrap(),
+            remote,
+            far_end: FarEnd(Far::Fixed(Some(remote))),
             carrier: None,
         };
         let client = client_config(cert.client_tls(ALPN), transport).unwrap();

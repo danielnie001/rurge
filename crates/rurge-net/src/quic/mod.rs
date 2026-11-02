@@ -38,9 +38,36 @@ use std::sync::Arc;
 pub struct Path {
     pub socket: Arc<dyn AsyncUdpSocket>,
     pub remote: SocketAddr,
+    /// The far end of the hop the path's packets leave rurge by (`phase 4 M4
+    /// design 10.3`): the address quinn sends to for a direct path, the
+    /// carrier's for one that goes over it, and the port in use at the moment
+    /// for one that hops.
+    far_end: FarEnd,
     /// The carrier under `socket`, when the path goes over one: should it
     /// fail, it says why (`connect`).
     carrier: Option<Arc<carrier::Carried>>,
+}
+
+/// The far end of a path's packets as it is when read: fixed for a path that
+/// goes to one address, and the port in use at that moment for one that hops
+/// (`phase 4 M4 design 10.3`).
+#[derive(Clone, Debug)]
+pub struct FarEnd(Far);
+
+#[derive(Clone, Debug)]
+enum Far {
+    Fixed(Option<SocketAddr>),
+    Hopping(hop::Current),
+}
+
+impl FarEnd {
+    /// The far end now: a hopping path's port moves, and this follows it.
+    pub fn now(&self) -> Option<SocketAddr> {
+        match &self.0 {
+            Far::Fixed(addr) => *addr,
+            Far::Hopping(current) => Some(current.now()),
+        }
+    }
 }
 
 impl Path {
@@ -93,6 +120,7 @@ impl Path {
                 Path {
                     socket: socket::direct_socket(direct, remote)?,
                     remote,
+                    far_end: FarEnd(Far::Fixed(Some(remote))),
                     carrier: None,
                 }
             }
@@ -103,9 +131,11 @@ impl Path {
                 let open = move || socket::direct_socket(&direct, SocketAddr::new(server, 0));
                 let hopping =
                     hop::Hopping::start(server, &hopping.ports, hopping.interval, Box::new(open))?;
+                let far_end = FarEnd(Far::Hopping(hopping.current()));
                 Path {
                     remote: hopping.remote(),
                     socket: Arc::new(hopping),
+                    far_end,
                     carrier: None,
                 }
             }
@@ -114,10 +144,14 @@ impl Path {
                     Some(name) => connector.connect_udp_resolved(name, server, opts).await?,
                     None => connector.connect_udp(server, opts).await?,
                 };
+                // the carrier's own far end, which `Carried::new` takes over:
+                // not the stand-in quinn is given
+                let far_end = FarEnd(Far::Fixed(carrier.far_end()));
                 let carried = Arc::new(carrier::Carried::new(carrier));
                 Path {
                     socket: carried.clone(),
                     remote: carrier::STAND_IN,
+                    far_end,
                     carrier: Some(carried),
                 }
             }
@@ -143,6 +177,14 @@ impl Path {
     /// sets it.
     pub fn is_carried(&self) -> bool {
         self.carrier.is_some()
+    }
+
+    /// The far end of the hop the path's packets leave rurge by, read when a
+    /// session records where it went (`phase 4 M4 design 10.3`): not what
+    /// quinn knows the server by, which is the stand-in over a carrier and the
+    /// first port for a path that hops.
+    pub fn far_end(&self) -> FarEnd {
+        self.far_end.clone()
     }
 }
 
@@ -449,6 +491,10 @@ mod tests {
             }
             self.0.poll_recv(cx, buf)
         }
+
+        fn far_end(&self) -> Option<SocketAddr> {
+            self.0.far_end()
+        }
     }
 
     impl Connector for Chained {
@@ -490,6 +536,41 @@ mod tests {
         let connection = dial(path, &cert, &Transport::STANDARD).await.unwrap();
         echoes(&connection).await;
         assert_eq!(connection.stats().path.sent_plpmtud_probes, 0);
+    }
+
+    /// A direct path's far end is the address of the server it sends to: the
+    /// one a session over it left rurge by.
+    #[tokio::test]
+    async fn a_direct_path_far_end_is_its_remote() {
+        let cert = TestCert::new();
+        let server = EchoServer::spawn(cert.server_config(ALPN));
+        let path = open(
+            &direct(),
+            &at("127.0.0.1", server.addr().port()),
+            None,
+            Tristate::Auto,
+        )
+        .await;
+        assert_eq!(path.far_end().now(), Some(path.remote));
+        assert_eq!(path.remote, server.addr());
+    }
+
+    /// A carried path's far end is the carrier's, not the stand-in quinn knows
+    /// the server by: a session over it left rurge by the carrier's hop.
+    #[tokio::test]
+    async fn a_carried_path_far_end_is_its_carriers_not_the_stand_in() {
+        let cert = TestCert::new();
+        let server = EchoServer::spawn(cert.server_config(ALPN));
+        let chain = Chained::default();
+        let named = at("quic.test", server.addr().port());
+        let path = open(&chain, &named, None, Tristate::Auto).await;
+        assert_eq!(path.remote, carrier::STAND_IN, "quinn knows the stand-in");
+        let far = Some(SocketAddr::new(
+            IpAddr::from([127, 0, 0, 1]),
+            server.addr().port(),
+        ));
+        assert_eq!(path.far_end().now(), far);
+        assert_ne!(path.far_end().now(), Some(path.remote));
     }
 
     /// A path says whether it goes over a carrier, whatever lies over it

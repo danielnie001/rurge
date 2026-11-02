@@ -198,6 +198,24 @@ impl Hopping {
     pub(crate) fn remote(&self) -> SocketAddr {
         self.shared.remote
     }
+
+    /// The port this socket sends to right now.
+    pub(crate) fn current(&self) -> Current {
+        Current(self.shared.clone())
+    }
+}
+
+/// A hopping socket's port as it is when read: the port a hop moves, kept
+/// so that what records a far end sees the port in use when it reads
+/// (`phase 4 M4 design 10.3`).
+#[derive(Clone, Debug)]
+pub(crate) struct Current(Arc<Shared>);
+
+impl Current {
+    /// The server's address with the port in use now.
+    pub(crate) fn now(&self) -> SocketAddr {
+        SocketAddr::new(self.0.server, self.0.state().port)
+    }
 }
 
 impl Drop for Hopping {
@@ -488,6 +506,29 @@ mod tests {
             assert!(Instant::now() < deadline, "no hops");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// What reads the current port follows the hops: the server's address
+    /// with the port in use at that moment, and another port after a hop.
+    #[tokio::test]
+    async fn the_current_port_follows_the_hops() {
+        let server = server(3).await;
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let socket = Hopping::start(
+            ip,
+            &ports_of(&server),
+            Duration::from_secs(3600),
+            Box::new(loopback),
+        )
+        .unwrap();
+        let before = socket.current().now();
+        assert_eq!(before, SocketAddr::new(ip, socket.shared.state().port));
+        assert_eq!(before, socket.remote(), "starts on the port quinn knows");
+        socket.shared.hop(loopback().unwrap());
+        let after = socket.current().now();
+        assert_eq!(after, SocketAddr::new(ip, socket.shared.state().port));
+        assert_ne!(after, before, "a hop moves the port");
+        assert_ne!(after, socket.remote(), "and never back to the first one");
     }
 
     /// The timer is the socket's: it ends when the socket goes.

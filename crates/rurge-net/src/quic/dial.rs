@@ -297,6 +297,7 @@ mod tests {
     use super::*;
     use crate::connector::Datagram;
     use crate::quic::carrier::{Carried, STAND_IN};
+    use crate::quic::{Far, FarEnd};
     use bytes::Bytes;
     use quinn::udp::RecvMeta;
     use quinn::{ApplicationClose, AsyncUdpSocket, ConnectionClose};
@@ -629,6 +630,7 @@ mod tests {
             let path = Path {
                 socket: carried.clone(),
                 remote: STAND_IN,
+                far_end: FarEnd(Far::Fixed(None)),
                 carrier: Some(carried),
             };
             connect(path, &config, "localhost")
