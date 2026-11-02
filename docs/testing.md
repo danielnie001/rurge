@@ -283,7 +283,7 @@ cargo run -p rurge -- service install -c config.conf --user --dry-run   # 打印
 
 ### 阶段 3 / M3a 起：`rurge-tun`
 
-阶段 3 / M3a 起另有一条：`rurge-tun` 的用例只拨用例写给假 `Dialer` 的回环地址（写了别的就 panic），所以没有一条的连接能离开回环；起 TUN 的辅助都经 `src/tests/support.rs` 的 `tun_dialing`（`Tun::start` 只在这一处调，M3b 加参数只改它）；要一连开关上千条回环 TCP 连接的用例，上游用内存里的（`Script::MemoryEcho`），不用回环上的服务器——两千条连接在开发机上用光过临时端口（`os error 10048`，单独连着跑 12 次红 9 次）；跑 TUN 核心的用例不暂停 tokio 的时钟（核心读 `std::time::Instant`，夹具跟 tokio 的时钟，混着暂停会空转），计时的用例在真实的时间里跑：能调的取短的选项（保活 100 毫秒、超时 3 秒、`linger`、`drop_hold`），停止的宽限 `STOP_GRACE`（1 秒）是真等的，用例给它的余量 `MARGIN` 是 3 秒。
+阶段 3 / M3a 起另有一条：`rurge-tun` 的用例只拨用例写给假 `Dialer` 的回环地址（写了别的就 panic），所以没有一条的连接能离开回环；起 TUN 的辅助都经 `src/tests/support.rs` 的 `tun_dialing`（`Tun::start` 只在这一处调，M3b 加参数只改它）；要一连开关上千条回环 TCP 连接的用例，上游用内存里的（`Script::MemoryEcho`），不用回环上的服务器——两千条连接在开发机上用光过临时端口（`os error 10048`，单独连着跑 12 次红 9 次）；跑 TUN 核心的用例不暂停 tokio 的时钟（核心读 `std::time::Instant`，夹具跟 tokio 的时钟，混着暂停会空转），计时的用例在真实的时间里跑：能调的取短的选项（保活 100 毫秒、超时 3 秒、`linger`、`drop_hold`），停止的宽限 `STOP_GRACE`（1 秒）是真等的，用例给它的余量 `MARGIN` 是 3 秒。要片或写者被挡住才成立的用例，前提在各任务的任何先后下都要成立：读设备的任务从不等队列（预算装不下就丢），片一轮至多取 `INGRESS_PER_WAKE` 个，写者一轮从每个队列至多取 `writer_queue` 批，所以预算要装得下比片被挡住之前能取的更多的包；`tests::dispatch` 的那一条另有一份跑在当前线程的运行时上，让读设备的任务跑在片前面，旧的预算在那里三次都红在与 CI 相同的那一行（CI 运行 41402787066 在 macOS 上撞上过，M4b 记录第 75 ～ 80 行）。
 
 ### 第二次 CI 运行起：UDP 的缓冲
 
