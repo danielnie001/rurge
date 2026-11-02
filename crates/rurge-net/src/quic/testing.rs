@@ -1,7 +1,9 @@
 //! Loopback QUIC servers for tests: a certificate and the configurations on
 //! either side of it, an echo server, a server socket on several ports for
 //! port hopping, a port whose endpoints restart, and a client's first
-//! datagram. Never used by production code.
+//! datagram. Also Initial packets sealed frame by frame, the datagrams they
+//! come in, and the ClientHello rustls writes, for the tests that read them
+//! (phase 4 / M5a). Never used by production code.
 
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::udp::{RecvMeta, Transmit};
@@ -522,6 +524,475 @@ pub fn client_initial_with_quic_bit(version: u32, dcid: &[u8], quic_bit: bool) -
     datagram
 }
 
+// The frames an Initial packet carries, and the packets themselves: what
+// `initial.rs` reads is built here, byte by byte (phase 4 / M5a plan P3).
+
+/// A frame of an Initial packet, as `encode` writes it: the frames these
+/// tests need, not every frame QUIC has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Frame {
+    /// `count` zero bytes; one frame or several, a reader cannot tell them
+    /// apart (RFC 9000 §19.1).
+    Padding(usize),
+    Ping,
+    Ack {
+        largest: u64,
+        delay: u64,
+        first_range: u64,
+        /// Each further range as the gap before it and its length
+        /// (RFC 9000 §19.3.1).
+        ranges: Vec<(u64, u64)>,
+        /// The three ECN counts, where the frame carries them (type 0x03).
+        ecn: Option<[u64; 3]>,
+    },
+    Crypto {
+        offset: u64,
+        data: Vec<u8>,
+    },
+    ConnectionClose {
+        error: u64,
+        frame_type: u64,
+        reason: Vec<u8>,
+    },
+    /// Bytes written as they are: a frame an Initial may not carry, or one
+    /// cut short, for the reader to trip over.
+    Raw(Vec<u8>),
+}
+
+impl Frame {
+    /// Write the frame into `out`.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Frame::Padding(count) => out.resize(out.len() + count, 0),
+            Frame::Ping => out.push(0x01),
+            Frame::Ack {
+                largest,
+                delay,
+                first_range,
+                ranges,
+                ecn,
+            } => {
+                out.push(if ecn.is_some() { 0x03 } else { 0x02 });
+                varint(out, *largest);
+                varint(out, *delay);
+                varint(out, u64::try_from(ranges.len()).expect("a range count"));
+                varint(out, *first_range);
+                for (gap, length) in ranges {
+                    varint(out, *gap);
+                    varint(out, *length);
+                }
+                if let Some(counts) = ecn {
+                    for count in counts {
+                        varint(out, *count);
+                    }
+                }
+            }
+            Frame::Crypto { offset, data } => {
+                out.push(0x06);
+                varint(out, *offset);
+                varint(out, u64::try_from(data.len()).expect("a length"));
+                out.extend_from_slice(data);
+            }
+            Frame::ConnectionClose {
+                error,
+                frame_type,
+                reason,
+            } => {
+                out.push(0x1c);
+                varint(out, *error);
+                varint(out, *frame_type);
+                varint(out, u64::try_from(reason.len()).expect("a length"));
+                out.extend_from_slice(reason);
+            }
+            Frame::Raw(bytes) => out.extend_from_slice(bytes),
+        }
+    }
+}
+
+/// A variable-length integer in the shortest form that holds `value`
+/// (RFC 9000 §16).
+fn varint(out: &mut Vec<u8>, value: u64) {
+    match value {
+        0..=0x3f => out.push(value as u8),
+        0x40..=0x3fff => out.extend_from_slice(&(0x4000u16 | value as u16).to_be_bytes()),
+        0x4000..=0x3fff_ffff => {
+            out.extend_from_slice(&(0x8000_0000u32 | value as u32).to_be_bytes())
+        }
+        _ => out.extend_from_slice(&(0xc000_0000_0000_0000u64 | value).to_be_bytes()),
+    }
+}
+
+/// An Initial packet to seal, and what to seal it with.
+#[derive(Clone, Debug)]
+pub struct Initial {
+    /// The version on the wire: 1, 0x6b3343cf, or a draft 0xff00001d to
+    /// 0xff000020. `seal` panics on any other.
+    pub version: u32,
+    /// The Destination Connection ID the packet names.
+    pub dcid: Vec<u8>,
+    /// The bytes its keys come from: the Destination Connection ID, unless
+    /// a test says otherwise.
+    pub keys_from: Vec<u8>,
+    pub number: u64,
+    /// One to four: how many bytes of `number` the packet carries. `new`
+    /// picks the shortest that holds `number`; a test may set another.
+    pub number_len: usize,
+    pub frames: Vec<Frame>,
+}
+
+impl Initial {
+    /// An Initial of `version` to `dcid`, packet number `number`, sealed
+    /// with the keys of `dcid` and carrying the shortest packet number that
+    /// holds `number`.
+    pub fn new(version: u32, dcid: &[u8], number: u64, frames: Vec<Frame>) -> Initial {
+        let number_len = match number {
+            0..=0xff => 1,
+            0x100..=0xffff => 2,
+            0x1_0000..=0xff_ffff => 3,
+            _ => 4,
+        };
+        Initial {
+            version,
+            dcid: dcid.to_vec(),
+            keys_from: dcid.to_vec(),
+            number,
+            number_len,
+            frames,
+        }
+    }
+
+    /// The packet, sealed and protected: a long header with this version's
+    /// Initial type and an empty token, the frames as the plaintext, and
+    /// `size` bytes in all — the rest PADDING — or, when `size` is `None`,
+    /// just the frames padded to the least that header protection needs.
+    /// Panics where the frames do not fit.
+    pub fn seal(&self, size: Option<usize>) -> Vec<u8> {
+        assert!(
+            (1..=4).contains(&self.number_len),
+            "one to four bytes of packet number, not {}",
+            self.number_len
+        );
+        let quic = crate::quic::initial::quic_version(self.version).unwrap_or_else(|| {
+            panic!(
+                "not a version whose Initial keys we have: {:#x}",
+                self.version
+            )
+        });
+        let kind: u8 = match quic {
+            rustls::quic::Version::V2 => 0b01,
+            _ => 0b00,
+        };
+        let mut plaintext = Vec::new();
+        for frame in &self.frames {
+            frame.encode(&mut plaintext);
+        }
+        // header protection samples the ciphertext from four bytes past the
+        // packet number's start (RFC 9001 §5.4.2), so the plaintext is at
+        // least what is left of those four bytes after the packet number
+        let least = 4usize.saturating_sub(self.number_len);
+        plaintext.resize(plaintext.len().max(least), 0);
+
+        // the header up to the packet number: the first byte, the version,
+        // the Destination Connection ID's length and itself, the source
+        // connection ID's length, the token's length, the two-byte Length
+        let header_len = 1 + 4 + 1 + self.dcid.len() + 1 + 1 + 2;
+        if let Some(size) = size {
+            let room = size
+                .checked_sub(header_len + self.number_len + 16)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a {size}-byte packet has no room for a {header_len}-byte header, \
+                         {} bytes of packet number and the tag",
+                        self.number_len
+                    )
+                });
+            if plaintext.len() > room {
+                panic!(
+                    "the frames take {} bytes, {} more than a {size}-byte packet has room for",
+                    plaintext.len(),
+                    plaintext.len() - room
+                );
+            }
+            plaintext.resize(room, 0);
+        }
+
+        let length = self.number_len + plaintext.len() + 16;
+        if length > 0x3fff {
+            panic!("a Length of {length} bytes does not fit two bytes");
+        }
+        let length = length as u16;
+
+        let mut datagram = Vec::with_capacity(header_len + self.number_len + plaintext.len() + 16);
+        datagram.push(
+            0x80 | 0x40
+                | (kind << 4)
+                | u8::try_from(self.number_len - 1).expect("one to four bytes of packet number"),
+        );
+        datagram.extend_from_slice(&self.version.to_be_bytes());
+        datagram.push(u8::try_from(self.dcid.len()).expect("a connection ID of at most 255 bytes"));
+        datagram.extend_from_slice(&self.dcid);
+        datagram.push(0); // source connection ID length
+        datagram.push(0); // token length
+        datagram.extend_from_slice(&(0x4000u16 | length).to_be_bytes());
+        let pn_offset = datagram.len();
+        datagram.extend_from_slice(&self.number.to_be_bytes()[8 - self.number_len..]);
+        datagram.extend_from_slice(&plaintext);
+
+        let keys = crate::quic::initial::initial_suite().keys(&self.keys_from, Side::Client, quic);
+        let (header, payload) = datagram.split_at_mut(pn_offset + self.number_len);
+        let tag = keys
+            .local
+            .packet
+            .encrypt_in_place(self.number, header, payload)
+            .expect("a payload the AEAD takes");
+        datagram.extend_from_slice(tag.as_ref());
+
+        // header protection: the sample is the ciphertext at the packet
+        // number offset plus four, and it masks the first byte's low bits and
+        // the packet number's bytes (RFC 9001 §5.4)
+        let sample: [u8; 16] = datagram[pn_offset + 4..pn_offset + 4 + 16]
+            .try_into()
+            .expect("the sample");
+        let mut first = datagram[0];
+        let mut number = [0u8; 4];
+        number.copy_from_slice(&datagram[pn_offset..pn_offset + 4]);
+        keys.local
+            .header
+            .encrypt_in_place(&sample, &mut first, &mut number)
+            .expect("a 16-byte sample");
+        datagram[0] = first;
+        // only the packet number's own bytes are protected: what follows is
+        // ciphertext that the masking must not touch
+        datagram[pn_offset..pn_offset + self.number_len]
+            .copy_from_slice(&number[..self.number_len]);
+        datagram
+    }
+}
+
+/// A long-header packet that is not sealed: `kind` in bits 4 and 5 of the
+/// first byte (the caller gives the version's numbering), no token, a
+/// two-byte Length of `payload`, then `payload` bytes of 0x5a. A reader
+/// skips it by its Length.
+pub fn long_packet(version: u32, kind: u8, dcid: &[u8], payload: usize) -> Vec<u8> {
+    let length = u16::try_from(payload).expect("a payload of at most 65535 bytes");
+    let mut packet = Vec::with_capacity(payload + 16);
+    packet.push(0x80 | 0x40 | ((kind & 0b11) << 4));
+    packet.extend_from_slice(&version.to_be_bytes());
+    packet.push(u8::try_from(dcid.len()).expect("a connection ID of at most 255 bytes"));
+    packet.extend_from_slice(dcid);
+    packet.push(0); // source connection ID length
+    packet.extend_from_slice(&(0x4000u16 | length).to_be_bytes());
+    packet.resize(packet.len() + payload, 0x5a);
+    packet
+}
+
+/// The packets joined into one datagram, padded with zeros where they are
+/// shorter than `pad_to` bytes (RFC 9000 §12.2).
+pub fn datagram(packets: &[Vec<u8>], pad_to: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pad_to);
+    for packet in packets {
+        out.extend_from_slice(packet);
+    }
+    out.resize(out.len().max(pad_to), 0);
+    out
+}
+
+/// The ClientHello a rustls client writes for one QUIC connection: one
+/// handshake message, with no handshake made. `server_name` becomes the
+/// Server Name, or, where it is `None`, an address, which rustls leaves out
+/// of the Server Name extension. The transport parameters carry one
+/// `initial_max_data` of one mebibyte (RFC 9000 §18.2); rustls writes them
+/// without checking them.
+pub fn client_hello(server_name: Option<&str>, alpn: &[&[u8]]) -> Vec<u8> {
+    let config = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let name = match server_name {
+        Some(name) => {
+            rustls::pki_types::ServerName::try_from(name.to_string()).expect("a server name")
+        }
+        None => rustls::pki_types::ServerName::IpAddress(
+            std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST).into(),
+        ),
+    };
+    let alpn: Vec<Vec<u8>> = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+    let mut connection = rustls::quic::ClientConnection::new_with_alpn(
+        Arc::new(config),
+        rustls::quic::Version::V1,
+        name,
+        vec![0x04, 0x04, 0x80, 0x10, 0x00, 0x00],
+        alpn,
+    )
+    .expect("a QUIC client");
+    let mut hello = Vec::new();
+    connection.write_hs(&mut hello);
+    hello
+}
+
+/// A ClientHello too big for one 1200-byte datagram and small enough for
+/// the two `hello_initials` splits it into (phase 4 / M5a plan P3 6, and the
+/// coordinator's ruling in that plan's execution record row 9): the ALPN
+/// list is long enough to take it there.
+pub fn big_client_hello(server_name: Option<&str>) -> Vec<u8> {
+    /// The number of ALPN names that puts a hello with a Server Name and one
+    /// without one both between 1550 and 1700 bytes: each name adds nineteen
+    /// bytes, so 74 names are 1601 bytes with a Server Name and 1583
+    /// without, and `hello_initials`' second packet (1001 bytes from offset
+    /// 600) still fits its 1200.
+    const NAMES: usize = 74;
+    let names: Vec<String> = (0..NAMES)
+        .map(|at| format!("rurge-test-alpn-{at:02}"))
+        .collect();
+    let alpn: Vec<&[u8]> = names.iter().map(|name| name.as_bytes()).collect();
+    client_hello(server_name, &alpn)
+}
+
+/// One datagram carrying the whole ClientHello from offset zero, sealed to
+/// 1200 bytes.
+pub fn hello_initial(dcid: &[u8], hello: &[u8]) -> Vec<u8> {
+    let frames = vec![Frame::Crypto {
+        offset: 0,
+        data: hello.to_vec(),
+    }];
+    Initial::new(1, dcid, 0, frames).seal(Some(1200))
+}
+
+/// Two datagrams: the first carries the ClientHello's bytes from zero up to
+/// `at` in packet 0, the second the rest from `at` in packet 1, each sealed
+/// to 1200 bytes.
+pub fn hello_initials(dcid: &[u8], hello: &[u8], at: usize) -> [Vec<u8>; 2] {
+    let offset = u64::try_from(at).expect("an offset of at most 64 KiB");
+    let first = vec![Frame::Crypto {
+        offset: 0,
+        data: hello[..at].to_vec(),
+    }];
+    let second = vec![Frame::Crypto {
+        offset,
+        data: hello[at..].to_vec(),
+    }];
+    [
+        Initial::new(1, dcid, 0, first).seal(Some(1200)),
+        Initial::new(1, dcid, 1, second).seal(Some(1200)),
+    ]
+}
+
+/// A SplitMix64 generator (Steele, Lea and Flood, 2014): a seed in, the same
+/// numbers out, which is all these tests need. Nothing a secret depends on
+/// uses it.
+#[derive(Clone, Debug)]
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> SplitMix64 {
+        SplitMix64 { state: seed }
+    }
+
+    fn next(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// A number below `n`, which must not be zero. The bias of taking a
+    /// remainder is nothing these tests mind.
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % u64::try_from(n).expect("a count of at least one")) as usize
+    }
+}
+
+/// The pieces of a ClientHello broken up as a browser breaks them: each cut
+/// at random places into two to ten more CRYPTO frames than there were
+/// pieces, with several PINGs and a little PADDING among them, all in a
+/// random order (QUICHE's `quic_chaos_protector.cc`, taken as fact: phase 4
+/// M5 design 4.2). Which bytes a frame carries stays the same.
+pub fn chaos_frames(pieces: &[(u64, &[u8])], seed: u64) -> Vec<Frame> {
+    let mut rng = SplitMix64::new(seed);
+    // each piece as the frames it is cut into: an offset and a length each
+    let mut segments: Vec<Vec<(u64, usize)>> = pieces
+        .iter()
+        .map(|(offset, data)| vec![(*offset, data.len())])
+        .collect();
+
+    let mut extra = 2 + rng.below(9);
+    while extra > 0 {
+        let cuttable: Vec<(usize, usize)> = segments
+            .iter()
+            .enumerate()
+            .flat_map(|(piece, frames)| {
+                frames
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, len))| *len > 1)
+                    .map(move |(frame, _)| (piece, frame))
+            })
+            .collect();
+        // a piece of one byte per frame cannot be cut again: fewer frames
+        // than asked for, as a browser would send them
+        let Some(&(piece, frame)) = cuttable.get(rng.below(cuttable.len().max(1))) else {
+            break;
+        };
+        let (offset, len) = segments[piece][frame];
+        let cut = offset + 1 + rng.below(len - 1) as u64;
+        segments[piece][frame] = (offset, usize::try_from(cut - offset).expect("a cut"));
+        segments[piece].insert(
+            frame + 1,
+            (
+                cut,
+                usize::try_from(offset + len as u64 - cut).expect("a cut"),
+            ),
+        );
+        extra -= 1;
+    }
+
+    let mut frames = Vec::new();
+    for (piece, (offset, data)) in pieces.iter().enumerate() {
+        for (at, len) in &segments[piece] {
+            let from = usize::try_from(at - offset).expect("an offset inside its piece");
+            frames.push(Frame::Crypto {
+                offset: *at,
+                data: data[from..from + len].to_vec(),
+            });
+        }
+    }
+    for _ in 0..2 + rng.below(9) {
+        frames.push(Frame::Ping);
+    }
+    for _ in 0..1 + rng.below(4) {
+        frames.push(Frame::Padding(1 + rng.below(8)));
+    }
+    // Fisher and Yates: every arrangement as likely as another
+    for at in (1..frames.len()).rev() {
+        frames.swap(at, rng.below(at + 1));
+    }
+    frames
+}
+
+/// What Chrome sends for one ClientHello in two packets (QUICHE's
+/// `MultiPacketChaosProtect`, taken as fact: phase 4 M5 design 4.2): the
+/// first carries the start and the end of the message, the second the
+/// middle.
+pub fn chrome_frames(hello: &[u8], seed: u64) -> [Vec<Frame>; 2] {
+    let mut rng = SplitMix64::new(seed);
+    let len = hello.len();
+    // the start the first packet carries: 55 to 86 bytes
+    let k = 55 + rng.below(32);
+    // and the end: what leaves the middle room in one 1200-byte datagram,
+    // and up to 64 bytes more
+    let e = (len - k).saturating_sub(1000) + rng.below(65);
+    let first = chaos_frames(
+        &[(0, &hello[..k]), (len as u64 - e as u64, &hello[len - e..])],
+        seed,
+    );
+    let second = chaos_frames(&[(k as u64, &hello[k..len - e])], seed ^ 1);
+    [first, second]
+}
+
 // The two RFCs' sample Initial packets, moved here from `initial.rs`'s
 // tests so that other tests can seal and read packets of their own
 // (phase 4 / M5a plan P3 9).
@@ -550,7 +1021,6 @@ pub fn unhex(hex: &str) -> Vec<u8> {
         .map(|pair| (hex_digit(pair[0]) << 4) | hex_digit(pair[1]))
         .collect()
 }
-
 
 // RFC 9001 A.2, SHA-256 of the 1200 bytes:
 // 73fa0210cb4a5a17dc10b9dc98e5cc359ba1c20fe7c0e93a9e1dcb473c37e097
@@ -637,3 +1107,419 @@ pub const RFC9369_CLIENT_INITIAL: &str = concat!(
     "9a37ddec600545473cfb5a05e08d0b209973b2172b4d21fb69745a262ccde96b",
     "a18b2faa745b6fe189cf772a9f84cbfc",
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quic::initial::{initial_suite, quic_version};
+    use rustls::Side;
+
+    /// The plaintext room a 1200-byte Initial leaves when its Destination
+    /// Connection ID is `RFC_DCID`'s eight bytes and its packet number one
+    /// byte: the header up to the packet number, the packet number and the
+    /// tag (phase 4 / M5a plan P3 2).
+    const ROOM: usize = 1200 - 18 - 1 - 16;
+
+    /// A variable-length integer (RFC 9000 §16) read by hand here, so that
+    /// these tests do not lean on the reader they check.
+    fn varint_at(buf: &[u8], at: usize) -> Option<(u64, usize)> {
+        let first = *buf.get(at)?;
+        let len = 1usize << (first >> 6);
+        let bytes = buf.get(at..at + len)?;
+        let value = bytes[1..]
+            .iter()
+            .fold(u64::from(first & 0x3f), |value, byte| {
+                (value << 8) | u64::from(*byte)
+            });
+        Some((value, len))
+    }
+
+    /// The packet number and the plaintext of a sealed Initial packet: the
+    /// header read, header protection taken off and the payload decrypted
+    /// with `keys_from`'s keys, all by hand. This is an independent check on
+    /// `Initial::seal`, which is why it uses neither `header` nor `opens`:
+    /// `None` where the packet does not open.
+    fn unseal(packet: &[u8], keys_from: &[u8]) -> Option<(u64, Vec<u8>)> {
+        let version = quic_version(u32::from_be_bytes(packet.get(1..5)?.try_into().ok()?))?;
+        let dcid_len = usize::from(*packet.get(5)?);
+        let mut at = 6 + dcid_len;
+        let scid_len = usize::from(*packet.get(at)?);
+        at += 1 + scid_len;
+        let (token_len, used) = varint_at(packet, at)?;
+        at += used + usize::try_from(token_len).ok()?;
+        let (length, used) = varint_at(packet, at)?;
+        let pn_offset = at + used;
+        let body = packet.get(pn_offset..pn_offset + usize::try_from(length).ok()?)?;
+
+        let keys = initial_suite().keys(keys_from, Side::Server, version);
+        // the sample is the ciphertext at the packet number offset plus four
+        // (RFC 9001 §5.4.2)
+        let sample: [u8; 16] = body.get(4..20)?.try_into().ok()?;
+        let mut first = *packet.first()?;
+        let mut number = [0u8; 4];
+        number.copy_from_slice(body.get(..4)?);
+        keys.remote
+            .header
+            .decrypt_in_place(&sample, &mut first, &mut number)
+            .ok()?;
+        let number_len = usize::from(first & 0x03) + 1;
+        let mut aad = packet[..pn_offset].to_vec();
+        aad[0] = first;
+        aad.extend_from_slice(&number[..number_len]);
+        let mut payload = body[number_len..].to_vec();
+        let number = number[..number_len]
+            .iter()
+            .fold(0u64, |number, byte| (number << 8) | u64::from(*byte));
+        let plain = keys
+            .remote
+            .packet
+            .decrypt_in_place(number, &aad, &mut payload)
+            .ok()?
+            .to_vec();
+        Some((number, plain))
+    }
+
+    /// The frames of these tests' own packets: PADDING, PING and CRYPTO,
+    /// which are the three they write. Any other type is a bug in a test, so
+    /// it panics.
+    fn read_frames(plaintext: &[u8]) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        let mut at = 0;
+        while at < plaintext.len() {
+            match plaintext[at] {
+                // a run of zeros is one PADDING frame or several: one is
+                // enough to read them back
+                0x00 => {
+                    let start = at;
+                    while plaintext.get(at) == Some(&0x00) {
+                        at += 1;
+                    }
+                    frames.push(Frame::Padding(at - start));
+                }
+                0x01 => {
+                    frames.push(Frame::Ping);
+                    at += 1;
+                }
+                0x06 => {
+                    at += 1;
+                    let (offset, used) = varint_at(plaintext, at).expect("a CRYPTO offset");
+                    at += used;
+                    let (len, used) = varint_at(plaintext, at).expect("a CRYPTO length");
+                    at += used;
+                    let len = usize::try_from(len).expect("a CRYPTO length this test writes");
+                    let data = plaintext[at..at + len].to_vec();
+                    at += len;
+                    frames.push(Frame::Crypto { offset, data });
+                }
+                other => panic!("a frame these tests do not write: {other:#x}"),
+            }
+        }
+        frames
+    }
+
+    /// Only the CRYPTO frames, in the order they were written.
+    fn crypto(frames: &[Frame]) -> Vec<(u64, Vec<u8>)> {
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Crypto { offset, data } => Some((*offset, data.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The Ping frames' count.
+    fn pings(frames: &[Frame]) -> usize {
+        frames
+            .iter()
+            .filter(|frame| matches!(frame, Frame::Ping))
+            .count()
+    }
+
+    /// Where each byte of a message of `len` bytes came from: a CRYPTO
+    /// frame's, or nothing where no frame carried it. Panics where two
+    /// frames carry the same byte.
+    fn assemble(len: usize, crypto: &[(u64, Vec<u8>)]) -> Vec<Option<u8>> {
+        let mut out = vec![None; len];
+        for (offset, data) in crypto {
+            let offset = usize::try_from(*offset).expect("an offset these tests write");
+            for (i, byte) in data.iter().enumerate() {
+                assert!(out[offset + i].is_none(), "byte {} came twice", offset + i);
+                out[offset + i] = Some(*byte);
+            }
+        }
+        out
+    }
+
+    /// A 1200-byte datagram holding one Initial of packet number `number`
+    /// and `frames`. The frames have to fit the room such a packet leaves,
+    /// and `what` (the seed, where a test has one) rides along in the
+    /// message.
+    fn sealed(frames: &[Frame], number: u64, what: &str) -> Vec<u8> {
+        let mut plain = Vec::new();
+        for frame in frames {
+            frame.encode(&mut plain);
+        }
+        assert!(
+            plain.len() <= ROOM,
+            "{what}: {} bytes of frames, room for {ROOM}",
+            plain.len()
+        );
+        Initial::new(1, RFC_DCID, number, frames.to_vec()).seal(Some(1200))
+    }
+
+    /// Every frame `encode` writes reads back as written, in three versions
+    /// and with one to four bytes of packet number.
+    #[test]
+    fn every_frame_reads_back_as_written() {
+        let frames = vec![
+            Frame::Ack {
+                largest: 5,
+                delay: 3,
+                first_range: 2,
+                ranges: vec![(1, 2)],
+                ecn: Some([1, 2, 3]),
+            },
+            Frame::Ping,
+            Frame::Padding(3),
+            Frame::Crypto {
+                offset: 5,
+                data: b"hello".to_vec(),
+            },
+            Frame::ConnectionClose {
+                error: 0x0a,
+                frame_type: 0x06,
+                reason: b"bye".to_vec(),
+            },
+        ];
+        let mut written = Vec::new();
+        for frame in &frames {
+            frame.encode(&mut written);
+        }
+
+        for version in [1u32, 0x6b33_43cf, 0xff00_001d] {
+            for (number_len, number) in [
+                (1usize, 0x12u64),
+                (2, 0x1234),
+                (3, 0x12_3456),
+                (4, 0x1234_5678),
+            ] {
+                let mut initial = Initial::new(version, RFC_DCID, number, frames.clone());
+                initial.number_len = number_len;
+                let what = format!("{version:#x}, {number_len} bytes of packet number");
+
+                // no room to spare: the plaintext is the frames themselves
+                let packet = initial.seal(None);
+                let (read, plaintext) = unseal(&packet, RFC_DCID).expect("a packet of our own");
+                assert_eq!(read, number, "{what}");
+                assert!(
+                    plaintext.starts_with(&written),
+                    "{what}: the frames as written"
+                );
+
+                // sealed into 1200 bytes: the rest is PADDING
+                let packet = initial.seal(Some(1200));
+                assert_eq!(packet.len(), 1200, "{what}");
+                let (read, plaintext) = unseal(&packet, RFC_DCID).expect("a packet of our own");
+                assert_eq!(read, number, "{what}");
+                assert!(
+                    plaintext.starts_with(&written),
+                    "{what}: the frames as written"
+                );
+                assert!(
+                    plaintext[written.len()..].iter().all(|byte| *byte == 0),
+                    "{what}: the rest is PADDING"
+                );
+            }
+        }
+    }
+
+    /// A packet's keys come from `keys_from`, not from its Destination
+    /// Connection ID: only the keys it was sealed with open it.
+    #[test]
+    fn a_packet_sealed_with_other_keys_opens_only_with_them() {
+        let keys_from = [0xaa; 8];
+        let mut initial = Initial::new(1, RFC_DCID, 0, vec![Frame::Ping]);
+        initial.keys_from = keys_from.to_vec();
+        let packet = initial.seal(Some(1200));
+        assert!(
+            unseal(&packet, RFC_DCID).is_none(),
+            "the connection ID's keys"
+        );
+        assert!(
+            unseal(&packet, &keys_from).is_some(),
+            "the keys it was sealed with"
+        );
+    }
+
+    /// What rustls writes is one handshake message of type 1, with the
+    /// Server Name in it when there is one.
+    #[test]
+    fn the_hello_rustls_writes_is_one_client_hello() {
+        for name in [Some("held.test"), None] {
+            let hello = client_hello(name, &[b"h3"]);
+            assert_eq!(hello[0], 1, "{name:?}: the ClientHello's type");
+            let len = usize::try_from(u32::from_be_bytes([0, hello[1], hello[2], hello[3]]))
+                .expect("a length of a message this test builds");
+            assert_eq!(len + 4, hello.len(), "{name:?}: one handshake message");
+            assert_eq!(
+                hello.windows(9).any(|window| window == b"held.test"),
+                name.is_some(),
+                "{name:?}: the Server Name"
+            );
+        }
+    }
+
+    /// The big ClientHello does not fit one 1200-byte datagram, and does fit
+    /// the two `hello_initials` splits it into.
+    #[test]
+    fn a_big_hello_needs_two_packets() {
+        let hello = big_client_hello(Some("held.test"));
+        assert!(
+            (1500..=1900).contains(&hello.len()),
+            "{} bytes, and a 1200-byte datagram holds about 1160",
+            hello.len()
+        );
+        assert!(hello.windows(9).any(|window| window == b"held.test"));
+    }
+
+    /// Two packets carry the two halves of a ClientHello, numbered 0 and 1,
+    /// each datagram 1200 bytes long.
+    #[test]
+    fn hello_initials_carry_the_two_halves() {
+        let hello = big_client_hello(Some("held.test"));
+        let [first, second] = hello_initials(RFC_DCID, &hello, 600);
+        assert_eq!(first.len(), 1200);
+        assert_eq!(second.len(), 1200);
+
+        let (number, plaintext) = unseal(&first, RFC_DCID).expect("the first packet");
+        assert_eq!(number, 0);
+        assert_eq!(
+            crypto(&read_frames(&plaintext)),
+            [(0, hello[..600].to_vec())]
+        );
+
+        let (number, plaintext) = unseal(&second, RFC_DCID).expect("the second packet");
+        assert_eq!(number, 1);
+        assert_eq!(
+            crypto(&read_frames(&plaintext)),
+            [(600, hello[600..].to_vec())]
+        );
+    }
+
+    /// What a browser does: the first packet holds the start and the end of
+    /// the ClientHello, the second the middle, each with several CRYPTO
+    /// frames, PINGs and PADDING; both fit a 1200-byte datagram; together
+    /// they are the ClientHello byte for byte.
+    #[test]
+    fn chrome_frames_put_the_start_and_the_end_first() {
+        let hello = big_client_hello(Some("held.test"));
+        let len = hello.len();
+        for seed in 0..32u64 {
+            let [first, second] = chrome_frames(&hello, seed);
+            assert!(
+                pings(&first) >= 1,
+                "seed {seed}: the first packet has a PING"
+            );
+            assert!(
+                pings(&second) >= 1,
+                "seed {seed}: the second packet has a PING"
+            );
+            let one = sealed(&first, 0, &format!("seed {seed}, the first packet"));
+            let two = sealed(&second, 1, &format!("seed {seed}, the second packet"));
+
+            let (number, plaintext) = unseal(&one, RFC_DCID).expect("the first packet");
+            assert_eq!(number, 0, "seed {seed}");
+            let start = assemble(len, &crypto(&read_frames(&plaintext)));
+            let (number, plaintext) = unseal(&two, RFC_DCID).expect("the second packet");
+            assert_eq!(number, 1, "seed {seed}");
+            let middle = assemble(len, &crypto(&read_frames(&plaintext)));
+
+            // the first packet's bytes are a prefix and a suffix
+            let k = start.iter().position(Option::is_none).unwrap_or(len);
+            let e = start
+                .iter()
+                .rposition(Option::is_none)
+                .map_or(0, |at| len - at - 1);
+            assert!((55..=86).contains(&k), "seed {seed}: k = {k}");
+            assert!(
+                start[k..len - e].iter().all(Option::is_none),
+                "seed {seed}: the middle is the second packet's"
+            );
+            assert!(
+                start[..k]
+                    .iter()
+                    .chain(&start[len - e..])
+                    .all(Option::is_some),
+                "seed {seed}: the start and the end are the first packet's"
+            );
+            assert!(
+                middle[k..len - e].iter().all(Option::is_some),
+                "seed {seed}: the middle is the second packet's"
+            );
+            assert!(
+                middle[..k]
+                    .iter()
+                    .chain(&middle[len - e..])
+                    .all(Option::is_none),
+                "seed {seed}: the start and the end are the first packet's"
+            );
+            for (at, byte) in hello.iter().enumerate() {
+                assert_eq!(
+                    start[at].or(middle[at]),
+                    Some(*byte),
+                    "seed {seed}, byte {at}"
+                );
+            }
+        }
+    }
+
+    /// `chaos_frames` covers its pieces byte for byte, in more CRYPTO frames
+    /// than there were pieces, with several PINGs. The asserion messages
+    /// carry the seed.
+    #[test]
+    fn chaos_frames_cover_their_pieces() {
+        let hello = big_client_hello(Some("held.test"));
+        let pieces: [(u64, &[u8]); 2] = [(0, &hello[..500]), (500, &hello[500..])];
+        for seed in 0..64u64 {
+            let frames = chaos_frames(&pieces, seed);
+            let cryptos = crypto(&frames).len();
+            assert!(
+                (pieces.len() + 2..=pieces.len() + 10).contains(&cryptos),
+                "seed {seed}: {cryptos} CRYPTO frames for {} pieces",
+                pieces.len()
+            );
+            let pings = pings(&frames);
+            assert!((2..=10).contains(&pings), "seed {seed}: {pings} PINGs");
+
+            let covered = assemble(hello.len(), &crypto(&frames));
+            for (at, byte) in hello.iter().enumerate() {
+                assert_eq!(covered[at], Some(*byte), "seed {seed}, byte {at}");
+            }
+        }
+    }
+
+    /// `datagram` joins packets and pads what is short of its length with
+    /// zeros.
+    #[test]
+    fn datagram_pads_with_zeros() {
+        let packet = Initial::new(1, RFC_DCID, 0, vec![Frame::Ping]).seal(Some(1200));
+        let padded = datagram(std::slice::from_ref(&packet), 1300);
+        assert_eq!(padded.len(), 1300);
+        assert!(padded.starts_with(&packet));
+        assert!(padded[packet.len()..].iter().all(|byte| *byte == 0));
+    }
+
+    /// An unsealed long-header packet ends where its Length says: the reader
+    /// skips what it does not read by that field alone.
+    #[test]
+    fn a_long_packet_ends_where_its_length_says() {
+        let packet = long_packet(1, 0b01, RFC_DCID, 100);
+        // no token: the Length field follows the source connection ID's
+        // length (RFC 9000 §17.2.2)
+        let at = 7 + RFC_DCID.len();
+        assert_eq!(packet[at], 0x40);
+        assert_eq!(usize::from(packet[at + 1]), 100);
+        assert_eq!(packet.len(), at + 2 + 100);
+    }
+}
