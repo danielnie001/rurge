@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
@@ -1384,6 +1384,107 @@ async fn requests_carry_the_listen_port_the_remote_address_and_the_lookup_time()
     assert_eq!(live["listenPort"], port);
     assert_eq!(live["remoteAddr"], target);
     assert!(live["dnsMs"].is_u64(), "{live}");
+}
+
+/// The three keys the request record gained for M4b (`phase 4 M4 design
+/// 10.1`), read back from the API: the two body counts of an HTTP request,
+/// and the span from the first byte back from upstream to the end. A tunnel
+/// that carried bytes is no HTTP request and counts no body, and its record
+/// says which far end it left by (`phase 4 M4 design 10.3`).
+#[tokio::test]
+async fn the_request_records_carry_the_three_new_keys() {
+    let api = api().await;
+    // a POST with a nine-byte body, answered by the target's eight bytes
+    let host = format!("target.test:{}", api.target_port());
+    let mut posted = TcpStream::connect(api.http()).await.unwrap();
+    posted
+        .write_all(
+            format!(
+                "POST {} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 9\r\nConnection: close\r\n\r\n123456789",
+                api.target_url()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), posted.read_to_end(&mut buf))
+        .await
+        .expect("the answer in time")
+        .unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = match text.find("\r\n\r\n") {
+        Some(pos) => text.split_at(pos + 4),
+        None => (text.as_str(), ""),
+    };
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, "hi there");
+    let mut served = Value::Null;
+    wait_until(async || {
+        let body = get(&api, "/v1/requests/recent").await.1;
+        served = body["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["method"] == "POST" && r["status"] == "completed")
+            .cloned()
+            .unwrap_or(Value::Null);
+        !served.is_null()
+    })
+    .await;
+    assert_eq!(served["requestBodyBytes"], 9, "{served}");
+    assert_eq!(served["responseBodyBytes"], "hi there".len(), "{served}");
+    assert!(served["receiveMs"].is_u64(), "{served}");
+
+    // a tunnel to an echo that nothing sniffs: no body at all
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = echo.accept().await.unwrap();
+        let mut ping = [0u8; 4];
+        stream.read_exact(&mut ping).await.unwrap();
+        stream.write_all(&ping).await.unwrap();
+    });
+    let mut tunnel = TcpStream::connect(api.http()).await.unwrap();
+    tunnel
+        .write_all(format!("CONNECT {echo_addr} HTTP/1.1\r\nHost: {echo_addr}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(5), tunnel.read(&mut buf))
+        .await
+        .expect("the tunnel in time")
+        .unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    tunnel.write_all(b"ping").await.unwrap();
+    let mut back = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), tunnel.read_exact(&mut back))
+        .await
+        .expect("the echo in time")
+        .unwrap();
+    assert_eq!(&back, b"ping");
+    drop(tunnel);
+    let dst = echo_addr.to_string();
+    let mut tunneled = Value::Null;
+    wait_until(async || {
+        let body = get(&api, "/v1/requests/recent").await.1;
+        tunneled = body["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["dst"] == dst && r["status"] == "completed")
+            .cloned()
+            .unwrap_or(Value::Null);
+        !tunneled.is_null()
+    })
+    .await;
+    assert!(
+        tunneled["requestBodyBytes"].is_null() && tunneled["responseBodyBytes"].is_null(),
+        "{tunneled}"
+    );
+    assert!(tunneled["receiveMs"].is_u64(), "{tunneled}");
+    assert_eq!(tunneled["remoteAddr"], dst);
 }
 
 #[tokio::test]
