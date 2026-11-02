@@ -12,6 +12,7 @@ use crate::control::Mode;
 use crate::engine::{Engine, HANDSHAKE_TIMEOUT, PassedBy, policy_known};
 use crate::fake_address::Turned;
 use crate::mitm::Hint;
+use crate::runtime::Runtime;
 use rurge_config::HostName;
 use rurge_config::general::General;
 use rurge_config::rule::ProtocolKind;
@@ -240,12 +241,7 @@ impl Engine {
     /// for the sessions whose refusal would otherwise come after the answer.
     pub(crate) fn sniffable_session(&self, session: &SessionInfo) -> bool {
         // design 4.1 (1): a TCP session of a client's entry
-        if session.transport != Transport::Tcp
-            || !matches!(
-                session.listener,
-                ListenerKind::Http | ListenerKind::Socks5 | ListenerKind::Tun
-            )
-        {
+        if session.transport != Transport::Tcp {
             return false;
         }
         // design 4.1 (2): a paused engine refuses its sessions before it
@@ -253,25 +249,56 @@ impl Engine {
         if self.is_suspended() {
             return false;
         }
+        // the settings are the ones of the generation in use now, as the rules
+        // will be when the session is dialed
+        let runtime = self.runtime();
+        let Some(probed) = self.sniffable_target(session, &runtime) else {
+            return false;
+        };
+        // design 4.3: the proxy ports have no SYN for pre-matching to refuse
+        // at, so the session is probed before it is answered — and only when
+        // the dial will ask the rules, and only for a session the probe does
+        // not count (plan P6)
+        let at_a_proxy_port = matches!(session.listener, ListenerKind::Http | ListenerKind::Socks5);
+        if at_a_proxy_port && self.reaches_the_rules() && runtime.rules.pre_refuses(&probed) {
+            return false;
+        }
+        true
+    }
+
+    /// The session as the target the sniffing rules see — the name behind a
+    /// fake address, at the entry the session came in — or `None` when the
+    /// entry, the lists or the port take it whole (design 4.1 steps 1, 4 and
+    /// 5; `phase 4 M2 design 7.6`).
+    ///
+    /// The transport is not asked: a UDP flow of a QUIC stream is judged by
+    /// this too, for `auto_quic_blocks`, while `sniffable_session` asks the
+    /// transport, the pause and pre-matching of its own (the plan's P9).
+    fn sniffable_target<'s>(
+        &self,
+        session: &'s SessionInfo,
+        runtime: &Runtime,
+    ) -> Option<Cow<'s, SessionInfo>> {
+        // design 4.1 (1): a session of a client's entry
+        if !matches!(
+            session.listener,
+            ListenerKind::Http | ListenerKind::Socks5 | ListenerKind::Tun
+        ) {
+            return None;
+        }
         // design 4.1: at a proxy port, an address of rurge's space is the name
         // behind it before the lists and the probe look at it. The probe only
         // asks the pool; the dial is what leases the address (`turn_back`).
         // An address that no name stands behind is not sniffed: its dial fails
         // as it does today (the plan's P5).
-        let at_a_proxy_port = matches!(session.listener, ListenerKind::Http | ListenerKind::Socks5);
-        let Some(probed) = self.named_at_a_proxy_port(session) else {
-            return false;
-        };
-        // the settings are the ones of the generation in use now, as the rules
-        // will be when the session is dialed
-        let runtime = self.runtime();
+        let probed = self.named_at_a_proxy_port(session)?;
         let general = &runtime.config.general;
         let (host, port) = (&probed.dst_host, probed.dst_port);
         // design 4.1 (4), which the general design puts before everything
         // else, and 4.2: either list takes the session whole — and the record
         // says which one took it (`phase 4 M4 design 10.2`)
         if raw_listed(general, host, port).is_some() {
-            return false;
+            return None;
         }
         // design 4.1 (5): the two ports of the design, and whatever
         // `force-http-engine-hosts` adds (whose default port is 80) — and a
@@ -281,16 +308,9 @@ impl Engine {
             && general.force_http_engine_hosts.matches(host, port) != Some(true)
             && !self.widened_by_mitm(session, runtime.mitm.as_deref())
         {
-            return false;
+            return None;
         }
-        // design 4.3: the proxy ports have no SYN for pre-matching to refuse
-        // at, so the session is probed before it is answered — and only when
-        // the dial will ask the rules, and only for a session the probe does
-        // not count (plan P6)
-        if at_a_proxy_port && self.reaches_the_rules() && runtime.rules.pre_refuses(&probed) {
-            return false;
-        }
-        true
+        Some(probed)
     }
 
     /// The session with the name behind a fake address it names at a proxy
