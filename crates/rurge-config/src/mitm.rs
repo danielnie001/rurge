@@ -41,7 +41,8 @@ pub struct MitmConfig {
     pub h2: bool,
     /// The sources allowed to be decrypted; `None` is every source.
     pub client_source_address: Option<SourceList>,
-    /// Whether a QUIC flow to a name `[MITM]` decrypts is blocked so the client falls back to TCP; on by default (`phase 4 M5 design 6.1`).
+    /// Whether a QUIC flow to a name `[MITM]` decrypts is blocked so the client
+    /// falls back to TCP; on by default (`phase 4 M5 design 6.1`).
     pub auto_quic_block: bool,
     /// The lines a problem found later is reported at.
     pub spans: MitmSpans,
