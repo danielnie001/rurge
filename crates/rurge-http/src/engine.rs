@@ -4206,6 +4206,11 @@ mod tests {
             self.stream.write_all(bytes.as_bytes()).await
         }
 
+        /// Closes the client's write side: the server sees a FIN.
+        async fn shutdown(&mut self) {
+            self.stream.shutdown().await.expect("a shutdown")
+        }
+
         /// Reads more into `buf`; false at EOF.
         async fn fill(&mut self) -> bool {
             let mut chunk = [0u8; 4096];
@@ -4931,6 +4936,52 @@ mod tests {
         assert!(
             held >= Duration::from_millis(300) && held < Duration::from_secs(5),
             "held {held:?}"
+        );
+    }
+
+    /// The other half of `REJECT-DROP` (`phase 4 M1 design 8.8`, the phase 4
+    /// / M6 plan's execution record row 9): a client that closes its own side
+    /// after its bodyless request was read ends the hold early — hyper sees
+    /// the FIN with the request complete and drops the in-flight service
+    /// future, so the connection goes long before `drop_hold`.
+    #[tokio::test]
+    async fn a_dropped_request_ends_early_when_the_client_closes() {
+        let origin = TestServer::spawn().await;
+        let mut rig = rig_timed(
+            Entry::Sniffed,
+            addr_of(&origin),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await;
+        rig.fake.script(
+            "/drop",
+            Step::Refused {
+                refusal: Refusal::Reject(RejectKind::Drop),
+                pages: Pages {
+                    error: true,
+                    reject: true,
+                },
+            },
+        );
+        rig.client
+            .send("GET /drop HTTP/1.1\r\nHost: target.test\r\n\r\n")
+            .await
+            .unwrap();
+        // the handle is ended before the hold begins; wait for it so that the
+        // client's FIN lands while the hold is running
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            handle.outcome(),
+            Some(SessionOutcome::Rejected(RejectKind::Drop))
+        );
+        rig.client.shutdown().await;
+        let started = std::time::Instant::now();
+        assert_eq!(rig.client.until_eof().await, "");
+        let held = started.elapsed();
+        assert!(
+            held < Duration::from_secs(2),
+            "the hold did not end early: {held:?}"
         );
     }
 
