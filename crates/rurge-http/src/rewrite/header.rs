@@ -337,6 +337,39 @@ mod tests {
         assert_eq!(values_of(&headers, "DNT"), ["1"]);
     }
 
+    /// A rule of one direction leaves the other direction's table alone
+    /// (`phase 4 M3 design 7.2`): the direction written on the line decides.
+    #[test]
+    fn a_rule_of_one_direction_leaves_the_other_alone() {
+        let rules = rewrite_of(
+            "[Header Rewrite]\n\
+             http-request ^http://a\\.test header-add X-Req 1\n\
+             http-response ^http://a\\.test header-add X-Resp 1",
+        );
+
+        let mut headers = map(&[("X", "0")]);
+        let mut notes = Vec::new();
+        rules.headers(
+            Direction::Request,
+            "http://a.test/x",
+            &mut headers,
+            &mut notes,
+        );
+        assert_eq!(values_of(&headers, "X-Req"), ["1"]);
+        assert!(values_of(&headers, "X-Resp").is_empty());
+
+        let mut headers = map(&[("X", "0")]);
+        let mut notes = Vec::new();
+        rules.headers(
+            Direction::Response,
+            "http://a.test/x",
+            &mut headers,
+            &mut notes,
+        );
+        assert_eq!(values_of(&headers, "X-Resp"), ["1"]);
+        assert!(values_of(&headers, "X-Req").is_empty());
+    }
+
     #[test]
     fn a_replace_regex_result_that_is_no_header_value_leaves_the_value() {
         let lines = "[Header Rewrite]\n^http://a\\.test header-replace-regex X-Token v4lue \u{1}";
