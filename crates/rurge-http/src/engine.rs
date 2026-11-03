@@ -5263,6 +5263,24 @@ mod tests {
         origin_answering(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nxxxxx".to_vec()).await
     }
 
+    /// An origin that answers `answer` and then closes the connection: the
+    /// answer promises more than it sends, so the body being buffered fails
+    /// rather than stalls (`phase 4 M3 design 9.3`).
+    async fn short_body_origin(answer: &[u8]) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let answer = answer.to_vec();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(&answer).await;
+                // dropping the stream here closes the connection
+            }
+        });
+        addr
+    }
+
     /// An origin that answers `answer` to every request it reads, on a
     /// connection it keeps open.
     async fn origin_answering(answer: Vec<u8>) -> SocketAddr {
@@ -10123,6 +10141,42 @@ mod tests {
         );
     }
 
+    /// A request body that fails part way (the client closed before the length
+    /// it promised) is not a rewrite failure either: the connection closes with
+    /// the reason `request body failed: …`, nothing is dialled, and no note or
+    /// count is left (`phase 4 M3 design 9.3`, the phase 4 / M3b plan's P14).
+    #[tokio::test]
+    async fn a_request_body_that_fails_while_buffered_closes() {
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-request ^http://b\\.test/ x y",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        // ten bytes promised, five sent, and then the write side closes
+        rig.client
+            .send("POST /fail HTTP/1.1\r\nHost: b.test\r\nContent-Length: 10\r\n\r\nxxxxx")
+            .await
+            .unwrap();
+        rig.client.shutdown().await;
+        assert_eq!(rig.client.until_eof().await, "");
+        assert_eq!(rig.fake.dials(), 0, "nothing is dialled");
+        assert!(records.lock().unwrap().is_empty());
+        let handle = rig.fake.finished(0).await;
+        let outcome = handle.outcome();
+        assert!(
+            matches!(&outcome, Some(SessionOutcome::Failed(reason)) if reason.starts_with("request body failed: ")),
+            "{outcome:?}"
+        );
+        assert!(
+            rewrite_notes(&handle).is_empty(),
+            "{:?}",
+            rewrite_notes(&handle)
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 0, 0));
+    }
+
     /// A request killed while its body is buffered stops at once (`phase 4 M3
     /// design 9.3`, the phase 4 / M3b plan's P14).
     #[tokio::test]
@@ -10499,6 +10553,43 @@ mod tests {
             rig.fake.dials(),
             2,
             "a connection whose body stalled is not lent again"
+        );
+    }
+
+    /// An upstream that fails while a body is being buffered (it closes before
+    /// the length it promised) answers 502 with the failure's own page, and
+    /// neither is a rewrite count (`phase 4 M3 design 9.3`, the phase 4 / M3b
+    /// plan's P14).
+    #[tokio::test]
+    async fn a_response_that_fails_while_buffered_answers_502() {
+        let addr = short_body_origin(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nxxxxx").await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ x y",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /f HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+        assert!(
+            String::from_utf8_lossy(&body).contains("The upstream server's response body failed."),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let handle = rig.fake.finished(0).await;
+        let outcome = handle.outcome();
+        assert!(
+            matches!(&outcome, Some(SessionOutcome::Failed(reason)) if reason.starts_with("upstream body failed: ")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            counters.snapshot(),
+            counted(0, 0, 0, 0),
+            "a failed answer is no rewrite failure (`the phase 4 / M3b plan's P18`)"
         );
     }
 
