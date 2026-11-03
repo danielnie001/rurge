@@ -7033,6 +7033,10 @@ mod tests {
         /// it before its end (`the phase 4 / M2b plan's execution record row
         /// 52`).
         ResetMidBody,
+        /// Answer the first stream's head and a part of its body, then close
+        /// the whole connection before its end (`the phase 4 / M6 plan's
+        /// execution record row 21`, recheck report item 7).
+        CloseMidBody,
         /// Answer every stream with its path and a `content-length`, then a
         /// trailer `x-t: 1` (`the phase 4 / M3b plan's execution record row
         /// 20`).
@@ -7088,6 +7092,7 @@ mod tests {
                                 match script {
                                     OriginScript::GoAwayAfterOne
                                     | OriginScript::ResetMidBody
+                                    | OriginScript::CloseMidBody
                                     | OriginScript::Trailers => {}
                                     OriginScript::RefuseAfterOne => {
                                         respond.send_reset(h2::Reason::REFUSED_STREAM);
@@ -7097,10 +7102,14 @@ mod tests {
                             }
                             if first
                                 && accepted == 1
-                                && matches!(script, OriginScript::ResetMidBody)
+                                && matches!(
+                                    script,
+                                    OriginScript::ResetMidBody | OriginScript::CloseMidBody
+                                )
                             {
                                 // a head with no `content-length`, a part of the
-                                // body, and a reset before the end
+                                // body, and then a reset, or a closed connection,
+                                // before the end
                                 let answer = Response::builder().body(()).expect("a response");
                                 if let Ok(mut send) = respond.send_response(answer, false) {
                                     let _ = send.send_data(Bytes::from_static(b"part"), false);
@@ -7118,6 +7127,13 @@ mod tests {
                                     tokio::select! {
                                         _ = reset.notified() => {}
                                         _ = conn.accept() => {}
+                                    }
+                                    // `the phase 4 / M6 plan's execution record
+                                    // row 21`: the case has read the part, so
+                                    // dropping the connection here ends it with
+                                    // the head and the part already written
+                                    if matches!(script, OriginScript::CloseMidBody) {
+                                        return;
                                     }
                                     send.send_reset(h2::Reason::REFUSED_STREAM);
                                 }
@@ -8237,6 +8253,58 @@ mod tests {
         assert!(
             !rig.served.is_finished(),
             "the client's connection is still open"
+        );
+        drop(sender);
+        conn.abort();
+        served_within(rig.served, Duration::from_secs(5)).await;
+    }
+
+    /// An upstream HTTP/2 connection that closes after the answer head and a
+    /// part of the body truncates the client's stream and is not recorded as a
+    /// completion (`the phase 4 / M6 plan's execution record row 21`; recheck
+    /// report item 7). The same failure as an upstream stream reset mid-body,
+    /// but the connection, not the stream, is what ends.
+    #[tokio::test]
+    async fn an_upstream_h2_connection_that_ends_mid_body_truncates_the_client() {
+        let fixture = TlsFixture::new(&["target.test"]);
+        let origin = h2_origin(&fixture, OriginScript::CloseMidBody).await;
+        let rig = rig_tls_h2(origin_tls_h2(fixture.roots(), "target.test"), origin.addr).await;
+        let (mut sender, conn) = h2_client(rig.client.stream).await;
+        let resp = sender
+            .send_request(h2_request(http::Method::GET, "https://target.test/one"))
+            .await
+            .expect("an answer");
+        assert_eq!(resp.status(), 200);
+        let mut body = resp.into_body();
+        // the part first: the origin closes the connection only once the case
+        // has it
+        let mut read = 0;
+        while read < 4 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+                .await
+                .expect("a frame within 5 s")
+                .expect("a frame, not the end")
+                .expect("the part, not an error");
+            read += frame.data_ref().map_or(0, |data| data.len());
+        }
+        assert_eq!(
+            read, 4,
+            "the part the origin sent before the connection ended"
+        );
+        origin.reset.notify_one();
+        let (rest, ended) = read_body(body).await;
+        assert_eq!(rest, 0, "nothing after the part");
+        assert!(ended.is_some(), "the body failed, it did not end");
+        let handle = rig.fake.finished(0).await;
+        match handle.outcome() {
+            Some(SessionOutcome::Failed(reason)) => {
+                assert!(reason.starts_with("upstream body failed: "), "{reason}")
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert!(
+            !matches!(handle.outcome(), Some(SessionOutcome::Completed)),
+            "a truncated answer was recorded as complete"
         );
         drop(sender);
         conn.abort();
