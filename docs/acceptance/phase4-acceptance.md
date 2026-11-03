@@ -58,16 +58,16 @@
 
 - 这份对照表是 148 行、十张表：会话入口与 HTTP 引擎 11、MITM 24、重写与 Map Local 47、请求记录与抓包 22、功能开关 3、配置与观测 17、总设计第 1.2 节另列的 2、总设计第 1.5 节的遗留 4、阶段 1 ～ 3 推过来的 12、非功能需求 6。
 - 句子的来处照 M6 设计第 3 节：需求文档第 7 节阶段 4 范围里的 14 行需求（第 3.1 节那张表的前 14 行：FR-RULE-14 与 FR-HTTP-01 ～ 11、13、14），另引的三行（FR-CFG-06、FR-CFG-18、FR-OBS-02 的阶段 4 部分），四条非功能需求（NFR-01、NFR-03、NFR-07、NFR-11 与阶段 4 相关的部分），总设计第 1.2 与 1.5 节，以及阶段 1 ～ 3 推过来的句子。
-- 同一句在两处的只读一次：十六行写着「同「…」的「…」一行」，它们说的是不同需求里的句子，各算一行（数法见「数字」）。
+- 同一句在两处的只读一次：十六行的代码一格写着「同「…」的「…」一行」，它们说的是不同需求里的句子，各算一行（数法见「数字」）；另有 FR-CFG-14 的「…Map Local 数据」一行（第 293 行）只在用例一格借了另一行的一组用例，它的代码与结论是自己的，不算在这十六行里。
 
 ### 谁读的
 
-一个读代码、读用例的断言、补用例的助手；协调的会话逐个任务评审（M6 设计第 9 节），不另派评审者。评审做的是：新写进文档的路径、`路径::函数` 与用例名用脚本在那个提交上逐个核；读每一次改坏验证的日志（改了哪一行、红在哪条用例、怎样改回、工作区是否干净）；核这个任务的行一句不少、结论只用八种写法、重对报告交给这个任务的条目都有去处；补了用例的任务核全量门禁的数；读法不同的退回修正。评审的结果与各自作的裁定在 M6 计划的「执行期修正记录」里协调者的评审行：第 4、17、20、23、27、32、37、39、46、51、54 行；各任务的修正轮次也在那张表里。
+一个读代码、读用例的断言、补用例的助手；协调者逐个任务评审（M6 设计第 9 节），不另派评审者。评审做的是：新写进文档的路径、`路径::函数` 与用例名用脚本在那个提交上逐个核；读每一次改坏验证的日志（改了哪一行、红在哪条用例、怎样改回、工作区是否干净）；核这个任务的行一句不少、结论只用八种写法、重对报告交给这个任务的条目都有去处；补了用例的任务核全量门禁的数；读法不同的退回修正。评审的结果与各自作的裁定在 M6 计划的「执行期修正记录」里协调者的评审行：第 4、17、20、23、27、32、37、39、46、51、54、58 行，与之后以「协调者评审任务」开头的各行；各任务的修正轮次也在那张表里。
 
 ### 读的代码
 
 - `bd981d2`（本地 `main` 上 M5 的最后一个提交），代码树与 `b43278b` 相同。
-- M6 补的用例与改的注释在 `cc8216b` ～ `88d8149` 的 21 个提交里，用例格里各写着补它的提交；`88d8149` 之后的提交只改文档。
+- M6 补的用例与改的注释在 `cc8216b` ～ `88d8149` 的 21 个提交里，用例格里各写着补它的提交。`88d8149` 之后改了代码的提交只有 `e85bcfa` 与 `223c492`：`e85bcfa` 改了阶段 3 的 `crates/rurge-platform/src/tun/windows/wintun.rs` 里的 `load`（装载 `wintun.dll` 期间线程的错误模式）、在同一个文件里加了一条用例，并给 `crates/rurge-platform/Cargo.toml` 的 `windows-sys` 加了一个 feature；`223c492` 只改那条用例的注释；两者都不是本文哪一句的代码，其余的提交只改文档。
 - 文中的路径、函数与用例名，在代码与 `88d8149` 相同的提交上用脚本与 `git grep` 核过。
 
 ### 没有覆盖的
@@ -91,19 +91,19 @@
 | 有意不同（已登记） | 2 | 1 | 0 | 1 |
 | 做了，本机没有能红的用例（第四个数） | 0 | 0 | 0 | 0 |
 
-功能需求有两句没有做完，都是 P0，都随 M3c（等总设计 Q4）：FR-HTTP-07 的「jq 表达式」与「解压…」之 `br`、`zstd`；非功能需求另有两句没有做完（NFR-01 之经 HTTP 引擎的路径、NFR-11 之阶段 4 用到的外部包），与功能需求那两句写在同一句里。所以阶段 4 的功能需求还有这两句 P0 没做完，不写成已经做完。
+功能需求有两句没有做完，都是 P0，都随 M3c（等总设计 Q4）：FR-HTTP-07 的「jq 表达式」与「解压…」之 `br`、`zstd`；非功能需求另有两句没有做完（NFR-01 之经 HTTP 引擎的路径、NFR-11 之阶段 4 用到的外部包）。所以阶段 4 的功能需求还有这两句 P0 没做完，不写成已经做完。
 
-另有 4 句「需求文字有问题」（FR-HTTP-07 的「先于脚本」、FR-HTTP-09 的「…→ 脚本」与「每请求 / 响应最多一个脚本」、FR-HTTP-11 的「通过…Dashboard 查看」）、2 句「有意不同（已登记）」（FR-OUT-01 的 `REJECT-DROP`、NFR-03 之 Windows）与 2 句「不属于阶段 4」：它们不是没有做，改的是需求或登记的字面，逐句见四张表。
+另有 4 句「需求文字有问题」（FR-HTTP-07 的「先于脚本」、FR-HTTP-09 的「…→ 脚本」与「每请求 / 响应最多一个脚本」、FR-HTTP-11 的「通过…Dashboard 查看」）与 2 句「有意不同（已登记）」（FR-OUT-01 的 `REJECT-DROP`、NFR-03 之 Windows）：它们不是没有做，改的是需求或登记的字面，逐句见「需求文字的问题」与「有意不同的」两张表。另有 2 句「不属于阶段 4」：FR-HTTP-10 的「…来源（…设备）」随阶段 7、「…备注（…脚本…）」随阶段 5（第一部分第 216、222 行），不在哪一张登记表里。
 
 需求逐句对过代码不等于验收通过。手工验收一项也没有做：阶段 4 的清单 68 项与阶段 1 ～ 3 的三份清单。`a262d4c` 之后的代码 CI 没有见过。
 
 总设计第 15 节七条各一句：
 
-1. 手册中每个重写示例有对应测试：25 行示例里有 23 行由 16 条名字以 the_manual_ 开头的用例对上（几行示例共用一条用例，第二部分那张表逐条写），jq 的两行没有（随 M3c）；还缺 jq。
-2. 主流站点 MITM 解密成功且证书固定站点给出提示：L1 在回环上（三种入口、HTTP/2 与 HTTP/1.1 两侧、握手之后不读的客户端与不信任的客户端各触发提示），L3 是手工清单第 2 条的项；还缺手工验收。
-3. Body Rewrite 与 jq 用例通过：Body Rewrite 的正则形式有 9 条名字带 the_manual_ 的用例，jq 没有（随 M3c）；还缺 jq。
-4. 大小限制行为与手册一致：`the_request_limit_is_thirty_two_mib`、`the_response_limit_is_ten_mib` 与 chunked、`Expect` 的用例（另有两段解压之后越过上限的用例在 `0b01ebf` 补）；还缺 CI 对 `a262d4c` 之后的代码。
-5. 抓包可通过 API 读取：API 的六条与命令行的 `a_capture_switched_on_over_the_api_is_exported_as_har`，手工清单第 5 条的项；还缺 CI 对 `a262d4c` 之后的代码。
+1. 手册中每个重写示例有对应测试：25 行示例里 22 行由 16 条名字以 the_manual_ 开头的用例对上（几行示例共用一条用例，第二部分那张表逐条写），`header-replace DNT 1` 那一行由 `the_four_actions` 对上，jq 的两行没有；还缺 jq 与 CI 对 `a262d4c` 之后的代码。
+2. 主流站点 MITM 解密成功且证书固定站点给出提示：L1 在回环上（三种入口、HTTP/2 与 HTTP/1.1 两侧、握手之后不发请求就关的客户端与不信任的客户端各触发提示），L3 是手工清单第 2 条的项；还缺手工验收。
+3. Body Rewrite 与 jq 用例通过：Body Rewrite 的正则形式有 7 条名字带 the_manual_ 的用例，jq 没有（随 M3c）；还缺 jq 与 CI 对 `a262d4c` 之后的代码。
+4. 大小限制行为与手册一致：`the_request_limit_is_thirty_two_mib`、`the_response_limit_is_ten_mib` 与 chunked、`Expect` 的用例（另有两条解压之后越过上限的用例在 `0b01ebf` 补）；还缺 CI 对 `a262d4c` 之后的代码。
+5. 抓包可通过 API 读取：API 的九条（M6 补的两条在内）与命令行的两条，手工清单第 5 条的项；还缺 CI 对 `a262d4c` 之后的代码。
 6. 阶段 4 的需求逐句对照代码，几个数照实写：**满足**——就是这一份文档的第一部分（148 行、十张表）与上面两组数；它说的是需求逐句对过代码，不是七条验收标准都已经满足。
 7. 三平台 CI 绿：**未满足**——最近一次运行 41411445901 没有全绿（Linux 与 Windows 的 check 的测试一步各有失败，都在测试一侧、不是阶段 4 的用例，由 M4b 任务 11 处理），`a262d4c` 之后的提交 CI 没有见过。
 
@@ -387,13 +387,13 @@
 | 需求 | 这一句 | 代码与为什么本机没有能红的用例（它的 cfg，或缺省的用例走不到的那一层） | 要补的用例 |
 | --- | --- | --- | --- |
 
-没有这样的句子：阶段 4 里本机编译不到的只有 `crates/rurge/src/cli/mitm.rs::restrict` 的 `#[cfg(unix)]` 那一支（与它的 `#[cfg(not(unix))]` 那一支），前者有一条只在 Linux 与 macOS 上编译、会因它而红的用例——`crates/rurge/tests/cli.rs`：`mitm_ca_generate_keeps_the_secrets_private`（两个私密文件的权限位是 `0600`）——照「怎么读」记 `做了`（NFR-03 之 Unix 那一行）。缺省的用例从不走到的那一层（解密时对上游信的根里的系统的根）也不是整段走不到：`skip-server-cert-verify` 为真与为假两支都有会红的用例，系统的根那一半没有断言，照设计第 4.4 节「逻辑钉住了、系统的效果没有钉住的」记 `做了`（FR-HTTP-03 的 `skip-server-cert-verify` 那一行）。
+没有这样的句子：阶段 4 的产品代码里本机编译不到的只有 `crates/rurge/src/cli/mitm.rs::restrict` 的 `#[cfg(unix)]` 那一支，它有一条只在 Linux 与 macOS 上编译、会因它而红的用例——`crates/rurge/tests/cli.rs`：`mitm_ca_generate_keeps_the_secrets_private`（两个私密文件的权限位是 `0600`）——照「怎么读」记 `做了`（NFR-03 之 Unix 那一行）。测试代码里两份量内存的模块（`crates/rurge-http/src/capture/memory.rs`、`crates/rurge-engine/src/observe/memory.rs`）的 Linux 与其余平台两支本机也编译不到，它们只供带 `#[ignore]` 的量法用例，不是哪一句需求的代码（见「靠 CI 的」）。缺省的用例从不走到的那一层（解密时对上游信的根里的系统的根）也不是整段走不到：`skip-server-cert-verify` 为真与为假两支都有会红的用例，系统的根那一半没有断言，照设计第 4.4 节「逻辑钉住了、系统的效果没有钉住的」记 `做了`（FR-HTTP-03 的 `skip-server-cert-verify` 那一行）。
 
 ## 第二部分：总设计第 15 节七条验收标准
 
 下面每一条照 M6 设计第 6 节写三种证据（阶段 4 没有 L2），每条最后一句写「满足」或「未满足」：
 
-- **L1**：回环上的用例——文件与名字，在写本文的那个提交上用脚本核对过；加全量门禁那一次的数：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 退出 0，`cargo test -j 4 --workspace --no-fail-fast` 93 个结果行、5011 通过、0 失败、29 忽略；`rurge-platform` 的单元测试二进制整份一起跑时挂在 `tun::windows::wintun` 那一组上（两次，CPU 不走），分两半单独跑都过——`--skip tun::windows::wintun` 得 454 通过、4 忽略，那一组 7 条得 7 通过——合计 **94 个结果行、5472 通过、0 失败、33 忽略**，与基线相同（一台 Windows 11 x86-64 开发机上的一次运行，**不是 CI**）。
+- **L1**：回环上的用例——文件与名字，在写本文的那个提交上用脚本核对过；门禁的数取自 `e85bcfa` 的代码上那一次：`cargo fmt --all --check` 与 `cargo clippy --all-targets -- -D warnings` 退出 0，`cargo test -j 4 --workspace --no-fail-fast` **94 个结果行、5473 通过、0 失败、33 忽略**，比 M6 计划修正记录第 46 行那一次多的一条是 `e85bcfa` 加的那条用例（一台 Windows 11 x86-64 开发机上的一次运行，**不是 CI**）。
 - **L3**：手工清单里证明这一条的项（`节/编号`，按平台），取自清单开头「第 7 节的五条验收标准各由哪几项证明」那张表；一项也没有做过。
 - **CI**：这条的 L1 用例在三个平台的 CI 上通过过没有，照「怎么读」里「用例一格里 CI 的证据」一段（M6-D28）写：运行 41402787066（`20efc16`）的 Linux 与 Windows、运行 41411445901（`a262d4c`）的 macOS；`a262d4c` 之后加的或改过的写「CI 没有见过」。
 
@@ -401,10 +401,10 @@
 
 ### 手册的重写示例与黄金用例（第 1 条）
 
-- **L1**：`crates/rurge-engine/tests/rewrite.rs` 里名字以 the_manual_ 开头的 16 条用例（M3a 的 7 条与 M3b 的 9 条），下面那张表逐条写每个示例对应哪一条、断言了什么；支撑它们的单元用例见第一部分重写那几张表。全量门禁那一次：94 个结果行、5472 通过、0 失败、33 忽略（一台机器上的一次运行，不是 CI）。
+- **L1**：`crates/rurge-engine/tests/rewrite.rs` 里名字以 the_manual_ 开头的 16 条用例（M3a 的 7 条与 M3b 的 9 条），下面那张表逐条写每个示例对应哪一条、断言了什么；支撑它们的单元用例见第一部分重写那几张表。全量门禁那一次：94 个结果行、5473 通过、0 失败、33 忽略（一台机器上的一次运行，不是 CI）。
 - **L3**：手工清单第 1 条写的是「—」（由用例证明、不是手工项）；清单里的 `M3/W6`、`M3/M6`、`M3/L6` 拿真实浏览器的流量与它们对照——一项也没有做过。
 - **CI**：16 条名字以 the_manual_ 开头的用例都在 `20efc16` 上，CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901）；表里另引的 `a_rule_matches_the_url_rebuilt_from_the_connection_target`（`06d0806` 补）CI 没有见过。
-- **还缺什么**：jq 的两行没有用例（随 M3c，等总设计 Q4）；其余 23 行各有用例。**未满足**。
+- **还缺什么**：jq 的两行没有用例（随 M3c，等总设计 Q4）；其余 23 行各有用例。另缺 CI 对 `a262d4c` 之后的代码（第 400 行那一段）。**未满足**。
 
 | 页 | 示例（原文） | 用例 | 用例断言了什么 |
 | --- | --- | --- | --- |
@@ -436,28 +436,28 @@
 
 ### 主流站点 MITM 解密成功且证书固定站点给出提示（第 2 条）
 
-- **L1**：`crates/rurge-engine/tests/mitm.rs`：`every_entry_decrypts_a_listed_host`（HTTP 监听器、SOCKS5 与虚拟网卡三种入口各解密一次）、`four_combinations_of_http1_and_h2_are_decrypted`（客户端与上游四种组合都解密，客户端一侧按 ALPN 落在 `h2` 或 `http/1.1`）、`a_client_that_closes_after_the_handshake_gets_the_pinning_hint`（握手之后不读就关的客户端：一行 WARN、`noRequest` 计 2）、`an_untrusting_client_is_warned_once_an_hour_and_counted_each_time`（不信任 rurge 签的叶证书的客户端：WARN 只有一行、第二次在 DEBUG，`untrusted` 计 2）。全量门禁那一次：94 个结果行、5472 通过、0 失败、33 忽略（一台机器上的一次运行，不是 CI）。
+- **L1**：`crates/rurge-engine/tests/mitm.rs`：`every_entry_decrypts_a_listed_host`（HTTP 监听器、SOCKS5 与虚拟网卡三种入口各解密一次）、`four_combinations_of_http1_and_h2_are_decrypted`（客户端与上游四种组合都解密，客户端一侧按 ALPN 落在 `h2` 或 `http/1.1`）、`a_client_that_closes_after_the_handshake_gets_the_pinning_hint`（握手之后不发请求就关的客户端：一行 WARN、`noRequest` 计 2）、`an_untrusting_client_is_warned_once_an_hour_and_counted_each_time`（不信任 rurge 签的叶证书的客户端：WARN 只有一行、第二次在 DEBUG，`untrusted` 计 2）。全量门禁那一次：94 个结果行、5473 通过、0 失败、33 忽略（一台机器上的一次运行，不是 CI）。
 - **L3**：手工清单第 2 条（清单开头「第 7 节的五条验收标准各由哪几项证明」那张表）：Windows `M2/W2`、`M2/W3`、`M5/W13`；macOS `M2/M2`、`M2/M3`、`M5/M13`；Linux `M2/L2`、`M2/L3`、`M5/L13`；与平台无关 `M2/P1`（证书固定的提示）与 `M2/P2` ～ `M2/P5`。一项也没有做过。
 - **CI**：上面四条都在 `20efc16` 上，CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901）。
 - **还缺什么**：手工验收——真实浏览器与真实源站的握手与 ALPN、真实源站的证书链、真的证书固定客户端，只有在真机上做（第 2 条的 L3）。**未满足**。
 
 ### Body Rewrite 与 jq 用例通过（第 3 条）
 
-- **L1**：`crates/rurge-engine/tests/rewrite.rs` 里 M3b 的 9 条名字带 the_manual_ 的用例：`the_manual_body_rewrite_request_example`、`the_manual_body_rewrite_response_example`、`the_manual_body_rewrite_pairs_example`、`the_manual_body_rewrite_capture_example`、`the_manual_body_rewrite_anchors_example`、`the_manual_body_rewrite_empty_body_example`、`the_manual_utf8_requirement`、`the_manual_map_local_examples`、`the_manual_map_local_empty_result`；另有 `crates/rurge-http/src/rewrite/body.rs`：`rules_and_pairs_act_in_sequence`（一条规则里的各对依次作用）与 `crates/rurge-config/src/rewrite.rs`：`body_rewrite_reads_the_manual_examples`；jq 一侧只有 `crates/rurge-config/src/rewrite.rs`：`jq_lines_are_ignored_with_w0042`（`http-request-jq` / `http-response-jq` 的行给 `W0042` 并跳过，没有求值）。全量门禁那一次：94 个结果行、5472 通过、0 失败、33 忽略（一台机器上的一次运行，不是 CI）。
+- **L1**：`crates/rurge-engine/tests/rewrite.rs` 里 M3b 的 7 条名字带 the_manual_ 的 Body Rewrite 用例：`the_manual_body_rewrite_request_example`、`the_manual_body_rewrite_response_example`、`the_manual_body_rewrite_pairs_example`、`the_manual_body_rewrite_capture_example`、`the_manual_body_rewrite_anchors_example`、`the_manual_body_rewrite_empty_body_example`、`the_manual_utf8_requirement`；M3b 另两条 the_manual_ 用例（`the_manual_map_local_examples`、`the_manual_map_local_empty_result`）是 Map Local 的，在第 1 条那张表里。另有 `crates/rurge-http/src/rewrite/body.rs`：`rules_and_pairs_act_in_sequence`（一条规则里的各对依次作用）与 `crates/rurge-config/src/rewrite.rs`：`body_rewrite_reads_the_manual_examples`；jq 一侧只有 `crates/rurge-config/src/rewrite.rs`：`jq_lines_are_ignored_with_w0042`（`http-request-jq` / `http-response-jq` 的行给 `W0042` 并跳过，没有求值）。全量门禁那一次：94 个结果行、5473 通过、0 失败、33 忽略（一台机器上的一次运行，不是 CI）。
 - **L3**：手工清单第 3 条：Body Rewrite 的正则形式有 `M3/W7`、`M3/M7`、`M3/L7`；jq 等 M3c——这一构建里 jq 的行是 `W0042`、那一行跳过（`M3/P10` 的一处）。一项也没有做过。
-- **CI**：上面九条名字带 the_manual_ 的用例与 `jq_lines_are_ignored_with_w0042` 都在 `20efc16` 上，CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901）。
-- **还缺什么**：jq（随 M3c，等总设计 Q4）：两个 jq 示例一条用例也没有。**未满足**。
+- **CI**：上面七条名字带 the_manual_ 的用例与 `jq_lines_are_ignored_with_w0042` 都在 `20efc16` 上，CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901）。
+- **还缺什么**：jq（随 M3c，等总设计 Q4）：两个 jq 示例一条用例也没有。另缺 CI 对 `a262d4c` 之后的代码（第 400 行那一段）。**未满足**。
 
 ### 大小限制行为与手册一致（第 4 条）
 
-- **L1**：`crates/rurge-engine/tests/rewrite.rs`：`the_request_limit_is_thirty_two_mib`（恰好 32 MiB 时整段改写，多一个字节时连接被关、记录 `Failed`）、`the_response_limit_is_ten_mib`（恰好 10 MiB 时改写，多一个字节时每个字节原样到客户端）、`an_http2_request_over_the_limit_resets_its_stream`（HTTP/2 上只重置这个流）、`a_chunked_request_is_forwarded_with_one_warning`（chunked 原样转发）、`an_expect_request_is_forwarded_unmodified`（`Expect: 100-continue` 原样转发）、`an_http2_request_without_a_length_is_forwarded_unmodified`（HTTP/2 上没有长度的正文原样转发）；`crates/rurge-http/src/engine.rs`：`a_decoded_request_over_thirty_two_mib_is_not_rewritten`、`a_decoded_response_over_ten_mib_is_not_rewritten`（解压之后越过上限，`0b01ebf` 补）；`crates/rurge-http/src/rewrite/body.rs`：`read_ahead_stops_one_byte_past_the_limit`、`a_length_over_the_limit_is_not_read`、`a_decompression_bomb_stops_at_the_limit`。全量门禁那一次：94 个结果行、5472 通过、0 失败、33 忽略（一台机器上的一次运行，不是 CI）。
+- **L1**：`crates/rurge-engine/tests/rewrite.rs`：`the_request_limit_is_thirty_two_mib`（恰好 32 MiB 时整段改写，多一个字节时连接被关、记录 `Failed`）、`the_response_limit_is_ten_mib`（恰好 10 MiB 时改写，多一个字节时每个字节原样到客户端）、`an_http2_request_over_the_limit_resets_its_stream`（HTTP/2 上只重置这个流）、`a_chunked_request_is_forwarded_with_one_warning`（chunked 原样转发）、`an_expect_request_is_forwarded_unmodified`（`Expect: 100-continue` 原样转发）、`an_http2_request_without_a_length_is_forwarded_unmodified`（HTTP/2 上没有长度的正文原样转发）；`crates/rurge-http/src/engine.rs`：`a_decoded_request_over_thirty_two_mib_is_not_rewritten`、`a_decoded_response_over_ten_mib_is_not_rewritten`（解压之后越过上限，`0b01ebf` 补）；`crates/rurge-http/src/rewrite/body.rs`：`read_ahead_stops_one_byte_past_the_limit`、`a_length_over_the_limit_is_not_read`、`a_decompression_bomb_stops_at_the_limit`。全量门禁那一次：94 个结果行、5473 通过、0 失败、33 忽略（一台机器上的一次运行，不是 CI）。
 - **L3**：手工清单第 4 条：`M3/P9`（32 MiB 与 10 MiB 的边界）。一项也没有做过。
 - **CI**：`20efc16` 上就有的都在那次运行里三平台通过；`a_decoded_request_over_thirty_two_mib_is_not_rewritten` 与 `a_decoded_response_over_ten_mib_is_not_rewritten`（`0b01ebf`）CI 没有见过。
 - **还缺什么**：还缺 CI 对 `a262d4c` 之后的代码（M6 在 `0b01ebf` 补的两条解压之后的上限用例在 `a262d4c` 之后）。**未满足**。
 
 ### 抓包可通过 API 读取（第 5 条）
 
-- **L1**：`crates/rurge-api/tests/api.rs`：`the_capture_status_says_the_limits_and_the_counts`、`capture_sessions_are_listed_by_name`、`a_capture_session_lists_its_entries_newest_first`、`an_entry_is_shown_whole_with_four_headers_masked`、`a_session_is_exported_as_har_oldest_first`（HAR 1.2 的条目由旧到新）、`har_bodies_are_text_or_base64_and_say_what_was_left_out`、`clearing_takes_one_session_or_all`，M6 补的两条 `the_outcome_upgraded_and_the_budget_truncation_are_named`（`3d4702b`）与 `the_decode_limit_is_the_body_limit_of_this_process`（`c24a278`）；`crates/rurge/tests/cli.rs`：`a_capture_switched_on_over_the_api_is_exported_as_har`（守护进程上经 API 打开抓包、取 HAR）、`the_capture_limits_come_from_the_options_or_the_variables`。全量门禁那一次：94 个结果行、5472 通过、0 失败、33 忽略（一台机器上的一次运行，不是 CI）。
+- **L1**：`crates/rurge-api/tests/api.rs`：`the_capture_status_says_the_limits_and_the_counts`、`capture_sessions_are_listed_by_name`、`a_capture_session_lists_its_entries_newest_first`、`an_entry_is_shown_whole_with_four_headers_masked`、`a_session_is_exported_as_har_oldest_first`（HAR 1.2 的条目由旧到新）、`har_bodies_are_text_or_base64_and_say_what_was_left_out`、`clearing_takes_one_session_or_all`，M6 补的两条 `the_outcome_upgraded_and_the_budget_truncation_are_named`（`3d4702b`）与 `the_decode_limit_is_the_body_limit_of_this_process`（`c24a278`）；`crates/rurge/tests/cli.rs`：`a_capture_switched_on_over_the_api_is_exported_as_har`（守护进程上经 API 打开抓包、取 HAR）、`the_capture_limits_come_from_the_options_or_the_variables`。全量门禁那一次：94 个结果行、5473 通过、0 失败、33 忽略（一台机器上的一次运行，不是 CI）。
 - **L3**：手工清单第 5 条：Windows `M4/W9`、`M4/W10`；macOS `M4/M9`、`M4/M10`；Linux `M4/L9`、`M4/L10`；与平台无关 `M4/P11` ～ `M4/P13`。一项也没有做过。
 - **CI**：`20efc16` 上就有的都在那次运行里三平台通过；`the_outcome_upgraded_and_the_budget_truncation_are_named`（`3d4702b`）与 `the_decode_limit_is_the_body_limit_of_this_process`（`c24a278`）CI 没有见过。
 - **还缺什么**：还缺 CI 对 `a262d4c` 之后的代码（M6 补的两条在 `a262d4c` 之后）。**未满足**。
@@ -490,7 +490,7 @@
 
 `M2/P1` 一项算三个平台：给证书固定提示的路径上没有按平台分的代码；但 macOS 与 Linux 上那条路径没有运行过。
 
-没有被任何一行点到的三项（`M2/W5`、`M2/M5`、`M2/L5`）验的是同一件：卸掉 CA 之后不信任的客户端（站点打不开、浏览器报证书错误，一行 WARN、`mitm.untrusted` 加一、承载连接一条失败记录）。没有一行点到它们，是因为验收文档里唯一说到不信任的客户端的那一句是「证书固定提示日志」，它的用例格引 `an_untrusting_client_is_warned_once_an_hour_and_counted_each_time` 是因为两种提示共用 `crates/rurge-engine/src/mitm.rs::MitmShared::warn_now` 的限频，不是因为那一句说到不信任的客户端；三项照旧按清单做。
+没有被任何一行点到的三项（`M2/W5`、`M2/M5`、`M2/L5`）验的是同一件：卸掉 CA 之后不信任的客户端（站点打不开、浏览器报证书错误，一行 WARN、`mitm.untrusted` 加一、承载连接一条失败记录）。没有一行点到它们，是因为第一部分没有一句需求说的是不信任的客户端；引了那条用例的两行——第 147 行引它是因为两种提示共用 `crates/rurge-engine/src/mitm.rs::MitmShared::warn_now` 的限频，第 257 行引它是为了它那一格写的 API 的数（`mitm` 四个数里的 `untrusted`）——说的都不是不信任的客户端；三项照旧按清单做。
 
 **一项也没有做过。** 阶段 1 ～ 3 的三份清单也一项都没有做。
 
@@ -508,7 +508,7 @@
 - `crates/rurge-engine/src/observe/memory.rs`：`an_empty_request_log_is_the_baseline`、`a_full_request_log_of_http_requests`（量一条记录占多大；引它的行是 FR-OBS-02 之 M4b 那一行，第 263 行）。同上。
 - `crates/rurge-engine/tests/bench.rs`：十六个——B1 的 `b1_plain_throughput`、`b1_plain_latency`，B2 的 `b2_decrypted_throughput`、`b2_decrypted_latency`，B3 的 `b3_a_thousand_rules_latency`，B4 的 `b4_leaf_certificates`，B5 的 `b5_idle_connections_plain_direct`、`b5_idle_connections_plain`、`b5_idle_connections_tls_direct`、`b5_idle_connections_relayed_tls`、`b5_idle_connections_decrypted`、`b5_body_direct`、`b5_body_streamed`、`b5_body_rewritten`、`b5_leaf_cache`，与 Q1 的 `q1_reading_a_quic_client_hello`；引它的行是 NFR-01 那一行，第 309 行。这个文件是阶段 4 / M5b 加的、在 `a262d4c` 之后，CI 既没有编译也没有运行过它。
 
-**`a262d4c` 之后的提交 CI 没有见过**：M4b 任务 11（`707decf`、`a9ef85b`）与 M5、M6 的提交。第一部分十张表里写着「CI 没有见过」的是这 26 行（行号是这一份文档里的）：117、118、125、141、143、144、153、154、169、170、183、184、189、204、215、255、256、261、262、264、282、283、284、309、311、313；第二部分那张黄金用例表里另有一行（第 418 行，`a_rule_matches_the_url_rebuilt_from_the_connection_target`，`06d0806` 补）。最近一次运行 41411445901（`a262d4c`）没有全绿，具体照 NFR-07 之 CI 那一行（第 313 行）与第二部分第 7 条写：Linux 与 Windows 的 `check` 的测试一步各有失败，都在测试一侧，由 M4b 任务 11 处理；那次的修正 CI 没有见过。所以「三平台构建与测试」对现在这棵树只有到 `a262d4c` 为止的证据。推送之后读回那次运行时就地改写这一节与上面那 27 行。
+**`a262d4c` 之后的提交 CI 没有见过**：M4b 任务 11（`707decf`、`a9ef85b`）与 M5、M6 的提交。第一部分十张表里写着「CI 没有见过」的是这 26 行（行号是这一份文档里的）：117、118、125、141、143、144、153、154、169、170、183、184、189、204、215、255、256、261、262、264、282、283、284、309、311、313；第二部分那张黄金用例表里另有一行（第 429 行，`a_rule_matches_the_url_rebuilt_from_the_connection_target`，`06d0806` 补）。最近一次运行 41411445901（`a262d4c`）没有全绿，具体照 NFR-07 之 CI 那一行（第 313 行）与第二部分第 7 条写：Linux 与 Windows 的 `check` 的测试一步各有失败，都在测试一侧，由 M4b 任务 11 处理；那次的修正 CI 没有见过。所以「三平台构建与测试」对现在这棵树只有到 `a262d4c` 为止的证据。推送之后读回那次运行时就地改写这一节与上面那 27 行。
 
 ## 留给项目所有者的
 
@@ -516,12 +516,12 @@
 
 1. **手工验收**：阶段 1 ～ 4 四份清单，一项也没有做过。阶段 4 的 68 项（Windows 16、macOS 16、Linux 16、与平台无关 20；被本文「真机上」一列点到 65 项，没有被点到的三项是 `M2/W5`、`M2/M5`、`M2/L5`，见「靠手工验收的」）。阶段 1、2、3 三份清单也没有做。
 2. **推送与读回 CI**：M4b 任务 11（`707decf`、`a9ef85b`）、M5 与 M6 的提交都在本地；本地 `main`（`bd981d2`）比 `origin/main`（`a262d4c`）多 48 个提交，M6 的提交在其后。推送之后读回那次运行的注解与任务摘要，M6 的收尾按读到的改（M6-D23、M6-D29）。
-3. **总设计 Q1 ～ Q6**：尤其 Q4——M3c（jq、`br`、`zstd`）等它；`p12-keystore` 的升级；`webpki-roots` 的许可（NFR-11 那一句：它是 CDLA-Permissive-2.0，不在需求字面的白名单里）；要不要改用 `rustls-platform-verifier`（重对报告第 3 节第 12 条：Surge 说它的上游证书链靠操作系统的信任评估）。Q1——记录里的 `url` 带着查询串出 API；Q2——重写节的头值要不要藏；Q3——`[MITM] # note` 这样的节头；Q5——把 CA 自动装进信任库、经虚拟网卡来的会话名字在 INFO 及以上；Q6——需求文档的阶段栏（FR-RULE-07 / 08 两行里的几句）。
+3. **总设计 Q1 ～ Q6**：尤其 Q4——M3c（jq、`br`、`zstd`）等它；`p12-keystore` 的升级；`webpki-roots` 的许可（NFR-11 那一句：它是 CDLA-Permissive-2.0，不在需求字面的白名单里）；要不要改用 `rustls-platform-verifier`（重对报告第 3 节第 12 条：Surge 说它的上游证书链靠操作系统的信任评估）。Q1——记录里的 `url` 带着查询串出 API；Q2——重写节的头值要不要藏；Q3——`[MITM] # note` 这样的节头；Q5——把 CA 自动装进系统与 Firefox 的信任库；Q6——需求文档的阶段栏（FR-RULE-07 / 08 两行里的几句）。
 4. **叶证书的密钥**：Surge Mac 6.10.0 撤回了"每个域名一把密钥"（理由是大量并发的 MITM 时慢）；rurge 每张叶证书一把 P-256（总设计 P4-D8），M5b 的 B4 量到签一张的中位数 248.6 µs。改不改；登记在兼容性清单 7.2 节。
 5. **抓包过滤器**：手册新写的 `GET` / `POST /v1/capture/filters` 与 `capture-filter`（兼容性清单 10.4 节的一行，阶段栏"待定"）：要不要做、在哪个阶段。
 6. **M5b 延后第 1 ～ 3 行**（M6-D22 答"不查"）：B1 的明文一路慢要不要查、要不要为它改引擎里 hyper 的写法；B4 的握手长尾要不要查（第一步是加一个直连的握手基线）；改写正文的峰值约多 3.94 份正文，要不要做得更省、归哪个里程碑。
 7. **M5 设计第 15 节第 1 ～ 6 条**：gQUIC；从不完整的 ClientHello 取 SNI；`block-quic = always-allow` 不放过 `auto-quic-block`（M5-D13）；没有 SNI 的 ClientHello 按目标（M5-D14）；`auto-quic-block` 跟着 TCP 一侧（M5-D11）；第 6 条——NFR-01 的线怎样用在经引擎的路径上（读数有了：B1 经 rurge 的明文下行 0.79 Gbit/s 是那条 1 Gbit/s 的 0.79 倍；B5 每条空闲连接经 rurge 比直连多出的是"每条 30 KB"的 1.36、1.02、2.58 倍）。第 7 条照旧。
-8. **M1a ～ M5b 归所有者的延后项与可以改的裁定**：照 `docs/status.md` 阶段 4 各节「去向写着项目所有者的」那一段汇总成本文末尾那张表；与上面各条重复的标"见第 N 条"，不另定去向。
+8. **M1a ～ M5b 归所有者的延后项与可以改的裁定**：本文末尾那张表列的是 `docs/status.md` 阶段 4 各节「去向写着项目所有者的」那几段里点了名的事项与设计里"尤其"列出的裁定；那几段另有一句总括——那个里程碑的设计与计划里代所有者作的裁定都可以改（各设计的 M1-D1 ～ D27、M2-D1 ～ D25、M3-D1 ～ D31、M4-D1 ～ D31、M5-D1 ～ D18，各计划的 P 项，修正记录里写着"协调者的裁定"的各行等）——那些不逐条进表，见各节。与上面各条重复的标"见第 N 条"，不另定去向。
 
 9. **对照查出的**：
    - 「需求文字有问题」4 句（FR-HTTP-07 的「先于脚本」、FR-HTTP-09 的「…→ 脚本」与「每请求 / 响应最多一个脚本」、FR-HTTP-11 的「通过…Dashboard 查看」）：各句的需求文字或阶段栏怎么改。
@@ -529,24 +529,27 @@
    - NFR-11 的 `webpki-roots` 与 NFR-01 的校准已在第 3、7 条里，不重复。
 10. **重对报告第 4 节**：与阶段 4 无关的手册与发行说明的变化（`block-quic = adaptive` 又改了两次、443 端口上的非 QUIC 协议、SOCKS5 的 UDP 关联、`socks5-listen` 的密码、规则集没有条数上限、`allow-peer-access`、MCP 与 Bearer、`upload-size-limit` 等）：要不要、在哪个阶段处理，要不要另开一轮重对把它们落进兼容性清单。
 11. **h2spec**（M6-D25）：要不要在 CI 里对 rurge 解密之后的 HTTP/2 一侧跑 h2spec。
-12. **M6 计划「延后事项」第 12、13 行**（对照查出的两件）：第 12 行——304、204、1xx 或 `HEAD` 这类没有正文的应答之后，同一条客户端连接上的下一个请求在现在的代码里会多拨一次上游连接（那条连接要等下一个请求来了才走 `complete` / `put`）；改不改、怎样改要先有设计。第 13 行——MITM 的 HTTP/2 连接上，读得慢的客户端让 rurge 在途攒多少没有量过、没有能红的用例（照读到的停在窗口与缓冲的量级，见 FR-HTTP-02 那一行）：要不要补那条用例。
+12. **M6 计划「延后事项」第 12、13 行**（对照查出的两件）：第 12 行——304、204、1xx 或 `HEAD` 这类没有正文的应答之后，同一条客户端连接上的下一个请求在现在的代码里会多拨一次上游连接（那条连接要等下一个请求来了才走 `complete` / `put`）；304 是用例里看到的，204、1xx 与 `HEAD` 照代码读是同一条路，没有单独核实；改不改、怎样改要先有设计。第 13 行——MITM 的 HTTP/2 连接上，读得慢的客户端让 rurge 在途攒多少没有量过、没有能红的用例（照读到的停在窗口与缓冲的量级，见 FR-HTTP-02 那一行）：要不要补那条用例。
 
 第 8 条那张表：
 
 | 里程碑 | 事项 | 出处 |
 | --- | --- | --- |
 | M1a | 设计里可以改的裁定（M1-D3、D5、D7、D11、D14、D23 等）与 R1（探询看不到会话的进程）、R2（`NeedMore` 取握手消息最早能齐的位置）两个裁定 | M1 细化设计第 19、21 节（总设计 Q1、Q6 见第 3 条） |
-| M1b | 升级之后转发的任务握着 `Shared`，池里别的空闲上游连接会活到转发结束 | M1b 计划「延后事项」第 2 行 |
+| M1b | 升级之后转发的任务握着 `Shared`，池里别的空闲上游连接会活到转发结束 | M1b 计划「延后事项」第 2 行（那一行的去向写的是"以后的会话：可以考虑升级时清池"（M1b 计划第 812 行），`docs/status.md` 的阶段 4 / M1b 一节把它列在归项目所有者的一段） |
 | M1b | 反查不到名字的 fake 地址在 `rurge-http` 与 `CONNECT` 两路的次序不同：要不要统一 | M1b 计划「延后事项」第 3 行 |
+| M2 | 设计里可以改的几项（尤其 M2-D2、M2-D4、M2-D9、M2-D11、M2-D18、M2-D21；M2-D2 的 `p12-keystore` 见第 3 条） | M2 细化设计第 22 节 |
+| M2 | 经虚拟网卡来的会话的名字要不要在 INFO 及以上带（M2 新加的握手失败与证书固定提示的行照 M3-D26 写，所有者若决定可以带，这几行随之改） | M2 细化设计第 22 节（阶段 3 / M3c 计划延后第 6 行那一项） |
 | M2a | 运行中 CA 到期要不要按时查、要不要告警或停止解密 | M2a 计划「延后事项」第 1 行 |
 | M2a | 解密的流上对端不发 `close_notify` 就关闭要不要当成流的结束 | M2a 计划「延后事项」第 2 行 |
 | M2b | 修正记录里代所有者作的裁定：流控窗口的推理、拨号请求的字节不追到准确、上游正文出错一律以 `INTERNAL_ERROR` 重置 | M2b 计划修正记录第 23、42、48 行 |
+| M2b | 上游以 `RST_STREAM(NO_ERROR)` 提前结束要不要识别（M2b 不识别，是协调者的裁定） | M2b 计划「延后事项」第 2 行（去向写的是 M2b 任务 6；`docs/status.md` 的阶段 4 / M2b 一节把它列在归所有者的一段） |
 | M2c | 证书固定提示把"握手完成之后才核证书、因而不信 CA"的客户端也报成证书固定：改不改措辞 | M2c 计划「延后事项」第 1 行 |
-| M3a | 设计里可以改的几项（尤其 M3-D2、M3-D4、M3-D7、M3-D16、M3-D27、M3-D30） | M3 设计第 21 节 |
-| M3b | 回溯上限的代价：1 亿要不要改、要不要按正文大小变 | M3b 计划修正记录第 22 行的测量与 M3 设计第 21 节 |
-| M4a | 抓到的内容算不算 API 输出、四个头遮住的做法；两个缺省上限（100 MiB 与 5 MiB）；`always-capture` 的范围；头的行数多得多的条目要不要按行数记账；`--capture-size` 小于一条最小的条目时要不要告警或拒绝 | M4 设计第 17 节与 M4a 计划修正记录第 80 行 |
+| M3a | 设计里可以改的九项（M3-D2、M3-D3、M3-D4、M3-D7、M3-D9、M3-D11、M3-D16、M3-D27、M3-D30） | M3 设计第 21 节 |
+| M3b | 回溯上限的代价：1 亿要不要改、要不要按正文大小变 | M3b 计划修正记录第 22 行的测量与 `docs/status.md` 的阶段 4 / M3b 一节（1 亿是 M3-D8 定的） |
+| M4a | 抓到的内容算不算 API 输出、四个头遮住的做法；两个缺省上限（100 MiB 与 5 MiB）；`always-capture` 的范围；请求在两处取样、没有发出的取求规则时的（M4-D11）、存进去的时刻（M4-D13）；头的行数多得多的条目要不要按行数记账；`--capture-size` 小于一条最小的条目时要不要告警或拒绝 | M4 设计第 17 节、M4a 计划修正记录第 80 行与 `docs/status.md` 的阶段 4 / M4a 一节 |
 | M4b | `remoteAddr` 的新口径；`--request-log-size` 的缺省（1 000 不改，量到的一条记录的大小） | M4 设计第 17 节（M4-D23、M4-D25）与 M4b 计划修正记录第 62 行 |
 | M5a | 设计第 15 节第 1 ～ 5 条与修正记录里代所有者作的裁定 | M5 设计第 15 节、M5a 计划修正记录第 9、11、14、25、26、27 行（见第 7 条） |
-| M5b | NFR-01 的线怎样用在经引擎的路径上；B1 的明文一路慢、B4 的握手长尾、改写正文的峰值 | M5 设计第 15 节第 6 条、M5b 计划「延后事项」第 1、3 行（见第 6、7 条） |
+| M5b | NFR-01 的线怎样用在经引擎的路径上；B1 的明文一路慢、B4 的握手长尾、改写正文的峰值 | M5 设计第 15 节第 6 条、M5b 计划「延后事项」第 1 ～ 3 行（见第 6、7 条） |
 
-M3a 与 M3b 的「延后事项」里没有归项目所有者的行（M3b 的三行分别是协调者两行与任务 9 一行，协调者的裁定同样可以改）；M4a、M4b、M5a 的「延后事项」里也没有归所有者的行。
+M3a 与 M3b 的「延后事项」里没有归项目所有者的行（M3b 的三行，两行去向是协调者，一行去向是 M3b 任务 9；协调者的裁定同样可以改）；M4a、M4b、M5a 的「延后事项」里也没有归所有者的行。
