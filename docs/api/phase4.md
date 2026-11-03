@@ -1183,6 +1183,6 @@ a ClientHello that does not parse
 
 **「M5a」一节有两处比代码说得少**：
 
-- 「被 `auto-quic-block` 阻断的流」一节写「两步都是 TCP 一侧今天的那段代码（入口、名字、`always-raw-tcp-hosts`、`always-raw-tcp-keywords` 与端口那几步抽成 `sniffable_target`，两侧共用，条件不会分叉）」，没有写入口那一步在 `sniffable_session` 里分在它前面：`sniffable_session`（`crates/rurge-engine/src/serve.rs`）先看传输（`session.transport != Transport::Tcp` 就不嗅探）与暂停（`self.is_suspended()`），再问 `sniffable_target`；`sniffable_target` 不看传输、也不看暂停（UDP 流也问它，`auto_quic_blocks` 就是问它的），它看的是入口（`Http`、`Socks5`、`Tun`）、名字、两个名单与端口。所以「两侧共用」说的是这几步，传输与暂停不共用（M5a 计划「执行期修正记录」第 19 行）。
+- 「被 `auto-quic-block` 阻断的流」一节写「…（入口、名字、`always-raw-tcp-hosts`、`always-raw-tcp-keywords` 与端口那几步抽成 `sniffable_target`，两侧共用，条件不会分叉）」，没有写入口那一步在 `sniffable_session` 里分在它前面：`sniffable_session`（`crates/rurge-engine/src/serve.rs`）先看传输（`session.transport != Transport::Tcp` 就不嗅探）与暂停（`self.is_suspended()`），再问 `sniffable_target`；`sniffable_target` 不看传输、也不看暂停（UDP 流也问它，`auto_quic_blocks` 就是问它的），它看的是入口（`Http`、`Socks5`、`Tun`）、名字、两个名单与端口。所以「两侧共用」说的是这几步，传输与暂停不共用（M5a 计划「执行期修正记录」第 19 行）。
 - 「没有覆盖的」里少了「`quic` 四个数在重载之后的读数」：上面「`GET /v1/rurge/http` 的 `quic`」一节写着四个数自进程启动起累计、重载不清零，写那一节时没有钉住它的用例；`84f5843` 补的 `the_quic_counts_survive_a_reload`（`crates/rurge-engine/tests/udp.rs`）在一条读完 ClientHello 的流之后用 `swap_runtime` 换一份配置，断言 `http_counts().quic` 仍是 `hello: 1`（失败时 `a reload does not clear the counts`）。
 - **没有观察过 Surge 在这些地方的实际行为**，照设计与手册写：`quic` 四个数的口径、两种备注与那一句说明的文字、持住的两个上限、阻断跟着 TCP 一侧的读法。
