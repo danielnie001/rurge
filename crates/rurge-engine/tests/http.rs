@@ -2476,6 +2476,202 @@ async fn chunked_bodies_go_both_ways() {
     assert_eq!(seen[0], body, "the origin got the client's bytes, whole");
 }
 
+/// A loopback origin that answers the first request of a connection with a
+/// 304 and writes a few bytes after it, as if a body followed a response that
+/// should have none; after that it answers normally (`the phase 4 M6 recheck
+/// report item 3`).
+///
+/// It reads one head at a time; the first request it ever reads gets the 304
+/// and the stray bytes, every later one the 200.
+async fn origin_with_a_body_after_a_304() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                break;
+            };
+            let n = n.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match s.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => head.push(byte[0]),
+                        }
+                    }
+                    let first = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    let answer: &[u8] = if first {
+                        // no body, then a few bytes nobody asked for
+                        b"HTTP/1.1 304 Not Modified\r\n\r\nstray"
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                    };
+                    if s.write_all(answer).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// An origin that sends a body after a 304 does not poison the next request
+/// of the same client connection (`the phase 4 M6 recheck report item 3`,
+/// Surge's release note: requests failed with 503): the second request gets
+/// the origin's 200 and its body, not a 502 or a closed connection.
+#[tokio::test]
+async fn a_body_after_a_304_does_not_poison_the_next_request() {
+    let origin = origin_with_a_body_after_a_304().await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    let first = request(&mut tunnel, "target.test", "/first").await;
+    assert!(first.starts_with("HTTP/1.1 304"), "{first}");
+    let second = request(&mut tunnel, "target.test", "/second").await;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    assert!(second.ends_with("ok"), "{second}");
+    drop(tunnel);
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].status_code, Some(304), "{records:?}");
+    assert_eq!(records[1].status_code, Some(200), "{records:?}");
+}
+
+/// A loopback origin that reads one request at a time, keeps its path and its
+/// body (chunked when the head says so), and answers the path as the body, so
+/// a client can tell two answers apart (`the phase 4 M6 recheck report item
+/// 9`).
+async fn path_echo() -> (SocketAddr, Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let seen: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>> = Arc::default();
+    let log = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                break;
+            };
+            let log = log.clone();
+            tokio::spawn(async move {
+                loop {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match s.read(&mut byte).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => head.push(byte[0]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&head).into_owned();
+                    let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let chunked = text.to_ascii_lowercase().contains("chunked");
+                    let body = if chunked {
+                        read_chunked(&mut s).await
+                    } else {
+                        Vec::new()
+                    };
+                    log.lock().unwrap().push((path.clone(), body));
+                    let answer = path.as_bytes();
+                    let out = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        answer.len()
+                    );
+                    if s.write_all(out.as_bytes()).await.is_err()
+                        || s.write_all(answer).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, seen)
+}
+
+/// A pipelined request sent right after a chunked body is its own request
+/// (`the phase 4 M6 recheck report item 9`: Surge fixed such a request being
+/// forwarded as part of the chunked body): each gets its answer, the origin
+/// reads the chunked body whole and the second request as a separate `GET`,
+/// and each request has a record.
+#[tokio::test]
+async fn a_pipelined_request_after_a_chunked_body_is_its_own_request() {
+    let (origin, seen) = path_echo().await;
+    let a = FakeSocks5::spawn(Socks5Script {
+        connect_to: Some(origin),
+        ..Socks5Script::default()
+    })
+    .await;
+    let h = harness_with(
+        Profile {
+            proxies: &format!("A = socks5, 127.0.0.1, {}", a.addr().port()),
+            rules: "DOMAIN,target.test,A",
+            ..Profile::default()
+        },
+        sniffing(),
+    )
+    .await;
+
+    let (reply, mut tunnel) = socks5_connect(h.socks(), "target.test", 80).await;
+    assert_eq!(reply[1], 0x00, "{reply:?}");
+    let upload: &[u8] = b"alpha-bravo-charlie";
+    // head, the chunked body, and a pipelined `GET`, all in one write
+    // (`CLAUDE.md`)
+    let mut sent =
+        b"POST /first HTTP/1.1\r\nHost: target.test\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    for piece in upload.chunks(7) {
+        sent.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+        sent.extend_from_slice(piece);
+        sent.extend_from_slice(b"\r\n");
+    }
+    sent.extend_from_slice(b"0\r\n\r\n");
+    sent.extend_from_slice(b"GET /second HTTP/1.1\r\nHost: target.test\r\n\r\n");
+    tunnel.write_all(&sent).await.unwrap();
+
+    let one = read_response(&mut tunnel).await;
+    assert!(one.starts_with("HTTP/1.1 200"), "{one}");
+    assert!(one.ends_with("/first"), "{one}");
+    let two = read_response(&mut tunnel).await;
+    assert!(two.starts_with("HTTP/1.1 200"), "{two}");
+    assert!(two.ends_with("/second"), "{two}");
+    drop(tunnel);
+
+    let got = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(got[0].0, "/first");
+    assert_eq!(got[0].1, upload.to_vec(), "the chunked body, whole");
+    assert_eq!(got[1].0, "/second");
+    assert!(got[1].1.is_empty(), "the `GET` has no body: {:?}", got[1].1);
+
+    let records = the_records(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].url.as_deref(), Some("http://target.test/first"));
+    assert_eq!(records[1].url.as_deref(), Some("http://target.test/second"));
+}
+
 /// What an origin that reads an upload keeps of it: its request head's
 /// fields, and the body.
 type SeenUpload = (Vec<(String, String)>, Vec<u8>);
