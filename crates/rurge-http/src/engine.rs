@@ -10568,6 +10568,91 @@ mod tests {
         assert_eq!(counters.snapshot(), counted(0, 0, 0, 0));
     }
 
+    /// A 304, a 204 and a `HEAD` answer over an HTTP/2 client are not buffered
+    /// either (`M3-D19`; the recheck report's item 8): the rule that would give
+    /// an empty body one does not, the origin's own length stays, and no note
+    /// or count is left. The `HEAD` and the 204 over HTTP/1.1 are
+    /// `head_and_204_answers_are_not_buffered` above; both versions take the
+    /// same `response_buffer` decision.
+    #[tokio::test]
+    async fn a_bodyless_answer_is_not_rewritten() {
+        // HTTP/1.1: the 304 the case above does not cover
+        let addr = origin_answering(b"HTTP/1.1 304 Not Modified\r\n\r\n".to_vec()).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ ^$ generated",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /n HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let head = rig.client.response_head().await;
+        assert!(head.starts_with("HTTP/1.1 304"), "{head}");
+        assert_eq!(header_value(&head, "content-length"), None, "{head}");
+        let handle = rig.fake.finished(0).await;
+        assert!(
+            rewrite_notes(&handle).is_empty(),
+            "{:?}",
+            rewrite_notes(&handle)
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 0, 0));
+
+        // HTTP/2: a 304, a 204 and a HEAD, over an HTTP/1.1 origin
+        for (method, raw, status, length) in [
+            (
+                http::Method::GET,
+                &b"HTTP/1.1 304 Not Modified\r\n\r\n"[..],
+                304,
+                None,
+            ),
+            (
+                http::Method::GET,
+                &b"HTTP/1.1 204 No Content\r\n\r\n"[..],
+                204,
+                None,
+            ),
+            (
+                http::Method::HEAD,
+                &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"[..],
+                200,
+                Some("2"),
+            ),
+        ] {
+            let addr = origin_answering(raw.to_vec()).await;
+            let (rules, counters) = rewrite_of(
+                "[Body Rewrite]\nhttp-response ^http://b\\.test/ ^$ generated",
+                roots_of("rurge test rewrite CA"),
+            );
+            let rig = rig_h2(addr, Duration::from_secs(5), Duration::from_secs(5)).await;
+            rig.fake.rewrite(rules);
+            let (mut sender, conn) = h2_client(rig.client).await;
+            let resp = sender
+                .send_request(h2_request(method, "http://b.test/p"))
+                .await
+                .expect("an answer");
+            assert_eq!(resp.status().as_u16(), status);
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_LENGTH)
+                    .map(|value| value.to_str().unwrap()),
+                length,
+                "the origin's own length, not a generated body's"
+            );
+            assert_eq!(body_of(resp).await, b"");
+            let handle = rig.fake.finished(0).await;
+            assert!(
+                rewrite_notes(&handle).is_empty(),
+                "{:?}",
+                rewrite_notes(&handle)
+            );
+            assert_eq!(counters.snapshot(), counted(0, 0, 0, 0));
+            drop(sender);
+            conn.abort();
+        }
+    }
+
     /// A shared HTTP/2 connection has no meter of its own: the bytes a buffered
     /// answer was read with count onto the request once, and not again when
     /// they go out (`phase 4 M2 design 10.2`, the phase 4 / M2b plan's P11; the

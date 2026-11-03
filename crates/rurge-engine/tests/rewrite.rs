@@ -4066,3 +4066,74 @@ async fn body_and_map_local_counts_reach_the_api_shape() {
     let records = the_records(&h, 7).await;
     assert_eq!(records.len(), 7, "{records:?}");
 }
+
+/// The engine's rewrite steps act in the design's order (`phase 4 M3 design
+/// 8.1`): Header Rewrite (request) before URL Rewrite, and URL Rewrite before
+/// Body Rewrite. The first half would dial the guard if the URL rule saw the
+/// `Host` before the header rule changed it; the second would leave the body
+/// as it came if the body rule saw the URL before the URL rule retargeted the
+/// request.
+#[tokio::test]
+async fn the_pipeline_order_is_header_then_url_then_body() {
+    // Header Rewrite before URL Rewrite: the URL rebuilt from the `Host` the
+    // header rule wrote (`phase 4 M3 design 6.2`'s second candidate) is what
+    // the URL rule matches.
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let h = harness_with(
+        Profile {
+            general: "show-error-page-for-reject = true",
+            proxies: &proxies,
+            hosts: "a.test = 127.0.0.1\nb.test = 127.0.0.1",
+            rules: "DOMAIN,a.test,guard",
+            sections: "[Header Rewrite]\n\
+                       http-request ^http://a\\.test header-replace Host b.test\n\
+                       [URL Rewrite]\n\
+                       ^http://b\\.test/blocked _ reject",
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let answer = plain_get(h.http(), "http://a.test/blocked", "a.test").await;
+    assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+    assert_eq!(
+        guard.connections(),
+        0,
+        "the URL rule matched the `Host` the header rule wrote, so the guard was not dialled"
+    );
+
+    // URL Rewrite before Body Rewrite: a `header` rule changes the URL, and
+    // the body rule compares the URL it became (`phase 4 M3 design 8.1`).
+    let origin = ScriptedOrigin::spawn(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nvalue".to_vec(),
+    )
+    .await;
+    let port = origin.port();
+    let sections = format!(
+        "[URL Rewrite]\n\
+         ^http://a\\.test/old http://b.test:{port}/new header\n\
+         [Body Rewrite]\n\
+         http-request ^http://b\\.test:{port}/new value abc"
+    );
+    let h = harness_with(
+        Profile {
+            hosts: "a.test = 127.0.0.1\nb.test = 127.0.0.1",
+            rules: "DOMAIN,a.test,DIRECT",
+            sections: &sections,
+            ..Profile::default()
+        },
+        shared_on(NetworkFacts::default()),
+    )
+    .await;
+    let request = "POST http://a.test/old HTTP/1.1\r\nHost: a.test\r\n\
+                   Content-Length: 5\r\nConnection: close\r\n\r\nvalue";
+    let (head, _) = answer_parts(&answer_bytes(h.http(), request.as_bytes()).await);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let heard = origin.heard();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(
+        heard[0].1, b"abc",
+        "the body rule matched the URL the URL rule left"
+    );
+}
