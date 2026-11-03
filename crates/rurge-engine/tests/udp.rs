@@ -1724,6 +1724,41 @@ async fn a_flow_whose_association_ends_while_held_leaves_no_record() {
     assert!(held_by.silent());
 }
 
+/// The four QUIC counts belong to the engine, not to a generation: a reload
+/// does not clear them (`docs/api/phase4.md` 的「M5a」一节).
+#[tokio::test]
+async fn the_quic_counts_survive_a_reload() {
+    let h = harness(Profile {
+        hosts: "held.test = 127.0.0.1",
+        rules: "DOMAIN,held.test,REJECT,extended-matching",
+        ..Profile::default()
+    })
+    .await;
+    let sink = udp_sink().await;
+    let ([d1, d2], _) = a_hello_over_two(600);
+    let association = udp_associate(h.socks()).await;
+    association.send("127.0.0.1", sink.port, &d1).await;
+    association.send("127.0.0.1", sink.port, &d2).await;
+
+    let dst = format!("127.0.0.1:{}", sink.port);
+    let record = flow_record(&h, &dst).await;
+    assert_eq!(record.sni.as_deref(), Some("held.test"));
+    let counted = QuicSniffed {
+        hello: 1,
+        ..QuicSniffed::default()
+    };
+    assert_eq!(h.engine.http_counts().quic, counted);
+
+    let text = std::fs::read_to_string(h.dir.path().join("t.conf")).unwrap();
+    h.engine
+        .swap_runtime(runtime(h.dir.path(), &text, h.engine.shared()).await);
+    assert_eq!(
+        h.engine.http_counts().quic,
+        counted,
+        "a reload does not clear the counts"
+    );
+}
+
 /// A real client's first datagram, read from the RFC 9001 sample, gives the
 /// flow its SNI.
 #[tokio::test]

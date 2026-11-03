@@ -3462,3 +3462,27 @@ async fn a_hello_without_sni_is_judged_by_its_target() {
     let quic = h.engine.http_counts().quic;
     assert_eq!((quic.blocked, quic.hello), (1, 2));
 }
+
+/// The list is matched by the name the ClientHello gives, not by the target
+/// alone: a flow to an address, whose hello names a listed host, is blocked
+/// (`phase 4 M5 design 6.1`).
+#[tokio::test]
+async fn a_listed_hello_is_blocked_at_an_address_it_names_it_to() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw"))),
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    // the target is an address the list does not name; the hello names the
+    // listed host, so only the SNI can take it
+    association
+        .send("127.0.0.1", 443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = ended(&h, "127.0.0.1:443").await;
+    assert_blocked(&record);
+    assert_eq!(record.sni.as_deref(), Some("origin.test"));
+    let quic = h.engine.http_counts().quic;
+    assert_eq!((quic.blocked, quic.hello), (1, 1));
+}
