@@ -10447,6 +10447,97 @@ mod tests {
         );
     }
 
+    /// An answer whose decoding goes over 10 MiB is not rewritten: the client
+    /// gets the compressed bytes as they came, with a note that names the
+    /// decoded limit (`phase 4 M3 design 9.3`, `9.4`; the manual's
+    /// "Limitations" on the response side). The body is a few gzip members,
+    /// each decoding to 1 MiB, so the case compresses little.
+    #[tokio::test]
+    async fn a_decoded_response_over_ten_mib_is_not_rewritten() {
+        let gz = gzipped(&vec![b'a'; 1024 * 1024]).repeat(11);
+        let mut answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\n\
+             Content-Length: {}\r\n\r\n",
+            gz.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(&gz);
+        let addr = origin_answering(answer).await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-response ^http://b\\.test/ a b",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        rig.client
+            .send("GET /big HTTP/1.1\r\nHost: b.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, gz, "the compressed bytes, as they came");
+        assert_eq!(
+            header_value(&head, "content-encoding").as_deref(),
+            Some("gzip"),
+            "{head}"
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Body Rewrite skipped: ^http://b\\.test/: the decoded body is over 10 MiB"]
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 1, 0));
+    }
+
+    /// A request body whose decoding goes over 32 MiB is not rewritten either:
+    /// the origin gets the compressed bytes as they came, with a note that
+    /// names the decoded limit (`phase 4 M3 design 9.3`, `9.4`).
+    #[tokio::test]
+    async fn a_decoded_request_over_thirty_two_mib_is_not_rewritten() {
+        let (addr, records) = recording_origin().await;
+        let (rules, counters) = rewrite_of(
+            "[Body Rewrite]\nhttp-request ^http://b\\.test/ a b",
+            roots_of("rurge test rewrite CA"),
+        );
+        let mut rig = connected(Entry::Sniffed, addr).await;
+        rig.fake.rewrite(rules);
+        // each member decodes to 1 MiB; 33 of them are 33 MiB decoded
+        let gz = gzipped(&vec![b'a'; 1024 * 1024]).repeat(33);
+        let mut request = format!(
+            "POST /big HTTP/1.1\r\nHost: b.test\r\nContent-Encoding: gzip\r\n\
+             Content-Length: {}\r\n\r\n",
+            gz.len()
+        )
+        .into_bytes();
+        // the head and the body go in one write, as `CLAUDE.md` asks of every
+        // request a case writes by hand
+        request.extend_from_slice(&gz);
+        rig.client
+            .stream
+            .write_all(&request)
+            .await
+            .expect("the request");
+        let (head, body) = rig.client.response().await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, b"ok");
+        let seen = records.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one request reached the origin");
+        assert_eq!(seen[0].body, gz, "the compressed bytes, as they came");
+        assert_eq!(
+            header_value(&seen[0].head, "content-encoding").as_deref(),
+            Some("gzip"),
+            "{}",
+            seen[0].head
+        );
+        let handle = rig.fake.finished(0).await;
+        assert_eq!(handle.outcome(), Some(SessionOutcome::Completed));
+        assert_eq!(
+            rewrite_notes(&handle),
+            ["Body Rewrite skipped: ^http://b\\.test/: the decoded body is over 32 MiB"]
+        );
+        assert_eq!(counters.snapshot(), counted(0, 0, 1, 0));
+    }
+
     /// An answer over the limit is not rewritten: what was read goes out first
     /// and the rest as it comes, and the client gets the origin's bytes
     /// (`phase 4 M3 design 9.3`, the phase 4 / M3b plan's P14).
