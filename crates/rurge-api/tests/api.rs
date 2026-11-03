@@ -3951,6 +3951,56 @@ async fn an_entry_is_shown_whole_with_four_headers_masked() {
     assert_eq!(refused["error"], "dropped by the rules", "{refused}");
 }
 
+/// The two values of the two fields the other cases do not reach — an
+/// `upgraded` outcome and a body truncated for the budget — and the `null`
+/// remote address of a session that left by nothing (`phase 4 M4 design 7.3`,
+/// `7.5`).
+#[tokio::test]
+async fn the_outcome_upgraded_and_the_budget_truncation_are_named() {
+    use rurge_engine::capture::{Body, Outcome, Truncated};
+    use rurge_proto::RejectKind;
+
+    let api = api().await;
+    // an upgrade, with a response body the store kept only part of for the
+    // budget
+    let mut upgraded = capture_entry(1, "a");
+    upgraded.outcome = Outcome::Upgraded;
+    upgraded.response_body = Body {
+        data: Bytes::from_static(b"x"),
+        size: 9,
+        truncated: Some(Truncated::Budget),
+    };
+    assert!(api.engine.capture().put(upgraded));
+
+    // a refusal that dialled nothing: no far end to write down
+    let mut refused = capture_entry(2, "a");
+    refused.response = None;
+    refused.outcome = Outcome::Rejected(RejectKind::Reject);
+    refused.remote = None;
+    assert!(api.engine.capture().put(refused));
+
+    let (status, body) = get(&api, "/v1/rurge/capture/entries/1").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"], "upgraded", "{body}");
+    assert_eq!(body["response"]["body"]["truncated"], "budget", "{body}");
+
+    let (status, body) = get(&api, "/v1/rurge/capture/entries/2").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["outcome"], "rejected", "{body}");
+    assert_eq!(body["remoteAddr"], Value::Null, "{body}");
+
+    // the summary names the same outcome and the same truncation
+    let (status, body) = get(&api, "/v1/rurge/capture/sessions/a").await;
+    assert_eq!(status, 200, "{body}");
+    let listed = body.as_array().expect("an array of summaries");
+    let upgraded = listed
+        .iter()
+        .find(|entry| entry["id"] == 1)
+        .expect("entry 1");
+    assert_eq!(upgraded["outcome"], "upgraded", "{body}");
+    assert_eq!(upgraded["truncated"], true, "{body}");
+}
+
 /// `?decode=true` undoes the `content-encoding` of both bodies, and says why
 /// it cannot for the ones it leaves as they are (`phase 4 M4 design 7.5`).
 #[tokio::test]
