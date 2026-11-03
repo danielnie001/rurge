@@ -2559,16 +2559,19 @@ async fn a_body_after_a_304_does_not_poison_the_next_request() {
     assert_eq!(records[1].status_code, Some(200), "{records:?}");
 }
 
+/// One request as `path_echo` read it: its path and its body.
+type SeenPath = (String, Vec<u8>);
+
 /// A loopback origin that reads one request at a time, keeps its path and its
 /// body (chunked when the head says so), and answers the path as the body, so
 /// a client can tell two answers apart (`the phase 4 M6 recheck report item
 /// 9`).
-async fn path_echo() -> (SocketAddr, Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>) {
+async fn path_echo() -> (SocketAddr, Arc<std::sync::Mutex<Vec<SeenPath>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let seen: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>> = Arc::default();
+    let seen: Arc<std::sync::Mutex<Vec<SeenPath>>> = Arc::default();
     let log = seen.clone();
     tokio::spawn(async move {
         loop {
