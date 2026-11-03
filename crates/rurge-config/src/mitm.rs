@@ -37,7 +37,7 @@ pub struct MitmConfig {
     pub ca_keystore_name: Option<String>,
     /// Whether the certificate an origin presents is checked.
     pub skip_server_cert_verify: bool,
-    /// Whether HTTP/2 is decrypted too; read only until M2b.
+    /// Whether HTTP/2 is decrypted too; off by default (`phase 4 M2 design 10`).
     pub h2: bool,
     /// The sources allowed to be decrypted; `None` is every source.
     pub client_source_address: Option<SourceList>,
