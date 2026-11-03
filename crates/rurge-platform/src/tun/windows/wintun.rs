@@ -743,12 +743,11 @@ mod tests {
     ///
     /// This is a second process on purpose. The process error mode is inherited
     /// from the parent, so what the test binary itself runs with depends on
-    /// where the gate was started from: `0x3` from Git Bash, `0x8003` from
-    /// PowerShell with redirected output, and `0x0` from the Explorer or from
-    /// `Start-Process` without redirection. `CREATE_DEFAULT_ERROR_MODE` gives
-    /// the child the default mode whatever the parent has, which is what a
-    /// process started from the Explorer or by `Start-Process` without
-    /// redirection looks like.
+    /// where the gate was started from. On the machine this test was written
+    /// on, it was `0x3` from Git Bash, `0x8003` from PowerShell (and from
+    /// `Start-Process` with redirected output), and `0x0` from `Start-Process`
+    /// without redirection. `CREATE_DEFAULT_ERROR_MODE` gives the child the
+    /// default mode whatever the parent has.
     ///
     /// Where there is no interactive desktop (CI, for one), a message box
     /// cannot appear, so this test may well pass there even if `load` stops
