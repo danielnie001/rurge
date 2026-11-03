@@ -32,6 +32,7 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Cryptography_Catalog",
     "Win32_Security_Cryptography_Sip",
     "Win32_Security_WinTrust",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",

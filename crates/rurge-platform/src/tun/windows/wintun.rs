@@ -299,15 +299,30 @@ fn verify_signer(path: &Path, file: &File) -> Result<Option<String>, String> {
 /// System32 only, and its eleven entry points. A module that has no Wintun in
 /// it is freed again before the error is returned, which names the entry point
 /// that was missing and asks whether this is wintun.dll at all.
+///
+/// The thread's error mode is `SEM_FAILCRITICALERRORS` for the load and is put
+/// back as it was as soon as the load returns: without it the loader puts a
+/// modal "Bad Image" box on the desktop for a file that is not a PE image and
+/// waits for somebody to dismiss it (the phase 4 / M6 plan's execution record
+/// row 56). It is the thread's mode, not the process's, so no other thread is
+/// affected.
 #[allow(unsafe_code)]
 fn load(path: &Path) -> io::Result<Wintun> {
     use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        SEM_FAILCRITICALERRORS, SetThreadErrorMode,
+    };
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
     };
 
     let path =
         wide(path.as_os_str()).map_err(|text| io::Error::new(io::ErrorKind::InvalidInput, text))?;
+    let mut previous: u32 = 0;
+    // SAFETY: `lpoldmode` points at a `THREAD_ERROR_MODE` this function owns
+    // and the call only writes it; the mode it sets applies to this thread
+    // alone.
+    let changed = unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, &raw mut previous) } != 0;
     // SAFETY: the path is NUL-terminated UTF-16 and outlives the call; no file
     // is given, the loader opens the DLL itself; the flag makes the DLL's own
     // dependencies come from System32 only (P7).
@@ -318,8 +333,19 @@ fn load(path: &Path) -> io::Result<Wintun> {
             LOAD_LIBRARY_SEARCH_SYSTEM32,
         )
     };
-    if module.is_null() {
-        let error = io::Error::last_os_error();
+    // read before the error mode is put back, which could reset it
+    let failure = if module.is_null() {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    if changed && previous != SEM_FAILCRITICALERRORS {
+        // SAFETY: the mode the `SetThreadErrorMode` above answered with, put
+        // back on the same thread; `lpoldmode` may be null, and nothing is
+        // written through it.
+        unsafe { SetThreadErrorMode(previous, std::ptr::null_mut()) };
+    }
+    if let Some(error) = failure {
         return Err(io::Error::new(
             error.kind(),
             format!("cannot load wintun.dll: {error}"),
@@ -709,6 +735,78 @@ mod tests {
         assert!(
             error.to_string().starts_with("cannot load wintun.dll: "),
             "{error}"
+        );
+    }
+
+    /// The same file, loaded by a process that has the default error mode: the
+    /// loader refuses it without putting a message box on the desktop.
+    ///
+    /// This is a second process on purpose. The process error mode is inherited
+    /// from the parent, so what the test binary itself runs with depends on
+    /// where the gate was started from: `0x3` from Git Bash, `0x8003` from
+    /// PowerShell with redirected output, and `0x0` from the Explorer or from
+    /// `Start-Process` without redirection. `CREATE_DEFAULT_ERROR_MODE` gives
+    /// the child the default mode whatever the parent has, which is what a
+    /// process started from the Explorer or by `Start-Process` without
+    /// redirection looks like.
+    ///
+    /// Where there is no interactive desktop (CI, for one), a message box
+    /// cannot appear, so this test may well pass there even if `load` stops
+    /// setting the thread error mode.
+    #[test]
+    fn a_file_that_is_not_a_dll_is_refused_with_the_default_error_mode() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Threading::CREATE_DEFAULT_ERROR_MODE;
+
+        const NAME: &str = "tun::windows::wintun::tests::a_file_that_is_not_a_dll_cannot_be_loaded";
+
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let mut child = Command::new(&exe)
+            .args(["--exact", NAME])
+            .creation_flags(CREATE_DEFAULT_ERROR_MODE)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the test binary starts again");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match child.try_wait().expect("the child's state is read") {
+                Some(_) => break,
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let output = child
+                        .wait_with_output()
+                        .expect("the child is waited for after the kill");
+                    panic!(
+                        "the child process was still running after 60 seconds, which most \
+                         likely means a \"Bad Image\" dialog box is waiting for somebody to \
+                         dismiss it\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+
+        let output = child
+            .wait_with_output()
+            .expect("the child's output is read");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the child could not load a file that is not a DLL\n--- stdout ---\n{stdout}\n--- \
+             stderr ---\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child ran no test: {NAME} did not run\n--- stdout ---\n{stdout}\n--- stderr \
+             ---\n{stderr}"
         );
     }
 
