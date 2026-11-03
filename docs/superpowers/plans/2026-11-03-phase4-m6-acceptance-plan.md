@@ -863,6 +863,7 @@
 | 13 | 1 | 订正第 11 行里“第 5 件”“第 6 件”的说法：①#115 的用例格里 `a_server_first_protocol_passes_after_the_wait` 不是“15 秒”——它用的是 300 毫秒的 `sniff_wait`，缺省的 15 秒没有用例等满（`docs/api/phase4.md`「M1a」的「没有覆盖的」第 2 条），句子照实改了；②#138 的用例格里经虚拟网卡那一段证明的是“两个请求各一条记录、`listener` / `method` / `url` / `statusCode`”，分不出 `url` 取自 `Host` 还是取自换回名字的连接目标——虚拟网卡的连接目标是 fake 地址、引擎先换回名字，两种取法都得 `http://target.test/a`；“`url` 与 `http_host` 取自 `Host`”改由 `the_session_of_a_request_says_what_the_rules_see` 证明；③#116 的用例格补上 `a_request_without_host_is_named_by_its_target`（`20efc16` 上已有，CI 三平台通过） | 本提交 |
 | 14 | 1 | 订正**延后第 12 行**：1xx 不算——hyper 1.11.1 的 `hyper-1.11.1/src/proto/h1/role.rs` 的 `Client::decoder`（第 1262 ～ 1285 行）跳过 100 与 102 ～ 199、不当最终应答交回，101 是升级、连接不回池；204、304 与 `HEAD` 是 `DecodedLength::ZERO`，所以与 304 走同一条路的只有 204 与 `HEAD`（到 `Tail::new` 也是同一个 `empty`），没有用例单独核实它们 | 本提交 |
 | 15 | 1 | 订正第 12 行：①概率写错了——序列号是 16 个随机字节、最高位清零（`crates/rurge-http/src/mitm/authority.rs` 第 469 ～ 475 行，M2 设计第 214 行的表），首字节为 0 的概率是 1/128，最短编码只在第二个字节最高位也为 0（1/2）时丢掉它，合起来约 1/256；产品照设计做了，是用例断言编码之后的长度断言得太死。**去向**：那条用例属于 M2 那一片，交任务 2a（它读叶证书的那几句），只改用例、不改产品。②`f9fc0ba` 的提交说明坏了：它是用 PowerShell 的双引号字符串写的，`` `a `` 成 BEL、`` `f `` 成 FF、别的反引号被吃掉（`git log -1 --format=%B f9fc0ba` 能看到）；照规矩不改写历史，这一轮的提交说明、报告与文档改用写文件工具 | 本提交 |
+| 16 | 1 | 订正第 13 行的第 ③ 处：#116 的用例格把“嗅探到的 `CONNECT` 没有 URL”记在了 `the_session_of_a_request_says_what_the_rules_see` 名下，可那条用例里没有 `CONNECT`——断言它的是同一个文件的 `a_connect_on_a_sniffed_connection_goes_to_its_target`（`crates/rurge-http/src/engine.rs` 第 6448 行 `assert_eq!(s.session.url, None)`）；用例格与报告第 5 件 M1b 表的 `url` 一项都改了 | 本提交 |
 
 ## 延后事项
 
