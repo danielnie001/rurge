@@ -957,6 +957,7 @@ async fn a_borrowed_connection_records_where_it_went() {
     for record in &records {
         assert_eq!(record.remote_addr, Some(a.addr()), "{record:?}");
         assert!(record.connect_ms.is_some(), "{record:?}");
+        assert!(record.first_byte_ms.is_some(), "{record:?}");
     }
 }
 
@@ -1426,6 +1427,7 @@ async fn an_unknown_fake_address_in_a_plain_request_is_a_502() {
         "{records:?}"
     );
     assert_eq!(records[0].status, RecordStatus::Failed, "{records:?}");
+    assert_eq!(records[0].status_code, Some(502), "{records:?}");
     assert_eq!(
         records[0].error.as_deref(),
         Some(FAKE_ADDRESS_NOT_KNOWN),

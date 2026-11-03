@@ -1011,6 +1011,12 @@ async fn a_stop_during_the_wait_ends_a_tun_session_at_once() {
     );
     assert!(rig.h.engine.request_log().active().is_empty());
     assert!(a.requests().is_empty(), "nothing is dialed after the stop");
+    // the stopped sniff has no ending, so it is not counted (design 7.5)
+    assert_eq!(
+        rig.h.engine.http_counts().sniffed,
+        SniffedCounts::default(),
+        "a stopped sniff is no ending"
+    );
 }
 
 /// A session the rules drop is held after the answer already went out, and
