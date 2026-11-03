@@ -498,8 +498,8 @@
 
 **只在 Linux 与 macOS 上编译的用例**（这台开发机编译不到，只有 CI 编译、运行）：
 
-- `crates/rurge/tests/cli.rs`：`mitm_ca_generate_keeps_the_secrets_private`（`#[cfg(unix)]`：`rurge mitm ca generate` 写出的 `rurge-ca.p12` 与 `rurge-mitm.conf` 的权限位 `& 0o777` 是 `0600`；第一部分 NFR-03 之 Unix 那一行，第 310 行，也是第一部分里唯一一行写着“只在 Linux 与 macOS 上编译”的）。CI：Linux 运行 41402787066、macOS 运行 41411445901 通过。
-- 两份量内存的模块里的平台分支不是“只在某个平台编译的用例”，而是同一个用例在不同平台编译不同的一支：`crates/rurge-http/src/capture/memory.rs` 与 `crates/rurge-engine/src/observe/memory.rs` 各有三支（`#[cfg(windows)]`、`#[cfg(target_os = "linux")]`、`#[cfg(not(any(windows, target_os = "linux")))]`），两个模块都只由 `#[cfg(test)] mod memory;` 拉进来。Windows 与 Linux 那两支在 CI 运行 41402787066 上编译过，其余那一支在运行 41411445901 的 macOS 上编译过；调用它们的四条用例带 `#[ignore]`（见下一段）。
+- `crates/rurge/tests/cli.rs`：`mitm_ca_generate_keeps_the_secrets_private`（`#[cfg(unix)]`：`rurge mitm ca generate` 写出的 `rurge-ca.p12` 与 `rurge-mitm.conf` 的权限位 `& 0o777` 是 `0600`；第一部分 NFR-03 之 Unix 那一行，第 310 行，也是第一部分里唯一一行写着"只在 Linux 与 macOS 上编译"的）。CI：Linux 运行 41402787066、macOS 运行 41411445901 通过。
+- 两份量内存的模块里的平台分支不是"只在某个平台编译的用例"，而是同一个用例在不同平台编译不同的一支：`crates/rurge-http/src/capture/memory.rs` 与 `crates/rurge-engine/src/observe/memory.rs` 各有三支（`#[cfg(windows)]`、`#[cfg(target_os = "linux")]`、`#[cfg(not(any(windows, target_os = "linux")))]`），两个模块都只由 `#[cfg(test)] mod memory;` 拉进来。Windows 与 Linux 那两支在 CI 运行 41402787066 上编译过，其余那一支在运行 41411445901 的 macOS 上编译过；调用它们的四条用例带 `#[ignore]`（见下一段）。
 - 阶段 4 没有只在 Windows 上编译的用例。
 
 **带 `#[ignore]` 的用例**（CI 编译、不运行）：
@@ -517,11 +517,11 @@
 1. **手工验收**：阶段 1 ～ 4 四份清单，一项也没有做过。阶段 4 的 68 项（Windows 16、macOS 16、Linux 16、与平台无关 20；被本文「真机上」一列点到 65 项，没有被点到的三项是 `M2/W5`、`M2/M5`、`M2/L5`，见「靠手工验收的」）。阶段 1、2、3 三份清单也没有做。
 2. **推送与读回 CI**：M4b 任务 11（`707decf`、`a9ef85b`）、M5 与 M6 的提交都在本地；本地 `main`（`bd981d2`）比 `origin/main`（`a262d4c`）多 48 个提交，M6 的提交在其后。推送之后读回那次运行的注解与任务摘要，M6 的收尾按读到的改（M6-D23、M6-D29）。
 3. **总设计 Q1 ～ Q6**：尤其 Q4——M3c（jq、`br`、`zstd`）等它；`p12-keystore` 的升级；`webpki-roots` 的许可（NFR-11 那一句：它是 CDLA-Permissive-2.0，不在需求字面的白名单里）；要不要改用 `rustls-platform-verifier`（重对报告第 3 节第 12 条：Surge 说它的上游证书链靠操作系统的信任评估）。Q1——记录里的 `url` 带着查询串出 API；Q2——重写节的头值要不要藏；Q3——`[MITM] # note` 这样的节头；Q5——把 CA 自动装进信任库、经虚拟网卡来的会话名字在 INFO 及以上；Q6——需求文档的阶段栏（FR-RULE-07 / 08 两行里的几句）。
-4. **叶证书的密钥**：Surge Mac 6.10.0 撤回了“每个域名一把密钥”（理由是大量并发的 MITM 时慢）；rurge 每张叶证书一把 P-256（总设计 P4-D8），M5b 的 B4 量到签一张的中位数 248.6 µs。改不改；登记在兼容性清单 7.2 节。
-5. **抓包过滤器**：手册新写的 `GET` / `POST /v1/capture/filters` 与 `capture-filter`（兼容性清单 10.4 节的一行，阶段栏“待定”）：要不要做、在哪个阶段。
-6. **M5b 延后第 1 ～ 3 行**（M6-D22 答“不查”）：B1 的明文一路慢要不要查、要不要为它改引擎里 hyper 的写法；B4 的握手长尾要不要查（第一步是加一个直连的握手基线）；改写正文的峰值约多 3.94 份正文，要不要做得更省、归哪个里程碑。
-7. **M5 设计第 15 节第 1 ～ 6 条**：gQUIC；从不完整的 ClientHello 取 SNI；`block-quic = always-allow` 不放过 `auto-quic-block`（M5-D13）；没有 SNI 的 ClientHello 按目标（M5-D14）；`auto-quic-block` 跟着 TCP 一侧（M5-D11）；第 6 条——NFR-01 的线怎样用在经引擎的路径上（读数有了：B1 经 rurge 的明文下行 0.79 Gbit/s 是那条 1 Gbit/s 的 0.79 倍；B5 每条空闲连接经 rurge 比直连多出的是“每条 30 KB”的 1.36、1.02、2.58 倍）。第 7 条照旧。
-8. **M1a ～ M5b 归所有者的延后项与可以改的裁定**：照 `docs/status.md` 阶段 4 各节「去向写着项目所有者的」那一段汇总成本文末尾那张表；与上面各条重复的标“见第 N 条”，不另定去向。
+4. **叶证书的密钥**：Surge Mac 6.10.0 撤回了"每个域名一把密钥"（理由是大量并发的 MITM 时慢）；rurge 每张叶证书一把 P-256（总设计 P4-D8），M5b 的 B4 量到签一张的中位数 248.6 µs。改不改；登记在兼容性清单 7.2 节。
+5. **抓包过滤器**：手册新写的 `GET` / `POST /v1/capture/filters` 与 `capture-filter`（兼容性清单 10.4 节的一行，阶段栏"待定"）：要不要做、在哪个阶段。
+6. **M5b 延后第 1 ～ 3 行**（M6-D22 答"不查"）：B1 的明文一路慢要不要查、要不要为它改引擎里 hyper 的写法；B4 的握手长尾要不要查（第一步是加一个直连的握手基线）；改写正文的峰值约多 3.94 份正文，要不要做得更省、归哪个里程碑。
+7. **M5 设计第 15 节第 1 ～ 6 条**：gQUIC；从不完整的 ClientHello 取 SNI；`block-quic = always-allow` 不放过 `auto-quic-block`（M5-D13）；没有 SNI 的 ClientHello 按目标（M5-D14）；`auto-quic-block` 跟着 TCP 一侧（M5-D11）；第 6 条——NFR-01 的线怎样用在经引擎的路径上（读数有了：B1 经 rurge 的明文下行 0.79 Gbit/s 是那条 1 Gbit/s 的 0.79 倍；B5 每条空闲连接经 rurge 比直连多出的是"每条 30 KB"的 1.36、1.02、2.58 倍）。第 7 条照旧。
+8. **M1a ～ M5b 归所有者的延后项与可以改的裁定**：照 `docs/status.md` 阶段 4 各节「去向写着项目所有者的」那一段汇总成本文末尾那张表；与上面各条重复的标"见第 N 条"，不另定去向。
 
 9. **对照查出的**：
    - 「需求文字有问题」4 句（FR-HTTP-07 的「先于脚本」、FR-HTTP-09 的「…→ 脚本」与「每请求 / 响应最多一个脚本」、FR-HTTP-11 的「通过…Dashboard 查看」）：各句的需求文字或阶段栏怎么改。
@@ -541,7 +541,7 @@
 | M2a | 运行中 CA 到期要不要按时查、要不要告警或停止解密 | M2a 计划「延后事项」第 1 行 |
 | M2a | 解密的流上对端不发 `close_notify` 就关闭要不要当成流的结束 | M2a 计划「延后事项」第 2 行 |
 | M2b | 修正记录里代所有者作的裁定：流控窗口的推理、拨号请求的字节不追到准确、上游正文出错一律以 `INTERNAL_ERROR` 重置 | M2b 计划修正记录第 23、42、48 行 |
-| M2c | 证书固定提示把“握手完成之后才核证书、因而不信 CA”的客户端也报成证书固定：改不改措辞 | M2c 计划「延后事项」第 1 行 |
+| M2c | 证书固定提示把"握手完成之后才核证书、因而不信 CA"的客户端也报成证书固定：改不改措辞 | M2c 计划「延后事项」第 1 行 |
 | M3a | 设计里可以改的几项（尤其 M3-D2、M3-D4、M3-D7、M3-D16、M3-D27、M3-D30） | M3 设计第 21 节 |
 | M3b | 回溯上限的代价：1 亿要不要改、要不要按正文大小变 | M3b 计划修正记录第 22 行的测量与 M3 设计第 21 节 |
 | M4a | 抓到的内容算不算 API 输出、四个头遮住的做法；两个缺省上限（100 MiB 与 5 MiB）；`always-capture` 的范围；头的行数多得多的条目要不要按行数记账；`--capture-size` 小于一条最小的条目时要不要告警或拒绝 | M4 设计第 17 节与 M4a 计划修正记录第 80 行 |
