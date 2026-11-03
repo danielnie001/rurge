@@ -330,6 +330,94 @@ async fn a_process_rule_matches_through_both_listeners() {
     }
 }
 
+/// One `GET` over an established stream, then the answer as its
+/// `content-length` says (the helper `tests/http.rs` keeps to itself).
+async fn request(s: &mut TcpStream, host: &str, path: &str) -> String {
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut byte))
+            .await
+            .expect("the response head comes within the bound")
+            .unwrap();
+        assert!(
+            n > 0,
+            "closed before the head: {:?}",
+            String::from_utf8_lossy(&head)
+        );
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let length: usize = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut body))
+        .await
+        .expect("the response body comes within the bound")
+        .unwrap();
+    format!("{head}{}", String::from_utf8_lossy(&body))
+}
+
+/// The requests of one engine connection carry that connection's process
+/// (`phase 4 M4 design 10.1`): a `PROCESS-NAME` rule matches each of them, and
+/// the lookup runs once for the connection, not once per request.
+#[tokio::test]
+async fn the_requests_on_an_engine_connection_carry_its_process() {
+    let fake = Arc::new(Fake::finding(app()));
+    let origin = TestServer::spawn().await;
+    origin.set("/a", "first");
+    origin.set("/b", "second");
+    let port = origin_addr(&origin).port();
+    let h = harness_with(
+        Profile {
+            rules: "PROCESS-NAME,app.exe,DIRECT",
+            hosts: "target.test = 127.0.0.1",
+            ..Profile::default()
+        },
+        shared_with(&fake),
+    )
+    .await;
+
+    let authority = format!("target.test:{port}");
+    let mut s = TcpStream::connect(h.http()).await.unwrap();
+    let first = request(&mut s, &authority, &format!("http://{authority}/a")).await;
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    let second = request(&mut s, &authority, &format!("http://{authority}/b")).await;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    drop(s);
+
+    let records = finished(&h, 2).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    for (record, path) in records.iter().zip(["/a", "/b"]) {
+        assert_eq!(record.method.as_deref(), Some("GET"), "{record:?}");
+        assert_eq!(
+            record.url.as_deref(),
+            Some(format!("http://{authority}{path}").as_str()),
+            "{record:?}"
+        );
+        assert_eq!(
+            record.rule.as_deref(),
+            Some("PROCESS-NAME,app.exe,DIRECT"),
+            "{record:?}"
+        );
+        assert_eq!(record.process.found(), Some(&app()), "{record:?}");
+    }
+    assert_eq!(
+        fake.owner_calls(),
+        1,
+        "one lookup for the connection, not one per request"
+    );
+}
+
 /// The lookup starts with the session, whatever the rules. A session that has
 /// no use for the process does not wait for it (the lookup is stuck at a gate
 /// here), and its record has the process whenever it comes.

@@ -4147,6 +4147,62 @@ async fn decode_undoes_gzip_and_says_why_it_cannot() {
     );
 }
 
+/// The limit a decoded body is measured against is this process's body limit
+/// (`phase 4 M4 design 7.5`, `8.2`): a gzip answer that decodes to one byte
+/// more says so with the limit, in the entry and in the HAR.
+#[tokio::test]
+async fn the_decode_limit_is_the_body_limit_of_this_process() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use rurge_engine::capture::Body;
+    use std::io::Write;
+
+    let api = api().await;
+    let (_, status) = get(&api, "/v1/rurge/capture").await;
+    let limit = status["limits"]["body"].as_u64().expect("a body limit");
+    let plain = vec![0u8; limit as usize + 1];
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&plain).expect("in memory");
+    let gz = Bytes::from(encoder.finish().expect("in memory"));
+
+    let mut entry = capture_entry(1, "a");
+    entry
+        .response
+        .as_mut()
+        .expect("a response")
+        .headers
+        .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    entry.response_body = Body {
+        size: gz.len() as u64,
+        data: gz.clone(),
+        truncated: None,
+    };
+    assert!(api.engine.capture().put(entry));
+
+    let (status, body) = get(&api, "/v1/rurge/capture/entries/1?decode=true").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["response"]["body"]["decoded"], false, "{body}");
+    assert_eq!(
+        body["response"]["body"]["notDecoded"],
+        format!("the decoded body is over {limit} bytes"),
+        "{body}"
+    );
+    assert_eq!(
+        body["response"]["body"]["base64"],
+        STANDARD.encode(&gz),
+        "{body}"
+    );
+
+    let doc = har_of_a(&api).await;
+    let content = &har_entry(&doc, 1)["response"]["content"];
+    assert_eq!(
+        content["comment"],
+        format!("not decoded: the decoded body is over {limit} bytes"),
+        "{doc}"
+    );
+    assert_eq!(content["size"], gz.len(), "{doc}");
+}
+
 /// `POST /v1/rurge/capture/clear` takes one session or all of them, and the
 /// four counts stay (`phase 4 M4 design 7.6`).
 #[tokio::test]
