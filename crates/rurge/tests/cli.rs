@@ -377,6 +377,12 @@ fn mitm_ca_generate_writes_four_files_and_prints_no_secret() {
         "Android",
         "iOS",
         "to use it: copy the lines of rurge-mitm.conf into your profile",
+        // who may read the two files that hold the secrets (`M2-D20`)
+        if cfg!(unix) {
+            "they were made readable by you alone (0600)"
+        } else {
+            "rurge sets no permissions of its own on Windows"
+        },
     ] {
         assert!(printed.contains(said), "`{said}` is not in: {printed}");
     }
