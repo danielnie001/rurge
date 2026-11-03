@@ -638,6 +638,64 @@ async fn the_manual_matching_details_example() {
     assert_eq!(records[0].policy, ["guard"], "{records:?}");
 }
 
+/// The third candidate `candidates` builds — the URL rebuilt from the
+/// connection's target — is tried too (`phase 4 M3 design 6.2`): a request that
+/// reached the engine over SOCKS5 with a `Host` field naming another host has
+/// only that target as its third candidate, and the rule matches it. The guard
+/// is where the dial would have gone, so its silence is the evidence that
+/// nothing was dialled.
+#[tokio::test]
+async fn a_rule_matches_the_url_rebuilt_from_the_connection_target() {
+    let guard = Guard::new();
+    let proxies = guard.policy("guard");
+    let port = guard.port;
+    let general =
+        format!("show-error-page-for-reject = true\nforce-http-engine-hosts = ad.com:{port}");
+    let h = harness_with(
+        Profile {
+            general: &general,
+            proxies: &proxies,
+            hosts: "ad.com = 127.0.0.1\nother.test = 127.0.0.1",
+            rules: "DOMAIN,ad.com,guard",
+            sections: "[URL Rewrite]\n^http://ad\\.com:\\d+/ad\\.png _ reject",
+            ..Profile::default()
+        },
+        EngineShared {
+            sniff_wait: Duration::from_millis(300),
+            ..shared_on(NetworkFacts::default())
+        },
+    )
+    .await;
+
+    // over SOCKS5: the request line names a path, `Host` names another host,
+    // and only the connection's target is `ad.com`
+    let mut tunnel = connect_via_socks5(h.socks(), "ad.com", port).await;
+    let answer = get(&mut tunnel, "other.test", "/ad.png").await;
+    assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+    assert!(
+        answer.contains("The request was rejected by a URL Rewrite rule."),
+        "{answer}"
+    );
+    assert_eq!(
+        guard.connections(),
+        0,
+        "the URL rebuilt from the connection target matched, so the guard was not dialled"
+    );
+    let records = the_records(&h, 1).await;
+    assert_eq!(
+        records[0].url.as_deref(),
+        Some("http://other.test/ad.png"),
+        "{records:?}"
+    );
+    assert_eq!(
+        records[0].notes,
+        ["URL Rewrite: reject by ^http://ad\\.com:\\d+/ad\\.png".to_string()],
+        "{records:?}"
+    );
+    let counts = h.engine.http_counts().rewrite;
+    assert_eq!(counts.url, 1, "{counts:?}");
+}
+
 /// An engine for the manual's header-rewrite examples: `example.com` pinned to
 /// the loopback, and the `[Header Rewrite]` lines of one example.
 async fn example_engine(section: &str) -> (Harness, TestServer) {
