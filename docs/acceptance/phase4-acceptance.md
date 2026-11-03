@@ -26,7 +26,7 @@
 
 ### 八种结论（M6-D4）
 
-阶段 1 的七种照用（把"不属于阶段 1"换成"不属于阶段 4"），定义照 `phase1-acceptance.md`「怎么读」，抄在这里，并把阶段 3 / M6 执行期的两条订正（M6 设计第 15 节）写进去：
+阶段 1 的七种照用（把"不属于阶段 1"换成"不属于阶段 4"），定义照 `phase1-acceptance.md`「怎么读」，抄在这里，并把阶段 3 / M6 执行期的两条订正（阶段 3 / M6 设计第 15 节）写进去：
 
 - `做了`：代码在，也有一条会因这一句不成立而红的用例。
 - `做了，补了用例`：代码在，读的时候没有这样的用例（把代码改坏一行，所有现有用例照样通过）；补了，并且在改坏的代码上看到它红。用例格后面括号里是补它的提交。
@@ -218,7 +218,7 @@
 
 ### 总设计第 1.2 节另列的
 
-总设计第 1.2 节另列的：这两句取自兼容性清单 3.1 节 `USER-AGENT`、`URL-REGEX` 两行；阶段 1 只对 HTTP 监听器转发的明文请求读过它们（阶段 1 对照第 181、182 行），这里读的是经 HTTP 引擎的每个请求（M6 设计第 3.2 节）。两句都按 FR-RULE-01 算 P0。
+这两句取自兼容性清单 3.1 节 `USER-AGENT`、`URL-REGEX` 两行；阶段 1 只对 HTTP 监听器转发的明文请求读过它们（阶段 1 对照第 181、182 行），这里读的是经 HTTP 引擎的每个请求（M6 设计第 3.2 节）。两句都按 FR-RULE-01 算 P0。
 
 | 需求 | 这一句 | 结论 | 代码 | 用例 | 真机上 |
 | --- | --- | --- | --- | --- | --- |
@@ -227,7 +227,7 @@
 
 ### 总设计第 1.5 节的遗留
 
-总设计第 1.5 节的遗留：这几句取自总设计第 1.5 节的表（M6 设计第 3.4 节与第 15 节第 1 条）；那张表别的行并进了别的表，出处写在那一行的「需求」一格里。
+这几句取自总设计第 1.5 节的表（M6 设计第 3.4 节与第 15 节第 1 条）；那张表别的行并进了别的表，出处写在那一行的「需求」一格里。
 
 | 需求 | 这一句 | 结论 | 代码 | 用例 | 真机上 |
 | --- | --- | --- | --- | --- | --- |
@@ -238,7 +238,7 @@
 
 ### 阶段 1 ～ 3 推过来的
 
-阶段 1 ～ 3 推过来的：这张表只列没有并进别的表的句子；并进别的表的（阶段 1 对照第 80、162、410、417、421 行，阶段 2 验收第 527 行，阶段 3 对照第 250、251 行），出处写在那一行的「需求」一格里；同一句在几份文档里都推过来的（阶段 2 验收第 564 行、阶段 3 对照第 247 行），并进这张表里阶段 1 的那一行（M6 设计第 3.3 节）。
+这张表只列没有并进别的表的句子；并进别的表的（阶段 1 对照第 80、162、410、417、421 行，阶段 2 验收第 527 行，阶段 3 对照第 250、251 行），出处写在那一行的「需求」一格里；同一句在几份文档里都推过来的（阶段 2 验收第 564 行、阶段 3 对照第 247 行），并进这张表里阶段 1 的那一行（M6 设计第 3.3 节）。
 
 | 需求 | 这一句 | 结论 | 代码 | 用例 | 真机上 |
 | --- | --- | --- | --- | --- | --- |
@@ -316,13 +316,13 @@
 | http/body-rewrite.html | `http-request-jq url-pattern jq-expression`、`http-response-jq url-pattern jq-expression` | | |
 | http/body-rewrite.html | `http-response-jq ^http://httpbingo.org/anything '.headers \|= with_entries(select(.key \| test("^X-") \| not))'` | | |
 | http/map-local.html | `^http://surgetest\.com/json data-type=text data="{}" status-code=500`、`^http://surgetest\.com/gif data-type=tiny-gif status-code=200`、`^http://surgetest\.com/file data-type=file data="data/map-local.json" header="a:b\|foo:bar"`、`^http://surgetest\.com/base64 data="dGVzdA==" data-type=base64` | | |
-| http/url-rewrite.html | `Besides the request-line URL, Surge also tries matching with the URL rebuilt from the `Host` header value and from the underlying connection's hostname.` | | |
-| http/header-rewrite.html | `Header Rewrite cannot change the message framing. If a rewrite changes the `Content-Length` or `Transfer-Encoding` headers, the modification is rejected and the request fails.` | | |
-| http/body-rewrite.html | `The replacement supports capture group references such as `$1`.` | | |
-| http/body-rewrite.html | `The `^` and `$` anchors match at the beginning and end of each line of the body.` | | |
-| http/body-rewrite.html | `Even if the original request does not contain a body, new content may still be generated through body rewrite, such as using the `^$` expression.` | | |
-| http/body-rewrite.html | `The body must be valid UTF-8 text for regex-based rewriting.` | | |
-| http/map-local.html | `You can use `data-type=text data=""` to return an empty result.` | | |
+| http/url-rewrite.html | "Besides the request-line URL, Surge also tries matching with the URL rebuilt from the `Host` header value and from the underlying connection's hostname." | | |
+| http/header-rewrite.html | "Header Rewrite cannot change the message framing. If a rewrite changes the `Content-Length` or `Transfer-Encoding` headers, the modification is rejected and the request fails." | | |
+| http/body-rewrite.html | "The replacement supports capture group references such as `$1`." | | |
+| http/body-rewrite.html | "The `^` and `$` anchors match at the beginning and end of each line of the body." | | |
+| http/body-rewrite.html | "Even if the original request does not contain a body, new content may still be generated through body rewrite, such as using the `^$` expression." | | |
+| http/body-rewrite.html | "The body must be valid UTF-8 text for regex-based rewriting." | | |
+| http/map-local.html | "You can use `data-type=text data=""` to return an empty result." | | |
 
 ## 靠手工验收的
 
