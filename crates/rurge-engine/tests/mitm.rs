@@ -516,6 +516,38 @@ async fn a_bare_entry_does_not_sniff_another_port() {
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 }
 
+/// A bare entry matches the SNI on every port sniffing takes: an entry for
+/// another host writes down the origin's port, which widens sniffing to it,
+/// and the session to the bare entry's host there is decrypted
+/// (`phase 4 M2 design 7.3`, 7.6).
+#[tokio::test]
+async fn a_bare_entry_decrypts_on_a_widened_port() {
+    let origin = TlsFixture::new(&["origin.test"]);
+    let server = TestServer::spawn_tls_with(origin.acceptor(false)).await;
+    server.set("/a", "from the origin");
+    let port = origin_addr(&server).port();
+    let mitm = mitm_ca();
+    let (ca, mitm_roots) = (mitm.ca_p12_base64("pw"), mitm.roots());
+    let section = mitm_section(&format!("origin.test, other.test:{port}"), &ca);
+    let h = harness_mitm(
+        direct_profile(
+            "origin.test = 127.0.0.1",
+            "DOMAIN,origin.test,DIRECT",
+            &section,
+        ),
+        origin.roots(),
+    )
+    .await;
+
+    let tunnel = connect_via_socks5(h.socks(), "origin.test", port).await;
+    let mut tls = handshake(tunnel, client_config(mitm_roots, &[], true), "origin.test")
+        .await
+        .expect("the bare entry takes the SNI on the widened port");
+    let response = get(&mut tls, "origin.test", "/a").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("from the origin"), "{response}");
+}
+
 /// `:0` widens sniffing to every port of the targets it matches, and to no
 /// other target (`phase 4 M2 design 7.6`, the general design's corrected
 /// 5.2).
@@ -3350,6 +3382,31 @@ async fn an_incomplete_hello_is_not_blocked() {
     assert_eq!((quic.blocked, quic.hello, quic.incomplete), (0, 0, 1));
 }
 
+/// A bare entry matches the SNI on every port sniffing takes: another entry's
+/// port widens sniffing to 8443, and QUIC to the bare entry's host there is
+/// blocked (`phase 4 M2 design 7.3`, `phase 4 M5 design 6.1`).
+#[tokio::test]
+async fn a_bare_entry_blocks_quic_on_a_widened_port() {
+    let ca = mitm_ca();
+    let h = harness_mitm(
+        quic_profile(&mitm_section(
+            "origin.test, other.test:8443",
+            &ca.ca_p12_base64("pw"),
+        )),
+        ca.roots(),
+    )
+    .await;
+    let association = udp_associate(h.socks()).await;
+    association
+        .send("origin.test", 8443, &quic_hello(Some("origin.test")))
+        .await;
+    let record = ended(&h, "origin.test:8443").await;
+    assert_blocked(&record);
+    assert_eq!(record.sni.as_deref(), Some("origin.test"));
+    let quic = h.engine.http_counts().quic;
+    assert_eq!((quic.blocked, quic.hello), (1, 1));
+}
+
 /// An entry with a port blocks that port only, not another one of the same
 /// name.
 #[tokio::test]
@@ -3467,7 +3524,7 @@ async fn a_hello_without_sni_is_judged_by_its_target() {
 /// alone: a flow to an address, whose hello names a listed host, is blocked
 /// (`phase 4 M5 design 6.1`).
 #[tokio::test]
-async fn a_listed_hello_is_blocked_at_an_address_it_names_it_to() {
+async fn a_flow_to_an_address_is_blocked_by_its_sni() {
     let ca = mitm_ca();
     let h = harness_mitm(
         quic_profile(&mitm_section("origin.test", &ca.ca_p12_base64("pw"))),

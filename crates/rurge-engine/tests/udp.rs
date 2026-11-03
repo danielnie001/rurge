@@ -1725,7 +1725,7 @@ async fn a_flow_whose_association_ends_while_held_leaves_no_record() {
 }
 
 /// The four QUIC counts belong to the engine, not to a generation: a reload
-/// does not clear them (`docs/api/phase4.md` 的「M5a」一节).
+/// does not clear them (`phase 4 M5 design 5.4`).
 #[tokio::test]
 async fn the_quic_counts_survive_a_reload() {
     let h = harness(Profile {
