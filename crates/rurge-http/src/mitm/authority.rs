@@ -1454,13 +1454,14 @@ mod tests {
             "no basic constraints"
         );
 
-        // a serial number rurge makes of 16 random bytes with the top bit
-        // cleared; DER trims a leading zero, so the encoded INTEGER is 15 or
-        // 16 bytes, and its first byte is never negative
+        // a serial number of 16 random bytes with the top bit cleared: DER
+        // drops every leading zero byte, so the encoded INTEGER is at most
+        // 16 bytes (15 about one leaf in 256, fewer about one in 65536); with
+        // the top bit left set, half the serials would be 17
         let serial = cert.raw_serial();
         assert!(
-            (15..=16).contains(&serial.len()),
-            "the encoded serial is 15 or 16 bytes, was {}",
+            serial.len() <= 16,
+            "the encoded serial is at most 16 bytes, was {}",
             serial.len()
         );
         assert_eq!(serial[0] & 0x80, 0, "a positive serial number");
