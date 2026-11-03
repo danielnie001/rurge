@@ -1439,6 +1439,8 @@ async fn an_unknown_fake_address_in_a_plain_request_is_a_502() {
         Some("IP-CIDR,198.18.0.0/15,REJECT,no-resolve"),
         "the rules saw the request before the address was found nameless: {records:?}"
     );
+    // it reached the rules, so it is counted even though nothing was dialed
+    assert_eq!(rig.h.engine.http_counts().requests, 1);
 }
 
 /// An origin that answers 200 with a body of `total` bytes and writes them,
