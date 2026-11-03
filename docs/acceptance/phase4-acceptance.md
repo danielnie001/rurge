@@ -66,14 +66,14 @@
 
 | 需求 | 这一句 | 结论 | 代码 | 用例 | 真机上 |
 | --- | --- | --- | --- | --- | --- |
-| FR-HTTP-01 | 「HTTP 引擎：HTTP/1.1 请求 / 响应解析与转发」 | 待读（任务 1） | | | |
-| FR-HTTP-01 | 「keep-alive」 | 待读（任务 1） | | | |
-| FR-HTTP-01 | 「chunked」 | 待读（任务 1） | | | |
-| FR-HTTP-01 | 「WebSocket 升级透传」 | 待读（任务 1） | | | |
-| FR-HTTP-01 | 「80 / 443 协议嗅探」 | 待读（任务 1） | | | |
-| FR-HTTP-01 | 「`force-http-engine-hosts`」 | 待读（任务 1） | | | |
-| FR-HTTP-01 | 「`always-raw-tcp-hosts`」 | 待读（任务 1） | | | |
-| FR-HTTP-01 | 「`always-raw-tcp-keywords`」 | 待读（任务 1） | | | |
+| FR-HTTP-01 | 「HTTP 引擎：HTTP/1.1 请求 / 响应解析与转发」 | 做了 | `crates/rurge-http/src/engine.rs::serve_connection`、`crates/rurge-http/src/engine.rs::serve`、`crates/rurge-http/src/engine.rs::Requests::handle` | `crates/rurge-http/src/engine.rs`：`a_request_goes_through_and_its_handle_finishes`（一个请求走完、句柄完成）；`crates/rurge-engine/tests/http.rs`：`a_sniffed_http_connection_has_a_record_per_request`（嗅探到的连接上两个请求各一条记录）、`every_entry_brings_its_requests_into_the_engine`（四种入口）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/W1、M1/W2、M1/M1、M1/M2、M1/L1、M1/L2 |
+| FR-HTTP-01 | 「keep-alive」 | 做了，补了用例 | `crates/rurge-http/src/engine.rs::serve`（借池里的连接）、`crates/rurge-http/src/engine.rs::complete`（还回池）、`crates/rurge-http/src/pool.rs::Pool` | `crates/rurge-http/src/engine.rs`：`two_requests_on_one_connection_share_an_upstream_connection`（第二条请求借同一条上游连接）；`crates/rurge-engine/tests/http.rs`：`a_sniffed_http_connection_has_a_record_per_request`（同上，两条各一条记录）、`a_body_after_a_304_does_not_poison_the_next_request`（重对报告第 3 条：上游在 304 后多送字节，第二个请求仍拿到 200）（`cc8216b`）；前两条 CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901），`a_body_after_a_304_does_not_poison_the_next_request`：CI 没有见过 | M1/P2、M1/W1、M1/M1、M1/L1 |
+| FR-HTTP-01 | 「chunked」 | 做了，补了用例 | `crates/rurge-http/src/engine.rs::serve`（正文流式；长度没人说的正文补 chunked 框架） | `crates/rurge-engine/tests/http.rs`：`chunked_bodies_go_both_ways`（chunked 请求与应答的字节两个方向原样）、`a_pipelined_request_after_a_chunked_body_is_its_own_request`（重对报告第 9 条：chunked 正文之后紧跟的 `GET` 是自己的请求，正文整块、两条记录）（`cc8216b`）；`crates/rurge-http/src/engine.rs`：`a_chunked_answer_counts_every_frame`（chunked 应答逐帧计数）；前两条 CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901），补的那一条：CI 没有见过 | — |
+| FR-HTTP-01 | 「WebSocket 升级透传」 | 做了 | `crates/rurge-http/src/engine.rs::serve`、`crates/rurge-http/src/engine.rs::wants_upgrade`、`crates/rurge-http/src/engine.rs::promote` | `crates/rurge-http/src/engine.rs`：`a_websocket_upgrade_is_relayed_and_counted_once`（升级之后两个方向的字节原样、只计一次）、`a_websocket_upgrade_goes_through_tls_and_is_counted_once`（解密连接上的升级）；`crates/rurge-engine/tests/http.rs`：`a_websocket_goes_through_every_entry`（四种入口）、`stopping_the_adapter_ends_an_upgraded_relay`（适配器停止结束升级后的转发）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | — |
+| FR-HTTP-01 | 「80 / 443 协议嗅探」 | 做了 | `crates/rurge-engine/src/serve.rs::sniffable_session`、`crates/rurge-engine/src/serve.rs::sniffable_target` | `crates/rurge-engine/tests/sniff.rs`：`which_sessions_are_sniffable`（80 / 443 与别的端口、三个名单、fake 地址）、`a_paused_engine_sniffs_nothing`、`a_session_that_pre_matching_refuses_is_not_sniffed`；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/P1、M1/P3、M1/W1、M1/M1、M1/L1 |
+| FR-HTTP-01 | 「`force-http-engine-hosts`」 | 做了 | `crates/rurge-engine/src/serve.rs::sniffable_target`（`force_http_engine_hosts.matches`，缺省端口 80）、`crates/rurge-engine/src/serve.rs::forces_http_engine` | `crates/rurge-engine/tests/sniff.rs`：`force_http_engine_hosts_sniff_another_port`（8080 命中名单才嗅探）；`crates/rurge-engine/tests/http.rs`：`force_http_engine_hosts_bring_another_port_into_the_engine`（命中后进引擎）；`crates/rurge-config/src/hostlist.rs`：`force_http_engine_hosts_examples`（带端口、`*`、`-` 排除、`:0`）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/P3 |
+| FR-HTTP-01 | 「`always-raw-tcp-hosts`」 | 做了 | `crates/rurge-engine/src/serve.rs::raw_listed`（`always_raw_tcp_hosts.matches`）、`crates/rurge-engine/src/serve.rs::sniffable_target` | `crates/rurge-engine/tests/sniff.rs`：`always_raw_tcp_hosts_keep_the_dial_first`（命中名单照今天的次序：先拨号，拒绝在答复之前）、`always_raw_tcp_hosts_and_keywords_are_noted`（记录里的原因）；`crates/rurge-config/src/hostlist.rs`：`force_http_engine_hosts_examples`（`-` 排除与端口）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/P3 |
+| FR-HTTP-01 | 「`always-raw-tcp-keywords`」 | 做了 | `crates/rurge-engine/src/serve.rs::raw_listed`（关键字只比名字、不分大小写） | `crates/rurge-engine/tests/sniff.rs`：`always_raw_tcp_keywords_ignore_case`（大小写不同照样命中）、`always_raw_tcp_hosts_and_keywords_are_noted`；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/P3 |
 | FR-HTTP-02 | 「HTTP/2：MITM 后与客户端…使用 HTTP/2（`h2=true`）」 | 待读（任务 2） | | | |
 | FR-HTTP-02 | 「…/ 上游使用 HTTP/2…」 | 待读（任务 2） | | | |
 | FR-HTTP-02 | 「`:authority` 提取」 | 待读（任务 2） | | | |
@@ -199,14 +199,14 @@
 | 需求 | 这一句 | 结论 | 代码 | 用例 | 真机上 |
 | --- | --- | --- | --- | --- | --- |
 | FR-CFG-06（兼容性清单 2.1 节；阶段 1 对照第 80 行） | 「…各键随所属功能阶段生效」之 `http-api-tls` | 待读（任务 2） | 同「MITM（FR-HTTP-03、04、14）」的「「`http-api-tls`：API 使用 MITM CA 签发的证书提供 HTTPS」」一行 | 同上 | |
-| FR-CFG-06（兼容性清单 2.1 节） | 「…各键随所属功能阶段生效」之 `force-http-engine-hosts` | 待读（任务 1） | 同「会话入口与 HTTP 引擎（FR-HTTP-01、02）」的「「`force-http-engine-hosts`」」一行 | 同上 | |
-| FR-CFG-06（兼容性清单 2.1 节） | 「…各键随所属功能阶段生效」之 `always-raw-tcp-hosts` | 待读（任务 1） | 同「会话入口与 HTTP 引擎（FR-HTTP-01、02）」的「「`always-raw-tcp-hosts`」」一行 | 同上 | |
-| FR-CFG-06（兼容性清单 2.1 节） | 「…各键随所属功能阶段生效」之 `always-raw-tcp-keywords` | 待读（任务 1） | 同「会话入口与 HTTP 引擎（FR-HTTP-01、02）」的「「`always-raw-tcp-keywords`」」一行 | 同上 | |
-| FR-CFG-06（兼容性清单 2.1 节） | 「…各键随所属功能阶段生效」之 `show-error-page`（经引擎的请求上） | 待读（任务 1） | | | |
-| FR-CFG-06（兼容性清单 2.1 节） | 「…各键随所属功能阶段生效」之 `show-error-page-for-reject`（经引擎的请求上） | 待读（任务 1） | | | |
+| FR-CFG-06（兼容性清单 2.1 节） | 「…各键随所属功能阶段生效」之 `force-http-engine-hosts` | 做了 | 同「会话入口与 HTTP 引擎（FR-HTTP-01、02）」的「「`force-http-engine-hosts`」」一行 | 同上 | M1/P3 |
+| FR-CFG-06（兼容性清单 2.1 节） | 「…各键随所属功能阶段生效」之 `always-raw-tcp-hosts` | 做了 | 同「会话入口与 HTTP 引擎（FR-HTTP-01、02）」的「「`always-raw-tcp-hosts`」」一行 | 同上 | M1/P3 |
+| FR-CFG-06（兼容性清单 2.1 节） | 「…各键随所属功能阶段生效」之 `always-raw-tcp-keywords` | 做了 | 同「会话入口与 HTTP 引擎（FR-HTTP-01、02）」的「「`always-raw-tcp-keywords`」」一行 | 同上 | M1/P3 |
+| FR-CFG-06（兼容性清单 2.1 节） | 「…各键随所属功能阶段生效」之 `show-error-page`（经引擎的请求上） | 做了 | `crates/rurge-engine/src/http.rs::ConnUpstreams::route`（把 `Pages { error, reject }` 交给引擎）、`crates/rurge-http/src/engine.rs::failed`、`crates/rurge-http/src/engine.rs::timed_out` | `crates/rurge-engine/tests/http.rs`：`the_listener_answers_refusals_and_failures_as_the_profile_says`（失败答 502 页）、`refusals_are_answered_on_every_entry`（四种入口）、`a_late_response_head_is_a_504`（等应答头超时答 504 页）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | — |
+| FR-CFG-06（兼容性清单 2.1 节） | 「…各键随所属功能阶段生效」之 `show-error-page-for-reject`（经引擎的请求上） | 做了 | `crates/rurge-engine/src/http.rs::ConnUpstreams::route`、`crates/rurge-http/src/engine.rs::answer` | `crates/rurge-engine/tests/http.rs`：`refusals_are_answered_on_every_entry`（`REJECT` 开着答 403 页、关着不答就关；`REJECT-TINYGIF` 不看这个设置答 GIF）、`the_listener_answers_refusals_and_failures_as_the_profile_says`；`crates/rurge-engine/tests/pipeline.rs`：`reject_rules_close_serve_gifs_or_render_pages`；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | — |
 | FR-CFG-18（阶段 1 对照第 162 行） | 「Header Rewrite 省略方向」 | 待读（任务 3） | | | |
-| FR-OBS-02 | 「路径、方法、JSON 字段与 Surge 一致（清单 10.4）」之阶段 4 / M1a 加的（`docs/api/phase4.md` 的「M1a」一节） | 待读（任务 1） | | | |
-| FR-OBS-02 | 「路径、方法、JSON 字段与 Surge 一致（清单 10.4）」之阶段 4 / M1b 加的（`docs/api/phase4.md` 的「M1b」一节） | 待读（任务 1） | | | |
+| FR-OBS-02 | 「路径、方法、JSON 字段与 Surge 一致（清单 10.4）」之阶段 4 / M1a 加的（`docs/api/phase4.md` 的「M1a」一节） | 做了 | `crates/rurge-api/src/routes/rurge_http.rs::http`、`crates/rurge-engine/src/serve.rs::SniffCounts` | `crates/rurge-api/tests/api.rs`：`rurge_http_counts_start_at_zero`（`sniffed` 五个键按次序、零与 401）；`crates/rurge-engine/tests/sniff.rs`：`the_sniffs_are_counted`（五种结局各记一次）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | — |
+| FR-OBS-02 | 「路径、方法、JSON 字段与 Surge 一致（清单 10.4）」之阶段 4 / M1b 加的（`docs/api/phase4.md` 的「M1b」一节） | 做了 | `crates/rurge-api/src/routes/rurge_http.rs::http`（`requests`）、`crates/rurge-engine/src/http.rs::ConnUpstreams::route`（计数）、`crates/rurge-api/src/routes/requests.rs::RequestJson`（`method` / `url` / `statusCode`）、`crates/rurge-engine/src/observe.rs::record_of` | `crates/rurge-engine/tests/http.rs`：`the_requests_are_counted`、`a_request_record_has_its_method_url_and_status`、`a_url_with_userinfo_is_recorded_without_it`、`the_request_log_line_shows_no_query_and_no_userinfo`；`crates/rurge-api/tests/api.rs`：`requests_carry_the_method_the_url_and_the_status_code`（键序与 `null`）、`rurge_http_counts_start_at_zero`；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/W1、M1/W2、M1/M1、M1/M2、M1/L1、M1/L2 |
 | FR-OBS-02 | 「路径、方法、JSON 字段与 Surge 一致（清单 10.4）」之阶段 4 / M2a 加的（`docs/api/phase4.md` 的「M2a」一节） | 待读（任务 2） | | | |
 | FR-OBS-02 | 「路径、方法、JSON 字段与 Surge 一致（清单 10.4）」之阶段 4 / M2b 加的（`docs/api/phase4.md` 的「M2b」一节） | 待读（任务 2） | | | |
 | FR-OBS-02 | 「路径、方法、JSON 字段与 Surge 一致（清单 10.4）」之阶段 4 / M2c 加的（`docs/api/phase4.md` 的「M2c」一节） | 待读（任务 2） | | | |
@@ -222,8 +222,8 @@
 
 | 需求 | 这一句 | 结论 | 代码 | 用例 | 真机上 |
 | --- | --- | --- | --- | --- | --- |
-| 总设计第 1.2 节（FR-RULE-01） | 「`USER-AGENT`：HTTP User-Agent，`*` `?` 通配，区分大小写」（3.1 节）之引擎里的每个请求 | 待读（任务 1） | | | |
-| 总设计第 1.2 节（FR-RULE-01） | 「`URL-REGEX`：在完整 URL 里搜索的正则…」（3.1 节）之引擎里的每个请求 | 待读（任务 1） | | | |
+| 总设计第 1.2 节（FR-RULE-01） | 「`USER-AGENT`：HTTP User-Agent，`*` `?` 通配，区分大小写」（3.1 节）之引擎里的每个请求 | 做了 | `crates/rurge-rules/src/matcher.rs::Matcher::eval`（`Matcher::UserAgent`）、`crates/rurge-http/src/engine.rs::prepare`（把 `User-Agent` 放进会话） | `crates/rurge-rules/src/matcher.rs`：`port_source_protocol_and_hostname_type_rules`（`USER-AGENT,Mozilla*` 命中、大小写不同不命中）；`crates/rurge-http/src/engine.rs`：`the_session_of_a_request_says_what_the_rules_see`（引擎里的请求带着 `User-Agent`）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | — |
+| 总设计第 1.2 节（FR-RULE-01） | 「`URL-REGEX`：在完整 URL 里搜索的正则…」（3.1 节）之引擎里的每个请求 | 做了 | `crates/rurge-rules/src/matcher.rs::Matcher::eval`（`Matcher::UrlRegex`）、`crates/rurge-http/src/engine.rs::prepare`（把 URL 放进会话） | `crates/rurge-engine/tests/http.rs`：`two_requests_of_one_connection_follow_their_own_rules`（同一条客户端连接上两个请求按 `URL-REGEX` 各走一条策略）；`crates/rurge-engine/tests/pipeline.rs`：`keep_alive_requests_are_dialed_one_by_one`；`crates/rurge-rules/src/matcher.rs`：`url_regex_without_an_anchor_matches_anywhere_in_the_url`；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/P2 |
 
 ### 总设计第 1.5 节的遗留
 
@@ -231,8 +231,8 @@
 
 | 需求 | 这一句 | 结论 | 代码 | 用例 | 真机上 |
 | --- | --- | --- | --- | --- | --- |
-| 总设计第 1.5 节（FR-HTTP-01） | 「经监听器来的绝对形式明文请求里，主机是 fake 地址时保留着它」 | 待读（任务 1） | | | |
-| 总设计第 1.5 节（FR-OUT-01） | 「HTTP 一侧的 `REJECT-DROP` 看不到客户端提前关闭」 | 待读（任务 1） | | | |
+| 总设计第 1.5 节（FR-HTTP-01） | 「经监听器来的绝对形式明文请求里，主机是 fake 地址时保留着它」 | 做了 | `crates/rurge-engine/src/http.rs::ConnUpstreams::named`、`crates/rurge-inbound/src/http.rs::handle`、`crates/rurge-http/src/engine.rs::prepare` | `crates/rurge-engine/tests/http.rs`：`a_fake_address_in_a_plain_request_is_turned_back_into_its_name`（请求行与 `Host` 里的 fake 地址换回域名再求规则与转发，反查不到时 502）；`crates/rurge-http/src/engine.rs`：`a_fake_address_is_turned_back_into_its_name`（会话的 `dst_host`、`url`、`http_host` 与上游的 `Host` 都换成名字）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | — |
+| 总设计第 1.5 节（FR-OUT-01） | 「HTTP 一侧的 `REJECT-DROP` 看不到客户端提前关闭」 | 有意不同（已登记） | `crates/rurge-http/src/engine.rs::answer`（`RejectKind::Drop`：请求正文读完后客户端先关会提前结束停留，没读完时停到 `drop_hold`；差异登记在 M1 细化设计第 20 节第 8 条与兼容性清单 4.1 节 `REJECT-DROP` 一行） | `crates/rurge-http/src/engine.rs`：`a_dropped_request_is_held_then_closed`（请求正文读完、客户端不走，停满 `drop_hold` 再关）、`a_dropped_h2_request_is_held_then_reset`（HTTP/2 上停满再重置这个流）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | — |
 | 总设计第 1.5 节（FR-RULE-07） | 「QUIC 里的 SNI、跨几个包的 ClientHello…」 | 待读（任务 5） | | | |
 | 总设计第 1.5 节（FR-RULE-07） | 「…按 SNI 匹配规则」 | 待读（任务 5） | | | |
 
@@ -244,15 +244,15 @@
 | --- | --- | --- | --- | --- | --- |
 | FR-CFG-12（阶段 1 对照第 126 行） | 「供…MITM `hostname` 等共用」 | 待读（任务 2） | | | |
 | FR-CFG-14（阶段 1 对照第 131 行） | 「…Map Local 数据」 | 待读（任务 3） | | | |
-| FR-RULE-02（阶段 1 对照第 204 行） | 「…参数」之 `extended-matching` | 待读（任务 1） | | | |
+| FR-RULE-02（阶段 1 对照第 204 行） | 「…参数」之 `extended-matching` | 做了 | `crates/rurge-rules/src/matcher.rs::domain_targets`（`extended` 时把 `sni` 与 `http_host` 加进域名目标）、`crates/rurge-rules/src/matcher.rs::Matcher::eval` | `crates/rurge-rules/src/matcher.rs`：`extended_matching_uses_sni_and_host`；`crates/rurge-engine/tests/sniff.rs`：`extended_matching_rules_a_tls_session_by_its_sni`、`extended_matching_rules_a_tls_session_by_its_sni_on_every_entry`、`without_extended_matching_the_sni_decides_nothing`；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/P1 |
 | FR-RULE-02（阶段 1 对照第 210 行） | 「…参数」之 `always-capture` | 待读（任务 4） | 同「请求记录与抓包（FR-HTTP-10、11，FR-RULE-14）」的「「`always-capture=<session>`：强制抓包…」」一行 | 同上 | |
-| FR-RULE-04（阶段 1 对照第 232 行；总设计第 1.5 节） | 「…文件格式约束」之行内可带 `extended-matching` | 待读（任务 1） | | | |
-| FR-RULE-04（阶段 1 对照第 241 行） | 「…行级参数作用于整集」之 `extended-matching` | 待读（任务 1） | | | |
-| FR-RULE-07（阶段 1 对照第 257 行；阶段 2 验收第 564 行；总设计第 1.5 节） | 「`extended-matching`：从 TLS ClientHello 提取 SNI」 | 待读（任务 1） | | | |
-| FR-RULE-07（阶段 1 对照第 258 行；阶段 3 对照第 247 行） | 「…从 HTTP/1.1 Host…提取主机名」 | 待读（任务 1） | | | |
+| FR-RULE-04（阶段 1 对照第 232 行；总设计第 1.5 节） | 「…文件格式约束」之行内可带 `extended-matching` | 做了 | `crates/rurge-rules/src/matcher.rs::Matcher::eval`（行内 `extended-matching` 让域名规则拿 SNI 与 `Host` 比） | `crates/rurge-rules/src/matcher.rs`：`extended_matching_uses_sni_and_host`；`crates/rurge-engine/tests/sniff.rs`：`extended_matching_rules_a_tls_session_by_its_sni`；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/P1 |
+| FR-RULE-04（阶段 1 对照第 241 行） | 「…行级参数作用于整集」之 `extended-matching` | 做了 | `crates/rurge-rules/src/set.rs::CompiledSet::compile` | `crates/rurge-rules/src/set.rs`：`a_flag_on_one_domain_line_applies_to_every_domain_line`、`extended_matching_applies_to_domain_entries`、`without_a_flag_a_rule_set_ignores_the_sni`、`a_flag_on_a_rule_that_is_not_a_domain_rule_does_not_spread`；`crates/rurge-engine/tests/sniff.rs`：`a_flag_on_one_line_of_a_rule_set_matches_the_sni`（真实规则集文件里一行上的标志作用于整集）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | — |
+| FR-RULE-07（阶段 1 对照第 257 行；阶段 2 验收第 564 行；总设计第 1.5 节） | 「`extended-matching`：从 TLS ClientHello 提取 SNI」 | 做了 | `crates/rurge-http/src/tls.rs::parse_client_hello`、`crates/rurge-http/src/sniff.rs::judge`、`crates/rurge-engine/src/serve.rs::serve_sniffed` | `crates/rurge-http/src/tls.rs`：`a_whole_hello_is_tls_with_its_sni_and_alpn`、`an_upper_case_sni_is_lowered`、`a_hello_over_several_records_is_put_together`、`a_hello_larger_than_a_record_is_read_to_its_end`；`crates/rurge-engine/tests/sniff.rs`：`extended_matching_rules_a_tls_session_by_its_sni`（规则之前就有 SNI）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/P1 |
+| FR-RULE-07（阶段 1 对照第 258 行；阶段 3 对照第 247 行） | 「…从 HTTP/1.1 Host…提取主机名」 | 做了 | `crates/rurge-http/src/engine.rs::prepare`（`http_host` 取 `Host` 的主机、小写）、`crates/rurge-rules/src/matcher.rs::domain_targets` | `crates/rurge-http/src/engine.rs`：`the_session_of_a_request_says_what_the_rules_see`（会话的 `http_host` 是小写的 `Host` 主机）；`crates/rurge-rules/src/matcher.rs`：`extended_matching_uses_sni_and_host`（域名规则拿 `Host` 比）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/W1、M1/W2、M1/M1、M1/M2、M1/L1、M1/L2 |
 | FR-RULE-07（阶段 1 对照第 259 行） | 「…HTTP/2 `:authority`…提取主机名」 | 待读（任务 2） | 同「会话入口与 HTTP 引擎（FR-HTTP-01、02）」的「「`:authority` 提取」」一行 | 同上 | |
-| FR-RULE-08（阶段 1 对照第 261 行；阶段 2 验收第 564 行） | 「协议识别：HTTP」之 CONNECT 隧道或 SOCKS5 连接里的明文 HTTP | 待读（任务 1） | | | |
-| FR-RULE-08（阶段 1 对照第 262 行） | 「…HTTPS（TLS）」 | 待读（任务 1） | | | |
+| FR-RULE-08（阶段 1 对照第 261 行；阶段 2 验收第 564 行） | 「协议识别：HTTP」之 CONNECT 隧道或 SOCKS5 连接里的明文 HTTP | 做了 | `crates/rurge-engine/src/serve.rs::serve_sniffed`（判为 HTTP 时 `session.protocol = Some(ProtocolKind::Http)`） | `crates/rurge-engine/tests/sniff.rs`：`a_plain_http_session_is_marked_http`（`PROTOCOL,HTTP` 规则命中、协议记 `http`）；`crates/rurge-rules/src/matcher.rs`：`port_source_protocol_and_hostname_type_rules`（`PROTOCOL,HTTP` 对 HTTPS 会话不命中）；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/W1、M1/W2、M1/M1、M1/M2、M1/L1、M1/L2 |
+| FR-RULE-08（阶段 1 对照第 262 行） | 「…HTTPS（TLS）」 | 做了 | `crates/rurge-engine/src/serve.rs::serve_sniffed`（判为 TLS 时 `session.protocol = Some(ProtocolKind::Https)`） | `crates/rurge-engine/tests/sniff.rs`：`protocol_https_refuses_before_the_dial`（`PROTOCOL,HTTPS` 在拨号之前命中、协议记 `https`）；`crates/rurge-rules/src/matcher.rs`：`port_source_protocol_and_hostname_type_rules`；CI 三平台通过（Linux、Windows：运行 41402787066；macOS：运行 41411445901） | M1/P1 |
 | FR-CFG-11（阶段 2 验收第 574 行） | 「…被…`ca-keystore-name`…引用」 | 待读（任务 2） | 同「MITM（FR-HTTP-03、04、14）」的「「`[MITM]` 九个键」之 `ca-keystore-name`」」一行 | 同上 | |
 
 ### 非功能需求
@@ -284,6 +284,7 @@
 
 | 需求 | 这一句 | 登记在 |
 | --- | --- | --- |
+| FR-OUT-01 | 「HTTP 一侧的 `REJECT-DROP` 看不到客户端提前关闭」 | M1 细化设计第 20 节第 8 条；兼容性清单 4.1 节 `REJECT-DROP` 一行 |
 
 ### 本机没有能红的用例的
 
