@@ -1169,4 +1169,20 @@ a ClientHello that does not parse
 - **全部证据是回环上的用例**：QUIC 的数据报是用例自己造的或 quinn 的客户端在回环上真发出的，没有一个 QUIC 握手完成过；没有经真浏览器、没有对真实的 HTTP/3 站点试过。
 - **设计第 4.7 节的四件没有做**（M5-D15）：从没有拼齐的 ClientHello 里取 SNI（Surge iOS 5.17.0 说有）、gQUIC 的 SNI（Surge iOS 5.14.6 说有）、Retry 之后的第二把密钥（持住时还没有到服务端，放出去之后不再读）、ECH（读到的是外层的 SNI）。前两件要不要做归项目所有者（设计第 15 节）。
 - **放行的 QUIC 流发往没有人收的回环端口**，用例因此**不断言说明为空**（计划 P12、设计第 16 节第 2 条）：Windows 上可能写上一个「连接被重置」一类的说明。被阻断的流断言的是 `error` 恰好那一句。
+
+## M6 的核对（2026-11-04）
+
+阶段 4 / M6 读这一份时查出五处与代码不符或说得不够的，订正在这里（M6 设计第 10 节：只在查出与代码不符时改，历史段落不改；前面各节一个字也不改）。
+
+**「M3b」一节「外部资源的 `data`」引的两条用例说多了**：
+
+- 「同一个 URL 写在几行里只有一项：第一次登记定下种类与标签（用例 `the_same_map_local_url_is_one_resource`）」只有前半句有用例：`crates/rurge-engine/tests/rewrite.rs` 的 `the_same_map_local_url_is_one_resource` 把同一个 URL 写进两行 `[Map Local]`，等到它下载好，然后断言 `map_local_data(&h)` 列出的项数是 1、`server.hits("/m.json")` 是 1（URL 只下载一次）；「第一次登记定下种类与标签」是它的文档注释里的话，断言里没有。
+- 「数据目录里有这个 URL 早先下载的副本时照那份副本答（用例 `offline_mode_uses_the_cache_only`）」是资源管理器自己的通用用例，不经 Map Local：`crates/rurge-net/src/resource/mod.rs` 的 `offline_mode_uses_the_cache_only` 先在线下载一次（`url_spec`，种类是 `RuleSet`），丢掉那份管理器，再以 `offline: true` 建一个新的，断言它读到之前那一份（`Available { version: 1, .. }`）、数据目录里没有的那个 URL 是 `Failed` 且 `last_error` 里带 `offline`。它算到 Map Local 上，靠的是 `crates/rurge-engine/src/runtime.rs` 的 `build_rewrite` 把 URL 的数据登记成本代资源管理器上的 `ResourceKind::MapLocal`，不是这条用例。
+
+**同一节「`POST /v1/external_resources/update` 可以按键更新它，`"all"` 也更新它」没有用例**：没有一条用例经这个端点按键更新一项 `data`，也没有一条经它以 `"all"` 更新一项 `data`。它成立靠的是与列出它同一个判断：`crates/rurge-engine/src/external_resources.rs` 的 `type_name` 对 `ResourceKind::MapLocal` 交回 `Some("data")`——列出走 `in_listing_order`，按键更新走 `lists`（`update_external_resources` 第 289、308、309 行），`"all"` 走 `in_listing_order` 并跳过本地的资源。端点的形状由 `crates/rurge-api/tests/api.rs` 的 `external_resources_are_updated_one_key_at_a_time` 断言。
+
+**「M5a」一节有两处比代码说得少**：
+
+- 「被 `auto-quic-block` 阻断的流」一节写「两步都是 TCP 一侧今天的那段代码（入口、名字、`always-raw-tcp-hosts`、`always-raw-tcp-keywords` 与端口那几步抽成 `sniffable_target`，两侧共用，条件不会分叉）」，没有写入口那一步在 `sniffable_session` 里分在它前面：`sniffable_session`（`crates/rurge-engine/src/serve.rs`）先看传输（`session.transport != Transport::Tcp` 就不嗅探）与暂停（`self.is_suspended()`），再问 `sniffable_target`；`sniffable_target` 不看传输、也不看暂停（UDP 流也问它，`auto_quic_blocks` 就是问它的），它看的是入口（`Http`、`Socks5`、`Tun`）、名字、两个名单与端口。所以「两侧共用」说的是这几步，传输与暂停不共用（M5a 计划「执行期修正记录」第 19 行）。
+- 「没有覆盖的」里少了「`quic` 四个数在重载之后的读数」：上面「`GET /v1/rurge/http` 的 `quic`」一节写着四个数自进程启动起累计、重载不清零，写那一节时没有钉住它的用例；`84f5843` 补的 `the_quic_counts_survive_a_reload`（`crates/rurge-engine/tests/udp.rs`）在一条读完 ClientHello 的流之后用 `swap_runtime` 换一份配置，断言 `http_counts().quic` 仍是 `hello: 1`（失败时 `a reload does not clear the counts`）。
 - **没有观察过 Surge 在这些地方的实际行为**，照设计与手册写：`quic` 四个数的口径、两种备注与那一句说明的文字、持住的两个上限、阻断跟着 TCP 一侧的读法。
