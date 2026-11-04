@@ -1466,6 +1466,42 @@ mod tests {
         );
         assert_eq!(serial[0] & 0x80, 0, "a positive serial number");
 
+        // The length above is what catches a serial whose top bit was not
+        // cleared. The assertion on the top bit alone catches nothing: rcgen
+        // writes the serial with yasna's `write_bigint_bytes(.., true)`, which
+        // puts a 0x00 before a first byte of 0x80 or more, so the first byte of
+        // the encoding is below 0x80 whether the product cleared it or not.
+        //
+        // One leaf makes that miss with probability 1/2 — only a serial whose
+        // first random byte is 0x80 or more would encode to 17 bytes. So the
+        // same CA signs 32 leaves, each under a name of its own (leaves are
+        // cached by name), and all 32 have to be at most 16 bytes: a product
+        // that stopped clearing the top bit would get past all of them with
+        // probability 2^-32. Thirty-two rather than sixty-four keeps the case
+        // under about two seconds in a debug build.
+        let authority = Arc::new(
+            Authority::load_at(
+                &cfg_with_ca(&ca_p12(&ca, "pw"), "pw"),
+                &[],
+                clock_at(NOW),
+            )
+            .expect("a usable CA")
+            .expect("a CA was named"),
+        );
+        for i in 0..32 {
+            let name = format!("leaf{i}.test");
+            let leaf = authority
+                .leaf(&HostName::parse(&name))
+                .await
+                .expect("a leaf");
+            let (_, cert) = parse_x509_certificate(leaf.cert[0].as_ref()).expect("a certificate");
+            assert!(
+                cert.raw_serial().len() <= 16,
+                "{name}: the encoded serial is at most 16 bytes, was {}",
+                cert.raw_serial().len()
+            );
+        }
+
         // an address is an address
         let leaf = leaf_of(&ca, "127.0.0.1").await;
         let (_, cert) = parse_x509_certificate(leaf.cert[0].as_ref()).expect("a certificate");
