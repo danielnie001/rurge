@@ -7064,15 +7064,17 @@ mod tests {
     /// An HTTP/2 origin of the case's own (`phase 4 / M2b plan P18`): it takes
     /// TLS connections that offer `h2` alone, follows `script` on its first
     /// connection, answers every stream of every later one with its path, says
-    /// when its first connection ended, and resets the first stream of
-    /// `ResetMidBody` when the case tells it the part of the body has arrived.
+    /// when its first connection ended, and — when the case tells it the part
+    /// of the body has arrived — resets the first stream of `ResetMidBody` or
+    /// closes the whole connection of `CloseMidBody`.
     struct H2Origin {
         addr: SocketAddr,
         connections: Arc<AtomicUsize>,
         ended: Arc<tokio::sync::Notify>,
-        /// Fired by the case once it has read the part `ResetMidBody` sent;
-        /// the origin resets the stream only then (`the phase 4 / M2b plan's
-        /// execution record row 52`).
+        /// Fired by the case once it has read the part `ResetMidBody` or
+        /// `CloseMidBody` sent; only then does the origin reset the stream, or
+        /// close the whole connection (`the phase 4 / M2b plan's execution
+        /// record row 52`, `the phase 4 / M6 plan's execution record row 21`).
         reset: Arc<tokio::sync::Notify>,
     }
 
@@ -7151,6 +7153,13 @@ mod tests {
                                     // dropping the connection here ends it with
                                     // the head and the part already written
                                     if matches!(script, OriginScript::CloseMidBody) {
+                                        // this is the first connection and it
+                                        // ends here, so a case waiting for
+                                        // `ended` hears of it as it does for
+                                        // the end further down
+                                        if first {
+                                            ended.notify_one();
+                                        }
                                         return;
                                     }
                                     send.send_reset(h2::Reason::REFUSED_STREAM);
