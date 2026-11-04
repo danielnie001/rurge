@@ -7150,17 +7150,16 @@ mod tests {
                                     }
                                     // `the phase 4 / M6 plan's execution record
                                     // row 21`: the case has read the part, so
-                                    // dropping the connection here ends it with
-                                    // the head and the part already written
+                                    // leaving the loop here ends the connection
+                                    // with the head and the part already written
                                     if matches!(script, OriginScript::CloseMidBody) {
-                                        // this is the first connection and it
-                                        // ends here, so a case waiting for
-                                        // `ended` hears of it as it does for
-                                        // the end further down
-                                        if first {
-                                            ended.notify_one();
-                                        }
-                                        return;
+                                        // leaving the loop drops `conn` at the end
+                                        // of this block, and what follows the
+                                        // block says once that the first
+                                        // connection ended — the same place the
+                                        // other scripts say it from (`the phase
+                                        // 4 / M6 plan's execution record row 67`)
+                                        break;
                                     }
                                     send.send_reset(h2::Reason::REFUSED_STREAM);
                                 }
@@ -8319,6 +8318,12 @@ mod tests {
             "the part the origin sent before the connection ended"
         );
         origin.reset.notify_one();
+        // the origin ends its first connection once the case has the part;
+        // waiting for that here is what says the connection is dropped before
+        // the case goes on (`the phase 4 / M6 plan's execution record row 67`)
+        tokio::time::timeout(Duration::from_secs(5), origin.ended.notified())
+            .await
+            .expect("the origin's first connection ended within 5 s");
         let (rest, ended) = read_body(body).await;
         assert_eq!(rest, 0, "nothing after the part");
         assert!(ended.is_some(), "the body failed, it did not end");
