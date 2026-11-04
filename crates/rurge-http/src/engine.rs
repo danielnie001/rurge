@@ -7153,12 +7153,12 @@ mod tests {
                                     // leaving the loop here ends the connection
                                     // with the head and the part already written
                                     if matches!(script, OriginScript::CloseMidBody) {
-                                        // leaving the loop drops `conn` at the end
-                                        // of this block, and what follows the
-                                        // block says once that the first
-                                        // connection ended — the same place the
-                                        // other scripts say it from (`the phase
-                                        // 4 / M6 plan's execution record row 67`)
+                                        // leaving the loop ends the `if let Ok(mut conn)`
+                                        // block, which drops `conn`; the lines after
+                                        // that block then say once that the first
+                                        // connection ended — the same place the other
+                                        // scripts say it from (`the phase 4 / M6
+                                        // plan's execution record row 67`)
                                         break;
                                     }
                                     send.send_reset(h2::Reason::REFUSED_STREAM);
