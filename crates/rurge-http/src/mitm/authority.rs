@@ -1477,16 +1477,14 @@ mod tests {
         // same CA signs 32 leaves, each under a name of its own (leaves are
         // cached by name), and all 32 have to be at most 16 bytes: a product
         // that stopped clearing the top bit would get past all of them with
-        // probability 2^-32. Thirty-two rather than sixty-four keeps the case
-        // under about two seconds in a debug build.
+        // probability 2^-32. Thirty-two rather than sixty-four: the count is
+        // not what the case's time is made of (loading the CA out of its P12
+        // is), and `the phase 4 / M6 plan's execution record row 66` keeps the
+        // case to thirty-two.
         let authority = Arc::new(
-            Authority::load_at(
-                &cfg_with_ca(&ca_p12(&ca, "pw"), "pw"),
-                &[],
-                clock_at(NOW),
-            )
-            .expect("a usable CA")
-            .expect("a CA was named"),
+            Authority::load_at(&cfg_with_ca(&ca_p12(&ca, "pw"), "pw"), &[], clock_at(NOW))
+                .expect("a usable CA")
+                .expect("a CA was named"),
         );
         for i in 0..32 {
             let name = format!("leaf{i}.test");
