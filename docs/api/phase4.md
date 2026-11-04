@@ -1169,6 +1169,7 @@ a ClientHello that does not parse
 - **全部证据是回环上的用例**：QUIC 的数据报是用例自己造的或 quinn 的客户端在回环上真发出的，没有一个 QUIC 握手完成过；没有经真浏览器、没有对真实的 HTTP/3 站点试过。
 - **设计第 4.7 节的四件没有做**（M5-D15）：从没有拼齐的 ClientHello 里取 SNI（Surge iOS 5.17.0 说有）、gQUIC 的 SNI（Surge iOS 5.14.6 说有）、Retry 之后的第二把密钥（持住时还没有到服务端，放出去之后不再读）、ECH（读到的是外层的 SNI）。前两件要不要做归项目所有者（设计第 15 节）。
 - **放行的 QUIC 流发往没有人收的回环端口**，用例因此**不断言说明为空**（计划 P12、设计第 16 节第 2 条）：Windows 上可能写上一个「连接被重置」一类的说明。被阻断的流断言的是 `error` 恰好那一句。
+- **没有观察过 Surge 在这些地方的实际行为**，照设计与手册写：`quic` 四个数的口径、两种备注与那一句说明的文字、持住的两个上限、阻断跟着 TCP 一侧的读法。
 
 ## M6 的核对（2026-11-04）
 
@@ -1183,6 +1184,5 @@ a ClientHello that does not parse
 
 **「M5a」一节有两处比代码说得少**：
 
-- 「被 `auto-quic-block` 阻断的流」一节写「…（入口、名字、`always-raw-tcp-hosts`、`always-raw-tcp-keywords` 与端口那几步抽成 `sniffable_target`，两侧共用，条件不会分叉）」，没有写入口那一步在 `sniffable_session` 里分在它前面：`sniffable_session`（`crates/rurge-engine/src/serve.rs`）先看传输（`session.transport != Transport::Tcp` 就不嗅探）与暂停（`self.is_suspended()`），再问 `sniffable_target`；`sniffable_target` 不看传输、也不看暂停（UDP 流也问它，`auto_quic_blocks` 就是问它的），它看的是入口（`Http`、`Socks5`、`Tun`）、名字、两个名单与端口。所以「两侧共用」说的是这几步，传输与暂停不共用（M5a 计划「执行期修正记录」第 19 行）。
+- 「被 `auto-quic-block` 阻断的流」一节写「…（入口、名字、`always-raw-tcp-hosts`、`always-raw-tcp-keywords` 与端口那几步抽成 `sniffable_target`，两侧共用，条件不会分叉）」，没有写入口那一步与预匹配在 `sniffable_session` 里分在它前后：`sniffable_session`（`crates/rurge-engine/src/serve.rs`）先看传输（`session.transport != Transport::Tcp` 就不嗅探）与暂停（`self.is_suspended()`），再问 `sniffable_target`，然后在代理端口上、这次拨号会问规则时（`reaches_the_rules()`）问一次预匹配（`runtime.rules.pre_refuses(&probed)`）；`sniffable_target` 不看传输、也不看暂停与预匹配（UDP 流也问它，`auto_quic_blocks` 就是问它的，它的文档注释写着 `Neither the pause nor pre-matching is asked`），它看的是入口（`Http`、`Socks5`、`Tun`）、名字、两个名单与端口。所以「两侧共用」说的是这几步，传输、暂停与预匹配不共用（M5a 计划「执行期修正记录」第 19 行）。
 - 「没有覆盖的」里少了「`quic` 四个数在重载之后的读数」：上面「`GET /v1/rurge/http` 的 `quic`」一节写着四个数自进程启动起累计、重载不清零，写那一节时没有钉住它的用例；`84f5843` 补的 `the_quic_counts_survive_a_reload`（`crates/rurge-engine/tests/udp.rs`）在一条读完 ClientHello 的流之后用 `swap_runtime` 换一份配置，断言 `http_counts().quic` 仍是 `hello: 1`（失败时 `a reload does not clear the counts`）。
-- **没有观察过 Surge 在这些地方的实际行为**，照设计与手册写：`quic` 四个数的口径、两种备注与那一句说明的文字、持住的两个上限、阻断跟着 TCP 一侧的读法。
