@@ -2480,10 +2480,10 @@ async fn chunked_bodies_go_both_ways() {
     assert_eq!(seen[0], body, "the origin got the client's bytes, whole");
 }
 
-/// A loopback origin that answers the first request of a connection with a
-/// 304 and writes a few bytes after it, as if a body followed a response that
-/// should have none; after that it answers normally (`the phase 4 M6 recheck
-/// report item 3`).
+/// A loopback origin that answers the first request it ever reads — on
+/// whichever of the connections it serves — with a 304 and writes a few bytes
+/// after it, as if a body followed a response that should have none; after that
+/// it answers normally (`the phase 4 M6 recheck report item 3`).
 ///
 /// It reads one head at a time; the first request it ever reads gets the 304
 /// and the stray bytes, every later one the 200.

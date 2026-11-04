@@ -749,9 +749,11 @@ mod tests {
     /// without redirection. `CREATE_DEFAULT_ERROR_MODE` gives the child the
     /// default mode whatever the parent has.
     ///
-    /// Where there is no interactive desktop (CI, for one), a message box
-    /// cannot appear, so this test may well pass there even if `load` stops
-    /// setting the thread error mode.
+    /// Where a message box can appear at all decides whether this test can
+    /// tell anything: whether the CI Windows runners have an interactive
+    /// desktop has not been checked here (the sources found disagree), and in a
+    /// session that cannot put one on a desktop this test passes even if `load`
+    /// stops setting the thread error mode.
     #[test]
     fn a_file_that_is_not_a_dll_is_refused_with_the_default_error_mode() {
         use std::os::windows::process::CommandExt;
