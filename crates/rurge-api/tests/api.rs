@@ -206,6 +206,12 @@ async fn api() -> Api {
     api_with("").await
 }
 
+/// `api` whose engine shares `shared`, for a case that sets or reads one of
+/// its fields.
+async fn api_sharing(shared: EngineShared) -> Api {
+    api_built_with("", "", None, "", |_| {}, shared).await
+}
+
 /// `rules` are inserted before `DOMAIN,ads.test,REJECT` / `FINAL,DIRECT`.
 async fn api_with(rules: &str) -> Api {
     api_in(rules, "").await
@@ -245,6 +251,20 @@ async fn api_built(
     geo: Option<&TestServer>,
     extra: &str,
     seed: impl FnOnce(&Path),
+) -> Api {
+    api_built_with(rules, groups, geo, extra, seed, EngineShared::default()).await
+}
+
+/// `api_built` with the engine's shared state given instead of a default one.
+/// A case whose subject is one of its fields — the limit the capture store
+/// carries, for one — has to set that field before the engine is built.
+async fn api_built_with(
+    rules: &str,
+    groups: &str,
+    geo: Option<&TestServer>,
+    extra: &str,
+    seed: impl FnOnce(&Path),
+    shared: EngineShared,
 ) -> Api {
     let dns = MockDns::spawn().await;
     dns.set("target.test", &["127.0.0.1"], &[], 60);
@@ -292,7 +312,7 @@ Locked = trojan, 1.2.3.4, 443, password=x\n\
             },
             outbound_mode: OutboundMode::Rule,
             idle_timeout: Duration::from_secs(600),
-            shared: EngineShared::default(),
+            shared,
             request_log_size: 1000,
         },
     )
@@ -4150,16 +4170,29 @@ async fn decode_undoes_gzip_and_says_why_it_cannot() {
 /// The limit a decoded body is measured against is this process's body limit
 /// (`phase 4 M4 design 7.5`, `8.2`): a gzip answer that decodes to one byte
 /// more says so with the limit, in the entry and in the HAR.
+///
+/// The case gives its engine a store whose body limit is its own, not the
+/// default one: the default is the constant the code names, so a case built
+/// with it reads the same number whether the answer comes from the store or
+/// from that constant.
 #[tokio::test]
 async fn the_decode_limit_is_the_body_limit_of_this_process() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use rurge_engine::capture::Body;
+    use rurge_engine::capture::{Body, CaptureStore, DEFAULT_TOTAL, Limits};
     use std::io::Write;
 
-    let api = api().await;
+    /// The body limit this case's own store carries, not the default one.
+    const LIMIT: u64 = 1024;
+
+    let shared = EngineShared {
+        capture: CaptureStore::new(Limits::new(DEFAULT_TOTAL, LIMIT)),
+        ..EngineShared::default()
+    };
+    let api = api_sharing(shared).await;
     let (_, status) = get(&api, "/v1/rurge/capture").await;
     let limit = status["limits"]["body"].as_u64().expect("a body limit");
+    assert_eq!(limit, LIMIT, "the case's own body limit");
     let plain = vec![0u8; limit as usize + 1];
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&plain).expect("in memory");
